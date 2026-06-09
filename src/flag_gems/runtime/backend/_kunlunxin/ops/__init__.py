@@ -24,6 +24,7 @@ from .attention import (
     scaled_dot_product_attention_forward,
 )
 from .avg_pool2d import avg_pool2d, avg_pool2d_backward
+from .avg_pool3d import avg_pool3d, avg_pool3d_backward
 from .baddbmm import baddbmm
 from .batch_norm import batch_norm, batch_norm_backward
 from .bitwise_and import (
@@ -89,6 +90,7 @@ from .flip import flip
 from .full import full
 from .full_like import full_like
 from .gather import gather, gather_backward
+from .gcd import gcd, gcd_out
 from .ge import ge, ge_scalar
 from .gelu import gelu, gelu_, gelu_backward
 from .get_scheduler_metadata import get_scheduler_metadata
@@ -108,12 +110,14 @@ from .isinf import isinf
 from .isnan import isnan
 from .kron import kron
 from .layernorm import layer_norm, layer_norm_backward
+from .leaky_relu import leaky_relu, leaky_relu_, leaky_relu_out
 from .le import le, le_scalar
 from .lerp import lerp_scalar, lerp_scalar_, lerp_tensor, lerp_tensor_
 from .linspace import linspace
 from .log import log
 from .log_sigmoid import log_sigmoid
 from .log_softmax import log_softmax, log_softmax_backward
+from .logsumexp import logsumexp
 from .logical_and import logical_and
 from .logical_not import logical_not
 from .logical_or import logical_or
@@ -213,12 +217,14 @@ from .to import to_copy
 from .topk import topk
 from .trace import trace
 from .triu import triu
+from .tril import tril, tril_, tril_out
 from .uniform import uniform_
 from .unique import _unique2
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
 from .upsample_linear1d import upsample_linear1d
 from .upsample_nearest1d import upsample_nearest1d
 from .upsample_nearest2d import upsample_nearest2d
+from .var import var, var_correction, var_dim
 from .var_mean import var_mean
 from .vdot import vdot
 from .vector_norm import vector_norm
@@ -228,7 +234,7 @@ from .where import where_scalar_other, where_scalar_self, where_self, where_self
 from .zero import zero, zero_out
 from .zeros import zeros
 from .zeros_like import zeros_like
-
+from .aminmax import aminmax
 __all__ = [
     "_conv_depthwise2d",
     "digamma_",
@@ -239,6 +245,7 @@ __all__ = [
     "_unique2",
     "_upsample_bicubic2d_aa",
     "apply_repetition_penalties",
+    "aminmax",
     "abs",
     "abs_",
     "acos",
@@ -268,6 +275,8 @@ __all__ = [
     "atan_",
     "avg_pool2d",
     "avg_pool2d_backward",
+    "avg_pool3d",
+    "avg_pool3d_backward",
     "baddbmm",
     "batch_norm",
     "batch_norm_backward",
@@ -349,6 +358,8 @@ __all__ = [
     "full_like",
     "gather",
     "gather_backward",
+    "gcd",
+    "gcd_out",
     "ge",
     "ge_scalar",
     "gelu",
@@ -377,6 +388,9 @@ __all__ = [
     "kron",
     "layer_norm",
     "layer_norm_backward",
+    "leaky_relu",
+    "leaky_relu_",
+    "leaky_relu_out",
     "le",
     "le_scalar",
     "lerp_scalar",
@@ -388,6 +402,7 @@ __all__ = [
     "log_sigmoid",
     "log_softmax",
     "log_softmax_backward",
+    "logsumexp",
     "logical_and",
     "logical_not",
     "logical_or",
@@ -524,6 +539,9 @@ __all__ = [
     "to_copy",
     "topk",
     "trace",
+    "tril",
+    "tril_",
+    "tril_out",
     "triu",
     "true_divide",
     "true_divide_out",
@@ -532,6 +550,9 @@ __all__ = [
     "upsample_linear1d",
     "upsample_nearest1d",
     "upsample_nearest2d",
+    "var",
+    "var_correction",
+    "var_dim",
     "var_mean",
     "vdot",
     "vector_norm",

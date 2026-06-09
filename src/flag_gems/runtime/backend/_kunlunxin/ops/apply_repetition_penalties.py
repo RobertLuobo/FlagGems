@@ -34,8 +34,9 @@ def _repetition_penalty_kernel(
 
     prompt_mask = tl.load(prompt_mask_ptr + mask_idx, mask=valid_vocab, other=False)
     output_mask = tl.load(output_mask_ptr + mask_idx, mask=valid_vocab, other=False)
-    logits = tl.load(logits_ptr + logits_idx, mask=valid_vocab, other=0.0)
+    logits = tl.load(logits_ptr + logits_idx, mask=valid_vocab, other=0.0).to(tl.float32)
 
+    penalty = penalty.to(tl.float32)
     is_repeated = prompt_mask | output_mask
 
     logits = tl.where(is_repeated & (logits > 0), logits / penalty, logits)
