@@ -7,6 +7,7 @@ from .geglu import dgeglu, geglu
 from .gelu_and_mul import gelu_and_mul
 from .instance_norm import instance_norm
 from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
+from .moe_sum import moe_sum
 from .outer import outer
 from .reglu import dreglu, reglu
 from .reshape_and_cache import reshape_and_cache
@@ -37,6 +38,7 @@ __all__ = [
     "reshape_and_cache",
     "moe_align_block_size",
     "moe_align_block_size_triton",
+    "moe_sum",
     "reshape_and_cache_flash",
     "flash_mla",
     "topk_softmax",
