@@ -165,6 +165,19 @@ ops:
       - LinearAlg
     stages:
       - stable: '4.0'
+  - id: addcmul_
+    description: |
+      The in-place version of `addcmul()`.
+    for:
+      - addcmul_
+    labels:
+      - aten
+      - pointwise
+      - KernelGen
+    kind:
+      - LinearAlg
+    stages:
+      - alpha: '5.4'
   - id: addcmul_out
     description: |
       A variant of `addcmul` that allows the output to be assigned to `out`.
@@ -1757,7 +1770,6 @@ ops:
       - diff
     labels:
       - aten
-      - KernelGen
     kind:
       - Math
     stages:
@@ -3638,6 +3650,18 @@ ops:
       - Tensor
     stages:
       - stable: '2.2'
+  - id: linear
+    description: |
+      Applies a linear transformation to the incoming data: y = x @ W^T + b.
+    for:
+      - linear
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - BLAS
+    stages:
+      - alpha: '5.4'
   - id: log
     description: Returns a new tensor with the natural logarithm of the elements of `input`.
     for:
@@ -4682,6 +4706,16 @@ ops:
       - Tensor
     stages:
       - alpha: '5.3'
+  - id: normal_
+    description: Random sampling operator (normal_).
+    for:
+      - normal_
+    labels:
+      - skip_precision_check
+    kind:
+      - Tensor
+    stages:
+      - alpha: '5.1'
   - id: normal_float_float_
     description: |
       Returns a tensor of random numbers drawn from separate normal distributions
@@ -5124,6 +5158,16 @@ ops:
       - Distribution
     stages:
       - stable: '2.1'
+  - id: random_
+    description: Random sampling operator (random_).
+    for:
+      - random_
+    labels:
+      - skip_precision_check
+    kind:
+      - Tensor
+    stages:
+      - alpha: '5.1'
   - id: randperm
     description: Returns a random permutation of integers from `0` to `n - 1`.
     for:
@@ -5701,6 +5745,12 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '2.2'
+  - id: scaled_grouped_mm
+    description: |
+      Performs grouped matrix multiplication with row-wise and column-wise scaling,
+      commonly used by quantized Mixture-of-Experts (MoE) workloads.
+    for:
+      - _scaled_grouped_mm
   - id: scaled_mm
     description: |
       Performs a scaled matrix multiplication. The result of `self @ mat2` is
@@ -6960,6 +7010,19 @@ ops:
       - NeuralNetwork
     stages:
       - stable: '5.0'
+  - id: unfold_copy
+    description: >
+      Returns a view of the original tensor which contains all slices of size from self tensor
+      in the specified dimension with given step between two slices.
+    for:
+      - unfold_copy
+    labels:
+      - aten
+      - KernelGen
+    kind:
+      - Tensor
+    stages:
+      - alpha: '5.4'
   - id: uniform_
     description: Fills `self` tensor with numbers sampled from the continuous uniform distribution.
     for:

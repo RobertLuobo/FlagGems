@@ -18,7 +18,7 @@ from flag_gems.runtime import flagtune
 from flag_gems.runtime.backend import SpecOpRegistrar
 from flag_gems.runtime.op_registrar import GeneralOpRegistrar
 
-__version__ = "5.0.2"
+__version__ = "5.4.0dev"
 device = runtime.device.name
 vendor_name = runtime.device.vendor_name
 backend_info = runtime.device
@@ -59,6 +59,7 @@ _FULL_CONFIG = (
     ("_log_softmax_backward_data.out", log_softmax_backward_out),
     ("_resize_output", _resize_output),
     ("_safe_softmax", _safe_softmax),
+    ("_scaled_grouped_mm", scaled_grouped_mm, lambda: torch_ge("2.8")),
     ("_scaled_mm", scaled_mm, lambda: torch_ge("2.5")),
     ("_scaled_mm.out", scaled_mm_out, lambda: torch_ge("2.5")),
     ("_segment_reduce_backward", _segment_reduce_backward),
@@ -335,6 +336,7 @@ _FULL_CONFIG = (
     ("lerp_.Tensor", lerp_tensor_),
     ("lift_fresh_copy", lift_fresh_copy),
     ("linalg_vector_norm", vector_norm),
+    ("linear", linear),
     ("linspace", linspace),
     ("log", log),
     ("log1p", log1p),
@@ -411,7 +413,7 @@ _FULL_CONFIG = (
     ("neg", neg),
     ("neg_", neg_),
     ("negative", negative),
-    ("new_full.Tensor", new_full),
+    ("new_full", new_full),
     ("nll_loss2d_backward", nll_loss2d_backward),
     ("nll_loss2d_forward", nll_loss2d_forward),
     ("nll_loss_backward", nll_loss_backward),
@@ -577,6 +579,7 @@ _FULL_CONFIG = (
     ("trunc", trunc),
     ("trunc_", trunc_),
     ("unfold_backward", unfold_backward),
+    ("unfold_copy", unfold_copy),
     ("uniform_", uniform_),
     ("unique_consecutive", unique_consecutive),
     ("unique_dim", unique_dim),
