@@ -89,6 +89,13 @@ def prod(inp, *, dtype=None):
 
 
 def heur_m_block_size(args):
+    # For large reduction dim N, assign one row per program (BLOCK_M=1): this
+    # maximizes grid parallelism and keeps the accumulator tile [1, BLOCK_N]
+    # small. For small N, pack many rows per program so the launch cost is
+    # amortized. The old unbounded BLOCK_M = next_pow2(cdiv(M, 12)) built giant
+    # [512, BLOCK_N] tiles with only ~8 programs -> catastrophic (see solution).
+    if args["N"] >= 2048:
+        return 1
     return triton.next_power_of_2(triton.cdiv(args["M"], 12))  # cluster_num
 
 
@@ -114,26 +121,25 @@ def prod_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # set offset
-    pid_m = ext.program_id(0)
-    m_offset = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # Map program id to its rows and pre-offset the base pointer so the inner
+    # `inp + cols` access is proven contiguous by OffsetAnalysis (block DMA).
+    # Computing `m_offset[:, None] * N + n_offset` inline (old impl) blocks the
+    # analysis -> discrete scalar gather.
+    pid = ext.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    inp = inp + pid * N
+    out = out + pid
+    row_mask = pid < M
 
     acc = tl.full((BLOCK_M, BLOCK_N), value=1.0, dtype=tl.float32)
-    for start_n in range(0, N, BLOCK_N):
-        n_offset = start_n + tl.arange(0, BLOCK_N)
-        offset = m_offset[:, None] * N + n_offset[None, :]
-
-        # set mask
-        mask = m_offset[:, None] < M and n_offset[None, :] < N
-        inp_ptrs = inp + offset
-        inp_vals = tl.load(inp_ptrs, mask=mask, other=1.0).to(tl.float32)
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        col_mask = cols < N
+        inp_vals = tl.load(inp + cols, mask=row_mask & col_mask, other=1.0).to(
+            tl.float32
+        )
         acc *= inp_vals
-    result_index = tl.reduce(acc, axis=1, combine_fn=reduce_mul)
-
-    offset_index = m_offset
-    out_ptrs = out + offset_index
-    mask1 = m_offset < M
-    tl.store(out_ptrs, result_index, mask=mask1)
+    result = tl.reduce(acc, axis=1, combine_fn=reduce_mul)[:, None]
+    tl.store(out, result, row_mask)
 
 
 def prod_dim(inp, dim=None, keepdim=False, *, dtype=None):

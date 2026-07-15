@@ -28,7 +28,13 @@ config_ = CodeGenConfig(
     32,
     True,
     prefer_1d_tile=True,
-    isCloseMemoryAsync=False,
+    # isCloseMemoryAsync must stay at its default (True = async copy closed).
+    # Enabling async copy (=False) makes ConvertTritonXPUToLLVM materialize a
+    # multi-`ptr` async-buffer struct ON TOP of the buffer_size_limit=2048
+    # i64-struct; both get re-printed on every insert/extractvalue, blowing the
+    # compiled IR up to ~19GB (see benchmark/ir_dump/ir-logical_or-dev7.log) and
+    # making the benchmark fail with ZeroDivisionError. unroll_num=8 + async
+    # closed keeps the i64 buffer chunked so nothing explodes (same as bitwise_and).
     kunlunAutoGrid=True,
     unroll_num=8,
 )

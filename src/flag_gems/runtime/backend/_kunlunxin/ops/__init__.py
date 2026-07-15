@@ -15,8 +15,8 @@
 from .abs import abs, abs_
 from .acos import acos
 from .add import add, add_
-from .addcdiv import addcdiv
-from .addcmul import addcmul
+from .addcdiv import addcdiv, addcdiv_, addcdiv_out
+from .addcmul import addcmul, addcmul_out
 from .addmm import addmm, addmm_out
 from .addmv import addmv, addmv_out
 from .addr import addr
@@ -29,6 +29,7 @@ from .apply_repetition_penalties import apply_repetition_penalties
 from .arange import arange, arange_start
 from .argmax import argmax
 from .argmin import argmin
+from .as_strided_copy import as_strided_copy, as_strided_copy_out
 from .atan import atan, atan_
 from .attention import (
     ScaleDotProductAttention,
@@ -60,8 +61,18 @@ from .bitwise_or import (
 from .bitwise_right_shift import bitwise_right_shift
 from .bmm import bmm, bmm_out
 from .cat import cat
+from .ceil import ceil, ceil_, ceil_out
 from .celu import celu, celu_
-from .clamp import clamp, clamp_, clamp_min, clamp_min_, clamp_tensor, clamp_tensor_
+from .clamp import (
+    clamp,
+    clamp_,
+    clamp_max,
+    clamp_max_,
+    clamp_min,
+    clamp_min_,
+    clamp_tensor,
+    clamp_tensor_,
+)
 from .contiguous import contiguous
 from .conv1d import conv1d
 from .conv2d import conv2d
@@ -103,6 +114,7 @@ from .eye import eye
 from .eye_m import eye_m
 from .fill import fill_scalar, fill_scalar_, fill_tensor, fill_tensor_
 from .flip import flip
+from .floor import floor, floor_, floor_out
 from .full import full
 from .full_like import full_like
 from .gather import gather, gather_backward
@@ -185,6 +197,7 @@ from .pow import (
     pow_tensor_tensor,
     pow_tensor_tensor_,
 )
+from .prelu import prelu
 from .prod import prod, prod_dim
 from .quantile import quantile
 from .rand import rand
@@ -208,6 +221,7 @@ from .rms_norm import rms_norm, rms_norm_backward, rms_norm_forward
 from .round import round, round_, round_out
 from .rsqrt import rsqrt, rsqrt_
 from .rsub import rsub
+from .safe_softmax import _safe_softmax
 from .scaled_softmax import scaled_softmax_backward, scaled_softmax_forward
 from .scatter import scatter, scatter_
 from .scatter_add_ import scatter_add_
@@ -227,6 +241,7 @@ from .stack import stack
 from .std import std
 from .sub import sub, sub_
 from .sum import sum, sum_dim, sum_dim_out, sum_out
+from .t_copy import t_copy, t_copy_out
 from .tan import tan, tan_
 from .tanh import tanh, tanh_, tanh_backward
 from .threshold import threshold, threshold_backward
@@ -236,6 +251,7 @@ from .topk import topk
 from .trace import trace
 from .tril import tril, tril_, tril_out
 from .triu import triu
+from .trunc import trunc, trunc_
 from .uniform import uniform_
 from .unique import _unique2
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
@@ -245,15 +261,17 @@ from .upsample_nearest2d import upsample_nearest2d
 from .var_mean import var_mean
 from .vdot import vdot
 from .vector_norm import vector_norm
+from .view_copy import view_copy
 from .vstack import vstack
 from .weightnorm import weight_norm_interface, weight_norm_interface_backward
 from .where import where_scalar_other, where_scalar_self, where_self, where_self_out
-from .zero import zero, zero_out
+from .zero import zero, zero_, zero_out
 from .zeros import zeros
 from .zeros_like import zeros_like
 
 __all__ = [
     "_conv_depthwise2d",
+    "_safe_softmax",
     "digamma_",
     "soft_margin_loss",
     "soft_margin_loss_out",
@@ -268,7 +286,10 @@ __all__ = [
     "add",
     "add_",
     "addcdiv",
+    "addcdiv_",
+    "addcdiv_out",
     "addcmul",
+    "addcmul_out",
     "addmm",
     "addmm_out",
     "addmv",
@@ -288,6 +309,8 @@ __all__ = [
     "arange_start",
     "argmax",
     "argmin",
+    "as_strided_copy",
+    "as_strided_copy_out",
     "atan",
     "atan_",
     "avg_pool2d",
@@ -312,10 +335,15 @@ __all__ = [
     "bmm",
     "bmm_out",
     "cat",
+    "ceil",
+    "ceil_",
+    "ceil_out",
     "celu",
     "celu_",
     "clamp",
     "clamp_",
+    "clamp_max",
+    "clamp_max_",
     "clamp_tensor",
     "clamp_tensor_",
     "clamp_min",
@@ -370,6 +398,9 @@ __all__ = [
     "flash_attention_forward",
     "flash_attn_varlen_func",
     "flip",
+    "floor",
+    "floor_",
+    "floor_out",
     "floor_divide",
     "floor_divide_",
     "full",
@@ -481,6 +512,7 @@ __all__ = [
     "pow_tensor_scalar_",
     "pow_tensor_tensor",
     "pow_tensor_tensor_",
+    "prelu",
     "prod",
     "prod_dim",
     "quantile",
@@ -551,6 +583,8 @@ __all__ = [
     "sum_out",
     "ScaleDotProductAttention",
     "SUPPORTED_FP8_DTYPE",
+    "t_copy",
+    "t_copy_out",
     "tan",
     "tan_",
     "tanh",
@@ -568,6 +602,8 @@ __all__ = [
     "triu",
     "true_divide",
     "true_divide_out",
+    "trunc",
+    "trunc_",
     "true_divide_",
     "uniform_",
     "upsample_linear1d",
@@ -576,6 +612,7 @@ __all__ = [
     "var_mean",
     "vdot",
     "vector_norm",
+    "view_copy",
     "vstack",
     "weight_norm_interface",
     "weight_norm_interface_backward",
@@ -584,6 +621,7 @@ __all__ = [
     "where_self",
     "where_self_out",
     "zero",
+    "zero_",
     "zero_out",
     "zeros",
     "zeros_like",

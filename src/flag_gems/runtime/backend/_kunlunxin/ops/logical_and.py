@@ -16,13 +16,32 @@ import logging
 
 import triton
 import triton.language as tl
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
+config_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    # Without an explicit config the codegen falls back to buffer_size_limit=2048
+    # (pointwise_dynamic.py). For this bool op ConvertTritonXPUToLLVM then
+    # materializes a 2048-wide llvm.struct<(i64, ...)> that is re-printed on every
+    # insert/extractvalue, blowing the compiled IR up to ~16GB (see
+    # benchmark/ir_dump/ir-logical_and-dev6.log). unroll_num=8 breaks the buffer
+    # into unrolled chunks so the monolithic struct is never formed; keep
+    # isCloseMemoryAsync at its default (True) to avoid the async-copy explosion
+    # documented for bitwise_and.
+    kunlunAutoGrid=True,
+    unroll_num=8,
+)
 
-@pointwise_dynamic(promotion_methods=[(0, 1, "ALWAYS_BOOL")])
+
+@pointwise_dynamic(promotion_methods=[(0, 1, "ALWAYS_BOOL")], config=config_)
 @triton.jit
 def logical_and_func(x, y):
     return x.to(tl.int1).logical_and(y.to(tl.int1))
