@@ -78,4 +78,5 @@ def test_slice_scatter():
         dtypes=consts.FLOAT_DTYPES,
         get_gbps=_get_gbps,
     )
+    print("TEST CI KUNLUNXIN")
     bench.run()
