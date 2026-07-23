@@ -95,7 +95,6 @@ ok
 # ── Source vendor environment ─────────────────────────────────
 export USE_TRITON="${USE_TRITON:-}"
 source tools/env.sh "${BACKEND}"
-echo "XPU_EVENT_KL3_ENABLE=${XPU_EVENT_KL3_ENABLE:-}"
 
 # ── Install build tools ──────────────────────────────────────
 printf "Installing build tools ..."

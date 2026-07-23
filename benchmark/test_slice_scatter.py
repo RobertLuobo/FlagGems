@@ -11,9 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import os
-
 import pytest
 import torch
 
@@ -21,9 +18,6 @@ import flag_gems
 from flag_gems.utils import shape_utils
 
 from . import base, consts
-
-os.environ["XPU_EVENT_KL3_ENABLE"] = "1"
-print(f"XPU_EVENT_KL3_ENABLE={os.environ['XPU_EVENT_KL3_ENABLE']}")
 
 
 class TensorSelectBenchmark(base.GenericBenchmark2DOnly):
@@ -83,5 +77,4 @@ def test_slice_scatter():
         dtypes=consts.FLOAT_DTYPES,
         get_gbps=_get_gbps,
     )
-    print(f"XPU_EVENT_KL3_ENABLE={os.environ['XPU_EVENT_KL3_ENABLE']}")
     bench.run()
