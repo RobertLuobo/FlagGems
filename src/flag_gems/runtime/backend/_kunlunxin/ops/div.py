@@ -377,7 +377,7 @@ def _float_floordiv_corrected(x, y):
 
 @pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=config_)
 @triton.jit
-def floor_div_func_corrected(x, y):
+def floor_div_func(x, y):
     if x.type.scalar.is_int() & y.type.scalar.is_int():
         return _int_floordiv(x, y)
     else:
@@ -388,7 +388,7 @@ def floor_div_func_corrected(x, y):
     is_tensor=[True, False], promotion_methods=[(0, "DEFAULT")], config=config_
 )
 @triton.jit
-def floor_div_func_corrected_tensor_scalar(x, y):
+def floor_div_func_tensor_scalar(x, y):
     if x.type.scalar.is_int() & y.type.scalar.is_int():
         return _int_floordiv(x, y)
     else:
@@ -397,19 +397,7 @@ def floor_div_func_corrected_tensor_scalar(x, y):
 
 @pointwise_dynamic(is_tensor=[True, False], promotion_methods=[(0, "DEFAULT")])
 @triton.jit
-def floor_div_lowp_tensor_scalar_func(x, y):
-    # fp16/bf16 scalar path: promote to fp32 and divide in fp32 (torch does
-    # the same; there is no native fp16/bf16 division), then floor exactly
-    # with the same exact-remainder semantics as the fp32 path.
-    y = tl.full(x.shape, y, x.dtype)
-    return _floor_div_fp32(x.to(tl.float32), y.to(tl.float32))
-
-
-@pointwise_dynamic(
-    is_tensor=[False, True], promotion_methods=[(0, 1, "DEFAULT")], config=config_
-)
-@triton.jit
-def floor_div_func_corrected_scalar_tensor(x, y):
+def floor_div_func_scalar_tensor(x, y):
     if x.type.scalar.is_int() & y.type.scalar.is_int():
         return _int_floordiv(x, y)
     else:
