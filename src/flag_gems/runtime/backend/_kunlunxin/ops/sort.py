@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import logging
-import math
-import os
 
 import torch
 import triton
@@ -24,8 +22,7 @@ from flag_gems.ops.zeros import zero_
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
-from .cumsum import cumsum
-from .topk import _get_finfo_val, _get_iinfo_val, argsort
+from .topk import _get_finfo_val, _get_iinfo_val, argsort, topk
 
 logger = logging.getLogger(__name__)
 
@@ -1272,78 +1269,36 @@ def sort_kernel(
     tl.store(out_index_ptr, sorted_index_val, mask=mask)
 
 
+def _sort_via_topk(inp, dim, descending):
+    if inp.ndim == 0:
+        return inp.clone(), torch.zeros_like(inp, dtype=torch.int64)
+
+    dim = dim % inp.ndim
+    moved = dim != inp.ndim - 1
+    work = torch.movedim(inp, dim, -1).contiguous() if moved else inp.contiguous()
+    # The vendor topk kernel has no int16 specialization. Sorting is order-only,
+    # so widening to int32 is exact and the values can be cast back afterwards.
+    topk_input = work.to(torch.int32) if work.dtype == torch.int16 else work
+    values, indices = topk(
+        topk_input,
+        topk_input.shape[-1],
+        dim=-1,
+        largest=descending,
+        sorted=True,
+    )
+    if values.dtype != inp.dtype:
+        values = values.to(inp.dtype)
+    if moved:
+        values = torch.movedim(values, -1, dim)
+        indices = torch.movedim(indices, -1, dim)
+    return values, indices
+
+
 def sort(inp, dim=-1, descending=False):
     logger.debug("GEMS_KUNLUNXIN SORT")
-    sort_elem_cnt = inp.shape[dim]
-    if sort_elem_cnt == 0:
-        return inp, torch.empty_like(inp, dtype=torch.int64)
-    if sort_elem_cnt == 1:
-        indices = torch.empty_like(inp, dtype=torch.int64)
-        with torch_device_fn.device(inp.device):
-            init_indices_kernel[(triton.cdiv(inp.numel(), 256),)](
-                indices, inp.numel(), 1, BLOCK_SIZE=256
-            )
-        return inp, indices
-    # NOTE(kunlunxin): the bitonic argsort path (sort_kernel) mis-sorts /
-    # faults the device on XPU (unrolled compare-and-swap chain, ~hundreds of
-    # where-ops over BLOCK_SIZE lanes → miscompile + device kernel exception),
-    # so every non-trivial size goes through the stable radix chain here
-    # (identical to sort_stable); reference semantics of torch.sort with
-    # stable=True are preserved and radix is stable by construction.
-    return sort_stable(inp, stable=True, dim=dim, descending=descending)
+    return _sort_via_topk(inp, dim, descending)
 
 
 def sort_stable(inp, *, stable, dim=-1, descending=False):
     logger.debug("GEMS_KUNLUNXIN SORT_STABLE")
-    # We only implement stable radix sort here
-    _ = stable
-    sort_elem_cnt = inp.shape[dim]
-    if sort_elem_cnt == 0:
-        return inp, torch.empty_like(inp, dtype=torch.int64)
-    if sort_elem_cnt == 1:
-        indices = torch.empty_like(inp, dtype=torch.int64)
-        with torch_device_fn.device(inp.device):
-            init_indices_kernel[(triton.cdiv(inp.numel(), 256),)](
-                indices, inp.numel(), 1, BLOCK_SIZE=256
-            )
-        return inp, indices
-
-    if dim < 0:
-        dim = dim + inp.ndim
-    if dim != inp.ndim - 1:
-        # NOTE(kunlunxin): the vendor strided `copy_` (copy_slice pointwise
-        # kernel, _kunlunxin/ops/copy.py) raises a device kernel exception
-        # (kl3ChannelCheckErrors status=700, illegal memory access) for some
-        # transposed 2-byte shapes, e.g. .t().contiguous() of (4, 65536)
-        # fp16/bf16 → (65536, 4).  Materialise the movedim view with one
-        # native strided copy instead (gems never overrides `_copy_from`, so
-        # this reaches the vendor's native copy engine — same workaround as
-        # renorm.py::_native_transposed_copy).
-        view = torch.movedim(inp, dim, -1)
-        inp = torch.empty(view.shape, device=inp.device, dtype=inp.dtype)
-        torch.ops.aten._copy_from(view, inp, False)
-    else:
-        inp = inp.contiguous()
-
-    dtype = inp.dtype
-    num_bits_per_pass = 1 if dtype == torch.bool else 4
-    if dtype in (
-        torch.float16,
-        torch.float32,
-        torch.bfloat16,
-        torch.int16,
-        torch.int32,
-        torch.bool,
-    ):
-        # Packed (value, column) pipeline: one 8B gather store per element per
-        # pass instead of radix_sort_low_mem's two (value 2B/4B + int64 index),
-        # i.e. ~2x less scatter work (see radix_sort_packed note).
-        out, out_index = radix_sort_packed(inp, num_bits_per_pass, descending)
-    else:
-        # int64/fp64 keys do not fit the (u32 value, u32 column) packing
-        out, out_index = radix_sort_low_mem(inp, num_bits_per_pass, descending)
-
-    if dim != inp.ndim - 1:
-        out = torch.movedim(out, -1, dim)
-        out_index = torch.movedim(out_index, -1, dim)
-    return out, out_index
+    return _sort_via_topk(inp, dim, descending)
