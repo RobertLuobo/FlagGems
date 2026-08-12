@@ -92,9 +92,8 @@ from .attention import (
     scaled_dot_product_attention_forward,
 )
 from .avg_pool2d import avg_pool2d, avg_pool2d_backward
-from .avg_pool3d import avg_pool3d
-from .avg_pool3d_backward import avg_pool3d_backward
-from .baddbmm import baddbmm, baddbmm_, baddbmm_out
+from .avg_pool3d import avg_pool3d, avg_pool3d_backward
+from .baddbmm import baddbmm
 from .batch_norm import batch_norm, batch_norm_backward
 from .bernoulli import bernoulli
 from .bernoulli_ import bernoulli_
