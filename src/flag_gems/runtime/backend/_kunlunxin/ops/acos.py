@@ -86,54 +86,8 @@ def _pick_block(n_elements):
     return 16384, 8, True
 
 
-@triton.jit
-def _acos_body(x):
-    t = 0.5 - 0.5 * tl.abs(x)
-    # |x| > 1 makes t < 0 -> rsqrt(NaN) -> NaN propagates out, matching torch.
-    s = t * xpu.rsqrt(t + 1e-30)
-    p = -493.19885254
-    p = p * t + 1060.03149414
-    p = p * t + -941.14831543
-    p = p * t + 445.70321655
-    p = p * t + -121.05153656
-    p = p * t + 18.99153519
-    p = p * t + -1.44778073
-    p = p * t + 0.39646727
-    p = p * t + 1.99919987
-    y = s * p
-    # acos(x) = y (x>=0) / pi - y (x<0); m = 1 iff x<0 (min/max, no select).
-    m = tl.minimum(1.0, tl.maximum(0.0, -x * 8.50705917e37))
-    return m * 3.1415927 + (1.0 - 2.0 * m) * y
-
-
-@triton.jit
-def acos_kernel(
-    x_ptr,
-    out_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset < n_elements
-    x = tl.load(x_ptr + offset, mask=mask, other=0).to(tl.float32)
-    t = 0.5 - 0.5 * tl.abs(x)
-    # |x| > 1 makes t < 0 -> sqrt(NaN) -> NaN propagates out, matching torch.
-    # XPU lowers compound boolean expressions ((x>=a) & (x<=b)) to a very slow
-    # non-vectorized path; relying on sqrt of a negative is faster and exact.
-    s = tl.sqrt(t)
-    p = -246.59942627
-    p = p * t + 530.01574707
-    p = p * t + -470.57415771
-    p = p * t + 222.85160828
-    p = p * t + -60.52576828
-    p = p * t + 9.49576759
-    p = p * t + -0.72389036
-    p = p * t + 0.19823363
-    p = p * t + 0.99959993
-    y = (s * p) * 2.0
-    r = tl.where(x < 0.0, 3.1415927 - y, y)
-    tl.store(out_ptr + offset, r.to(out_ptr.dtype.element_ty), mask=mask)
+_acos = tl_extra_shim.acos
+_atan2 = tl_extra_shim.atan2
 
 
 @triton.jit
@@ -160,41 +114,20 @@ def acos_kernel_unmasked(
     r = tl.where(x < 0.0, 3.1415927 - y, y)
     tl.store(out_ptr + offset, r.to(out_ptr.dtype.element_ty))
 
+@pointwise_dynamic(promotion_methods=[(0, "INT_TO_FLOAT")], config=config_)
+@triton.jit()
+def acos_kernel(x):
+    x_f32 = x.to(tl.float32)
+    in_domain = tl.abs(x_f32) <= 1.0
 
-def _launch(x, out, unroll_num=UNROLL_NUM):
-    n_elements = x.numel()
-    if n_elements == 0:
-        return
-    block_size, num_warps, masked = _pick_block(n_elements)
-    if masked:
-        grid = (triton.cdiv(n_elements, block_size),)
-        acos_kernel[grid](
-            x,
-            out,
-            n_elements,
-            BLOCK_SIZE=block_size,
-            num_warps=num_warps,
-            unroll_num=unroll_num,
-            buffer_size_limit=BUFFER_SIZE_LIMIT,
-            isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
-        )
-    else:
-        grid = (n_elements // block_size,)
-        acos_kernel_unmasked[grid](
-            x,
-            out,
-            BLOCK_SIZE=block_size,
-            num_warps=num_warps,
-            unroll_num=unroll_num,
-            buffer_size_limit=BUFFER_SIZE_LIMIT,
-            isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
-        )
-
-
-def _inplace_unroll(dtype):
-    if dtype == torch.bfloat16:
-        return INPLACE_UNROLL_NUM_BF16
-    return INPLACE_UNROLL_NUM
+    # The P800 acos intrinsic has a repeatable error of about 3e-3 on
+    # in-domain fp32 values.  atan2(sqrt(1 - x^2), x) avoids that intrinsic;
+    # clamp the radicand because fp32 roundoff can make it slightly negative
+    # at the endpoints.  Keep the intrinsic for out-of-domain and NaN inputs,
+    # where the identity would otherwise return a finite 0 or pi.
+    radicand = tl.maximum(1.0 - x_f32 * x_f32, 0.0)
+    stable = _atan2(tl.sqrt(radicand), x_f32)
+    return tl.where(in_domain, stable, _acos(x_f32))
 
 
 def acos(x):
