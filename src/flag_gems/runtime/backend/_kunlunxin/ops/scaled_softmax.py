@@ -12,26 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-
 import torch
 import triton
 import triton.language as tl
 
 from flag_gems.utils import libentry
-
-logger = logging.getLogger(__name__)
-
-# One program per (query, head, batch) row; the row-wise running max/sum are
-# 0-d (scalar) values so the XPU `TritonXPUCoreTiling` pipeline sees only
-# {scalar <-> [BLOCK_K]} broadcasts -- the pattern validated by the vendor
-# `softmax`/`log_softmax` kernels. The previous vectorized online-rescale
-# (`m_old - m` on [BLOCK_Q] vectors, 2D tiles loaded from bf16/fp16 memory)
-# intermittently fails to compile on this backend ("arith.subf op requires the
-# same encoding" in TritonXPUCoreTiling) and the autotuned launch then
-# silently leaves the output buffer uninitialized (all-zeros), so autotuning
-# was dropped in favour of a fixed tile width.
-_BLOCK_K = 1024
 
 
 @libentry()
@@ -85,7 +70,6 @@ def scaled_softmax_forward_kernel(
 
 
 def scaled_softmax_forward(input_t: torch.Tensor, scale_factor: float):
-    logger.debug("GEMS_KUNLUNXIN SCALED_SOFTMAX_FORWARD")
     assert input_t.dim() == 4, "expected 4D tensor"
     batch_size, attn_heads, query_seq_len, key_seq_len = input_t.shape
     assert input_t.dtype in [
@@ -104,10 +88,11 @@ def scaled_softmax_forward(input_t: torch.Tensor, scale_factor: float):
         scale_factor,
         query_seq_len,
         key_seq_len,
-        input_t.stride(0),
-        input_t.stride(1),
-        input_t.stride(2),
-        BLOCK_K=_BLOCK_K,
+        stride_b,
+        stride_h,
+        stride_q,
+        BLOCK_Q=1,
+        BLOCK_K=128,
         num_warps=4,
         num_stages=2,
     )
@@ -172,7 +157,6 @@ def scaled_softmax_backward_kernel(
 def scaled_softmax_backward(
     grad_output: torch.Tensor, softmax_results: torch.Tensor, scale_factor: float
 ):
-    logger.debug("GEMS_KUNLUNXIN SCALED_SOFTMAX_BACKWARD")
     assert grad_output.dim() == 4, "expected 4D tensor"
     assert softmax_results.dim() == 4, "expected 4D tensor"
     assert grad_output.dtype in [
@@ -198,10 +182,11 @@ def scaled_softmax_backward(
         scale_factor,
         query_seq_len,
         key_seq_len,
-        softmax_results.stride(0),
-        softmax_results.stride(1),
-        softmax_results.stride(2),
-        BLOCK_K=_BLOCK_K,
+        stride_b,
+        stride_h,
+        stride_q,
+        BLOCK_Q=1,
+        BLOCK_K=128,
         num_warps=4,
         num_stages=2,
     )
