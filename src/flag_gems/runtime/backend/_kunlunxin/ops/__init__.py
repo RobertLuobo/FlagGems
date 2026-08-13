@@ -342,9 +342,6 @@ from .max_pool2d_with_indices import (
     max_pool2d_with_indices,
     max_pool2d_with_indices_backward,
 )
-from .max_pool3d_backward import max_pool3d_with_indices_backward
-from .max_pool3d_with_indices import max_pool3d_backward, max_pool3d_with_indices
-from .max_unpool3d import max_unpool3d  # noqa: F401
 from .maximum import maximum
 from .mean import mean, mean_dim
 from .median import median, median_dim, median_dim_values, median_out
@@ -893,9 +890,8 @@ __all__ = [
     "matmuladd",
     "max",
     "max_dim",
-    "maximum",
-    "max_pool2d_with_indices",
     "max_pool2d_backward",
+    "max_pool2d_with_indices_backward",
     "mean",
     "mean_dim",
     "min",
