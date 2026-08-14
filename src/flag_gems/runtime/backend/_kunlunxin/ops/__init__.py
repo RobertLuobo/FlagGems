@@ -47,7 +47,7 @@ from .__irshift__ import __irshift__  # noqa: F401
 from .abs import abs, abs_
 from .absolute import absolute
 from .acos import acos
-from .adaptive_max_pool2d_backward import adaptive_max_pool2d_backward
+from .adaptive_avg_pool2d_backward import _adaptive_avg_pool2d_backward
 from .add import add, add_
 from .add_relu import _add_relu, _add_relu_
 from .addbmm import addbmm, addbmm_  # noqa: F401
@@ -692,6 +692,7 @@ __all__ = [
     "atanh_",
     "avg_pool2d",
     "avg_pool2d_backward",
+    "_adaptive_avg_pool2d_backward",
     "baddbmm",
     "batch_norm",
     "batch_norm_backward",
