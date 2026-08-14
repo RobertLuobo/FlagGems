@@ -83,8 +83,7 @@ from .asinh_ import asinh_  # noqa: F401
 from .assert_async import _assert_async
 from .atan import atan, atan_
 from .atan2 import atan2, atan2_, atan2_out
-from .atanh import atanh, atanh_  # noqa: F401
-from .attention import (  # noqa: F401
+from .attention import (
     ScaleDotProductAttention,
     flash_attention_forward,
     flash_attn_varlen_func,
@@ -678,6 +677,9 @@ __all__ = [
     "asin_",
     "atan",
     "atan_",
+    "atan2",
+    "atan2_",
+    "atan2_out",
     "avg_pool2d",
     "avg_pool2d_backward",
     "baddbmm",
