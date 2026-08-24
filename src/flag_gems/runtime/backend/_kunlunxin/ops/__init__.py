@@ -487,20 +487,7 @@ from .scalar_tensor import scalar_tensor
 from .scaled_mm import scaled_mm, scaled_mm_out
 from .scaled_softmax import scaled_softmax_backward, scaled_softmax_forward
 from .scatter import scatter, scatter_
-from .scatter_add_ import scatter_add, scatter_add_
-from .scatter_reduce import scatter_reduce, scatter_reduce_, scatter_reduce_out
-from .searchsorted import (
-    searchsorted,
-    searchsorted_out,
-    searchsorted_scalar,
-    searchsorted_scalar_out,
-)
-from .segment_reduce import (
-    _segment_reduce_backward,
-    _segment_reduce_backward_out,
-    segment_reduce,
-    segment_reduce_out,
-)
+from .scatter_add_ import scatter_add_
 from .select_backward import select_backward
 from .select_scatter import select_scatter
 from .segment_reduce import (
@@ -1047,9 +1034,8 @@ __all__ = [
     "scatter_",
     "scatter_add",
     "scatter_add_",
+    "select_backward",
     "select_scatter",
-    "segment_reduce",
-    "segment_reduce_out",
     "selu",
     "selu_",
     "sigmoid",

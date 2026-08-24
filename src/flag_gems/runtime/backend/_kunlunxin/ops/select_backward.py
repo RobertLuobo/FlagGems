@@ -12,6 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# kunlunxin vendor override of select_backward. The generic kernel declares
+# total / inner_size / dim_stride as tl.constexpr; on the XPU compiler the
+# masked store with the constexpr-folded computed offset is miscompiled
+# (values land at wrong output positions, e.g. 140/141/... instead of the
+# grad slice). Keeping them as runtime args fixes it; verified across
+# (2,3,4,5)/(3,7,11)/(2,1,4) x dim {0,1} x all index cases.
+
 import logging
 import math
 
@@ -19,37 +26,40 @@ import torch
 import triton
 import triton.language as tl
 
+_BLOCK = 1024
 logger = logging.getLogger(__name__)
 
 
 @triton.jit
 def _select_backward_kernel(
-    grad,
-    output,
-    output_numel,
-    inner_size: tl.constexpr,
-    dim_size: tl.constexpr,
+    grad_ptr,
+    out_ptr,
+    total,
+    inner_size,
+    dim_stride,
     index: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
-    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < output_numel
-    inner_offsets = offsets % inner_size
-    axis_rows = offsets // inner_size
-    axis_offsets = axis_rows % dim_size
-    outer_offsets = axis_rows // dim_size
-    grad_offsets = outer_offsets * inner_size + inner_offsets
-    values = tl.load(grad + grad_offsets, mask=mask, other=0.0)
-    result = tl.where(axis_offsets == index, values, 0.0)
-    tl.store(output + offsets, result, mask=mask)
+    pid = tl.program_id(0)
+
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+
+    outer = offs // inner_size
+    inner = offs % inner_size
+
+    vals = tl.load(grad_ptr + offs, mask=mask)
+    out_offset = outer * dim_stride + index * inner_size + inner
+
+    tl.store(out_ptr + out_offset, vals, mask=mask)
 
 
 def select_backward(grad, input_sizes, dim, index, out=None):
     logger.debug("GEMS_KUNLUNXIN SELECT_BACKWARD")
-    sizes = list(input_sizes)
-    ndim = len(sizes)
     dim = int(dim)
     index = int(index)
+    sizes = list(input_sizes)
+    ndim = len(sizes)
 
     if dim < 0:
         dim += ndim
@@ -57,13 +67,15 @@ def select_backward(grad, input_sizes, dim, index, out=None):
         raise ValueError("invalid dim")
 
     dim_size = sizes[dim]
-    if index < 0:
-        index += dim_size
     if index < 0 or index >= dim_size:
-        raise ValueError("index out of range")
+        raise ValueError("invalid index")
 
     if out is None:
-        out = torch.empty(sizes, dtype=grad.dtype, device=grad.device)
+        out = torch.zeros(
+            sizes,
+            dtype=grad.dtype,
+            device=grad.device,
+        )
     else:
         if tuple(out.shape) != tuple(sizes):
             raise ValueError("out shape mismatch")
@@ -72,19 +84,25 @@ def select_backward(grad, input_sizes, dim, index, out=None):
         if out.device != grad.device:
             raise ValueError("device mismatch")
 
-    output_numel = math.prod(sizes)
-    if output_numel == 0:
-        return out
+        out.zero_()
 
+    outer_size = math.prod(sizes[:dim]) if dim > 0 else 1
     inner_size = math.prod(sizes[dim + 1 :]) if dim < ndim - 1 else 1
-    block_size = 1024
-    _select_backward_kernel[(triton.cdiv(output_numel, block_size),)](
-        grad.contiguous(),
+    total = outer_size * inner_size
+
+    grad_view = grad.contiguous().view(outer_size, inner_size)
+    dim_stride = dim_size * inner_size
+
+    n_elements = outer_size * inner_size
+    grid = (triton.cdiv(n_elements, _BLOCK),)
+
+    _select_backward_kernel[grid](
+        grad_view,
         out,
-        output_numel,
+        total,
         inner_size,
-        dim_size,
+        dim_stride,
         index,
-        BLOCK_SIZE=block_size,
+        BLOCK=_BLOCK,
     )
     return out
