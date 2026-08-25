@@ -72,7 +72,7 @@ from .arccosh import arccosh_  # noqa: F401
 from .arcsin import arcsin, arcsin_, arcsin_out
 from .arcsinh import arcsinh, arcsinh_, arcsinh_out  # noqa: F401
 from .arctan import arctan, arctan_
-from .arctan2 import arctan2, arctan2_
+from .arctan2 import arctan2, arctan2_, arctan2_out
 from .argmax import argmax
 from .argmin import argmin
 from .argsort import argsort, argsort_stable
@@ -665,6 +665,9 @@ __all__ = [
     "arcsin_out",
     "arctan",
     "arctan_",
+    "arctan2",
+    "arctan2_",
+    "arctan2_out",
     "argmax",
     "argmin",
     "as_strided_copy",

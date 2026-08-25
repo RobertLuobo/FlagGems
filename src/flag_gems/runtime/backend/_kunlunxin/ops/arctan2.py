@@ -2,12 +2,21 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import logging
+import math
 
 import triton
 import triton.language as tl
-from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from flag_gems.utils import tl_extra_shim
 
@@ -15,43 +24,50 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
-
-config_ = CodeGenConfig(
-    512,
-    (65536, 65536, 65536),
-    32,
-    True,
-    prefer_1d_tile=True,
-    buffer_size_limit=2048,
-    isCloseVectorization=True,
-    kunlunAutoGrid=True,
-    unroll_num=8,
-)
+_atan2 = tl_extra_shim.atan2
 
 
-@pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=config_)
+@pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")])
 @triton.jit
-def _arctan2_kernel(input, other):
-    input_f32 = input.to(tl.float32)
-    other_f32 = other.to(tl.float32)
-    result = tl_extra_shim.atan2(input_f32, other_f32)
+def arctan2_kernel(x, y):
+    x = x.to(tl.float32)
+    y = y.to(tl.float32)
+    result = _atan2(x, y)
+    pi = math.pi
 
-    # XPU atan2 returns zero for atan2(+/-0, negative), losing the quadrant.
-    input_bits = input_f32.to(tl.int32, bitcast=True)
-    other_bits = other_f32.to(tl.int32, bitcast=True)
-    signed_pi = tl.where(input_bits < 0, -3.141592653589793, 3.141592653589793)
-    negative_other = (other_f32 < 0.0) | ((other_f32 == 0.0) & (other_bits < 0))
-    result = tl.where((input_f32 == 0.0) & negative_other, signed_pi, result)
-    is_nan = (input_f32 != input_f32) | (other_f32 != other_f32)
-    return tl.where(is_nan, float("nan"), result)
+    x_negative = x.to(tl.int32, bitcast=True) < 0
+    y_negative = y.to(tl.int32, bitcast=True) < 0
+
+    # XPU atan2f returns zero for (+/-0, negative axis). Preserve the signed
+    # zero on the positive axis and return signed pi on the negative axis.
+    zero_result = tl.where(
+        y_negative,
+        tl.where(x_negative, -pi, pi),
+        x,
+    )
+    result = tl.where(x == 0.0, zero_result, result)
+
+    # XPU atan2f returns NaN when both arguments are infinite.
+    x_inf = (x == float("inf")) | (x == -float("inf"))
+    y_inf = (y == float("inf")) | (y == -float("inf"))
+    inf_angle = tl.where(y_negative, 2.356194490192345, 0.7853981633974483)
+    inf_angle = tl.where(x_negative, -inf_angle, inf_angle)
+    result = tl.where(x_inf & y_inf, inf_angle, result)
+
+    return tl.where((x != x) | (y != y), float("nan"), result)
 
 
 def arctan2(input, other):
     logger.debug("GEMS_KUNLUNXIN ARCTAN2")
-    return _arctan2_kernel(input, other)
+    return arctan2_kernel(input, other)
+
+
+def arctan2_out(input, other, out):
+    logger.debug("GEMS_KUNLUNXIN ARCTAN2_OUT")
+    return arctan2_kernel(input, other, out0=out)
 
 
 def arctan2_(input, other):
     logger.debug("GEMS_KUNLUNXIN ARCTAN2_")
-    _arctan2_kernel(input, other, out0=input)
+    arctan2_kernel(input, other, out0=input)
     return input
