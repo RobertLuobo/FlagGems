@@ -272,7 +272,7 @@ from .hardtanh_backward import hardtanh_backward  # noqa: F401
 from .heaviside_ import heaviside_  # noqa: F401
 from .histc import histc
 from .hstack import hstack
-from .igamma_ import igamma_
+from .hypot_ import hypot_
 from .index import index
 from .index_add import index_add, index_add_
 from .index_copy_ import index_copy, index_copy_
@@ -819,6 +819,7 @@ __all__ = [
     "gt",
     "gt_scalar",
     "hstack",
+    "hypot_",
     "hadamard_transform",
     "hardsigmoid",
     "hardsigmoid_out",
