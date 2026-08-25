@@ -49,105 +49,49 @@ UNROLL_NUM = 8
 BUFFER_SIZE_LIMIT = 8192
 IS_CLOSE_MEMORY_ASYNC = False
 
+_atan2 = tl_extra_shim.atan2
+_asin = tl_extra_shim.asin
 
-def _pick_block(n_elements):
-    # Bucket the tile into a few unmasked sizes + 1 masked fallback so the
-    # kernel compiles at most ~4 times total. Unmasked runs when the shape
-    # divides the tile exactly (masked memory path on XPU costs ~2x).
-    if n_elements >= 16384 and n_elements % 32768 == 0:
-        return 32768, 8, False
-    if n_elements >= 16384 and n_elements % 16384 == 0:
-        return 16384, 8, False
-    if n_elements <= 65536:
-        return 2048, 4, True
-    return 16384, 8, True
-
-
-@triton.jit
-def asin_kernel(
-    x_ptr,
-    out_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset < n_elements
-    x = tl.load(x_ptr + offset, mask=mask, other=0).to(tl.float32)
-    t = 0.5 - 0.5 * tl.abs(x)
-    # |x| > 1 makes t < 0 -> sqrt(NaN) -> NaN propagates out, matching torch.
-    s = tl.sqrt(t)
-    p = -246.59942627
-    p = p * t + 530.01574707
-    p = p * t + -470.57415771
-    p = p * t + 222.85160828
-    p = p * t + -60.52576828
-    p = p * t + 9.49576759
-    p = p * t + -0.72389036
-    p = p * t + 0.19823363
-    p = p * t + 0.99959993
-    v = (s * p) * 2.0
-    # asin(x) = pi/2 - acos(x); acos(x) = x<0 ? pi-v : v  (v == acos(|x|))
-    r = tl.where(x < 0.0, v - 1.5707964, 1.5707964 - v)
-    tl.store(out_ptr + offset, r.to(out_ptr.dtype.element_ty), mask=mask)
+# Without an explicit CodeGenConfig, pointwise_dynamic specializes the kernel
+# per input shape on XPU -> per-shape recompile -> IR explosion, and the default
+# tiny tile<256> no-unroll codegen underutilizes the XPU badly
+# (baseline ~0.007-0.45x torch; see ir-asin_-dev4.log, 163k-line IR dump).
+# kunlunAutoGrid=True + prefer_1d_tile + bounded tile makes the kernel
+# shape-independent so it compiles ONCE and covers large tensors. Mirrors acos.
+#
+# isCloseVectorization MUST stay False (vec OPEN) for the _asin transcendental:
+# flipping it to True is catastrophic here (measured [1024,65536] fp32 211ms /
+# [4096,4096] 55ms, avg collapses back to ~0.069 == baseline). This is the
+# OPPOSITE of silu (where vec OPEN spiked); tune vectorization per-op, not by
+# copying a sibling's flag.
+config_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    buffer_size_limit=4096,
+    isCloseVectorization=False,
+    kunlunAutoGrid=True,
+    unroll_num=8,
+)
 
 
-@triton.jit
-def asin_kernel_unmasked(
-    x_ptr,
-    out_ptr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offset).to(tl.float32)
-    t = 0.5 - 0.5 * tl.abs(x)
-    s = tl.sqrt(t)
-    p = -246.59942627
-    p = p * t + 530.01574707
-    p = p * t + -470.57415771
-    p = p * t + 222.85160828
-    p = p * t + -60.52576828
-    p = p * t + 9.49576759
-    p = p * t + -0.72389036
-    p = p * t + 0.19823363
-    p = p * t + 0.99959993
-    v = (s * p) * 2.0
-    r = tl.where(x < 0.0, v - 1.5707964, 1.5707964 - v)
-    tl.store(out_ptr + offset, r.to(out_ptr.dtype.element_ty))
+@pointwise_dynamic(promotion_methods=[(0, "INT_TO_FLOAT")], config=config_)
+@triton.jit()
+def asin_kernel(x):
+    x_f32 = x.to(tl.float32)
+    in_domain = tl.abs(x_f32) <= 1.0
+    # P800 asin intrinsic mirrors acos: ~3e-3 repeatable error on
+    # in-domain fp32 values.  atan2(x, sqrt(1-x^2)) avoids the intrinsic
+    # (radicand clamped against fp32 roundoff at endpoints; keep the
+    # intrinsic for out-of-domain/NaN where identity gives finite 0).
+    radicand = tl.maximum(1.0 - x_f32 * x_f32, 0.0)
+    stable = _atan2(x_f32, tl.sqrt(radicand))
+    return tl.where(in_domain, stable, _asin(x_f32))
 
 
-def _launch(x, out):
-    n_elements = x.numel()
-    if n_elements == 0:
-        return
-    block_size, num_warps, masked = _pick_block(n_elements)
-    if masked:
-        grid = (triton.cdiv(n_elements, block_size),)
-        asin_kernel[grid](
-            x,
-            out,
-            n_elements,
-            BLOCK_SIZE=block_size,
-            num_warps=num_warps,
-            unroll_num=UNROLL_NUM,
-            buffer_size_limit=BUFFER_SIZE_LIMIT,
-            isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
-        )
-    else:
-        grid = (n_elements // block_size,)
-        asin_kernel_unmasked[grid](
-            x,
-            out,
-            BLOCK_SIZE=block_size,
-            num_warps=num_warps,
-            unroll_num=UNROLL_NUM,
-            buffer_size_limit=BUFFER_SIZE_LIMIT,
-            isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
-        )
-
-
-def asin(x, *, out=None):
+def asin(x):
     logger.debug("GEMS_KUNLUNXIN ASIN")
     xc = x.contiguous()
     if out is None:
