@@ -57,84 +57,155 @@ def true_div_func_scalar_tensor(x, y):
     return x / y
 
 
-# Tuned scalar-path variants (config_): the untuned kernels above are
-# launch-optimal for small tensors, so they are kept for
-# numel < DIV_SCALAR_CFG_THRESHOLD; larger tensors use the Kunlunxin tuned
-# CodeGenConfig. Measured on XPU (scalar path, same do_bench):
-#   (4096,4096) fp32 221us -> 142us, bf16 224us -> 149us, fp16 206us -> 168us;
-#   (2^28,) fp32 3317us -> 2053us, fp16 3089us -> 2292us, bf16 3369us -> 2171us;
-#   (10000,256) fp32 41us -> 30us. Small tensors are untouched (launch floor).
-DIV_SCALAR_CFG_THRESHOLD = 1 << 20
+# ---- complex true division (bit-view kernels) ----
+# XPU triton has no complex type support (jit specialization KeyErrors) and
+# xdnn native casts/copies on complex dtypes are [NOT IMPLEMENTED] / broken
+# (copy_ invalid device function). Decompose to interleaved component views
+# (complex32 -> float16, complex64 -> float32) and compute entirely in-kernel
+# with fp32 math; zero torch-side ops on complex tensors.
 
 
-@pointwise_dynamic(
-    is_tensor=[True, False], promotion_methods=[(0, 1, "INT_TO_FLOAT")], config=config_
-)
 @triton.jit
-def true_div_func_tensor_scalar_cfg(x, y):
-    return x / y
+def _cdiv_tt_kernel(a_ptr, b_ptr, o_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    ar = tl.load(a_ptr + 2 * offs, mask=m, other=0.0).to(tl.float32)
+    ai = tl.load(a_ptr + 2 * offs + 1, mask=m, other=0.0).to(tl.float32)
+    br = tl.load(b_ptr + 2 * offs, mask=m, other=0.0).to(tl.float32)
+    bi = tl.load(b_ptr + 2 * offs + 1, mask=m, other=0.0).to(tl.float32)
+    den = br * br + bi * bi
+    re = (ar * br + ai * bi) / den
+    im = (ai * br - ar * bi) / den
+    ty = o_ptr.dtype.element_ty
+    tl.store(o_ptr + 2 * offs, re.to(ty), mask=m)
+    tl.store(o_ptr + 2 * offs + 1, im.to(ty), mask=m)
 
 
-@pointwise_dynamic(
-    is_tensor=[False, True], promotion_methods=[(0, 1, "INT_TO_FLOAT")], config=config_
-)
 @triton.jit
-def true_div_func_scalar_tensor_cfg(x, y):
-    return x / y
+def _cdiv_tr_kernel(a_ptr, b_ptr, o_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    ar = tl.load(a_ptr + 2 * offs, mask=m, other=0.0).to(tl.float32)
+    ai = tl.load(a_ptr + 2 * offs + 1, mask=m, other=0.0).to(tl.float32)
+    br = tl.load(b_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    # direct componentwise division: IEEE x/0 -> +/-inf, 0/0 -> nan, matching
+    # torch CPU semantics for a real divisor (den=br*br flushes to 0 on XPU
+    # when b is an exact f16 zero or tiny f32, wrongly yielding 0/0)
+    re = ar / br
+    im = ai / br
+    ty = o_ptr.dtype.element_ty
+    tl.store(o_ptr + 2 * offs, re.to(ty), mask=m)
+    tl.store(o_ptr + 2 * offs + 1, im.to(ty), mask=m)
 
 
-# fp32-only unroll-16 variant of the tuned scalar kernel: measured on XPU for
-# the in-place scalar path (out0=A, same do_bench median, 3 interleaved
-# rounds) that unroll_num=16 is strictly faster than unroll 8 for fp32 across
-# the whole shape range ((4096,4096) 141.9->138.4us, (10000,256) 30.3->29.6us,
-# (2^28,) 2043->1998us, (10000,65536) 4949->4842us; ~2.2%), while fp16/bf16
-# are flat or slightly worse with unroll 16 (fp16 (2^28,) 2292->2341us), so
-# the unroll-16 kernel is dispatched only for fp32 in true_divide_.
-CFG_UNROLL16 = CodeGenConfig(
-    512,
-    (65536, 65536, 65536),
-    32,
-    True,
-    prefer_1d_tile=True,
-    buffer_size_limit=4096,
-    isCloseVectorization=True,
-    unroll_num=16,
-)
-
-
-@pointwise_dynamic(
-    is_tensor=[True, False],
-    promotion_methods=[(0, 1, "INT_TO_FLOAT")],
-    config=CFG_UNROLL16,
-)
 @triton.jit
-def true_div_func_tensor_scalar_cfg16(x, y):
-    return x / y
+def _cdiv_ts_kernel(a_ptr, o_ptr, n, scalar, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    ar = tl.load(a_ptr + 2 * offs, mask=m, other=0.0).to(tl.float32)
+    ai = tl.load(a_ptr + 2 * offs + 1, mask=m, other=0.0).to(tl.float32)
+    re = ar / scalar
+    im = ai / scalar
+    ty = o_ptr.dtype.element_ty
+    tl.store(o_ptr + 2 * offs, re.to(ty), mask=m)
+    tl.store(o_ptr + 2 * offs + 1, im.to(ty), mask=m)
 
 
-# Tensor/tensor unroll-16 variant (CFG_UNROLL16): measured on XPU with
-# isolated processes (official do_bench warmup=1000ms/rep=100ms median) that
-# unroll 16 is strictly faster than unroll 8 (config_) for fp16/fp32 at
-# numel >= 4M, while bf16 regresses at all sizes and numel < 4M explodes:
-#   fp16 (4096,4096) 0.996->1.114x  (1024,65536) 1.023->1.148x
-#        (64,64,65536) 1.042->1.170x (64,64,4096) 0.993->1.114x
-#   fp32 (4096,4096) 0.703->0.731x  (1024,65536) 0.717->0.761x
-#        (1024,4096) 0.67->0.72x    (64,64,4096) ~0.70->0.73x
-#   bf16 (4096,4096) 0.960->0.852x  (1024,65536) 0.986->0.865x (regress)
-#   fp32 (1024,256) 1.02->0.045x    (1024,16) 1.02->0.185x (explode)
-# -> dispatch unroll16 only for fp16/fp32 tensor/tensor at numel >= 4M;
-# bf16 and smaller tensors keep config_ (true_div_func).
-DIV_TENSOR_U16_MIN_NUMEL = 1 << 22  # 4M
-
-
-@pointwise_dynamic(promotion_methods=[(0, 1, "INT_TO_FLOAT")], config=CFG_UNROLL16)
 @triton.jit
-def true_div_func_u16(x, y):
-    return x / y
+def _cdiv_rt_kernel(a_ptr, b_ptr, o_ptr, n, BLOCK: tl.constexpr):
+    # real tensor / complex tensor: a * conj(b) / |b|^2
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    ar = tl.load(a_ptr + offs, mask=m, other=0.0).to(tl.float32)
+    br = tl.load(b_ptr + 2 * offs, mask=m, other=0.0).to(tl.float32)
+    bi = tl.load(b_ptr + 2 * offs + 1, mask=m, other=0.0).to(tl.float32)
+    den = br * br + bi * bi
+    re = (ar * br) / den
+    im = (-ar * bi) / den
+    ty = o_ptr.dtype.element_ty
+    tl.store(o_ptr + 2 * offs, re.to(ty), mask=m)
+    tl.store(o_ptr + 2 * offs + 1, im.to(ty), mask=m)
+
+
+@triton.jit
+def _cdiv_st_kernel(b_ptr, o_ptr, n, scalar, BLOCK: tl.constexpr):
+    # python scalar / complex tensor
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    br = tl.load(b_ptr + 2 * offs, mask=m, other=0.0).to(tl.float32)
+    bi = tl.load(b_ptr + 2 * offs + 1, mask=m, other=0.0).to(tl.float32)
+    den = br * br + bi * bi
+    re = (scalar * br) / den
+    im = (-scalar * bi) / den
+    ty = o_ptr.dtype.element_ty
+    tl.store(o_ptr + 2 * offs, re.to(ty), mask=m)
+    tl.store(o_ptr + 2 * offs + 1, im.to(ty), mask=m)
+
+
+def _complex_view(T):
+    if T.dim() == 0:
+        T = T.unsqueeze(0)
+    if T.dtype == torch.complex32:
+        return T.view(torch.float16).reshape(-1)
+    return T.view(torch.float32).reshape(-1)
+
+
+def _complex_true_divide(A, B, out=None):
+    # A complex tensor path (B: complex tensor / real tensor / python scalar)
+    n = A.numel()
+    if out is None:
+        out = torch.empty_like(A)
+    ov = _complex_view(out)
+    BLOCK = 256
+    grid = (triton.cdiv(n, BLOCK),)
+    av = _complex_view(A)
+    if isinstance(B, torch.Tensor):
+        if B.is_complex():
+            _cdiv_tt_kernel[grid](av, _complex_view(B), ov, n, BLOCK=BLOCK)
+        else:
+            _cdiv_tr_kernel[grid](av, B.reshape(-1), ov, n, BLOCK=BLOCK)
+    else:
+        _cdiv_ts_kernel[grid](av, ov, n, float(B), BLOCK=BLOCK)
+    return out
+
+
+def _rational_true_divide(A, B, out=None):
+    # A real tensor / python scalar, B complex tensor -> complex result
+    n = B.numel()
+    if out is None:
+        out = torch.empty_like(B)
+    ov = _complex_view(out)
+    BLOCK = 256
+    grid = (triton.cdiv(n, BLOCK),)
+    _cdiv_rt_kernel[grid](A.reshape(-1), _complex_view(B), ov, n, BLOCK=BLOCK)
+    return out
+
+
+def _scalar_over_complex(A, B, out=None):
+    # A python scalar, B complex tensor -> complex result
+    n = B.numel()
+    if out is None:
+        out = torch.empty_like(B)
+    ov = _complex_view(out)
+    BLOCK = 256
+    grid = (triton.cdiv(n, BLOCK),)
+    _cdiv_st_kernel[grid](_complex_view(B), ov, n, float(A), BLOCK=BLOCK)
+    return out
 
 
 def true_divide(A, B):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE")
+    if isinstance(A, torch.Tensor) and A.is_complex():
+        return _complex_true_divide(A, B)
+    if isinstance(B, torch.Tensor) and B.is_complex():
+        if isinstance(A, torch.Tensor):
+            return _rational_true_divide(A, B)
+        return _scalar_over_complex(A, B)
     if isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor):
         if (
             A.dtype in (torch.float16, torch.float32)
@@ -180,6 +251,12 @@ def true_divide_tensor(A, B):
 
 def true_divide_out(A, B, out):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_OUT")
+    if isinstance(A, torch.Tensor) and A.is_complex():
+        return _complex_true_divide(A, B, out=out)
+    if isinstance(B, torch.Tensor) and B.is_complex():
+        if isinstance(A, torch.Tensor):
+            return _rational_true_divide(A, B, out=out)
+        return _scalar_over_complex(A, B, out=out)
     if isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor):
         if (
             A.dtype in (torch.float16, torch.float32)
@@ -202,6 +279,8 @@ def true_divide_out(A, B, out):
 
 def true_divide_(A, B):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_")
+    if A.is_complex():
+        return _complex_true_divide(A, B, out=A)
     if isinstance(B, torch.Tensor):
         if (
             A.dtype in (torch.float16, torch.float32)
