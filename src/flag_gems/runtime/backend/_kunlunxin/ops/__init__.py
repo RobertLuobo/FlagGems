@@ -582,8 +582,8 @@ from .unique_dim import unique_dim
 from .unsafe_chunk import unsafe_chunk
 from .unsqueeze import unsqueeze_  # noqa: F401 (in-place dim insertion, XPU fast path)
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
-from .upsample_bicubic2d_aa_backward import _upsample_bicubic2d_aa_backward
-from .upsample_bilinear2d import upsample_bilinear2d  # noqa: F401
+from .upsample_bilinear2d import upsample_bilinear2d
+from .upsample_bilinear2d_aa import _upsample_bilinear2d_aa
 from .upsample_linear1d import upsample_linear1d
 from .upsample_linear1d_backward import upsample_linear1d_backward
 from .upsample_nearest1d import upsample_nearest1d
@@ -636,6 +636,7 @@ __all__ = [
     "softshrink_out",
     "_unique2",
     "_upsample_bicubic2d_aa",
+    "_upsample_bilinear2d_aa",
     "apply_repetition_penalties",
     "abs",
     "abs_",
@@ -1105,7 +1106,6 @@ __all__ = [
     "trunc_",
     "true_divide_",
     "uniform_",
-    "unsafe_chunk",
     "upsample_bilinear2d",
     "upsample_linear1d",
     "upsample_nearest1d",
