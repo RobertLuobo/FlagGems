@@ -588,7 +588,10 @@ from .upsample_linear1d import upsample_linear1d
 from .upsample_linear1d_backward import upsample_linear1d_backward
 from .upsample_nearest1d import upsample_nearest1d
 from .upsample_nearest2d import upsample_nearest2d
-from .upsample_nearest3d import upsample_nearest3d
+from .upsample_nearest_exact1d_backward import (
+    _upsample_nearest_exact1d_backward,
+    _upsample_nearest_exact1d_backward_grad_input,
+)
 from .upsample_trilinear3d import upsample_trilinear3d
 from .var import var, var_correction, var_dim
 from .var_mean import var_mean
@@ -637,6 +640,8 @@ __all__ = [
     "_unique2",
     "_upsample_bicubic2d_aa",
     "_upsample_bilinear2d_aa",
+    "_upsample_nearest_exact1d_backward",
+    "_upsample_nearest_exact1d_backward_grad_input",
     "apply_repetition_penalties",
     "abs",
     "abs_",
