@@ -169,6 +169,7 @@ from .clamp import (
 from .clip import clip, clip_
 from .col2im import col2im
 from .concatenate import concatenate
+from .conj_physical import conj_physical
 from .contiguous import contiguous
 from .conv1d import conv1d
 from .conv2d import conv2d
@@ -742,6 +743,7 @@ __all__ = [
     "clip",
     "clip_",
     "concatenate",
+    "conj_physical",
     "constant_pad_nd",
     "contiguous",
     "conv1d",
