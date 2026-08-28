@@ -517,28 +517,7 @@ from .sort import sort, sort_stable
 from .special_legendre_polynomial_p import special_legendre_polynomial_p
 from .special_log_softmax import special_log_softmax
 from .special_logsumexp import special_logsumexp
-from .special_modified_bessel_k0 import (
-    special_modified_bessel_k0,
-    special_modified_bessel_k0_out,
-)
-from .special_multigammaln import special_multigammaln
-from .special_ndtr import special_ndtr
-from .special_ndtri import special_ndtri
-from .special_round import special_round, special_round_out
-from .special_shifted_chebyshev_polynomial_t import (
-    special_shifted_chebyshev_polynomial_t,
-)
-from .special_shifted_chebyshev_polynomial_u import (
-    special_shifted_chebyshev_polynomial_u,
-    special_shifted_chebyshev_polynomial_u_,
-)
-from .special_shifted_chebyshev_polynomial_v import (
-    special_shifted_chebyshev_polynomial_v,
-)
-from .special_shifted_chebyshev_polynomial_w import (
-    special_shifted_chebyshev_polynomial_w,
-)
-from .split_with_sizes_copy import split_with_sizes_copy  # noqa: F401
+from .special_shifted_chebyshev_polynomial_u import special_shifted_chebyshev_polynomial_u, special_shifted_chebyshev_polynomial_u_
 from .sqrt import sqrt, sqrt_
 from .square import square, square_, square_out
 from .squeeze_copy import squeeze_copy  # noqa: F401
