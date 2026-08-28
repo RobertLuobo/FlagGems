@@ -324,23 +324,24 @@ def nonzero_numpy(inp):
     inp_ndim = inp.ndim
     n_elements = inp.numel()
 
-    if n_elements == 0:
-        # ATen: empty input -> ndim empty 1-D index tensors.
-        out = torch.empty(0, inp_ndim, dtype=torch.int64, device=inp.device)
-        return list(out.unbind(dim=1))
-
-    inp = inp.contiguous()
-
-    if inp_ndim <= 8 and n_elements < 2**31:
-        n_full, rem, counts_h = _nznp_block_counts(inp.view(-1), n_elements)
-        total = int(counts_h.sum().item())
-        if total * inp_ndim < 2**31:
-            if total == n_elements:
-                return list(_dense_result(inp, total, True))
-            n_dirty = int((counts_h[:n_full] != _NZNP_BLOCK).sum().item())
-            if 4 * n_dirty <= n_full:
-                return _nznp_compact(inp, n_elements, n_full, rem, counts_h, total)
-            return list(_sparse_result(inp, inp_ndim, n_elements, total, True))
+    # DENSE fast path: write coordinates dim-major into [ndim, N] with stride-1
+    # contiguous stores, then unbind(0) gives ndim contiguous [N] views for free.
+    if inp_ndim >= 1 and num_nonzeros == n_elements and n_elements < 2**31:
+        out = torch.empty(inp_ndim, num_nonzeros, dtype=torch.int64, device=inp.device)
+        if n_elements > 0:
+            shape_t = torch.tensor(inp.shape, dtype=torch.int32, device=inp.device)
+            block = _dense_block_size(n_elements)
+            grid = (triton.cdiv(n_elements, block),)
+            with torch_device_fn.device(inp.device):
+                nonzero_dense_dimmajor_kernel[grid](
+                    out,
+                    n_elements,
+                    shape_t,
+                    inp_ndim,
+                    block,
+                    isCloseUnrollControl=True,
+                )
+        return list(out.unbind(dim=0))
 
     # Outputs at/over the int32 index ceiling, or ndim > 8: previously closed
     # chain (exact two-phase count + dense args kernel / prefix-sum scatter).

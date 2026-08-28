@@ -1654,7 +1654,7 @@ def _unique2(
         # permutation) -> no atomic contention.
         cum = torch.cumsum(cum_input, 0)
         inverse_indices = torch.empty(N, dtype=torch.int64, device=flat.device)
-        inverse_indices.scatter_(0, sorted_indices, cum)
+        inverse_indices.index_copy_(0, sorted_indices, cum)
 
     if return_counts:
         # counts[k] = length of the k-th value-run = start[k+1] - start[k].
