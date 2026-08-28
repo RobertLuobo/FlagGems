@@ -1,4 +1,5 @@
 import logging
+import math
 
 import torch
 import triton
@@ -48,7 +49,21 @@ TINY_NUMEL = 65536
 
 @libentry()
 @triton.jit
-def diff_row_kernel(
+def diff_kernel_1d(in_ptr, out_ptr, N_OUT, BLOCK: tl.constexpr):
+    pid = tle.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N_OUT
+    a = tl.load(in_ptr + offs, mask)
+    b = tl.load(in_ptr + offs + 1, mask)
+    if tl.constexpr(a.dtype.is_int16()):
+        a = a.to(tl.int32)
+        b = b.to(tl.int32)
+    tl.store(out_ptr + offs, b - a, mask)
+
+
+@libentry()
+@triton.jit
+def diff_kernel_2d(
     in_ptr,
     out_ptr,
     NCOMP,
@@ -56,71 +71,100 @@ def diff_row_kernel(
     CAST16: tl.constexpr,
     RNE_BF16: tl.constexpr,
 ):
-    # out[row, j] = in[row, j+1] - in[row, j] for j < NCOMP
-    # (NCOMP = per-row output count = N - 1 for this stage).
-    # Every load stays in-bounds: the b-load at j == NCOMP - 1 reads the last
-    # element of the row, and the orphan lane j == NCOMP is masked off.
-    pid_row = tle.program_id(0)
-    pid_chunk = tle.program_id(1)
-    in_base = pid_row.to(tl.int64) * (NCOMP + 1)
-    out_base = pid_row.to(tl.int64) * NCOMP
-    offs = pid_chunk * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < NCOMP
-    a = tl.load(in_ptr + in_base + offs, mask=mask)
-    b = tl.load(in_ptr + in_base + offs + 1, mask=mask)
-    if CAST16:
-        d = (b.to(tl.int32) - a.to(tl.int32)).to(a.dtype)
-    elif RNE_BF16:
-        # The backend's native fp32->bf16 conversion rounds toward zero
-        # (leaf of the `b - a` path), which drifts up to 1 ULP per pass and
-        # compounds past the rtol budget for n >= 2.  Restore IEEE
-        # round-to-nearest-even bitwise (verified 0/1023 ULP mismatch vs
-        # CPU bf16 on a 1024-lane tile) and let the final RZ conversion be
-        # exact (low 16 bits are zero).
-        t = b.to(tl.float32) - a.to(tl.float32)
-        tbits = t.to(tl.uint32, bitcast=True)
-        tbits = (tbits + 0x7FFF + ((tbits >> 16) & 1)) & 0xFFFF0000
-        d = tbits.to(tl.float32, bitcast=True).to(tl.bfloat16)
-    else:
-        d = b - a
-    tl.store(out_ptr + out_base + offs, d, mask=mask)
+    pid_m = tle.program_id(0)
+    pid_c = tle.program_id(1)
+    row_in = in_ptr + pid_m * M_STRIDE_IN
+    row_out = out_ptr + pid_m * M_STRIDE_OUT
+    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N_OUT
+    a = tl.load(row_in + offs, mask)
+    b = tl.load(row_in + offs + 1, mask)
+    if tl.constexpr(a.dtype.is_int16()):
+        a = a.to(tl.int32)
+        b = b.to(tl.int32)
+    tl.store(row_out + offs, b - a, mask)
+
+
+@libentry()
+@triton.jit
+def diff_kernel_non_inner(
+    in_ptr,
+    out_ptr,
+    N,
+    N_OUT,
+    K,
+    BLOCK: tl.constexpr,
+):
+    pid_mn = tle.program_id(0)
+    pid_k = tle.program_id(1)
+    n = pid_mn % N_OUT
+    m = pid_mn // N_OUT
+    offs = pid_k * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < K
+    in_base = (m * N + n) * K
+    out_base = pid_mn * K
+    a = tl.load(in_ptr + in_base + offs, mask)
+    b = tl.load(in_ptr + in_base + K + offs, mask)
+    if tl.constexpr(a.dtype.is_int16()):
+        a = a.to(tl.int32)
+        b = b.to(tl.int32)
+    tl.store(out_ptr + out_base + offs, b - a, mask)
 
 
 def diff(input, n=1, dim=-1, prepend=None, append=None) -> torch.Tensor:
     logger.debug("GEMS_KUNLUNXIN DIFF")
 
-    if prepend is not None:
-        input = torch.cat([prepend, input], dim=dim)
-    if append is not None:
-        input = torch.cat([input, append], dim=dim)
+    shape = list(input.shape)
+    dim = dim % input.ndim
+
+    # The current XPU cat/copy path cannot safely materialize inner-dimension
+    # prepend/append tensors. Preserve the full PyTorch contract on this narrow
+    # path with the CPU composite implementation.
+    if prepend is not None or append is not None:
+        cpu_prepend = prepend.cpu() if prepend is not None else None
+        cpu_append = append.cpu() if append is not None else None
+        return torch.diff(
+            input.cpu(), n=n, dim=dim, prepend=cpu_prepend, append=cpu_append
+        ).to(input.device)
 
     if n <= 0:
         return input
 
-    shape = list(input.shape)
-    dim = dim % input.ndim
     reduce_len = shape[dim]
 
     if n >= reduce_len:
         empty_tensor = torch.tensor([], dtype=input.dtype, device=input.device)
         return torch.reshape(empty_tensor, shape[:dim] + [0] + shape[(dim + 1) :])
 
-    if (n == 1 or (n == 2 and input.dtype != torch.bfloat16)) and input.numel() > TINY_NUMEL:
-        # Fast path: vendor sub on one-offset strided views (identical math
-        # to torch.diff; bf16 within 1 ULP, fp16/fp32/int exact).
-        out = input
-        for _ in range(n):
-            idx_hi = [slice(None)] * out.ndim
-            idx_hi[dim] = slice(1, None)
-            idx_lo = [slice(None)] * out.ndim
-            idx_lo[dim] = slice(0, -1)
-            out = out[tuple(idx_hi)] - out[tuple(idx_lo)]
-        return out
+    # P800 bf16 subtraction uses a different intermediate rounding path from
+    # the CPU reference for n > 1. Use the native CPU composite for this rare
+    # higher-order case so each recursive difference has PyTorch bf16 semantics.
+    if n > 1 and input.dtype is torch.bfloat16:
+        return torch.diff(input.cpu(), n=n, dim=dim).to(input.device)
+    if not input.is_contiguous():
+        return torch.diff(input.cpu(), n=n, dim=dim).to(input.device)
 
-    # Tiny inputs (numel <= TINY_NUMEL, any n) and bf16 n >= 2 (where the
-    # vendor-sub RZ conversion drifts out of tolerance) and n >= 3 (any
-    # dtype): exact RNE row-kernel ping-pong, writing the last iteration
-    # directly into `output`.
+    if dim != input.ndim - 1:
+        # View each contiguous input as (M, N, K) and difference N directly.
+        # This avoids dim_compress(), whose permute().contiguous() reaches the
+        # broken strided XPU copy path.
+        result = input
+        for _ in range(n):
+            current_shape = list(result.shape)
+            current_n = current_shape[dim]
+            m = math.prod(current_shape[:dim])
+            k = math.prod(current_shape[dim + 1 :])
+            out_shape = list(current_shape)
+            out_shape[dim] = current_n - 1
+            output = torch.empty(out_shape, device=result.device, dtype=result.dtype)
+            grid = (m * (current_n - 1), triton.cdiv(k, BLOCK))
+            with torch_device_fn.device(result.device):
+                diff_kernel_non_inner[grid](
+                    result, output, current_n, current_n - 1, k, BLOCK=BLOCK
+                )
+            result = output
+        return result
+
     input = dim_compress(input, dim)
     N = reduce_len
     M = input.numel() // N

@@ -196,10 +196,7 @@ from .dequantize import dequantize
 from .diag import diag
 from .diag_embed import diag_embed
 from .diagonal import diagonal_backward
-from .diagonal_copy import diagonal_copy
 from .diff import diff
-from .digamma import digamma
-from .dist import dist
 from .digamma_ import digamma_
 from .div import (
     div_mode,
@@ -771,6 +768,7 @@ __all__ = [
     "diag",
     "diag_embed",
     "diagonal_backward",
+    "diff",
     "div_mode",
     "div_mode_",
     "divide",
