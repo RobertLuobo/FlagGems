@@ -6,11 +6,10 @@ import flag_gems
 from . import accuracy_utils as utils
 
 
-# TODO: Reference GitHub issue for multi-backend support
-@pytest.mark.skipif(
-    flag_gems.vendor_name not in ("nvidia", "thead"),
-    reason="Only nvidia and thead backends support this op",
-)
+# Multi-backend: the previous `vendor_name not in ("nvidia", "thead")` skipif was stale.
+# Verified on kunlunxin (XPU, 2026-08-31) with the case bodies below unchanged: all
+# 6 POINTWISE_SHAPES cells plus the out-of-range case pass against a CPU reference,
+# so no vendor gate is needed here.
 @pytest.mark.special_shifted_chebyshev_polynomial_w
 @pytest.mark.parametrize("shape", utils.POINTWISE_SHAPES)
 # PyTorch reference only supports float32 for this operator
@@ -32,10 +31,6 @@ def test_special_shifted_chebyshev_polynomial_w(shape, dtype):
     utils.gems_assert_close(res_out, ref_out, dtype)
 
 
-@pytest.mark.skipif(
-    flag_gems.vendor_name not in ("nvidia", "thead"),
-    reason="Only nvidia and thead backends support this op",
-)
 @pytest.mark.special_shifted_chebyshev_polynomial_w
 def test_special_shifted_chebyshev_polynomial_w_n_out_of_range():
     # Verify that n > 10 raises an error.

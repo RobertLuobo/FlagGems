@@ -51,9 +51,11 @@ import triton.language as tl
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 
-# x ** p is decomposed as exp2(p * log2(x)): tl_extra_shim.pow is too heavy
+# x ** p: vendor powf (see _pd_mode_reduce). exp2/log2 remain for the
+# per-row finalization (single op, cost negligible).
 exp2 = tl_extra_shim.exp2
 log2 = tl_extra_shim.log2
+pow = tl_extra_shim.pow
 logger = logging.getLogger(__name__)
 
 # Chunk width for the D axis. 2048 lanes keeps the fp32 tl.sum rounding well
@@ -82,8 +84,16 @@ def _pd_mode_reduce(diff, p_scalar, MODE: tl.constexpr):
         return tl.max(diff)
     elif MODE == 4:  # -inf
         return tl.min(diff)
-    else:  # general p (exp2/log2 decomposition)
-        return tl.sum(exp2(p_scalar * log2(diff)))
+    else:  # general p: vendor powf (single libdevice call). The former
+        # exp2(p * log2(x)) decomposition measured ~37x slower on XPU
+        # (xpu log2f/exp2f are emulated; powf is a short sequence), and
+        # matches exp2/log2 to <1e-6 relative on 2048/4096-lane chunks.
+        # The exponent must be a constant tensor: `diff * 0.0 + p_scalar`
+        # would poison the exponent to NaN on +/-inf diff (inf*0.0 = NaN),
+        # while a constant preserves IEEE pow(x, p): inf^p -> inf (p>0) / 0
+        # (p<0), matching the old exp2(p*log2(x)) on non-finite inputs.
+        p_const = tl.full(diff.shape, p_scalar, diff.dtype)
+        return tl.sum(pow(diff, p_const))
 
 
 @triton.jit
@@ -213,6 +223,73 @@ def _pd_small_kernel(
         NSCALAR,
     )
     tl.store(out_ptr + pid, _pd_finalize(acc, p_scalar, MODE))
+
+
+# Multi-row variant of _pd_small_kernel: ROWS independent rows per program to
+# cut the program count (and therefore the launch overhead) when N is large
+# but D is small (launch-bound regime, e.g. (10000, 1) / (10000, 256)). Each
+# row is processed exactly as in _pd_small_kernel; rows are independent so the
+# loads pipeline across the ROWS iterations.
+_ROWS = 8
+
+
+@libentry()
+@triton.jit
+def _pd_small_multi_kernel(
+    x1_ptr,
+    x2_ptr,
+    out_ptr,
+    N,
+    D,
+    eps,
+    p_scalar,
+    MODE: tl.constexpr,
+    S: tl.constexpr,
+    NP: tl.constexpr,
+    NSCALAR: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    for r in tl.static_range(ROWS):
+        row = pid * ROWS + r
+        if row < N:
+            base = row * D
+            acc = _pd_piece_sum(
+                x1_ptr, x2_ptr, base, eps, p_scalar, MODE, S, NP, NSCALAR,
+            )
+            tl.store(out_ptr + row, _pd_finalize(acc, p_scalar, MODE))
+
+
+# D == 1: every row is a single element, so all p-norms collapse to
+# |x1 - x2 + eps| (p == 0 counts non-zeros: 1.0 for every lane since
+# eps > 0 makes |x1 - x2 + eps| > 0 except a measure-zero set handled by the
+# comparison). A single flat elementwise pass over the N rows replaces the
+# per-row reduction kernel, which measured ~90x slower (row-serial latency).
+# Loads use a clamped index so no masked (possibly OOB) load is ever emitted;
+# the store mask only discards valid load results.
+@libentry()
+@triton.jit
+def _pd_d1_kernel(
+    x1_ptr,
+    x2_ptr,
+    out_ptr,
+    N,
+    eps,
+    MODE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    off = pid * BLOCK + tl.arange(0, BLOCK)
+    safe = tl.minimum(off, N - 1)
+    a = tl.load(x1_ptr + safe).to(tl.float32)
+    b = tl.load(x2_ptr + safe).to(tl.float32)
+    d = tl.abs(a - b + eps)
+    if MODE == 2:  # p == 0: nonzero count of a 1-element row.  Compare the
+        # raw elements (== |a - b| != 0, exact in fp32: bf16/fp16 convert
+        # losslessly) instead of `d` (which folds eps in and disagrees with
+        # the reference when a - b == -eps exactly).
+        d = (a != b).to(tl.float32)
+    tl.store(out_ptr + off, d, mask=off < N)
 
 
 @libentry()
@@ -404,11 +481,13 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
                 NSCALAR=PNSC,
             )
         else:
-            MID = D // _BLOCK_D
-            T = D - MID * _BLOCK_D
-            if mode in (3, 4):
-                MID = D // 4096
-                T = D - MID * 4096
+            # All modes use 4096-lane chunks when D >= 4096 (halves the chunk
+            # program count vs 2048 and is numerically safe: tl.sum is complete
+            # for BLOCK <= 8192). D in (2048, 4096) keeps 2048-lane chunks so
+            # the remainder stays short; the small path handles D <= 2048.
+            chunk_block = 4096 if (mode in (3, 4) or D >= 2 * _BLOCK_D) else _BLOCK_D
+            MID = D // chunk_block
+            T = D - MID * chunk_block
             P = MID + (1 if T > 0 else 0)
             # Padded lanes must hold the MODE identity so unmasked partial
             # reductions stay correct: 0.0 for sums/counts, -inf for max,
@@ -420,6 +499,8 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
             else:
                 pad = 0.0
             stride = triton.next_power_of_2(P)
+            if stride < 2:
+                stride = 2
             if stride > _MID_BLOCK:
                 stride = triton.cdiv(P, _MID_BLOCK) * _MID_BLOCK
             mid = torch.full((N * stride,), pad, device=x1.device, dtype=torch.float32)

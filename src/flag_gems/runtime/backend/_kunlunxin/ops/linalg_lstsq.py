@@ -222,19 +222,26 @@ def _upd_kernel(
     WV,
     V,
     C0,
+    R0,
     NCP: tl.constexpr,
     MP: tl.constexpr,
     BC: tl.constexpr,
+    BN: tl.constexpr,
 ):
     """M <- H M, i.e. W[c, r] -= WV[c] * v[r].
 
     Both rank-1 operands are stride-0 duplicated-address 2-D loads. Written as
     1-D broadcasts (``WV[c][:, None] * V[r][None, :]``) this is silently wrong
     for MP > 128 on this backend.
+
+    R0 is the first row (r) this launch touches, always a multiple of BN: rows
+    below the current pivot column's 64-aligned block have v == 0, so touching
+    them is pure wasted traffic, and on a square problem that is ~half the
+    kernel's bytes. Grid is (batch, ncols/BC, (MP - R0)/BN).
     """
     b = tl.program_id(0)
     c = C0 + tl.program_id(1) * BC + tl.arange(0, BC)
-    r = tl.arange(0, MP)
+    r = R0 + tl.program_id(2) * BN + tl.arange(0, BN)
     off = b * (NCP * MP) + c[:, None] * MP + r[None, :]
     wt = tl.load(WV + b * NCP + c[:, None] + r[None, :] * 0)
     vt = tl.load(V + b * MP + r[None, :] + c[:, None] * 0)
@@ -390,7 +397,18 @@ def _qr_sweep(W, NCP, MP, NP, nsteps, batch, dt, dev, keep_reflectors):
 
     for j in range(nsteps):
         c0 = (j // BC) * BC
+        r0 = (j // BC) * BC
         nb = (NCP - c0) // BC
+        # Segment the r (row) axis only when the pivot block has moved off the
+        # top: at r0 == 0 the full row range is live anyway (only steps j < 64
+        # land here), so segmenting just multiplies the launch count by
+        # MP/64 with zero traffic saved -- measured 30x slower on (8,16,512).
+        if r0 > 0:
+            nr = (MP - r0) // BC
+            bn = BC
+        else:
+            nr = 1
+            bn = MP
         _mk_v_kernel[(batch,)](W, V, XJ, j, NCP=NCP, MP=MP)
         _dot_kernel[(batch, nb)](W, V, S, c0, NCP=NCP, MP=MP, BC=BC)
         _scal_kernel[(batch,)](
@@ -412,7 +430,13 @@ def _lstsq_tall(A, B, rcond):
     KP = max(_LANES, _p2(nrhs))
     MP = max(_MIN_ROW, _p2(m))
     NP = max(_MIN_COL, _p2(n))
-    NCP = max(NP, _p2(n + KP))
+    # Column count needs no power-of-two (only the c-tile width does, and that
+    # is always 64): 64-align n + nrhs_pad instead of next_pow2, which aligns the
+    # real RHS columns at 2048 for n = 1024 (and 4096 for n = 2048) when only
+    # ~n + 64 are ever touched. Zero-padded columns are exact zeros, so the
+    # factorisation and the RHS slice below are unchanged; the wasted traffic
+    # per Householder step drops by ~half.
+    NCP = max(NP, ((n + KP + _LANES - 1) // _LANES) * _LANES)
 
     W = torch.zeros((batch, NCP, MP), dtype=dt, device=dev)
     W[:, :n, :m] = A.transpose(-1, -2)
@@ -433,7 +457,7 @@ def _lstsq_tall(A, B, rcond):
             )
             # R[j, i] == W[i, j]: the update coefficient is a ROW of W.
             _rowcpy_kernel[(batch,)](W, RROW, NCP * MP, i, LD=MP, NW=NP)
-            _upd_kernel[(batch, 1)](RHS, XI, RROW, 0, NCP=KP, MP=NP, BC=KP)
+            _upd_kernel[(batch, 1, 1)](RHS, XI, RROW, 0, 0, NCP=KP, MP=NP, BC=KP, BN=NP)
 
         RES = torch.zeros((batch, KP), dtype=dt, device=dev)
         if m > n:
@@ -478,7 +502,7 @@ def _lstsq_wide(A, B, rcond):
                 RHS, YI, YS, DIAG, RMAX, rcond, c, m, NW=MIP, KP=KP
             )
             _colcpy_kernel[(batch,)](W, COL, NRP * MP, c, LD=MP, NW=MIP)
-            _upd_kernel[(batch, 1)](RHS, YI, COL, 0, NCP=KP, MP=MIP, BC=KP)
+            _upd_kernel[(batch, 1, 1)](RHS, YI, COL, 0, 0, NCP=KP, MP=MIP, BC=KP, BN=MIP)
 
         # x = Q y = H_0 .. H_{m-1} [y; 0]
         Z = torch.zeros((batch, KP, MP), dtype=dt, device=dev)
@@ -491,7 +515,7 @@ def _lstsq_wide(A, B, rcond):
             _rowcpy_kernel[(batch,)](VS, RROW, NRP * MP, j, LD=MP, NW=MP)
             _dot_kernel[(batch, 1)](Z, RROW, DOT, 0, NCP=KP, MP=MP, BC=KP)
             _scale_kernel[(batch,)](DOT, BETAS, COEF, j, NRP, KP=KP)
-            _upd_kernel[(batch, 1)](Z, COEF, RROW, 0, NCP=KP, MP=MP, BC=KP)
+            _upd_kernel[(batch, 1, 1)](Z, COEF, RROW, 0, 0, NCP=KP, MP=MP, BC=KP, BN=MP)
 
     return Z[:, :nrhs, :n].transpose(-1, -2).contiguous()
 

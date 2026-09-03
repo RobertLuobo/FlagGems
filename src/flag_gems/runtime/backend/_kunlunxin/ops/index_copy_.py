@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import torch
 import triton
 import triton.language as tl
 
@@ -180,3 +181,16 @@ def index_copy_(inp, dim, index, src):
     else:
         raise NotImplementedError("Kunlunxin index_copy_ supports ranks 1 through 3")
     return inp
+
+
+def index_copy(inp, dim, index, src):
+    _validate(inp, dim, index, src)
+    dim %= inp.ndim
+    # Functional variant: copy the input with the native strided-copy engine
+    # (FlagGems does not override `aten::_copy_from`), then reuse the in-place
+    # Triton kernel above. Avoids the generic code-generated kernel, which
+    # wedges the XPU device on large 3-D shapes (NOC idle timeout) and
+    # produces wrong results.
+    out = torch.empty_like(inp, memory_format=torch.contiguous_format)
+    torch.ops.aten._copy_from(inp, out, False)
+    return index_copy_(out, dim, index, src)

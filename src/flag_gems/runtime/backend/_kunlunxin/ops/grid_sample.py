@@ -506,6 +506,9 @@ def grid_sample(
         # BLOCK=256 keeps the launch count low enough to leave the launch-bound
         # regime while staying far below the BLOCK>=4096 range, which triggers a
         # device-side kernel exception (NOC timeout) on this 3D kernel.
+        # (BLOCK=512 was tried: it improved large 4D cases ~10-20% but
+        # regressed small/5D cases under the cold-cache benchmark protocol,
+        # and the equal-weight aggregate was strictly worse -> kept 256.)
         block = 256
         _grid_sample_3d_kunlunxin_kernel[(triton.cdiv(total, block),)](
             output,
@@ -553,6 +556,9 @@ def grid_sample(
     # BLOCK=256 instead of 64: the previous tile made large outputs launch-bound
     # ((2,32,64,64) -> 4096 tiny programs). BLOCK only changes the tile split, the
     # numerics are bit-identical.
+    # (BLOCK=512 was tried: it improved large 4D cases ~10-20% but regressed
+    # small/5D cases under the cold-cache benchmark protocol, and the
+    # equal-weight aggregate was strictly worse -> kept 256.)
     block = 256
     _grid_sample_2d_kunlunxin_kernel[(triton.cdiv(total, block),)](
         output,

@@ -246,7 +246,16 @@ def _scatter_reduce_2d_kernel(
     output_offset = tl.program_id(0)
     y = output_offset % input_size1
     x = output_offset // input_size1
-    offsets = tl.arange(0, BLOCK)
+    # DIM=0 strided loads (runtime stride): the backend's vectorized (int64,
+    # BLOCK >= 128 lanes) address lowering reuses the first lane's address for
+    # every lane of a vector (effective stride halved/quartered), silently
+    # reading wrong elements.  int64 offsets force correct per-lane addressing.
+    # DIM=1 keeps plain int32 arange: int64 there makes the buffer-size tuner
+    # fail ("Failed to tune buffer size").
+    if DIM == 0:
+        offsets = tl.arange(0, BLOCK).to(tl.int64)
+    else:
+        offsets = tl.arange(0, BLOCK)
     if DIM == 0:
         valid_base = y < index_size1
         dim_size, index_base, src_base = index_size0, y, y
