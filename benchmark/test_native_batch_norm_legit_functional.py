@@ -28,15 +28,16 @@ def test_native_batch_norm_legit_functional():
         running_var = torch.ones(C, dtype=dtype, device=device)
         yield inp, weight, bias, running_mean, running_var, True, 0.1, 1e-5
 
+    # NOTE: no set_gems() here on purpose.  The generic
+    # flag_gems.ops._native_batch_norm_legit_functional (2D-tile
+    # batch_norm_forward_kernel) does not compile on kunlunxin/XPU
+    # (out of resource: uni_sram), and the production implementation is the
+    # vendor override reached through the aten dispatch under use_gems() --
+    # the same pattern as benchmark/test_batch_norm.py / test_native_batch_norm.py.
     bench = NormBenchmark(
         input_fn=native_batch_norm_legit_functional_input_fn,
         op_name="native_batch_norm_legit_functional",
         torch_op=torch.ops.aten._native_batch_norm_legit_functional.default,
         dtypes=consts.FLOAT_DTYPES,
     )
-    from flag_gems.ops._native_batch_norm_legit_functional import (
-        _native_batch_norm_legit_functional as gems_bn,
-    )
-
-    bench.set_gems(gems_bn)
     bench.run()

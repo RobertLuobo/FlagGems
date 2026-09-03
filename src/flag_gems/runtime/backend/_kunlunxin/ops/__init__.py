@@ -199,6 +199,7 @@ from .dot import dot
 from .dropout import dropout, dropout_backward
 from .elu import elu, elu_, elu_backward
 from .embedding import embedding, embedding_backward, embedding_dense_backward
+from .empty_permuted import empty_permuted
 from .eq import eq, eq_, eq_scalar, eq_scalar_
 from .erf import erf, erf_, special_erf
 from .erfc import erfc, erfc_, special_erfc
@@ -262,7 +263,7 @@ from .igammac_ import igammac_
 from .im2col import im2col
 from .index import index
 from .index_add import index_add, index_add_
-from .index_copy_ import index_copy_
+from .index_copy_ import index_copy, index_copy_
 from .index_put import index_put, index_put_
 from .index_put_impl import _index_put_impl_
 from .index_reduce import index_reduce_
@@ -837,6 +838,7 @@ __all__ = [
     "embedding",
     "embedding_backward",
     "embedding_dense_backward",
+    "empty_permuted",
     "eq",
     "eq_",
     "eq_scalar",

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .add_rms_norm import add_rms_norm
 from .beam_search_score import beam_search_score, beam_search_score_
 from .bincount import bincount
 from .concat_and_cache_mla import concat_and_cache_mla
@@ -58,6 +59,7 @@ __all__ = [
     "beam_search_score_",
     "skip_layer_norm",
     "fused_add_rms_norm",
+    "add_rms_norm",
     "silu_and_mul",
     "silu_and_mul_out",
     "silu_and_mul_with_clamp",
