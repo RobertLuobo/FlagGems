@@ -24,6 +24,7 @@ from ._scaled_dot_product_fused_attention_overrideable import (
     _scaled_dot_product_fused_attention_overrideable,
 )
 from ._thnn_fused_lstm_cell_backward_impl import _thnn_fused_lstm_cell_backward_impl
+from ._unsafe_masked_index_put_accumulate import _unsafe_masked_index_put_accumulate
 from ._upsample_bilinear2d_aa import _upsample_bilinear2d_aa  # noqa: F401
 from ._upsample_nearest_exact2d_backward import _upsample_nearest_exact2d_backward
 from .abs import abs, abs_
@@ -53,7 +54,9 @@ from .arcsin import arcsin, arcsin_, arcsin_out
 from .arctan import arctan, arctan_
 from .argmax import argmax
 from .argmin import argmin
+from .argsort import argsort
 from .as_strided_copy import as_strided_copy, as_strided_copy_out
+from .as_strided_scatter import as_strided_scatter
 from .asin import asin, asin_
 from .atan import atan, atan_
 from .attention import (
@@ -89,6 +92,7 @@ from .bitwise_or import (
 from .bitwise_right_shift import bitwise_right_shift
 from .bmm import bmm, bmm_out
 from .broadcast_to import broadcast_to
+from .bucketize import bucketize
 from .cat import cat, cat_out
 from .ceil import ceil, ceil_, ceil_out
 from .celu import celu, celu_
@@ -122,10 +126,12 @@ from .cummax import cummax
 from .cummin import cummin
 from .cumprod import cumprod, cumprod_
 from .cumsum import cumsum, cumsum_out, normed_cumsum
+from .cumsum_ import cumsum_
 from .deg2rad import deg2rad, deg2rad_, deg2rad_out
 from .diag import diag
 from .diag_embed import diag_embed
 from .diagonal import diagonal_backward
+from .diagonal_copy import diagonal_copy
 from .digamma import digamma
 from .digamma_ import digamma_
 from .div import (
@@ -179,20 +185,26 @@ from .groupnorm import group_norm, group_norm_backward
 from .gt import gt, gt_scalar
 from .hadamard_transform import hadamard_transform
 from .hardsigmoid import hardsigmoid, hardsigmoid_out
+from .histc import histc
 from .hstack import hstack
 from .igammac import igammac, igammac_out
 from .igammac_ import igammac_
 from .im2col import im2col
 from .index import index
 from .index_add import index_add, index_add_
+from .index_copy_ import index_copy_
 from .index_put import index_put, index_put_
+from .index_put_impl import _index_put_impl_
+from .index_reduce import index_reduce_
 from .index_select import index_select
+from .index_select_backward import index_select_backward
 from .isclose import allclose, isclose
 from .isfinite import isfinite
 from .isin import isin
 from .isinf import isinf
 from .isnan import isnan
 from .kron import kron
+from .kthvalue import kthvalue
 from .layernorm import layer_norm, layer_norm_backward
 from .le import le, le_scalar
 from .leaky_relu import leaky_relu, leaky_relu_, leaky_relu_out
@@ -243,6 +255,7 @@ from .lt import lt, lt_, lt_scalar, lt_scalar_
 from .lu_unpack import lu_unpack, lu_unpack_out
 from .masked_fill import masked_fill, masked_fill_
 from .masked_scatter import masked_scatter, masked_scatter_
+from .masked_scatter_backward import masked_scatter_backward
 from .masked_select import masked_select
 from .matmul_bf16 import matmul_bf16
 from .matmul_int8 import matmul_int8
@@ -257,9 +270,11 @@ from .max_pool3d_with_indices import max_pool3d_backward, max_pool3d_with_indice
 from .max_unpool3d import max_unpool3d  # noqa: F401
 from .maximum import maximum
 from .mean import mean, mean_dim
+from .median import median, median_dim, median_dim_values, median_out
 from .min import min, min_dim
 from .minimum import minimum
 from .mm import mm, mm_out
+from .mode import mode
 from .mse_loss import mse_loss
 from .mul import mul, mul_
 from .multinomial import multinomial
@@ -283,6 +298,7 @@ from .nllloss import (
 )
 from .nonzero import nonzero
 from .nonzero_numpy import nonzero_numpy
+from .nonzero_static import nonzero_static, nonzero_static_out  # noqa: F401
 from .norm import norm, norm_scalar, norm_scalaropt_dim
 from .normal import (
     normal_,
@@ -345,6 +361,7 @@ from .resolve_conj import resolve_conj
 from .resolve_neg import resolve_neg
 from .rms_norm import rms_norm, rms_norm_backward, rms_norm_forward
 from .rnn_relu import rnn_relu
+from .roll import roll
 from .rot90 import rot90
 from .round import round, round_, round_out
 from .rsqrt import rsqrt, rsqrt_
@@ -353,6 +370,20 @@ from .safe_softmax import _safe_softmax
 from .scaled_softmax import scaled_softmax_backward, scaled_softmax_forward
 from .scatter import scatter, scatter_
 from .scatter_add_ import scatter_add_
+from .scatter_reduce import scatter_reduce, scatter_reduce_, scatter_reduce_out
+from .searchsorted import (
+    searchsorted,
+    searchsorted_out,
+    searchsorted_scalar,
+    searchsorted_scalar_out,
+)
+from .segment_reduce import (
+    _segment_reduce_backward,
+    _segment_reduce_backward_out,
+    segment_reduce,
+    segment_reduce_out,
+)
+from .select_backward import select_backward
 from .select_scatter import select_scatter
 from .selu import selu, selu_
 from .sgn_ import sgn_
@@ -412,7 +443,9 @@ from .special_shifted_chebyshev_polynomial_v import (
 from .special_shifted_chebyshev_polynomial_w import (
     special_shifted_chebyshev_polynomial_w,
 )
+from .split_with_sizes_copy import split_with_sizes_copy  # noqa: F401
 from .sqrt import sqrt, sqrt_
+from .squeeze_copy import squeeze_copy  # noqa: F401
 from .stack import stack
 from .std import std
 from .sub import sub, sub_, subtract_
@@ -428,8 +461,12 @@ from .trace import trace
 from .tril import tril, tril_, tril_out
 from .triu import triu, triu_
 from .trunc import trunc, trunc_
+from .unbind_copy import unbind_copy  # noqa: F401
+from .unfold_copy import unfold_copy
 from .uniform import uniform_
 from .unique import _unique2
+from .unique_consecutive import unique_consecutive
+from .unique_dim import unique_dim
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
 from .upsample_bicubic2d_aa_backward import _upsample_bicubic2d_aa_backward
 from .upsample_linear1d import upsample_linear1d
@@ -1029,4 +1066,38 @@ __all__ = [
     "norm_scalaropt_dim",
     "renorm",
     "renorm_",
+    "_unsafe_masked_index_put_accumulate",
+    "unique_consecutive",
+    "unique_dim",
+    "argsort",
+    "as_strided_scatter",
+    "unfold_copy",
+    "bucketize",
+    "cumsum_",
+    "diagonal_copy",
+    "histc",
+    "index_copy_",
+    "_index_put_impl_",
+    "index_reduce_",
+    "index_select_backward",
+    "kthvalue",
+    "masked_scatter_backward",
+    "median",
+    "median_dim",
+    "median_dim_values",
+    "median_out",
+    "mode",
+    "roll",
+    "scatter_reduce",
+    "scatter_reduce_",
+    "scatter_reduce_out",
+    "searchsorted",
+    "searchsorted_out",
+    "searchsorted_scalar",
+    "searchsorted_scalar_out",
+    "_segment_reduce_backward",
+    "_segment_reduce_backward_out",
+    "segment_reduce",
+    "segment_reduce_out",
+    "select_backward",
 ]
