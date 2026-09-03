@@ -273,14 +273,7 @@ def _grad_input_nearest_kernel(
         xn = tl.floor(ix + 0.5).to(tl.int32)
         yn = tl.floor(iy + 0.5).to(tl.int32)
         zn = tl.floor(iz + 0.5).to(tl.int32)
-        ok = (
-            (xn >= 0)
-            & (xn < iW)
-            & (yn >= 0)
-            & (yn < iH)
-            & (zn >= 0)
-            & (zn < iD)
-        )
+        ok = (xn >= 0) & (xn < iW) & (yn >= 0) & (yn < iH) & (zn >= 0) & (zn < iD)
         xs = tl.maximum(tl.minimum(xn, iW - 1), 0)
         ys = tl.maximum(tl.minimum(yn, iH - 1), 0)
         zs = tl.maximum(tl.minimum(zn, iD - 1), 0)
@@ -502,9 +495,7 @@ def grid_sampler_3d_backward(
     grad_input = torch.zeros(
         (N, C, iD, iH, iW), dtype=torch.float32, device=input.device
     )
-    grad_grid = torch.zeros(
-        (N, oD, oH, oW, 3), dtype=torch.float32, device=grid.device
-    )
+    grad_grid = torch.zeros((N, oD, oH, oW, 3), dtype=torch.float32, device=grid.device)
 
     n_per_batch = oD * oH * oW
     num_elements = N * n_per_batch

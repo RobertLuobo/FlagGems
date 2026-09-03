@@ -543,12 +543,8 @@ def median_key_info_chunk_kernel(
             max_fill = get_dtype_max(dtype)
         vals = tl.load(inp + pid // NCHUNK * N + offsets, mask=mask, other=max_fill)
         keys = _median_keys(vals, KEY_BITS)
-        vals_lo = tl.load(
-            inp + pid // NCHUNK * N + offsets, mask=mask, other=min_fill
-        )
-        vals_hi = tl.load(
-            inp + pid // NCHUNK * N + offsets, mask=mask, other=max_fill
-        )
+        vals_lo = tl.load(inp + pid // NCHUNK * N + offsets, mask=mask, other=min_fill)
+        vals_hi = tl.load(inp + pid // NCHUNK * N + offsets, mask=mask, other=max_fill)
         keys_lo = _median_keys(vals_lo, KEY_BITS)
         keys_hi = _median_keys(vals_hi, KEY_BITS)
     # keybuf layout: (M * NCHUNK, CHUNK); pad lanes keep the wrapper's
@@ -561,9 +557,7 @@ def median_key_info_chunk_kernel(
         # key info kernel).  Pack = global index, sentinel = 0x7FFFFFFF.
         nan = mask & _median_is_nan(vals)
         local_first = tl.min(tl.where(nan, cols, CHUNK), axis=0)
-        pack = tl.where(
-            local_first < CHUNK, local_first + chunk * CHUNK, 2147483647
-        )
+        pack = tl.where(local_first < CHUNK, local_first + chunk * CHUNK, 2147483647)
         tl.store(chunk_nan + cidx, pack)
     else:
         tl.store(chunk_nan + cidx, 2147483647)
@@ -600,9 +594,7 @@ def median_key_info_partial_kernel(
     mask = cols < PARTIAL
     if PREORDERED:
         keys = tl.load(inp + pid * N + offsets, mask=mask, other=0)
-        keys_lo = tl.load(
-            inp + pid * N + offsets, mask=mask, other=0xFFFFFFFFFFFFFFFF
-        )
+        keys_lo = tl.load(inp + pid * N + offsets, mask=mask, other=0xFFFFFFFFFFFFFFFF)
         keys_hi = tl.load(inp + pid * N + offsets, mask=mask, other=0)
     else:
         dtype = inp.dtype.element_ty
@@ -984,7 +976,9 @@ def _nanmedian_flat_chunked(flat, N, key_bits):
     chunk_nan = torch.full(
         (M * reduce_block,), 2147483647, dtype=torch.int32, device=flat.device
     )
-    chunk_counts = torch.empty((M * reduce_block,), dtype=torch.int32, device=flat.device)
+    chunk_counts = torch.empty(
+        (M * reduce_block,), dtype=torch.int32, device=flat.device
+    )
     counts = torch.empty((M,), dtype=torch.int32, device=flat.device)
     lo = torch.empty((M,), dtype=key_dtype, device=flat.device)
     hi = torch.empty((M,), dtype=key_dtype, device=flat.device)
@@ -1042,7 +1036,9 @@ def _nanmedian_flat_chunked(flat, N, key_bits):
         def _u64_of(t, i):
             if key_bits == 64:
                 return int(t.view(torch.int64)[i].item()) & 0xFFFFFFFFFFFFFFFF
-            return int(np.asarray(np.float32(t.view(torch.float32)[i].item())).view(np.uint32))
+            return int(
+                np.asarray(np.float32(t.view(torch.float32)[i].item())).view(np.uint32)
+            )
 
         lo_h = [_u64_of(lo, r) for r in range(M)]
         hi_h = [_u64_of(hi, r) for r in range(M)]
@@ -1058,8 +1054,17 @@ def _nanmedian_flat_chunked(flat, N, key_bits):
                 )
             if partial:
                 median_count_partial_kernel[(M,)](
-                    keybuf, mid, chunk_counts, N, nchunks, partial,
-                    reduce_block, row_stride, tail_base, tail_blk, **nan_kw
+                    keybuf,
+                    mid,
+                    chunk_counts,
+                    N,
+                    nchunks,
+                    partial,
+                    reduce_block,
+                    row_stride,
+                    tail_base,
+                    tail_blk,
+                    **nan_kw,
                 )
             median_row_reduce_kernel[(M,)](
                 chunk_counts, counts, nchunks, 0, reduce_block, 2, **nan_kw
@@ -1072,15 +1077,27 @@ def _nanmedian_flat_chunked(flat, N, key_bits):
         sel_keys = lo
         for r in range(M):
             median_set_scalar_kernel[(1,)](sel_keys, r, lo_h[r], **nan_kw)
-        chunk_first = torch.empty((M * reduce_block,), dtype=torch.int32, device=flat.device)
+        chunk_first = torch.empty(
+            (M * reduce_block,), dtype=torch.int32, device=flat.device
+        )
         if nfull:
             median_select_chunk_kernel[(M * nfull,)](
                 keybuf, sel_keys, chunk_first, N, nchunks, reduce_block, CHUNK, **nan_kw
             )
         if partial:
             median_select_partial_kernel[(M,)](
-                keybuf, sel_keys, chunk_first, N, nchunks, tail_start, partial,
-                reduce_block, row_stride, tail_base, tail_blk, **nan_kw
+                keybuf,
+                sel_keys,
+                chunk_first,
+                N,
+                nchunks,
+                tail_start,
+                partial,
+                reduce_block,
+                row_stride,
+                tail_base,
+                tail_blk,
+                **nan_kw,
             )
         median_merge_select_chunk_kernel[(M,)](
             flat,
@@ -1470,7 +1487,9 @@ def _nmflat_chunked(flat, N):
     # +64 slots of head room: a scalar store can commit a full 64-element
     # vector on this backend, and the tail tile writes at index nall - 1.
     pad_r = block_r + 64
-    part_min = torch.full((pad_r,), -1, dtype=torch.int32, device=dev).view(torch.uint32)
+    part_min = torch.full((pad_r,), -1, dtype=torch.int32, device=dev).view(
+        torch.uint32
+    )
     part_max = torch.zeros((pad_r,), dtype=torch.int32, device=dev).view(torch.uint32)
     part_nan = torch.zeros((pad_r,), dtype=torch.int32, device=dev)
     part_cnt = torch.zeros((pad_r,), dtype=torch.int32, device=dev)
@@ -1636,7 +1655,6 @@ def _nanmedian_flat_impl(inp, out=None):
         torch.ops.aten._copy_from(result, out, False)
         return out
     return result
-
 
 
 def nanmedian(inp):
@@ -1991,7 +2009,6 @@ def nmdim_finish_kernel(
     ridx = tl.minimum(best, N - 1)
     tl.store(out_values + row, tl.load(inp + row.to(tl.int64) * ROW_PITCH + ridx))
     tl.store(out_indices + row, ridx.to(tl.int64))
-
 
 
 def _nmdim_key_bits(dtype):

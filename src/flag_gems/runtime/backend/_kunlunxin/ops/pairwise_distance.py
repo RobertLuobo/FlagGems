@@ -202,7 +202,15 @@ def _pd_small_kernel(
     pid = tl.program_id(0)
     base = pid * D
     acc = _pd_piece_sum(
-        x1_ptr, x2_ptr, base, eps, p_scalar, MODE, S, NP, NSCALAR,
+        x1_ptr,
+        x2_ptr,
+        base,
+        eps,
+        p_scalar,
+        MODE,
+        S,
+        NP,
+        NSCALAR,
     )
     tl.store(out_ptr + pid, _pd_finalize(acc, p_scalar, MODE))
 
@@ -252,7 +260,15 @@ def _pd_tail_kernel(
     pid = tl.program_id(0)
     base = pid * D + D - T
     acc = _pd_piece_sum(
-        x1_ptr, x2_ptr, base, eps, p_scalar, MODE, S, NP, NSCALAR,
+        x1_ptr,
+        x2_ptr,
+        base,
+        eps,
+        p_scalar,
+        MODE,
+        S,
+        NP,
+        NSCALAR,
     )
     tl.store(mid_ptr + pid * MID_STRIDE + MID_SIZE, acc)
 
@@ -375,8 +391,17 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
         if D <= _BLOCK_D:
             PS, PNP, PNSC = _piece_args(D)
             _pd_small_kernel[(N,)](
-                x1, x2, out, N, D, eps, p_scalar, MODE=mode,
-                S=PS, NP=PNP, NSCALAR=PNSC,
+                x1,
+                x2,
+                out,
+                N,
+                D,
+                eps,
+                p_scalar,
+                MODE=mode,
+                S=PS,
+                NP=PNP,
+                NSCALAR=PNSC,
             )
         else:
             MID = D // _BLOCK_D
@@ -397,21 +422,39 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
             stride = triton.next_power_of_2(P)
             if stride > _MID_BLOCK:
                 stride = triton.cdiv(P, _MID_BLOCK) * _MID_BLOCK
-            mid = torch.full(
-                (N * stride,), pad, device=x1.device, dtype=torch.float32
-            )
+            mid = torch.full((N * stride,), pad, device=x1.device, dtype=torch.float32)
             # max/min reductions are exact at any width: use 4096-lane chunks
             # to halve the program count for the p=inf/-inf paths.
             chunk_block = 4096 if mode in (3, 4) else _BLOCK_D
             _pd_chunk_kernel[(N, MID)](
-                x1, x2, mid, D, eps, p_scalar, stride, MID, MODE=mode,
+                x1,
+                x2,
+                mid,
+                D,
+                eps,
+                p_scalar,
+                stride,
+                MID,
+                MODE=mode,
                 BLOCK=chunk_block,
             )
             if T > 0:
                 PS, PNP, NCSC = _piece_args(T)
                 _pd_tail_kernel[(N,)](
-                    x1, x2, mid, N, D, T, eps, p_scalar, MID, stride, MODE=mode,
-                    S=PS, NP=PNP, NSCALAR=NCSC,
+                    x1,
+                    x2,
+                    mid,
+                    N,
+                    D,
+                    T,
+                    eps,
+                    p_scalar,
+                    MID,
+                    stride,
+                    MODE=mode,
+                    S=PS,
+                    NP=PNP,
+                    NSCALAR=NCSC,
                 )
             cur_mid, cur_stride, cur_n = mid, stride, P
             while triton.next_power_of_2(cur_n) > _MID_BLOCK:
@@ -421,12 +464,21 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
                     (N * nstride,), pad, device=x1.device, dtype=torch.float32
                 )
                 _pd_mid_reduce_kernel[(N, g)](
-                    cur_mid, cur_out, MID=cur_n, STRIDE_IN=cur_stride,
-                    STRIDE_OUT=nstride, MODE=mode, BLOCK=_MID_BLOCK,
+                    cur_mid,
+                    cur_out,
+                    MID=cur_n,
+                    STRIDE_IN=cur_stride,
+                    STRIDE_OUT=nstride,
+                    MODE=mode,
+                    BLOCK=_MID_BLOCK,
                 )
                 cur_mid, cur_stride, cur_n = cur_out, nstride, g
             _pd_final_kernel[(N,)](
-                cur_mid, out, p_scalar, cur_stride, MODE=mode,
+                cur_mid,
+                out,
+                p_scalar,
+                cur_stride,
+                MODE=mode,
                 BLOCK_MID=triton.next_power_of_2(cur_n),
             )
 

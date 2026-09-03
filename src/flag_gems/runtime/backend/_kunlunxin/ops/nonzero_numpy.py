@@ -22,12 +22,7 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
-from .nonzero import (
-    _count_nonzero,
-    _dense_result,
-    _sparse_result,
-    nonzero,
-)
+from .nonzero import _count_nonzero, _dense_result, _sparse_result, nonzero
 
 logger = logging.getLogger(__name__)
 
@@ -352,10 +347,6 @@ def nonzero_numpy(inp):
     if n_elements >= 8192 and inp.dtype != torch.bool:
         return list(nonzero(inp, as_tuple=True))
     num_nonzeros = _count_nonzero(inp, n_elements)
-    if (
-        inp_ndim >= 1
-        and num_nonzeros == n_elements
-        and num_nonzeros * inp_ndim < 2**31
-    ):
+    if inp_ndim >= 1 and num_nonzeros == n_elements and num_nonzeros * inp_ndim < 2**31:
         return list(_dense_result(inp, num_nonzeros, True))
     return list(_sparse_result(inp, inp_ndim, n_elements, num_nonzeros, True))

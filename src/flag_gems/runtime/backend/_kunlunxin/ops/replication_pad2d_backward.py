@@ -71,11 +71,11 @@ def _replication_pad2d_backward_bulk_kernel(
     gi_ptr,
     OW,
     W,
-    H_2,       # H - 2
+    H_2,  # H - 2
     pt,
     pl,
-    OHW,       # OH * OW
-    HW,        # H * W
+    OHW,  # OH * OW
+    HW,  # H * W
     CPW: tl.constexpr,  # chunks per row
     NEED_MASK: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -192,9 +192,7 @@ def _replication_pad2d_backward_col_edge_kernel(
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
     for c in tl.static_range(MAXG):
         cc = tl.minimum(c, tl.maximum(cnt_c - 1, 0))
-        v = tl.load(go_ptr + out_base + lo_c + cc, mask=mask, other=0.0).to(
-            tl.float32
-        )
+        v = tl.load(go_ptr + out_base + lo_c + cc, mask=mask, other=0.0).to(tl.float32)
         acc += tl.where(c < cnt_c, v, 0.0)
     in_base = nc * HW + ih * W
     tl.store(gi_ptr + in_base + tl.where(cid == 0, 0, W - 1), acc, mask=mask)
@@ -238,9 +236,7 @@ def _replication_pad2d_backward_colfold_kernel(
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
     for c in tl.static_range(MAXG):
         cc = tl.minimum(c, tl.maximum(cnt - 1, 0))
-        v = tl.load(go_ptr + out_base + lo + cc, mask=mask, other=0.0).to(
-            tl.float32
-        )
+        v = tl.load(go_ptr + out_base + lo + cc, mask=mask, other=0.0).to(tl.float32)
         acc += tl.where(c < cnt, v, 0.0)
     tl.store(cf_ptr + o, acc, mask=mask)
 
@@ -403,9 +399,7 @@ def _replication_pad2d_backward_impl(
                 MAXG=maxg_col,
                 BLOCK=256,
             )
-            _replication_pad2d_backward_rowfold_kernel[
-                (triton.cdiv(NC * H * W, 256),)
-            ](
+            _replication_pad2d_backward_rowfold_kernel[(triton.cdiv(NC * H * W, 256),)](
                 cf,
                 gi,
                 W,
@@ -428,9 +422,7 @@ def _replication_pad2d_backward_impl(
                     BLOCK, need_mask = cand, False
                     break
             cpw = triton.cdiv(W, BLOCK)
-            _replication_pad2d_backward_bulk_kernel[
-                (NC * (H - 2) * cpw,)
-            ](
+            _replication_pad2d_backward_bulk_kernel[(NC * (H - 2) * cpw,)](
                 go,
                 gi,
                 OW,
@@ -445,9 +437,7 @@ def _replication_pad2d_backward_impl(
                 BLOCK=BLOCK,
             )
             n_row = NC * 2 * W
-            _replication_pad2d_backward_row_edge_kernel[
-                (triton.cdiv(n_row, BLOCK),)
-            ](
+            _replication_pad2d_backward_row_edge_kernel[(triton.cdiv(n_row, BLOCK),)](
                 go,
                 gi,
                 OW,
@@ -464,9 +454,7 @@ def _replication_pad2d_backward_impl(
                 BLOCK=BLOCK,
             )
             n_col = NC * 2 * (H - 2)
-            _replication_pad2d_backward_col_edge_kernel[
-                (triton.cdiv(n_col, BLOCK),)
-            ](
+            _replication_pad2d_backward_col_edge_kernel[(triton.cdiv(n_col, BLOCK),)](
                 go,
                 gi,
                 OW,
@@ -505,6 +493,4 @@ def replication_pad2d_backward_grad_input(
     grad_input: torch.Tensor,
 ) -> torch.Tensor:
     logger.debug("GEMS_KUNLUNXIN REPLICATION_PAD2D_BACKWARD_GRAD_INPUT")
-    return _replication_pad2d_backward_impl(
-        grad_output, self, padding, out=grad_input
-    )
+    return _replication_pad2d_backward_impl(grad_output, self, padding, out=grad_input)

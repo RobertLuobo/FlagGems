@@ -294,9 +294,7 @@ def dswiglu(
         )
     N = shape[-1] // 2
     if input_tensor.numel() == 0:
-        return torch.empty(
-            shape, device=input_tensor.device, dtype=input_tensor.dtype
-        )
+        return torch.empty(shape, device=input_tensor.device, dtype=input_tensor.dtype)
     M = input_tensor.numel() // shape[-1]
     grad_output_2d = grad_output.contiguous().view(M, N)
     input_2d = input_tensor.contiguous().view(M, 2 * N)
@@ -322,4 +320,3 @@ def dswiglu(
         num_warps=num_warps,
     )
     return grad_input.view(shape)
-

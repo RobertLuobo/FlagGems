@@ -157,9 +157,7 @@ def launch_replication_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
 
     dim = input.dim()
     if dim not in (2, 3):
-        raise ValueError(
-            "replication_pad1d expects 2D (C, W) or 3D (N, C, W) input"
-        )
+        raise ValueError("replication_pad1d expects 2D (C, W) or 3D (N, C, W) input")
 
     x = input.contiguous()
     is_2d = dim == 2
@@ -177,9 +175,7 @@ def launch_replication_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
             "and other non-zero dimensions for input"
         )
     if W_in <= 0:
-        raise ValueError(
-            "Input width must be greater than 0 for replication padding"
-        )
+        raise ValueError("Input width must be greater than 0 for replication padding")
     if W_out <= 0:
         raise RuntimeError(
             f"replication_pad1d: output spatial dimension is non-positive: "
@@ -225,9 +221,7 @@ def launch_replication_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
     # already-padded interior).
     with torch_device_fn.device(x.device):
         # 1. interior block
-        torch.ops.aten._copy_from(
-            x, out3[:, :, pad_l : pad_l + W_in]
-        )
+        torch.ops.aten._copy_from(x, out3[:, :, pad_l : pad_l + W_in])
         # 2-3. width edges (left / right first-interior-element replicated)
         if pad_l:
             torch.ops.aten._copy_from(

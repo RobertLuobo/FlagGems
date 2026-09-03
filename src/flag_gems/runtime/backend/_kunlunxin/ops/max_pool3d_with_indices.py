@@ -123,9 +123,7 @@ def max_pool3d_forward_flat_kernel(
     input_offset = (
         nc_safe[:, None] * (in_d * in_hw) + id_safe * in_hw + ih_safe * in_w + iw_safe
     )
-    value = tl.load(
-        input_ptr + input_offset, mask=valid, other=float("-inf")
-    )
+    value = tl.load(input_ptr + input_offset, mask=valid, other=float("-inf"))
     value = tl.where(valid, value.to(tl.float32), float("-inf"))
 
     max_val = tl.max(value, axis=1)
@@ -140,7 +138,9 @@ def max_pool3d_forward_flat_kernel(
     ihs_best = oh * stride_h - padding_h + kh_best * dilation_h
     iws_best = ow * stride_w - padding_w + kw_best * dilation_w
     flat_idx = (
-        ids_best.to(tl.int64) * in_hw + ihs_best.to(tl.int64) * in_w + iws_best.to(tl.int64)
+        ids_best.to(tl.int64) * in_hw
+        + ihs_best.to(tl.int64) * in_w
+        + iws_best.to(tl.int64)
     )
 
     tl.store(output_ptr + offsets, max_val, mask=output_mask)
@@ -172,12 +172,12 @@ def max_pool3d_backward_scatter_kernel(
     mask = offsets < out_numel_per_nc
 
     base_out = nc_idx * out_numel_per_nc
-    grad_val = tl.load(
-        grad_output_ptr + base_out + offsets, mask=mask, other=0.0
-    ).to(tl.float32)
-    idx_val = tl.load(
-        indices_ptr + base_out + offsets, mask=mask, other=-1
-    ).to(tl.int32)
+    grad_val = tl.load(grad_output_ptr + base_out + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    idx_val = tl.load(indices_ptr + base_out + offsets, mask=mask, other=-1).to(
+        tl.int32
+    )
     valid = mask & (idx_val >= 0)
     safe_idx = tl.where(valid, idx_val, 0).to(tl.int32)
 

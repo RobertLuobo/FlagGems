@@ -332,7 +332,8 @@ def _unpack_cell_params(param, device, dtype, geo, cache):
     baked in. The prepacked handles are host-side, so this is cached per params
     object -- repeating the host copy every call would dominate the runtime.
     """
-    key = (        id(param),
+    key = (
+        id(param),
         device,
         dtype,
         geo["gate_step"],
@@ -455,9 +456,7 @@ def _run_direction(x, h0, c0, w_ih, w_hh, b_ih, b_hh, geo, reverse):
 
     g_s0, g_s1 = gates.stride(0), gates.stride(1)
     w_s0, w_s1 = w_hh.stride(0), w_hh.stride(1)
-    pad_kh, step_bm, bn, bk_h = (
-        geo["pad_kh"], geo["step_bm"], geo["bn"], geo["bk_h"]
-    )
+    pad_kh, step_bm, bn, bk_h = (geo["pad_kh"], geo["step_bm"], geo["bn"], geo["bk_h"])
     h_s0, h_s1 = h.stride(0), h.stride(1)
 
     steps = range(seq_len - 1, -1, -1) if reverse else range(seq_len)

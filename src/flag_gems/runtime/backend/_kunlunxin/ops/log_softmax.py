@@ -439,9 +439,7 @@ def log_softmax_tail_masked_partial(
     n_offsets = tl.arange(0, 64)
     within = n_offsets < TAIL_LEN
     off = pid * N + TAIL_BASE + n_offsets
-    x = tl.load(
-        input_ptr + off, mask=within, other=float("-inf")
-    ).to(tl.float32)
+    x = tl.load(input_ptr + off, mask=within, other=float("-inf")).to(tl.float32)
     m_key = _k_fwd_key_u32(x.to(tl.uint32, bitcast=True))
     m = _k_fwd_decode_key(tl.max(m_key, 0))
     z = tl.sum(tl.exp(x - m), 0)
@@ -629,7 +627,7 @@ def _fwd_chunk_split(out, inp, M, N):
             num_warps=8,
         )
     if c_full:
-        if (pieces or have_rem):
+        if pieces or have_rem:
             log_softmax_chunk_strided[(M * c_full, 1, 1)](
                 pm,
                 pz,

@@ -234,9 +234,8 @@ def cumsum_row_kernel(
     if tl.constexpr(x.dtype.is_bf16()) or tl.constexpr(x.dtype.is_fp16()):
         x = x.to(tl.float32)
     elif (
-        (tl.constexpr(x.dtype.is_int64()) or tl.constexpr(x.dtype.is_uint64()))
-        or tl.constexpr(x.dtype.is_fp64())
-    ):
+        tl.constexpr(x.dtype.is_int64()) or tl.constexpr(x.dtype.is_uint64())
+    ) or tl.constexpr(x.dtype.is_fp64()):
         x = x
     elif tl.constexpr(x.dtype.is_int()):
         x = x.to(tl.int32)

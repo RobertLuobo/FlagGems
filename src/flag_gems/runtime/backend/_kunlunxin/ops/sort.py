@@ -568,6 +568,359 @@ def radix_sort_low_mem(arr, k_bits=4, descending=False):
     return arr_in.reshape(original_shape), idx_in.reshape(original_shape)
 
 
+@triton.jit
+def build_packed_kernel(
+    arr_ptr,
+    packed_ptr,
+    M,
+    N,
+    BLOCK_N: tl.constexpr,
+    descending: tl.constexpr,
+    GRID_N: tl.constexpr,
+):
+    # Pack (value_uint, column_index) into one 64-bit word:
+    #     packed = (u32(val_u) << 32) | u32(column)
+    # Sorting packed lexicographically == sorting by (value, original column),
+    # i.e. exactly the stable order; the column is the within-row position
+    # (0..N-1, N < 2**32), so it needs no global offset.
+    pid = tl.program_id(0)
+    row_idx = pid // GRID_N
+    block_idx = pid % GRID_N
+    row_start = row_idx * N
+    n_offset = block_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = n_offset < N
+    val = tl.load(arr_ptr + row_start + n_offset, mask=mask, other=0)
+    val_u = convert_to_uint_preverse_order(val, descending)
+    idx = n_offset.to(tl.uint32)
+    packed = (val_u.to(tl.uint32).to(tl.uint64) << 32) | idx.to(tl.uint64)
+    tl.store(packed_ptr + row_start + n_offset, packed, mask=mask)
+
+
+@triton.jit
+def fused_pass_kernel(
+    p_ptr,
+    p_out_ptr,
+    M,
+    N,
+    bit_offset,
+    num_bins: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # NOTE(kunlunxin): one program per row (grid_n == 1).  Fuses the histogram
+    # (tl.sum of the one-hot), the bin-offset scan (scalar field extracts, no
+    # cross-lane scan) and the within-bin rank (4 x u64 cumsum, 16-bit fields)
+    # into a single kernel, so a full radix pass costs exactly one gather
+    # store (8B) per element instead of count + binscan + scatter.
+    # The 16-bit one-hot fields are safe: counts per (bin, row) are <= N and
+    # this kernel only runs when N <= BLOCK_N <= 4096 << 2**16.
+    pid = tl.program_id(0)
+    n = tl.arange(0, BLOCK_N)
+    mask = n < N
+    # NOTE(kunlunxin): masked int64 loads whose addresses run past the
+    # allocation poison the whole tile on this backend (observed with
+    # BLOCK_N > N + 256), so load *unmasked* with clamped (in-bounds)
+    # addresses; the masked lanes are neutralised below via `one`/`s`/`dest`
+    # (their one-hot and rank are forced to 0 by the `mask` where's).
+    packed = tl.load(p_ptr + pid * N + tl.minimum(n, N - 1))
+    packed_u = packed.to(tl.uint64, bitcast=True)
+    key = ((packed_u >> (32 + bit_offset)) & (num_bins - 1)).to(tl.int32)
+    w = tl.where(mask, key >> 2, 0)
+    f = tl.where(mask, key & 3, 0)
+    one = tl.where(mask, tl.full((), 1, tl.uint64) << (16 * f), 0)
+    m0 = tl.where(w == 0, one, 0)
+    m1 = tl.where(w == 1, one, 0)
+    m2 = tl.where(w == 2, one, 0)
+    m3 = tl.where(w == 3, one, 0)
+    # histogram: 4 x u64 scalars, each holding four 16-bit bin counts
+    h0 = tl.sum(m0, axis=0)
+    h1 = tl.sum(m1, axis=0)
+    h2 = tl.sum(m2, axis=0)
+    h3 = tl.sum(m3, axis=0)
+    # within-bin exclusive rank (same one-hot packing as the histogram)
+    s0 = tl.cumsum(m0, axis=0)
+    s1 = tl.cumsum(m1, axis=0)
+    s2 = tl.cumsum(m2, axis=0)
+    s3 = tl.cumsum(m3, axis=0)
+    s = tl.where(w == 0, s0, tl.where(w == 1, s1, tl.where(w == 2, s2, s3)))
+    rank_incl = ((s >> (16 * f)) & 0xFFFF).to(tl.int32)
+    local_rank = tl.where(mask, rank_incl - 1, 0)
+    # dest = row_start + sum_{b' < key} count[b'] + local_rank
+    dest = (tl.arange(0, BLOCK_N) - BLOCK_N).to(tl.int64)
+    acc = tl.zeros((), tl.int64)
+    for b in range(num_bins):
+        if b < 4:
+            h = h0
+            bf = b
+        elif b < 8:
+            h = h1
+            bf = b - 4
+        elif b < 12:
+            h = h2
+            bf = b - 8
+        else:
+            h = h3
+            bf = b - 12
+        cbb = ((h >> (16 * bf)) & 0xFFFF).to(tl.int64)
+        dest = tl.where(
+            key == b,
+            (pid.to(tl.int64) * N + acc + local_rank.to(tl.int64)),
+            dest,
+        )
+        acc += cbb
+    # masked lanes: per-lane unique head-pad scratch (see scatter_kernel note;
+    # store masks are not honoured for data-dependent addresses here)
+    dest = tl.where(mask, dest, (tl.arange(0, BLOCK_N) - BLOCK_N).to(tl.int64))
+    tl.store(p_out_ptr + dest, packed)
+
+
+@triton.jit
+def count_packed_kernel(
+    p_ptr,
+    counts_ptr,
+    M,
+    N,
+    bit_offset,
+    num_bins: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GRID_N: tl.constexpr,
+    R_PAD: tl.constexpr,
+):
+    # Same bin-major histogram as count_kernel, but the key bits come from the
+    # packed 64-bit word ([32 + bit_offset, 36 + bit_offset)).
+    # NOTE(kunlunxin): masked int64 loads whose addresses run past the
+    # allocation poison the whole tile on this backend, so the load is
+    # *unmasked* with clamped (in-bounds) addresses and the masked lanes are
+    # neutralised via key = -1 (matches no bin) instead.
+    pid = tl.program_id(0)
+    row_idx = pid // GRID_N
+    block_idx = pid % GRID_N
+    row_start = row_idx * N
+    n_offset = block_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = n_offset < N
+    packed = tl.load(p_ptr + row_start + tl.minimum(n_offset, N - 1))
+    packed_u = packed.to(tl.uint64, bitcast=True)
+    key = tl.where(
+        mask,
+        ((packed_u >> (32 + bit_offset)) & (num_bins - 1)).to(tl.int32),
+        -1,
+    )
+    counts_row = counts_ptr + row_idx * R_PAD + block_idx
+    for i in range(num_bins):
+        bin_mask = key == i
+        count = tl.sum(bin_mask.to(tl.int32))
+        tl.store(counts_row + i * GRID_N, count)
+
+
+@triton.jit
+def scatter_packed_kernel(
+    p_ptr,
+    p_out_ptr,
+    global_offsets_ptr,
+    M,
+    N,
+    bit_offset,
+    num_bins: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GRID_N: tl.constexpr,
+    R_PAD: tl.constexpr,
+):
+    # grid_n > 1 variant of fused_pass_kernel: the row spans several programs,
+    # so the bin offsets come from the bin-major scan (bin_prefix_kernel).
+    # One-hot rank: 4 x u64 cumsums with 16-bit fields (counts per (bin,
+    # block) are <= BLOCK_N <= 4096 << 2**16).
+    # NOTE(kunlunxin): same clamping as count_packed_kernel -- masked int64
+    # loads past the allocation poison the tile, so load unmasked in-bounds
+    # and neutralise the masked lanes via the key (their one-hot is already 0
+    # via `mask` below, so they never enter the rank/histogram).
+    pid = tl.program_id(0)
+    row_idx = pid // GRID_N
+    block_idx = pid % GRID_N
+    row_start = row_idx * N
+    n_offset = block_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = n_offset < N
+    packed = tl.load(p_ptr + row_start + tl.minimum(n_offset, N - 1))
+    packed_u = packed.to(tl.uint64, bitcast=True)
+    key = tl.where(
+        mask,
+        ((packed_u >> (32 + bit_offset)) & (num_bins - 1)).to(tl.int32),
+        -1,
+    )
+    w = tl.where(mask, key >> 2, 0)
+    f = tl.where(mask, key & 3, 0)
+    one = tl.where(mask, tl.full((), 1, tl.uint64) << (16 * f), 0)
+    m0 = tl.where(w == 0, one, 0)
+    m1 = tl.where(w == 1, one, 0)
+    m2 = tl.where(w == 2, one, 0)
+    m3 = tl.where(w == 3, one, 0)
+    s0 = tl.cumsum(m0, axis=0)
+    s1 = tl.cumsum(m1, axis=0)
+    s2 = tl.cumsum(m2, axis=0)
+    s3 = tl.cumsum(m3, axis=0)
+    s = tl.where(w == 0, s0, tl.where(w == 1, s1, tl.where(w == 2, s2, s3)))
+    rank_incl = ((s >> (16 * f)) & 0xFFFF).to(tl.int32)
+    local_rank = tl.where(mask, rank_incl - 1, 0)
+    offsets_row = global_offsets_ptr + row_idx * R_PAD + block_idx
+    global_start = tl.load(offsets_row + key * GRID_N)
+    dest = tl.where(
+        mask,
+        (row_start + global_start + local_rank).to(tl.int64),
+        (tl.arange(0, BLOCK_N) - BLOCK_N).to(tl.int64),
+    )
+    tl.store(p_out_ptr + dest, packed)
+
+
+@triton.jit
+def unpack_packed_kernel(
+    p_ptr,
+    out_ptr,
+    M,
+    N,
+    BLOCK_N: tl.constexpr,
+    GRID_N: tl.constexpr,
+):
+    # Extract the column back from the final (sorted) packed words.
+    pid = tl.program_id(0)
+    row_idx = pid // GRID_N
+    block_idx = pid % GRID_N
+    row_start = row_idx * N
+    n_offset = block_idx * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = n_offset < N
+    packed = tl.load(p_ptr + row_start + n_offset, mask=mask, other=0)
+    packed_u = packed.to(tl.uint64, bitcast=True)
+    tl.store(
+        out_ptr + row_start + n_offset, (packed_u & 0xFFFFFFFF).to(tl.int64), mask=mask
+    )
+
+
+def radix_argsort(inp, k_bits=4, descending=False):
+    """Stable argsort (indices only) through packed (value, column) radix passes.
+
+    NOTE(kunlunxin): the value+index radix chain (radix_sort_low_mem) issues
+    TWO data-dependent stores per element per pass (2B value + 8B index), and
+    a data-dependent (gather) store is the most expensive op on this backend:
+    each one serialises an 8-byte DMA behind llvm_xpu.mfence (measured ~4.3ns
+    vs ~0.5ns for an affine store on XPU; gather *loads* are only ~0.6ns and
+    pipeline fine).  Packing (val_u, column) into one 64-bit word cuts the
+    scatter to ONE 8-byte gather store per element, and the low-32-bit column
+    makes (key, column) the stable order, so sort==argsort and no value
+    reconstruction is needed here (the caller only wants indices).
+
+    grid_n == 1 (rows of <= 4096 elements): the whole per-pass pipeline is
+    fused into a single kernel (fused_pass_kernel) - no count/binscan.
+    grid_n > 1: count_packed_kernel + bin_prefix_kernel + scatter_packed_kernel
+    (the bin-major scan needs data from every block of the row).
+    """
+    original_shape = inp.shape
+    N = inp.shape[-1]
+    # NOTE(kunlunxin): the xdnn reshape wrapper mis-handles non-contiguous
+    # inputs (returns wrong data instead of copying), so force a proper
+    # contiguous copy first (no-op for the common contiguous case).
+    inp = inp.contiguous()
+    arr = inp.reshape(-1, N)
+    M = arr.shape[0]
+
+    _env_block_n = os.environ.get("GEMS_XPU_RADIX_BLOCK_N")
+    if _env_block_n:
+        BLOCK_N = int(_env_block_n)
+    else:
+        BLOCK_N = min(4096, max(64, triton.next_power_of_2(N)))
+    grid_n = triton.cdiv(N, BLOCK_N)
+    grid = (M * grid_n,)
+
+    dtype = inp.dtype
+    num_bits = 1
+    if dtype == torch.bool:
+        pass
+    elif dtype == torch.bfloat16:
+        # the bf16 path promotes to fp32 before the uint conversion, so the
+        # key is 32 bits (mirrors radix_sort_low_mem)
+        num_bits = 4 * 8
+    else:
+        num_bits = inp.element_size() * 8
+    num_passes = (num_bits + k_bits - 1) // k_bits
+    num_bins = 2**k_bits
+
+    # Same head/tail padding scheme as radix_sort_low_mem: the fused and
+    # scatter kernels park masked lanes on the head pad (store masks are not
+    # honoured for data-dependent addresses), and masked *affine* stores touch
+    # a full 64-element granule.
+    _HEAD_PAD = BLOCK_N
+    _TAIL_PAD = 256
+    _keepalive = []
+
+    def _padded():
+        buf = torch.empty(
+            _HEAD_PAD + M * N + _TAIL_PAD, device=inp.device, dtype=torch.int64
+        )
+        _keepalive.append(buf)
+        return buf[_HEAD_PAD : _HEAD_PAD + M * N].view(M, N)
+
+    packed_in = _padded()
+    packed_out = _padded()
+
+    with torch_device_fn.device(inp.device):
+        build_packed_kernel[grid](
+            arr, packed_in, M, N, BLOCK_N, descending, GRID_N=grid_n
+        )
+        if grid_n == 1:
+            for p in range(num_passes):
+                fused_pass_kernel[(M,)](
+                    packed_in,
+                    packed_out,
+                    M,
+                    N,
+                    p * k_bits,
+                    num_bins,
+                    BLOCK_N,
+                )
+                packed_in, packed_out = packed_out, packed_in
+        else:
+            r = num_bins * grid_n
+            tile_r = max(64, min(4096, triton.next_power_of_2(r)))
+            r_pad = triton.cdiv(r, tile_r) * tile_r
+            counts = torch.empty(M * r_pad, device=inp.device, dtype=torch.int32)
+            global_offsets = torch.empty(
+                M * r_pad, device=inp.device, dtype=torch.int32
+            )
+            for p in range(num_passes):
+                bit_offset = p * k_bits
+                count_packed_kernel[grid](
+                    packed_in,
+                    counts,
+                    M,
+                    N,
+                    bit_offset,
+                    num_bins,
+                    BLOCK_N,
+                    GRID_N=grid_n,
+                    R_PAD=r_pad,
+                )
+                bin_prefix_kernel[(M,)](
+                    counts,
+                    global_offsets,
+                    R=r,
+                    R_PAD=r_pad,
+                    TILE=tile_r,
+                )
+                scatter_packed_kernel[grid](
+                    packed_in,
+                    packed_out,
+                    global_offsets,
+                    M,
+                    N,
+                    bit_offset,
+                    num_bins,
+                    BLOCK_N,
+                    GRID_N=grid_n,
+                    R_PAD=r_pad,
+                )
+                packed_in, packed_out = packed_out, packed_in
+        indices = _padded()
+        unpack_packed_kernel[grid](packed_in, indices, M, N, BLOCK_N, GRID_N=grid_n)
+
+    return indices.reshape(original_shape)
+
+
 def radix_sort(arr, k_bits=8, descending=False):
     n = arr.shape[-1]
     m = arr.numel() // n

@@ -301,9 +301,9 @@ def index_add(inp, dim, index, src, alpha=1):
     # call on XPU (cross-device compare + allocation + sync), i.e. the single
     # dominant fixed cost for small shapes. .all() is one device reduction +
     # one sync and preserves the assert semantics (0 <= index < size(dim)).
-    assert bool(((index >= 0) & (index < inp.size(dim))).all()), (
-        "0 <= index < self.size(dim)"
-    )
+    assert bool(
+        ((index >= 0) & (index < inp.size(dim))).all()
+    ), "0 <= index < self.size(dim)"
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
     assert index.numel() == src.size(
         dim
@@ -393,9 +393,9 @@ def index_add_(inp, dim, index, src, alpha=1):
     # empty index: t.all() on a 0-element tensor goes through the vendor
     # `all` override which divides by zero.
     if index.numel() > 0:
-        assert bool(((index >= 0) & (index < inp.size(dim))).all()), (
-            "0 <= index < self.size(dim)"
-        )
+        assert bool(
+            ((index >= 0) & (index < inp.size(dim))).all()
+        ), "0 <= index < self.size(dim)"
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
     assert index.numel() == src.size(
         dim

@@ -18,11 +18,22 @@ from .concat_and_cache_mla import concat_and_cache_mla
 from .cross_entropy_loss import cross_entropy_loss
 from .flashmla_sparse import flash_mla_sparse_fwd
 from .fused_add_rms_norm import fused_add_rms_norm
+
+# fused_deepseek_v4_qnorm_rope_kv_rope_insert vendor kernel (XPU): the generic
+# kernel neither compiles (reduction inside a `while` grid-stride loop aborts
+# ConvertTritonXPUToLLVM) nor is numerically safe here (its 32-lane stride-2
+# scatter stores spill a 64-element block into the next row).
+from .fused_deepseek_v4_qnorm_rope_kv_rope_insert import (
+    fused_deepseek_v4_qnorm_rope_kv_rope_insert,
+)
 from .geglu import dgeglu, geglu
 from .gelu_and_mul import gelu_and_mul
 from .instance_norm import instance_norm
-from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
 from .matmul_bias_activation import matmul_bias_activation
+
+# mhc_pre vendor kernel (XPU): self-installs the direct-import entrypoint
+from .mhc_pre import mhc_pre
+from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
 from .outer import outer
 from .reglu import dreglu, reglu
 from .reshape_and_cache import reshape_and_cache
@@ -40,16 +51,6 @@ from .sparse_attention import sparse_attn_triton
 from .swiglu import dswiglu, swiglu
 from .topk_softmax import topk_softmax
 from .weight_norm import weight_norm
-# mhc_pre vendor kernel (XPU): self-installs the direct-import entrypoint
-from .mhc_pre import mhc_pre
-
-# fused_deepseek_v4_qnorm_rope_kv_rope_insert vendor kernel (XPU): the generic
-# kernel neither compiles (reduction inside a `while` grid-stride loop aborts
-# ConvertTritonXPUToLLVM) nor is numerically safe here (its 32-lane stride-2
-# scatter stores spill a 64-element block into the next row).
-from .fused_deepseek_v4_qnorm_rope_kv_rope_insert import (
-    fused_deepseek_v4_qnorm_rope_kv_rope_insert,
-)
 
 __all__ = [
     "apply_rotary_pos_emb",

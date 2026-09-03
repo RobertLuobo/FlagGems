@@ -398,9 +398,7 @@ def _qr_sweep(W, NCP, MP, NP, nsteps, batch, dt, dev, keep_reflectors):
         )
         if keep_reflectors:
             _vsave_kernel[(batch,)](V, BETA, VS, BETAS, j, NP, MP=MP)
-        _wvec_kernel[(batch, nb)](
-            W, S, ALPHA, BETA, WV, j, c0, NCP=NCP, MP=MP, BC=BC
-        )
+        _wvec_kernel[(batch, nb)](W, S, ALPHA, BETA, WV, j, c0, NCP=NCP, MP=MP, BC=BC)
         _upd_kernel[(batch, nb)](W, WV, V, c0, NCP=NCP, MP=MP, BC=BC)
     return DIAG, RMAX, VS, BETAS
 
@@ -466,9 +464,7 @@ def _lstsq_wide(A, B, rcond):
     W[:, :m, :n] = A
 
     with torch_device_fn.device(dev):
-        DIAG, RMAX, VS, BETAS = _qr_sweep(
-            W, NRP, MP, NRP, m, batch, dt, dev, True
-        )
+        DIAG, RMAX, VS, BETAS = _qr_sweep(W, NRP, MP, NRP, m, batch, dt, dev, True)
 
         # forward substitution R^T y = b: the coefficient matrix is L[c, i] =
         # W[c, i], so the update coefficient is a COLUMN of W.

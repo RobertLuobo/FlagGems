@@ -140,19 +140,31 @@ def _mix_kernel_hc4(
     go = pid * 24
 
     pre_0 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 0) * rms_inv * scale_0 + tl.load(hc_base_ptr + 0))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 0) * rms_inv * scale_0
+            + tl.load(hc_base_ptr + 0)
+        )
         + hc_pre_eps
     )
     pre_1 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 1) * rms_inv * scale_0 + tl.load(hc_base_ptr + 1))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 1) * rms_inv * scale_0
+            + tl.load(hc_base_ptr + 1)
+        )
         + hc_pre_eps
     )
     pre_2 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 2) * rms_inv * scale_0 + tl.load(hc_base_ptr + 2))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 2) * rms_inv * scale_0
+            + tl.load(hc_base_ptr + 2)
+        )
         + hc_pre_eps
     )
     pre_3 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 3) * rms_inv * scale_0 + tl.load(hc_base_ptr + 3))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 3) * rms_inv * scale_0
+            + tl.load(hc_base_ptr + 3)
+        )
         + hc_pre_eps
     )
     tl.store(pre_mix_ptr + pid * 4 + 0, pre_0)
@@ -161,43 +173,87 @@ def _mix_kernel_hc4(
     tl.store(pre_mix_ptr + pid * 4 + 3, pre_3)
 
     post_0 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 4) * rms_inv * scale_1 + tl.load(hc_base_ptr + 4))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 4) * rms_inv * scale_1
+            + tl.load(hc_base_ptr + 4)
+        )
         * hc_post_mult_value
     )
     tl.store(post_mix_ptr + pid * 4 + 0, post_0)
     post_1 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 5) * rms_inv * scale_1 + tl.load(hc_base_ptr + 5))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 5) * rms_inv * scale_1
+            + tl.load(hc_base_ptr + 5)
+        )
         * hc_post_mult_value
     )
     tl.store(post_mix_ptr + pid * 4 + 1, post_1)
     post_2 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 6) * rms_inv * scale_1 + tl.load(hc_base_ptr + 6))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 6) * rms_inv * scale_1
+            + tl.load(hc_base_ptr + 6)
+        )
         * hc_post_mult_value
     )
     tl.store(post_mix_ptr + pid * 4 + 2, post_2)
     post_3 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 7) * rms_inv * scale_1 + tl.load(hc_base_ptr + 7))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 7) * rms_inv * scale_1
+            + tl.load(hc_base_ptr + 7)
+        )
         * hc_post_mult_value
     )
     tl.store(post_mix_ptr + pid * 4 + 3, post_3)
 
     cb = 8
-    cm_00 = tl.load(gemm_out_ptr + go + cb + 0) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 0)
-    cm_01 = tl.load(gemm_out_ptr + go + cb + 1) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 1)
-    cm_02 = tl.load(gemm_out_ptr + go + cb + 2) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 2)
-    cm_03 = tl.load(gemm_out_ptr + go + cb + 3) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 3)
-    cm_10 = tl.load(gemm_out_ptr + go + cb + 4) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 4)
-    cm_11 = tl.load(gemm_out_ptr + go + cb + 5) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 5)
-    cm_12 = tl.load(gemm_out_ptr + go + cb + 6) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 6)
-    cm_13 = tl.load(gemm_out_ptr + go + cb + 7) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 7)
-    cm_20 = tl.load(gemm_out_ptr + go + cb + 8) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 8)
-    cm_21 = tl.load(gemm_out_ptr + go + cb + 9) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 9)
-    cm_22 = tl.load(gemm_out_ptr + go + cb + 10) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 10)
-    cm_23 = tl.load(gemm_out_ptr + go + cb + 11) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 11)
-    cm_30 = tl.load(gemm_out_ptr + go + cb + 12) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 12)
-    cm_31 = tl.load(gemm_out_ptr + go + cb + 13) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 13)
-    cm_32 = tl.load(gemm_out_ptr + go + cb + 14) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 14)
-    cm_33 = tl.load(gemm_out_ptr + go + cb + 15) * rms_inv * scale_2 + tl.load(hc_base_ptr + cb + 15)
+    cm_00 = tl.load(gemm_out_ptr + go + cb + 0) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 0
+    )
+    cm_01 = tl.load(gemm_out_ptr + go + cb + 1) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 1
+    )
+    cm_02 = tl.load(gemm_out_ptr + go + cb + 2) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 2
+    )
+    cm_03 = tl.load(gemm_out_ptr + go + cb + 3) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 3
+    )
+    cm_10 = tl.load(gemm_out_ptr + go + cb + 4) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 4
+    )
+    cm_11 = tl.load(gemm_out_ptr + go + cb + 5) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 5
+    )
+    cm_12 = tl.load(gemm_out_ptr + go + cb + 6) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 6
+    )
+    cm_13 = tl.load(gemm_out_ptr + go + cb + 7) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 7
+    )
+    cm_20 = tl.load(gemm_out_ptr + go + cb + 8) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 8
+    )
+    cm_21 = tl.load(gemm_out_ptr + go + cb + 9) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 9
+    )
+    cm_22 = tl.load(gemm_out_ptr + go + cb + 10) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 10
+    )
+    cm_23 = tl.load(gemm_out_ptr + go + cb + 11) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 11
+    )
+    cm_30 = tl.load(gemm_out_ptr + go + cb + 12) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 12
+    )
+    cm_31 = tl.load(gemm_out_ptr + go + cb + 13) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 13
+    )
+    cm_32 = tl.load(gemm_out_ptr + go + cb + 14) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 14
+    )
+    cm_33 = tl.load(gemm_out_ptr + go + cb + 15) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + cb + 15
+    )
 
     # row softmax + eps
     rm = tl.maximum(tl.maximum(cm_00, cm_01), tl.maximum(cm_02, cm_03))
@@ -375,31 +431,51 @@ def _mix_kernel_hc2(
     go = pid * 8
 
     pre_0 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 0) * rms_inv * scale_0 + tl.load(hc_base_ptr + 0))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 0) * rms_inv * scale_0
+            + tl.load(hc_base_ptr + 0)
+        )
         + hc_pre_eps
     )
     pre_1 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 1) * rms_inv * scale_0 + tl.load(hc_base_ptr + 1))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 1) * rms_inv * scale_0
+            + tl.load(hc_base_ptr + 1)
+        )
         + hc_pre_eps
     )
     tl.store(pre_mix_ptr + pid * 2 + 0, pre_0)
     tl.store(pre_mix_ptr + pid * 2 + 1, pre_1)
 
     post_0 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 2) * rms_inv * scale_1 + tl.load(hc_base_ptr + 2))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 2) * rms_inv * scale_1
+            + tl.load(hc_base_ptr + 2)
+        )
         * hc_post_mult_value
     )
     tl.store(post_mix_ptr + pid * 2 + 0, post_0)
     post_1 = (
-        tl.sigmoid(tl.load(gemm_out_ptr + go + 3) * rms_inv * scale_1 + tl.load(hc_base_ptr + 3))
+        tl.sigmoid(
+            tl.load(gemm_out_ptr + go + 3) * rms_inv * scale_1
+            + tl.load(hc_base_ptr + 3)
+        )
         * hc_post_mult_value
     )
     tl.store(post_mix_ptr + pid * 2 + 1, post_1)
 
-    cm_00 = tl.load(gemm_out_ptr + go + 4) * rms_inv * scale_2 + tl.load(hc_base_ptr + 4)
-    cm_01 = tl.load(gemm_out_ptr + go + 5) * rms_inv * scale_2 + tl.load(hc_base_ptr + 5)
-    cm_10 = tl.load(gemm_out_ptr + go + 6) * rms_inv * scale_2 + tl.load(hc_base_ptr + 6)
-    cm_11 = tl.load(gemm_out_ptr + go + 7) * rms_inv * scale_2 + tl.load(hc_base_ptr + 7)
+    cm_00 = tl.load(gemm_out_ptr + go + 4) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + 4
+    )
+    cm_01 = tl.load(gemm_out_ptr + go + 5) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + 5
+    )
+    cm_10 = tl.load(gemm_out_ptr + go + 6) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + 6
+    )
+    cm_11 = tl.load(gemm_out_ptr + go + 7) * rms_inv * scale_2 + tl.load(
+        hc_base_ptr + 7
+    )
 
     rm = tl.maximum(cm_00, cm_01)
     e_00 = tl.exp(cm_00 - rm)
@@ -466,7 +542,9 @@ def _weighted_row_kernel(
     acc = tl.zeros([B], dtype=tl.float32)
     for k in tl.static_range(HC):
         pk = tl.load(pre_mix_ptr + pid * HC + k)
-        r = tl.load(residual_ptr + base + k * H + offs, mask=m, other=0.0).to(tl.float32)
+        r = tl.load(residual_ptr + base + k * H + offs, mask=m, other=0.0).to(
+            tl.float32
+        )
         acc += pk * r
     tl.store(layer_input_ptr + pid * H + offs, acc.to(tl.bfloat16), mask=m)
 

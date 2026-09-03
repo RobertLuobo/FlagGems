@@ -46,6 +46,7 @@ def _native_nonzero(x):
         return _NATIVE_NONZERO.call_boxed(_VENDOR_KS, x)
     return x.nonzero()
 
+
 # The old kunlunxin kernel materialized a full global `cumsum` (int64) and did a
 # data-dependent DISCRETE masked STORE (`out_ptr + out_offset`). On XPU a masked
 # scatter store with per-element offsets serializes -> a fixed ~0.029 GBPS wall

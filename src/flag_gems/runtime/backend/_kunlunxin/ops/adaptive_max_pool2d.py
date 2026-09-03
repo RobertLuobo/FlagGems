@@ -77,9 +77,7 @@ def adaptive_max_pool2d_forward_flat_kernel(
             w_safe = tl.where(w_ok, w_in, w_start)
             value = tl.load(plane_base + h_safe * IW + w_safe).to(tl.float32)
             active = h_ok & w_ok
-            is_new = active & (
-                (value > acc_val) | (value != value) | (acc_idx < 0)
-            )
+            is_new = active & ((value > acc_val) | (value != value) | (acc_idx < 0))
             acc_val = tl.where(is_new, value, acc_val)
             acc_idx = tl.where(is_new, h_in * IW + w_in, acc_idx)
 

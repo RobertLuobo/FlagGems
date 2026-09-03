@@ -75,9 +75,10 @@ def sum_flat_core_kernel(inp, out, CHUNK: tl.constexpr):
     """Unmasked exact-size 1D chunk reduce. Grid = number of full chunks."""
     if tl.constexpr(inp.dtype.element_ty == tl.float64):
         cdtype = tl.float64
-    elif (tl.constexpr(inp.dtype.element_ty == tl.float16) or tl.constexpr(
-        inp.dtype.element_ty == tl.bfloat16
-    )) or tl.constexpr(inp.dtype.element_ty == tl.float32):
+    elif (
+        tl.constexpr(inp.dtype.element_ty == tl.float16)
+        or tl.constexpr(inp.dtype.element_ty == tl.bfloat16)
+    ) or tl.constexpr(inp.dtype.element_ty == tl.float32):
         cdtype = tl.float32
     else:
         cdtype = tl.int64
@@ -94,9 +95,10 @@ def _sum_flat_tail_kernel(inp, out, TL: tl.constexpr):
     TL == next_pow2(tail) <= _FLAT_CHUNK."""
     if tl.constexpr(inp.dtype.element_ty == tl.float64):
         cdtype = tl.float64
-    elif (tl.constexpr(inp.dtype.element_ty == tl.float16) or tl.constexpr(
-        inp.dtype.element_ty == tl.bfloat16
-    )) or tl.constexpr(inp.dtype.element_ty == tl.float32):
+    elif (
+        tl.constexpr(inp.dtype.element_ty == tl.float16)
+        or tl.constexpr(inp.dtype.element_ty == tl.bfloat16)
+    ) or tl.constexpr(inp.dtype.element_ty == tl.float32):
         cdtype = tl.float32
     else:
         cdtype = tl.int64
@@ -112,9 +114,10 @@ def _sum_flat_tail_masked_kernel(inp, out, start, NTAIL, TL: tl.constexpr):
     start is a scalar flat offset."""
     if tl.constexpr(inp.dtype.element_ty == tl.float64):
         cdtype = tl.float64
-    elif (tl.constexpr(inp.dtype.element_ty == tl.float16) or tl.constexpr(
-        inp.dtype.element_ty == tl.bfloat16
-    )) or tl.constexpr(inp.dtype.element_ty == tl.float32):
+    elif (
+        tl.constexpr(inp.dtype.element_ty == tl.float16)
+        or tl.constexpr(inp.dtype.element_ty == tl.bfloat16)
+    ) or tl.constexpr(inp.dtype.element_ty == tl.float32):
         cdtype = tl.float32
     else:
         cdtype = tl.int64
@@ -129,9 +132,10 @@ def _sum_flat_merge_kernel(mid, out, np, NLANES: tl.constexpr):
     """Single-shot masked merge of np partials (np <= 8192)."""
     if tl.constexpr(mid.dtype.element_ty == tl.float64):
         cdtype = tl.float64
-    elif (tl.constexpr(mid.dtype.element_ty == tl.float16) or tl.constexpr(
-        mid.dtype.element_ty == tl.bfloat16
-    )) or tl.constexpr(mid.dtype.element_ty == tl.float32):
+    elif (
+        tl.constexpr(mid.dtype.element_ty == tl.float16)
+        or tl.constexpr(mid.dtype.element_ty == tl.bfloat16)
+    ) or tl.constexpr(mid.dtype.element_ty == tl.float32):
         cdtype = tl.float32
     else:
         cdtype = tl.int64
@@ -179,12 +183,13 @@ def _launch_sum_flat(inp, out, acc_dtype):
     mid = torch.empty((nb,), dtype=acc_dtype, device=inp.device)
     with torch_device_fn.device(inp.device):
         if nfull:
-            sum_flat_core_kernel[(nfull, 1, 1)](
-                inp, mid, CH, buffer_size_limit=2048
-            )
+            sum_flat_core_kernel[(nfull, 1, 1)](inp, mid, CH, buffer_size_limit=2048)
         if tail and tail <= 8192:
             _sum_flat_tail_masked_kernel[(1, 1, 1)](
-                inp, mid[nfull : nfull + 1], nfull * CH, tail,
+                inp,
+                mid[nfull : nfull + 1],
+                nfull * CH,
+                tail,
                 triton.next_power_of_2(tail),
             )
         elif tail:
@@ -195,9 +200,7 @@ def _launch_sum_flat(inp, out, acc_dtype):
                 staged, mid[nfull : nfull + 1], TL, buffer_size_limit=2048
             )
         if nb <= 8192:
-            _sum_flat_merge_kernel[(1, 1, 1)](
-                mid, out, nb, triton.next_power_of_2(nb)
-            )
+            _sum_flat_merge_kernel[(1, 1, 1)](mid, out, nb, triton.next_power_of_2(nb))
         else:
             # > 8192 partials (M > 268M): compress via 8192-wide unmasked
             # groups of a zero-padded partial buffer, then a small merge.
@@ -206,23 +209,24 @@ def _launch_sum_flat(inp, out, acc_dtype):
             torch.ops.aten._copy_from(mid, padded[:nb], False)
             gsum = torch.empty((g,), dtype=acc_dtype, device=inp.device)
             _sum_flat_group_kernel[(g, 1, 1)](padded, gsum, 8192)
-            _sum_flat_merge_kernel[(1, 1, 1)](
-                gsum, out, g, triton.next_power_of_2(g)
-            )
+            _sum_flat_merge_kernel[(1, 1, 1)](gsum, out, g, triton.next_power_of_2(g))
 
 
 @libentry()
 @triton.jit
-def _sum_row_full_kernel(inp, out, M, STRIDE, NW, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+def _sum_row_full_kernel(
+    inp, out, M, STRIDE, NW, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
     """Row-reduce over cols [0, NW) with NW % BLOCK_N == 0 and row stride
     STRIDE (STRIDE >= NW; the trailing STRIDE-NW lanes carry the tail).
     Fully unmasked loads (rows clamped to [0, M-1]), reduce-OUTSIDE
     accumulation, masked row stores. Exact (validated 2026-08-22)."""
     if tl.constexpr(inp.dtype.element_ty == tl.float64):
         cdtype = tl.float64
-    elif (tl.constexpr(inp.dtype.element_ty == tl.float16) or tl.constexpr(
-        inp.dtype.element_ty == tl.bfloat16
-    )) or tl.constexpr(inp.dtype.element_ty == tl.float32):
+    elif (
+        tl.constexpr(inp.dtype.element_ty == tl.float16)
+        or tl.constexpr(inp.dtype.element_ty == tl.bfloat16)
+    ) or tl.constexpr(inp.dtype.element_ty == tl.float32):
         cdtype = tl.float32
     else:
         cdtype = tl.int64
@@ -258,9 +262,10 @@ def _sum_row_tail_kernel(
     (static-unrolled over rows; validated 2026-08-22)."""
     if tl.constexpr(inp.dtype.element_ty == tl.float64):
         cdtype = tl.float64
-    elif (tl.constexpr(inp.dtype.element_ty == tl.float16) or tl.constexpr(
-        inp.dtype.element_ty == tl.bfloat16
-    )) or tl.constexpr(inp.dtype.element_ty == tl.float32):
+    elif (
+        tl.constexpr(inp.dtype.element_ty == tl.float16)
+        or tl.constexpr(inp.dtype.element_ty == tl.bfloat16)
+    ) or tl.constexpr(inp.dtype.element_ty == tl.float32):
         cdtype = tl.float32
     else:
         cdtype = tl.int64

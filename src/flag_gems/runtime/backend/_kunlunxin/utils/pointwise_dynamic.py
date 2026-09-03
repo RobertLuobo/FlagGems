@@ -943,7 +943,6 @@ class WrapperGenerator:
             code.writeline("    num_tiles = triton.cdiv(num_tasks, tile_size)")
             code.writeline("    num_ctas = num_tiles")
 
-
             # code.writeline("element_size = get_element_size(in0.dtype)")
             # code.writeline(
             #     "tile_size = min("

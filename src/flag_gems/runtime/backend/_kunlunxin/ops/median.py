@@ -203,9 +203,7 @@ def median_key_info_chunk_kernel(
     mask = offsets < N
     if PREORDERED:
         keys = tl.load(inp + row * N + offsets, mask=mask, other=0)
-        keys_lo = tl.load(
-            inp + row * N + offsets, mask=mask, other=0xFFFFFFFFFFFFFFFF
-        )
+        keys_lo = tl.load(inp + row * N + offsets, mask=mask, other=0xFFFFFFFFFFFFFFFF)
         keys_hi = tl.load(inp + row * N + offsets, mask=mask, other=0)
     else:
         dtype = inp.dtype.element_ty
@@ -218,12 +216,8 @@ def median_key_info_chunk_kernel(
             max_fill = get_dtype_max(dtype)
         vals = tl.load(inp + row * N + offsets, mask=mask, other=max_fill)
         keys = _median_keys(vals, KEY_BITS)
-        vals_lo = tl.load(
-            inp + row * N + offsets, mask=mask, other=min_fill
-        )
-        vals_hi = tl.load(
-            inp + row * N + offsets, mask=mask, other=max_fill
-        )
+        vals_lo = tl.load(inp + row * N + offsets, mask=mask, other=min_fill)
+        vals_hi = tl.load(inp + row * N + offsets, mask=mask, other=max_fill)
         keys_lo = _median_keys(vals_lo, KEY_BITS)
         keys_hi = _median_keys(vals_hi, KEY_BITS)
     # keybuf layout: (M, NCHUNK, CHUNK); pad lanes keep the wrapper's
@@ -236,9 +230,7 @@ def median_key_info_chunk_kernel(
         # key info kernel).  Pack = global index, sentinel = 0x7FFFFFFF.
         nan = mask & _median_is_nan(vals)
         local_first = tl.min(tl.where(nan, cols, CHUNK), axis=0)
-        pack = tl.where(
-            local_first < CHUNK, local_first + chunk * CHUNK, 2147483647
-        )
+        pack = tl.where(local_first < CHUNK, local_first + chunk * CHUNK, 2147483647)
         tl.store(chunk_nan + cidx, pack)
     else:
         tl.store(chunk_nan + cidx, 2147483647)
@@ -330,9 +322,7 @@ def median_key_info_partial_kernel(
     mask = cols < PARTIAL
     if PREORDERED:
         keys = tl.load(inp + pid * N + offsets, mask=mask, other=0)
-        keys_lo = tl.load(
-            inp + pid * N + offsets, mask=mask, other=0xFFFFFFFFFFFFFFFF
-        )
+        keys_lo = tl.load(inp + pid * N + offsets, mask=mask, other=0xFFFFFFFFFFFFFFFF)
         keys_hi = tl.load(inp + pid * N + offsets, mask=mask, other=0)
     else:
         dtype = inp.dtype.element_ty
@@ -936,8 +926,12 @@ def _median_key_select_chunked(rows, N, key_bits):
     reduce_block = triton.next_power_of_2(nall)
     chunk_mins = torch.empty((M * reduce_block,), dtype=key_dtype, device=rows.device)
     chunk_maxs = torch.empty((M * reduce_block,), dtype=key_dtype, device=rows.device)
-    chunk_nan = torch.full((M * reduce_block,), 2147483647, dtype=torch.int32, device=rows.device)
-    chunk_counts = torch.empty((M * reduce_block,), dtype=torch.int32, device=rows.device)
+    chunk_nan = torch.full(
+        (M * reduce_block,), 2147483647, dtype=torch.int32, device=rows.device
+    )
+    chunk_counts = torch.empty(
+        (M * reduce_block,), dtype=torch.int32, device=rows.device
+    )
     counts = torch.empty((M,), dtype=torch.int32, device=rows.device)
     row_nan_first = torch.full((M,), -1, dtype=torch.int32, device=rows.device)
     lo = torch.empty((M,), dtype=key_dtype, device=rows.device)
@@ -954,7 +948,11 @@ def _median_key_select_chunked(rows, N, key_bits):
         work = _order_keys64(rows)
     elif rows.dtype in (torch.float16, torch.bfloat16):
         work = rows.to(torch.float32)
-    elif rows.dtype == torch.int8 or rows.dtype == torch.uint8 or rows.dtype == torch.int16:
+    elif (
+        rows.dtype == torch.int8
+        or rows.dtype == torch.uint8
+        or rows.dtype == torch.int16
+    ):
         work = rows.to(torch.int32)
     else:
         work = rows
@@ -962,7 +960,9 @@ def _median_key_select_chunked(rows, N, key_bits):
         nanf = rows.isnan()
         nan_firsts = nanf.to(torch.int64).argmax(dim=1)
         row_nan_first = torch.where(
-            nanf.any(dim=1), nan_firsts.to(torch.int32), torch.full((M,), -1, dtype=torch.int32, device=rows.device)
+            nanf.any(dim=1),
+            nan_firsts.to(torch.int32),
+            torch.full((M,), -1, dtype=torch.int32, device=rows.device),
         )
 
     tail_blk = triton.next_power_of_2(partial) if partial else 1
@@ -1013,6 +1013,7 @@ def _median_key_select_chunked(rows, N, key_bits):
             chunk_maxs, hi, nchunks, 0, reduce_block, 1, **nan_kw
         )
         target = (N - 1) // 2
+
         # Host-loop binary search.  Bulk D2H copies are rejected by the
         # Kunlunxin to/copy overrides, so the small per-row state is read
         # with scalar .item() (bitcast via f32 for uint32) and the mids are
@@ -1020,7 +1021,10 @@ def _median_key_select_chunked(rows, N, key_bits):
         def _u32_of(t, i):
             if key_bits == 64:
                 return int(t.view(torch.int64)[i].item()) & 0xFFFFFFFFFFFFFFFF
-            return int(np.asarray(np.float32(t.view(torch.float32)[i].item())).view(np.uint32))
+            return int(
+                np.asarray(np.float32(t.view(torch.float32)[i].item())).view(np.uint32)
+            )
+
         lo_h = [_u32_of(lo, r) for r in range(M)]
         hi_h = [_u32_of(hi, r) for r in range(M)]
         for _ in range(key_bits + 6):
@@ -1031,12 +1035,29 @@ def _median_key_select_chunked(rows, N, key_bits):
                 median_set_scalar_kernel[(1,)](mid, r, mid_h[r], **nan_kw)
             if nfull:
                 median_count_chunk_kernel[(M * nfull,)](
-                    keybuf, mid, chunk_counts, N, nchunks, nfull, reduce_block, CHUNK, **nan_kw
+                    keybuf,
+                    mid,
+                    chunk_counts,
+                    N,
+                    nchunks,
+                    nfull,
+                    reduce_block,
+                    CHUNK,
+                    **nan_kw,
                 )
             if partial:
                 median_count_partial_kernel[(M,)](
-                    keybuf, mid, chunk_counts, N, nchunks, partial,
-                    reduce_block, row_stride, tail_base, tail_blk, **nan_kw
+                    keybuf,
+                    mid,
+                    chunk_counts,
+                    N,
+                    nchunks,
+                    partial,
+                    reduce_block,
+                    row_stride,
+                    tail_base,
+                    tail_blk,
+                    **nan_kw,
                 )
             median_row_reduce_kernel[(M,)](
                 chunk_counts, counts, nchunks, 0, reduce_block, 2, **nan_kw
@@ -1051,15 +1072,35 @@ def _median_key_select_chunked(rows, N, key_bits):
             median_set_scalar_kernel[(1,)](sel_keys, r, lo_h[r], **nan_kw)
         out_values = torch.empty((M,), dtype=rows.dtype, device=rows.device)
         out_indices = torch.empty((M,), dtype=torch.long, device=rows.device)
-        chunk_first = torch.empty((M * reduce_block,), dtype=torch.int32, device=rows.device)
+        chunk_first = torch.empty(
+            (M * reduce_block,), dtype=torch.int32, device=rows.device
+        )
         if nfull:
             median_select_chunk_kernel[(M * nfull,)](
-                keybuf, sel_keys, chunk_first, N, nchunks, nfull, reduce_block, CHUNK, **nan_kw
+                keybuf,
+                sel_keys,
+                chunk_first,
+                N,
+                nchunks,
+                nfull,
+                reduce_block,
+                CHUNK,
+                **nan_kw,
             )
         if partial:
             median_select_partial_kernel[(M,)](
-                keybuf, sel_keys, chunk_first, N, nchunks, tail_start, partial,
-                reduce_block, row_stride, tail_base, tail_blk, **nan_kw
+                keybuf,
+                sel_keys,
+                chunk_first,
+                N,
+                nchunks,
+                tail_start,
+                partial,
+                reduce_block,
+                row_stride,
+                tail_base,
+                tail_blk,
+                **nan_kw,
             )
         use_row_nan = rows.dtype == torch.float64
         median_merge_select_chunk_kernel[(M,)](

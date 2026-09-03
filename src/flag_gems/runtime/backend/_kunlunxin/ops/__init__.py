@@ -27,7 +27,6 @@ from ._functional_sym_constrain_range_for_size import (
 )
 from ._fused_adam import _fused_adam, _fused_adam_
 from ._fused_rms_norm import _fused_rms_norm
-from .functional_assert_async import _functional_assert_async
 from ._is_all_true import _is_all_true
 from ._linalg_eigvals import _linalg_eigvals
 from ._native_batch_norm_legit_functional import _native_batch_norm_legit_functional
@@ -35,7 +34,6 @@ from ._native_batch_norm_legit_no_training import _native_batch_norm_legit_no_tr
 from ._nested_view_from_buffer_copy import _nested_view_from_buffer_copy
 from ._pdist_backward import _pdist_backward
 from ._pdist_forward import _pdist_forward, pdist
-from .pairwise_distance import pairwise_distance
 from ._prelu_kernel import _prelu_kernel
 from ._scaled_dot_product_fused_attention_overrideable import (
     _scaled_dot_product_fused_attention_overrideable,
@@ -77,9 +75,8 @@ from .argmin import argmin
 from .argsort import argsort
 from .as_strided_copy import as_strided_copy, as_strided_copy_out
 from .as_strided_scatter import as_strided_scatter
-from .assert_async import _assert_async
-from .unfold_copy import unfold_copy
 from .asin import asin, asin_
+from .assert_async import _assert_async
 from .atan import atan, atan_
 from .atan2 import atan2, atan2_, atan2_out
 from .atanh import atanh, atanh_
@@ -132,6 +129,7 @@ from .bitwise_xor import (
     xor_scalar_,
     xor_scalar_tensor,
 )
+from .block_diag import block_diag
 from .bmm import bmm, bmm_out
 from .broadcast_tensors import broadcast_tensors
 from .broadcast_to import broadcast_to
@@ -180,12 +178,14 @@ from .diag import diag
 from .diag_embed import diag_embed
 from .diagonal import diagonal_backward
 from .diagonal_copy import diagonal_copy
+from .diagonal_scatter import diagonal_scatter
 from .diff import diff
 from .digamma import digamma
 from .digamma_ import digamma_
 from .div import (
     div_mode,
     div_mode_,
+    divide,
     floor_divide,
     floor_divide_,
     remainder,
@@ -201,10 +201,12 @@ from .elu import elu, elu_, elu_backward
 from .embedding import embedding, embedding_backward, embedding_dense_backward
 from .eq import eq, eq_, eq_scalar, eq_scalar_
 from .erf import erf, erf_, special_erf
+from .erfc import erfc, erfc_, special_erfc
 from .erfinv import erfinv
 from .erfinv_ import erfinv_
 from .exp import exp, exp_, exp_out
 from .exp2 import exp2, exp2_
+from .expand_copy import expand_copy
 from .expm1 import expm1, expm1_, expm1_out
 from .exponential_ import exponential_
 from .eye import eye
@@ -226,6 +228,7 @@ from .fmod import fmod_scalar, fmod_scalar_, fmod_tensor, fmod_tensor_
 from .fractional_max_pool2d import fractional_max_pool2d, fractional_max_pool2d_backward
 from .full import full
 from .full_like import full_like
+from .functional_assert_async import _functional_assert_async
 from .fused_experts_impl import (
     fused_experts_impl,
     inplace_fused_experts,
@@ -243,11 +246,12 @@ from .glu import glu, glu_backward
 from .greater import greater, greater_out, greater_scalar, greater_scalar_out
 from .grid_sample import grid_sample
 from .grid_sampler_3d_backward import grid_sampler_3d_backward
-from .groupnorm import group_norm, group_norm_backward
 from .grouped_mm import group_mm
+from .groupnorm import group_norm, group_norm_backward
 from .gt import gt, gt_scalar, gt_scalar_, gt_tensor_
 from .hadamard_transform import hadamard_transform
 from .hardsigmoid import hardsigmoid, hardsigmoid_out
+from .hardsigmoid_backward import hardsigmoid_backward
 from .heaviside_ import heaviside_
 from .histc import histc
 from .hstack import hstack
@@ -278,7 +282,7 @@ from .lcm import lcm, lcm_
 from .le import le, le_, le_scalar
 from .leaky_relu import leaky_relu, leaky_relu_, leaky_relu_backward, leaky_relu_out
 from .lerp import lerp_scalar, lerp_scalar_, lerp_tensor, lerp_tensor_
-from .less_equal import less_equal, less_equal_scalar
+from .less_equal import less_equal, less_equal_, less_equal_scalar, less_equal_scalar_
 from .lgamma import lgamma, lgamma_
 from .lift_fresh import lift_fresh
 from .lift_fresh_copy import lift_fresh_copy
@@ -301,7 +305,6 @@ from .linalg_solve_triangular import (
 from .linear_backward import linear_backward
 from .linspace import linspace
 from .log import log
-from .lu_unpack import lu_unpack, lu_unpack_out
 from .log1p import log1p, log1p_
 from .log2 import log2, log2_
 from .log10 import log10, log10_, log10_out
@@ -324,7 +327,8 @@ from .logical_or import logical_or, logical_or_
 from .logical_xor import logical_xor, logical_xor_
 from .logspace import logspace
 from .logsumexp import logsumexp
-from .lt import lt, lt_, lt_scalar, lt_scalar_
+from .lt import less_, less_scalar_, lt, lt_, lt_scalar, lt_scalar_
+from .lu_unpack import lu_unpack, lu_unpack_out
 from .margin_ranking_loss import margin_ranking_loss
 from .masked_fill import masked_fill, masked_fill_
 from .masked_scatter import masked_scatter, masked_scatter_
@@ -338,16 +342,16 @@ from .max_pool2d_with_indices import (
     max_pool2d_with_indices,
     max_pool2d_with_indices_backward,
 )
-from .max_pool3d_with_indices import max_pool3d_backward, max_pool3d_with_indices
 from .max_pool3d_backward import max_pool3d_backward, max_pool3d_with_indices_backward
+from .max_pool3d_with_indices import max_pool3d_backward, max_pool3d_with_indices
 from .max_unpool3d import max_unpool3d
 from .maximum import maximum
 from .mean import mean, mean_dim
 from .median import median, median_dim, median_dim_values, median_out
 from .min import min, min_dim
 from .minimum import minimum
-from .mish_backward import mish_backward
 from .miopen_batch_norm_backward import miopen_batch_norm_backward
+from .mish_backward import mish_backward
 from .mm import mm, mm_out
 from .mode import mode
 from .moe_sum import moe_sum
@@ -360,7 +364,7 @@ from .multiply_ import multiply_
 from .mv import mv, mv_cluster
 from .mvlgamma import mvlgamma
 from .mvlgamma_ import mvlgamma_
-from .nan_to_num import nan_to_num
+from .nan_to_num import nan_to_num, nan_to_num_
 from .nanmedian import nanmedian, nanmedian_dim, nanmedian_dim_values, nanmedian_out
 from .nansum import nansum, nansum_out
 from .narrow_copy import narrow_copy
@@ -383,7 +387,6 @@ from .nllloss import (
     nll_loss_nd_backward,
     nll_loss_nd_forward,
 )
-from .ormqr import ormqr
 from .nonzero import nonzero
 from .nonzero_numpy import nonzero_numpy
 from .nonzero_static import nonzero_static, nonzero_static_out
@@ -397,7 +400,9 @@ from .normal import (
 from .not_equal import not_equal, not_equal_scalar
 from .ones import ones
 from .ones_like import ones_like
+from .ormqr import ormqr
 from .pad import constant_pad_nd, pad
+from .pairwise_distance import pairwise_distance
 from .per_token_group_quant_fp8 import SUPPORTED_FP8_DTYPE, per_token_group_quant_fp8
 from .permute_copy import permute_copy
 from .pixel_unshuffle import pixel_unshuffle, pixel_unshuffle_out
@@ -512,6 +517,7 @@ from .special_digamma import special_digamma
 from .special_erfcx import special_erfcx
 from .special_erfinv import special_erfinv, special_erfinv_, special_erfinv_out
 from .special_exp2 import special_exp2
+from .special_expit import special_expit
 from .special_gammainc import special_gammainc
 from .special_gammaincc import special_gammaincc
 from .special_gammaln import special_gammaln, special_gammaln_out
@@ -563,6 +569,7 @@ from .tril import tril, tril_, tril_out
 from .triu import triu, triu_
 from .trunc import trunc, trunc_
 from .unbind_copy import unbind_copy
+from .unfold_copy import unfold_copy
 from .uniform import uniform_
 from .unique import _unique2
 from .unique_consecutive import unique_consecutive
@@ -586,10 +593,12 @@ from .weightnorm import weight_norm_interface, weight_norm_interface_backward
 from .where import where_scalar_other, where_scalar_self, where_self, where_self_out
 from .xlogy import (
     xlogy,
+    xlogy_,
     xlogy_out,
     xlogy_scalar_tensor,
     xlogy_scalar_tensor_out,
     xlogy_tensor_scalar,
+    xlogy_tensor_scalar_,
     xlogy_tensor_scalar_out,
 )
 from .zero import zero, zero_, zero_out
@@ -633,6 +642,7 @@ __all__ = [
     "special_gammaln_out",
     "special_digamma",
     "special_erfcx",
+    "special_expit",
     "special_log_ndtr",
     "special_log_ndtr_",
     "special_multigammaln",
@@ -813,9 +823,11 @@ __all__ = [
     "diag_embed",
     "diagonal_backward",
     "diagonal_copy",
+    "diagonal_scatter",
     "diff",
     "div_mode",
     "div_mode_",
+    "divide",
     "dot",
     "dropout",
     "dropout_backward",
@@ -831,13 +843,17 @@ __all__ = [
     "eq_scalar_",
     "erf",
     "erf_",
+    "erfc",
+    "erfc_",
     "erfinv",
     "special_erf",
+    "special_erfc",
     "exp",
     "exp_",
     "exp_out",
     "exp2",
     "exp2_",
+    "expand_copy",
     "expm1",
     "expm1_",
     "expm1_out",
@@ -911,6 +927,7 @@ __all__ = [
     "hstack",
     "hadamard_transform",
     "hardsigmoid",
+    "hardsigmoid_backward",
     "hardsigmoid_out",
     "histc",
     "hypot",
@@ -952,7 +969,9 @@ __all__ = [
     "lerp_tensor",
     "lerp_tensor_",
     "less_equal",
+    "less_equal_",
     "less_equal_scalar",
+    "less_equal_scalar_",
     "lift_fresh_copy",
     "lcm",
     "lcm_",
@@ -1036,6 +1055,8 @@ __all__ = [
     "lt_",
     "lt_scalar",
     "lt_scalar_",
+    "less_",
+    "less_scalar_",
     "matmul_bf16",
     "matmul_int8",
     "margin_ranking_loss",
@@ -1079,6 +1100,7 @@ __all__ = [
     "mv",
     "mv_cluster",
     "nan_to_num",
+    "nan_to_num_",
     "narrow_copy",
     "nanmedian",
     "nanmedian_dim",
@@ -1313,10 +1335,12 @@ __all__ = [
     "where_self",
     "where_self_out",
     "xlogy",
+    "xlogy_",
     "xlogy_out",
     "xlogy_scalar_tensor",
     "xlogy_scalar_tensor_out",
     "xlogy_tensor_scalar",
+    "xlogy_tensor_scalar_",
     "xlogy_tensor_scalar_out",
     "zero",
     "zero_",

@@ -45,9 +45,7 @@ def _pos_block(nnz_per_batch, M):
 
 
 def _combine_block(nnz):
-    return (
-        _COMBINE_BLOCK_LARGE if nnz > _COMBINE_LARGE_NNZ else _COMBINE_BLOCK_SMALL
-    )
+    return _COMBINE_BLOCK_LARGE if nnz > _COMBINE_LARGE_NNZ else _COMBINE_BLOCK_SMALL
 
 
 def _heur_group_m(args):

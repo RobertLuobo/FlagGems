@@ -292,9 +292,9 @@ def linalg_householder_product(A, tau):
     """
     logger.debug("GEMS LINALG_HOUSEHOLDER_PRODUCT")
 
-    assert A.dtype in _SUPPORTED_DTYPES, (
-        f"linalg_householder_product only supports float32 and float64, got {A.dtype}"
-    )
+    assert (
+        A.dtype in _SUPPORTED_DTYPES
+    ), f"linalg_householder_product only supports float32 and float64, got {A.dtype}"
     shape = A.shape
     if len(shape) < 2:
         raise ValueError("A must be at least 2D")

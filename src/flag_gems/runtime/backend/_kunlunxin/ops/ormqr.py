@@ -474,8 +474,9 @@ def _kunlunxin_update_one_kernel(
             base = bid * s_wb + m * (WCOL * 2)
             hi = tl.load(W_ptr + base + wg * 64 + tl.arange(0, 64))
             lo = tl.load(W_ptr + base + WCOL + wg * 64 + tl.arange(0, 64))
-            wsum += tl.sum(hi.to(tl.float64) + lo.to(tl.float64),
-                           axis=0, keep_dims=True)
+            wsum += tl.sum(
+                hi.to(tl.float64) + lo.to(tl.float64), axis=0, keep_dims=True
+            )
         wsc = tl.sum(wsum, axis=0)
         crow64 = tl.load(C_ptr + bid * s_cb + m * s_cm + (i + col) * s_cn).to(
             tl.float64
@@ -510,27 +511,73 @@ def _make_w_scratch(B, rows, Wn, dtype, device):
     return torch.zeros(int(B), int(rows), 2 * int(Wc), dtype=dtype, device=device)
 
 
-def _apply_one(C, V, T, W, rows, i, s_cb, s_cm, s_cn, s_vb, s_vm, s_vk,
-               s_wb, s_tb, Nchunk, DT):
+def _apply_one(
+    C, V, T, W, rows, i, s_cb, s_cm, s_cn, s_vb, s_vm, s_vk, s_wb, s_tb, Nchunk, DT
+):
     """Apply one reflector: fused for single-64 spans; otherwise one w-partial
     launch per 64-lane chunk followed by one update launch per chunk."""
     Bn = W.shape[0]
     if Nchunk == 1:
         _kunlunxin_reflect_fused_kernel[(Bn,)](
-            C, V, T, rows, i, s_cb, s_cm, s_cn, s_vb, s_vm, s_vk, s_tb,
-            NCHUNK=1, BLOCK_N=_XPU_VEC, DT=DT,
+            C,
+            V,
+            T,
+            rows,
+            i,
+            s_cb,
+            s_cm,
+            s_cn,
+            s_vb,
+            s_vm,
+            s_vk,
+            s_tb,
+            NCHUNK=1,
+            BLOCK_N=_XPU_VEC,
+            DT=DT,
         )
         return
     for c in range(Nchunk):
         _kunlunxin_w_one_kernel[(Bn,)](
-            C, V, W, rows, i, s_cb, s_cm, s_cn, s_vb, s_vm, s_vk, s_wb,
-            WCOL=W.shape[2] // 2, CHUNK0=c, NCHUNK=Nchunk, BLOCK_N=_XPU_VEC, DT=DT,
+            C,
+            V,
+            W,
+            rows,
+            i,
+            s_cb,
+            s_cm,
+            s_cn,
+            s_vb,
+            s_vm,
+            s_vk,
+            s_wb,
+            WCOL=W.shape[2] // 2,
+            CHUNK0=c,
+            NCHUNK=Nchunk,
+            BLOCK_N=_XPU_VEC,
+            DT=DT,
         )
     for c in range(Nchunk):
         _kunlunxin_update_one_kernel[(Bn,)](
-            C, V, W, T, rows, i, s_cb, s_cm, s_cn, s_vb, s_vm, s_vk, s_wb, s_tb,
-            WCOL=W.shape[2] // 2, CHUNK0=c, NCHUNK=Nchunk, WCH=(Nchunk + 63) // 64,
-            BLOCK_N=_XPU_VEC, DT=DT,
+            C,
+            V,
+            W,
+            T,
+            rows,
+            i,
+            s_cb,
+            s_cm,
+            s_cn,
+            s_vb,
+            s_vm,
+            s_vk,
+            s_wb,
+            s_tb,
+            WCOL=W.shape[2] // 2,
+            CHUNK0=c,
+            NCHUNK=Nchunk,
+            WCH=(Nchunk + 63) // 64,
+            BLOCK_N=_XPU_VEC,
+            DT=DT,
         )
 
 
@@ -582,8 +629,11 @@ def ormqr(input, tau, other, left=True, transpose=False):
         Nchunk = BR // _XPU_VEC
         V_pad_rows = M + 2 * BR
         V_work = torch.zeros(
-            B, V_pad_rows, input_flat.shape[-1],
-            dtype=input.dtype, device=input.device,
+            B,
+            V_pad_rows,
+            input_flat.shape[-1],
+            dtype=input.dtype,
+            device=input.device,
         )
         torch.ops.aten._copy_from(
             input_flat, V_work[:, : input_flat.shape[-2], :], False
@@ -599,9 +649,24 @@ def ormqr(input, tau, other, left=True, transpose=False):
         Wscr = _make_w_scratch(B, N, Nchunk, C.dtype, C.device)
         s_wb = Wscr.stride(0)
         for i in indices:
-            _apply_one(C_t, V_work, tau_flat, Wscr, N, i,
-                       s_cb, s_cm, s_cn, s_vb, s_vm, s_vk, s_wb, s_tb,
-                       Nchunk, DT)
+            _apply_one(
+                C_t,
+                V_work,
+                tau_flat,
+                Wscr,
+                N,
+                i,
+                s_cb,
+                s_cm,
+                s_cn,
+                s_vb,
+                s_vm,
+                s_vk,
+                s_wb,
+                s_tb,
+                Nchunk,
+                DT,
+            )
         res = C_pad[:, :M, :]
         return res.squeeze(0) if two_d else res
     else:
@@ -614,8 +679,11 @@ def ormqr(input, tau, other, left=True, transpose=False):
         V_rows = input_flat.shape[-2]
         V_pad_rows = N + 2 * BR
         V_work = torch.zeros(
-            B, max(V_pad_rows, V_rows), input_flat.shape[-1],
-            dtype=input.dtype, device=input.device,
+            B,
+            max(V_pad_rows, V_rows),
+            input_flat.shape[-1],
+            dtype=input.dtype,
+            device=input.device,
         )
         torch.ops.aten._copy_from(input_flat, V_work[:, :V_rows, :], False)
         V_work = _set_diag(V_work, k)
@@ -626,8 +694,23 @@ def ormqr(input, tau, other, left=True, transpose=False):
         Wscr = _make_w_scratch(B, M, Nchunk, C.dtype, C.device)
         s_wb = Wscr.stride(0)
         for i in indices:
-            _apply_one(C_pad, V_work, tau_flat, Wscr, M, i,
-                       s_cb, s_cm, s_cn, s_vb, s_vm, s_vk, s_wb, s_tb,
-                       Nchunk, DT)
+            _apply_one(
+                C_pad,
+                V_work,
+                tau_flat,
+                Wscr,
+                M,
+                i,
+                s_cb,
+                s_cm,
+                s_cn,
+                s_vb,
+                s_vm,
+                s_vk,
+                s_wb,
+                s_tb,
+                Nchunk,
+                DT,
+            )
         res2 = C_pad[:, :, :N]
         return res2.squeeze(0) if two_d else res2

@@ -166,7 +166,11 @@ def moe_sum(input, output):
         # 极小 N 且 H>1 时 2 次 alloc 的 pad 路径反而不如 direct 快。
         # 注意源必须用未 pad 的 input_work（H 补齐后的 work 行宽与 M*H 错位）。
         n_flat = M * hidden_size
-        if topk == 1 and n_flat <= (1 << 24) and (hidden_size == 1 or n_flat >= (1 << 16)):
+        if (
+            topk == 1
+            and n_flat <= (1 << 24)
+            and (hidden_size == 1 or n_flat >= (1 << 16))
+        ):
             block = 16384
             n_pad = (n_flat + block - 1) // block * block
             if n_pad == n_flat:
@@ -174,16 +178,14 @@ def moe_sum(input, output):
                     input_work.view(-1), out.view(-1), BLOCK=block
                 )
             else:
-                src_w = torch.empty((n_pad,), dtype=input_work.dtype, device=input_work.device)
-                torch.ops.aten._copy_from(
-                    input_work.view(-1), src_w[:n_flat], False
+                src_w = torch.empty(
+                    (n_pad,), dtype=input_work.dtype, device=input_work.device
                 )
+                torch.ops.aten._copy_from(input_work.view(-1), src_w[:n_flat], False)
                 dst_w = torch.empty(
                     (n_pad,), dtype=output_work.dtype, device=output_work.device
                 )
-                _moe_sum_flat_copy_kernel[(n_pad // block,)](
-                    src_w, dst_w, BLOCK=block
-                )
+                _moe_sum_flat_copy_kernel[(n_pad // block,)](src_w, dst_w, BLOCK=block)
                 torch.ops.aten._copy_from(dst_w[:n_flat], out.view(-1), False)
         elif topk <= STATIC_UNROLL:
             block_h = H if H <= 4096 else 4096

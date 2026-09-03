@@ -218,4 +218,3 @@ def median_row_hist_select_kernel(
         below = tl.sum(tl.where(bin_cols < digit, h, 0), axis=0)
         sel_key = (sel_key << 8) | digit.to(sel_key.dtype)
         rank = rank - below
-

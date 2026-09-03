@@ -86,7 +86,9 @@ def roll(inp: torch.Tensor, shifts, dims=None) -> torch.Tensor:
         return _rotate_flat(flat, shift).view(shape)
 
     effective = _effective_shifts(shape, _as_tuple(shifts), _as_tuple(dims), numel == 0)
-    active = [(dim, shift) for dim, shift in enumerate(effective) if shift and shape[dim]]
+    active = [
+        (dim, shift) for dim, shift in enumerate(effective) if shift and shape[dim]
+    ]
 
     if numel == 0 or not active:
         out = torch.empty_like(src)

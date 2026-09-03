@@ -240,8 +240,7 @@ def native_batch_norm_normalize_kernel(
                 tl.store(
                     running_var_pointer + c,
                     (
-                        (1.0 - momentum) * running_var
-                        + momentum * var * var_correction
+                        (1.0 - momentum) * running_var + momentum * var * var_correction
                     ).to(running_var_pointer.dtype.element_ty),
                 )
     else:
