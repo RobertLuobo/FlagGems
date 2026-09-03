@@ -233,9 +233,22 @@ def _launch_pow_scalar_fast(x, out, lnb):
 def pow_scalar(A, exponent):
     logger.debug("GEMS_KUNLUNXIN POW_SCALAR")
     base = float(A)
-    if base > 0.0 and base != 1.0 and math.isfinite(base):
+    # Fast path gating (in addition to the base range check):
+    #  * exponent must be floating-point: int/bool/complex exponents are cast
+    #    to int on store by the exp2 kernel (e.g. 0.001^1 -> 0), and torch
+    #    returns float32 for (float scalar, int tensor) -- keep generic path.
+    #  * output must be allocated with the contiguous layout used by the
+    #    kernel's linear indexing; empty_like(exponent) on a non-contiguous
+    #    view would produce a strided output whose linear writes hit the
+    #    wrong logical elements (silently wrong values).
+    if (
+        base > 0.0
+        and base != 1.0
+        and math.isfinite(base)
+        and exponent.is_floating_point()
+    ):
         x = exponent.contiguous()
-        out = torch.empty_like(exponent)
+        out = torch.empty_like(x)
         _launch_pow_scalar_fast(x, out, math.log(base))
         return out
     return pow_func_scalar_tensor(A, exponent)
