@@ -384,6 +384,7 @@ def sum_dim(inp, dim=None, keepdim=False, *, dtype=None):
 
 def sum_dim_out(inp, dim=None, keepdim=False, *, dtype=None, out):
     logger.debug("GEMS_KUNLUNXIN SUM_DIM_OUT")
+    out_dtype = _resolve_out_dtype(inp.dtype, dtype)
 
     if inp.numel() == 0:
         dims = (

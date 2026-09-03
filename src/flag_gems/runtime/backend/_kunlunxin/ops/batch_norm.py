@@ -509,153 +509,250 @@ def batch_norm_forward_kernel(
             )
 
 
-def batch_norm_heur_block_m(args):
-    return min(64, triton.next_power_of_2(args.get("batch_dim", 0)))
-
-
-def batch_norm_heur_block_n(args):
-    BLOCK_M = batch_norm_heur_block_m(args)
-    BLOCK_N = triton.next_power_of_2(args.get("spatial_dim", 0))
-    return min(BLOCK_N, max(1, 2**14 // BLOCK_M))
+# NOTE (kunlunxin / XPU backward rewrite, 2026-09-03):
+# The previous vendor backward path transposed [N, C, S] -> [N*S, C, 1] (two permuted
+# copies for x and grad) and launched the 2D-tile kernel with grid=(C,). Every program
+# then streamed N*S elements with STRIDE-C discrete gather access (1/C cache-line
+# utilization), and the grid had only C (often 8-16) programs -> 0.0038-0.15 speedup on
+# the benchmark shapes (up to 10 ms on [16, 8, 128, 128]).
+#
+# We now follow the validated forward-path design: keep the natural [N, C, S] layout
+# (no transpose; each (n, c) slice is S CONTIGUOUS elements) and map one program to each
+# (n, c) slice (grid = N*C) for the stats / grad kernels, with a per-channel combine
+# kernel for the batch reduction (chunked when batch_dim > 32, reusing the forward's
+# batch_norm_reduce_partials_kernel). Small per-channel counts (<= BNB_FUSED_MAX_ELEMS)
+# use a single-launch fused kernel (grid=(C,), two streaming passes) that skips the
+# partials round-trip entirely, matching the forward's small-shape crossover.
+#
+# Backward math (train, save_mean/save_invstd given):
+#   pre_lin = (x - mean) * inv_std
+#   term1[c] = sum_{n,s} pre_lin * dy ; term2[c] = sum_{n,s} dy
+#   grad_x = inv_std * weight * (dy - (term1 * pre_lin + term2) / (N*S))
+#   grad_w = term1 ; grad_b = term2
 
 
 @libentry()
-@triton.heuristics(
-    values={
-        "BLOCK_M": batch_norm_heur_block_m,
-        "BLOCK_N": batch_norm_heur_block_n,
-    },
-)
 @triton.jit
-def batch_norm_backward_kernel(
-    output_grad_pointer,
-    input_pointer,
-    mean_pointer,
-    inv_std_pointer,
-    weight_pointer,
+def batch_norm_backward_fused_kernel(
+    grad_pointer,  # [N*C, S] contiguous, flattened
+    input_pointer,  # [N*C, S] contiguous, flattened
+    mean_pointer,  # [C] f32
+    inv_std_pointer,  # [C] f32
+    weight_pointer,  # [C] or unused
     input_grad_pointer,
     weight_grad_pointer,
     bias_grad_pointer,
     batch_dim,
+    feat_dim,
     spatial_dim,
-    output_grad_batch_stride,
-    output_grad_feat_stride,
-    output_grad_spatial_stride,
-    input_batch_stride,
-    input_feat_stride,
-    input_spatial_stride,
-    input_grad_batch_stride,
-    input_grad_feat_stride,
-    input_grad_spatial_stride,
-    input_grad_mask: tl.constexpr,
-    weight_grad_mask: tl.constexpr,
-    bias_grad_mask: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    IG_MASK: tl.constexpr,
+    WG_MASK: tl.constexpr,
+    BG_MASK: tl.constexpr,
+    TILE_S: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
-    feat_pid = tl.program_id(axis=0)
-
-    mean = tl.load(feat_pid + mean_pointer).to(tl.float32)
-    inv_std = tl.load(feat_pid + inv_std_pointer).to(tl.float32)
-
-    term1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    term2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    for m_step in range(0, tl.cdiv(batch_dim, BLOCK_M)):
-        batch_offset = m_step * BLOCK_M + tl.arange(0, BLOCK_M)
-        batch_mask = batch_offset < batch_dim
-
-        for n_step in range(0, tl.cdiv(spatial_dim, BLOCK_N)):
-            spatial_offset = n_step * BLOCK_N + tl.arange(0, BLOCK_N)
-            spatial_mask = spatial_offset < spatial_dim
-
-            curr_output_grad_pointer = (
-                output_grad_pointer
-                + output_grad_feat_stride * feat_pid
-                + output_grad_batch_stride * batch_offset[:, None]
-                + output_grad_spatial_stride * spatial_offset[None, :]
-            )
-            curr_input_pointer = (
-                input_pointer
-                + input_feat_stride * feat_pid
-                + input_batch_stride * batch_offset[:, None]
-                + input_spatial_stride * spatial_offset[None, :]
-            )
-
-            mask = batch_mask[:, None] & spatial_mask[None, :]
-            curr_input = tl.load(curr_input_pointer, mask=mask, other=0).to(tl.float32)
-
-            curr_pre_lin = ((curr_input - mean) * inv_std).to(tl.float32)
-            curr_output_grad = tl.load(
-                curr_output_grad_pointer, mask=mask, other=0.0
-            ).to(tl.float32)
-
-            term1 += curr_pre_lin * curr_output_grad
-            term2 += curr_output_grad
-
-    term1 = tl.sum(term1)
-    term2 = tl.sum(term2)
-
-    if weight_grad_mask:
-        tl.store(feat_pid + weight_grad_pointer, term1)
-    if bias_grad_mask:
-        tl.store(feat_pid + bias_grad_pointer, term2)
-
-    if not input_grad_mask:
-        return
-
-    if weight_pointer:
-        weight = tl.load(feat_pid + weight_pointer).to(tl.float32)
-    else:
-        weight = 1.0
-        weight = weight.to(tl.float32)
-
+    # One program per channel; two streaming passes over the channel's N*S elements
+    # (all contiguous S-runs) so the per-channel reductions land in registers.
+    c = tl.program_id(axis=0)
+    mean = tl.load(mean_pointer + c).to(tl.float32)
+    inv_std = tl.load(inv_std_pointer + c).to(tl.float32)
     count = batch_dim * spatial_dim
 
-    for m_step in range(0, tl.cdiv(batch_dim, BLOCK_M)):
-        for n_step in range(0, tl.cdiv(spatial_dim, BLOCK_N)):
-            batch_offset = m_step * BLOCK_M + tl.arange(0, BLOCK_M)
-            batch_mask = batch_offset < batch_dim
+    t1 = tl.zeros([TILE_S], dtype=tl.float32)
+    t2 = tl.zeros([TILE_S], dtype=tl.float32)
+    for n in range(0, batch_dim):
+        base = (n * feat_dim + c) * spatial_dim
+        for off in range(0, spatial_dim, TILE_S):
+            idx = off + tl.arange(0, TILE_S)
+            if NEED_MASK:
+                mask = idx < spatial_dim
+                x = tl.load(input_pointer + base + idx, mask=mask, other=0.0).to(
+                    tl.float32
+                )
+                dy = tl.load(grad_pointer + base + idx, mask=mask, other=0.0).to(
+                    tl.float32
+                )
+                pre_lin = (x - mean) * inv_std
+                t1 += tl.where(mask, pre_lin * dy, 0.0)
+                t2 += tl.where(mask, dy, 0.0)
+            else:
+                x = tl.load(input_pointer + base + idx).to(tl.float32)
+                dy = tl.load(grad_pointer + base + idx).to(tl.float32)
+                pre_lin = (x - mean) * inv_std
+                t1 += pre_lin * dy
+                t2 += dy
+    term1 = tl.sum(t1)
+    term2 = tl.sum(t2)
+    if WG_MASK:
+        tl.store(weight_grad_pointer + c, term1)
+    if BG_MASK:
+        tl.store(bias_grad_pointer + c, term2)
 
-            spatial_offset = n_step * BLOCK_N + tl.arange(0, BLOCK_N)
-            spatial_mask = spatial_offset < spatial_dim
+    if not IG_MASK:
+        return
 
-            curr_output_grad_pointer = (
-                output_grad_pointer
-                + output_grad_feat_stride * feat_pid
-                + output_grad_batch_stride * batch_offset[:, None]
-                + output_grad_spatial_stride * spatial_offset[None, :]
-            )
-            curr_input_pointer = (
-                input_pointer
-                + input_feat_stride * feat_pid
-                + input_batch_stride * batch_offset[:, None]
-                + input_spatial_stride * spatial_offset[None, :]
-            )
-            curr_input_grad_pointer = (
-                input_grad_pointer
-                + input_grad_feat_stride * feat_pid
-                + input_grad_batch_stride * batch_offset[:, None]
-                + input_grad_spatial_stride * spatial_offset[None, :]
-            )
+    if HAS_WEIGHT:
+        weight = tl.load(weight_pointer + c).to(tl.float32)
+    else:
+        weight = 1.0
+    scale = inv_std * weight
+    rcp = 1.0 / count
+    for n in range(0, batch_dim):
+        base = (n * feat_dim + c) * spatial_dim
+        for off in range(0, spatial_dim, TILE_S):
+            idx = off + tl.arange(0, TILE_S)
+            if NEED_MASK:
+                mask = idx < spatial_dim
+                x = tl.load(input_pointer + base + idx, mask=mask).to(tl.float32)
+                dy = tl.load(grad_pointer + base + idx, mask=mask).to(tl.float32)
+                pre_lin = (x - mean) * inv_std
+                g = scale * (dy - (term1 * pre_lin + term2) * rcp)
+                tl.store(
+                    input_grad_pointer + base + idx,
+                    g.to(input_grad_pointer.dtype.element_ty),
+                    mask=mask,
+                )
+            else:
+                x = tl.load(input_pointer + base + idx).to(tl.float32)
+                dy = tl.load(grad_pointer + base + idx).to(tl.float32)
+                pre_lin = (x - mean) * inv_std
+                g = scale * (dy - (term1 * pre_lin + term2) * rcp)
+                tl.store(
+                    input_grad_pointer + base + idx,
+                    g.to(input_grad_pointer.dtype.element_ty),
+                )
 
-            curr_input = tl.load(
-                curr_input_pointer, mask=batch_mask[:, None] & spatial_mask[None, :]
-            ).to(tl.float32)
-            curr_pre_lin = (curr_input - mean) * inv_std
-            curr_output_grad = tl.load(
-                curr_output_grad_pointer,
-                mask=batch_mask[:, None] & spatial_mask[None, :],
-            ).to(tl.float32)
-            curr_input_grad = (
-                inv_std
-                * weight
-                * (curr_output_grad - (term1 * curr_pre_lin + term2) / count)
-            )
+
+@libentry()
+@triton.jit
+def batch_norm_backward_stats_kernel(
+    grad_pointer,  # [N*C, S] contiguous, flattened
+    input_pointer,  # [N*C, S] contiguous, flattened
+    mean_pointer,  # [C] f32
+    inv_std_pointer,  # [C] f32
+    part_t1_pointer,  # [N*C] f32 out
+    part_t2_pointer,  # [N*C] f32 out
+    feat_dim,
+    spatial_dim,
+    TILE_S: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    # One program per (n, c) slice: contiguous S-run, partial (t1, t2) for the slice.
+    pid = tl.program_id(axis=0)
+    c = pid % feat_dim
+    base = pid * spatial_dim
+    mean = tl.load(mean_pointer + c).to(tl.float32)
+    inv_std = tl.load(inv_std_pointer + c).to(tl.float32)
+
+    t1 = tl.zeros([TILE_S], dtype=tl.float32)
+    t2 = tl.zeros([TILE_S], dtype=tl.float32)
+    for off in range(0, spatial_dim, TILE_S):
+        idx = off + tl.arange(0, TILE_S)
+        if NEED_MASK:
+            mask = idx < spatial_dim
+            x = tl.load(input_pointer + base + idx, mask=mask, other=0.0).to(tl.float32)
+            dy = tl.load(grad_pointer + base + idx, mask=mask, other=0.0).to(tl.float32)
+            pre_lin = (x - mean) * inv_std
+            t1 += tl.where(mask, pre_lin * dy, 0.0)
+            t2 += tl.where(mask, dy, 0.0)
+        else:
+            x = tl.load(input_pointer + base + idx).to(tl.float32)
+            dy = tl.load(grad_pointer + base + idx).to(tl.float32)
+            pre_lin = (x - mean) * inv_std
+            t1 += pre_lin * dy
+            t2 += dy
+    tl.store(part_t1_pointer + pid, tl.sum(t1))
+    tl.store(part_t2_pointer + pid, tl.sum(t2))
+
+
+@libentry()
+@triton.jit
+def batch_norm_backward_combine_kernel(
+    part_t1_pointer,  # [B, C] f32 row-major partials
+    part_t2_pointer,  # [B, C] f32 row-major partials
+    term1_pointer,  # [C] f32 out
+    term2_pointer,  # [C] f32 out
+    weight_grad_pointer,  # [C] out (input dtype), or unused
+    bias_grad_pointer,  # [C] out (input dtype), or unused
+    batch_dim,
+    feat_dim,
+    WG_MASK: tl.constexpr,
+    BG_MASK: tl.constexpr,
+    TILE_N: tl.constexpr,
+):
+    # One program per channel; reduce the batch partials (strided by feat_dim).
+    # The per-channel terms are published to weight/bias grads here (cast to the
+    # output dtype) so the wrapper needs no extra copy launches.
+    c = tl.program_id(axis=0)
+    idx = tl.arange(0, TILE_N)
+    mask = idx < batch_dim
+    offs = idx * feat_dim + c
+    t1 = tl.load(part_t1_pointer + offs, mask=mask, other=0.0)
+    t2 = tl.load(part_t2_pointer + offs, mask=mask, other=0.0)
+    s1 = tl.sum(t1)
+    s2 = tl.sum(t2)
+    tl.store(term1_pointer + c, s1)
+    tl.store(term2_pointer + c, s2)
+    if WG_MASK:
+        tl.store(weight_grad_pointer + c, s1.to(weight_grad_pointer.dtype.element_ty))
+    if BG_MASK:
+        tl.store(bias_grad_pointer + c, s2.to(bias_grad_pointer.dtype.element_ty))
+
+
+@libentry()
+@triton.jit
+def batch_norm_backward_grad_kernel(
+    grad_pointer,  # [N*C, S] contiguous, flattened
+    input_pointer,  # [N*C, S] contiguous, flattened
+    mean_pointer,  # [C] f32
+    inv_std_pointer,  # [C] f32
+    term1_pointer,  # [C] f32
+    term2_pointer,  # [C] f32
+    weight_pointer,  # [C] or unused
+    input_grad_pointer,
+    feat_dim,
+    spatial_dim,
+    count,
+    HAS_WEIGHT: tl.constexpr,
+    TILE_S: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    # One program per (n, c) slice: contiguous S-run, apply the channel terms.
+    pid = tl.program_id(axis=0)
+    c = pid % feat_dim
+    base = pid * spatial_dim
+    mean = tl.load(mean_pointer + c).to(tl.float32)
+    inv_std = tl.load(inv_std_pointer + c).to(tl.float32)
+    term1 = tl.load(term1_pointer + c)
+    term2 = tl.load(term2_pointer + c)
+    if HAS_WEIGHT:
+        weight = tl.load(weight_pointer + c).to(tl.float32)
+    else:
+        weight = 1.0
+    scale = inv_std * weight
+    rcp = 1.0 / count
+    for off in range(0, spatial_dim, TILE_S):
+        idx = off + tl.arange(0, TILE_S)
+        if NEED_MASK:
+            mask = idx < spatial_dim
+            x = tl.load(input_pointer + base + idx, mask=mask).to(tl.float32)
+            dy = tl.load(grad_pointer + base + idx, mask=mask).to(tl.float32)
+            pre_lin = (x - mean) * inv_std
+            g = scale * (dy - (term1 * pre_lin + term2) * rcp)
             tl.store(
-                curr_input_grad_pointer,
-                curr_input_grad,
-                mask=batch_mask[:, None] & spatial_mask[None, :],
+                input_grad_pointer + base + idx,
+                g.to(input_grad_pointer.dtype.element_ty),
+                mask=mask,
+            )
+        else:
+            x = tl.load(input_pointer + base + idx).to(tl.float32)
+            dy = tl.load(grad_pointer + base + idx).to(tl.float32)
+            pre_lin = (x - mean) * inv_std
+            g = scale * (dy - (term1 * pre_lin + term2) * rcp)
+            tl.store(
+                input_grad_pointer + base + idx,
+                g.to(input_grad_pointer.dtype.element_ty),
             )
 
 
@@ -984,6 +1081,12 @@ def batch_norm(
     return output.view_as(input), mean, inv_std
 
 
+# Per-channel element-count (batch_dim * spatial_dim) at/below which the single-launch
+# fused backward kernel (2 streaming passes, grid=(C,)) beats the 3-stage path (stats +
+# combine + grad, 3 launches). Matches the forward's BN_FUSED_TRAIN_MAX_ELEMS crossover.
+BNB_FUSED_MAX_ELEMS = 2048
+
+
 def batch_norm_backward(
     grad_out,
     input,
@@ -997,16 +1100,18 @@ def batch_norm_backward(
     output_mask=None,
 ):
     logger.debug("GEMS_KUNLUNXIN BATCH_NORM_BACKWARD")
-    input_3d_i = make_3d_for_bn(input)
-    m, n, k = input_3d_i.shape
-    input_3d_f = input_3d_i.permute(0, 2, 1).reshape(-1, n)
-    input_3d = make_3d_for_bn(input_3d_f)
-
-    output_grad_3d_i = make_3d_for_bn(grad_out)
-    output_grad_3d_f = output_grad_3d_i.permute(0, 2, 1).reshape(-1, n)
-    output_grad_3d = make_3d_for_bn(output_grad_3d_f)
+    # Natural [N, C, S] layout: NO transpose (the old vendor path paid two permuted
+    # copies + stride-C discrete gathers). Each (n, c) slice is S contiguous elements.
+    input_3d = make_3d_for_bn(input)  # [N, C, S]
+    grad_3d = make_3d_for_bn(grad_out)  # [N, C, S]
+    if not input_3d.is_contiguous():
+        input_3d = input_3d.contiguous()
+    if not grad_3d.is_contiguous():
+        grad_3d = grad_3d.contiguous()
 
     batch_dim, feat_dim, spatial_dim = input_3d.shape
+    n_slices = batch_dim * feat_dim
+    count = batch_dim * spatial_dim
 
     if output_mask[0]:
         input_grad = torch.empty_like(input_3d)
@@ -1021,27 +1126,158 @@ def batch_norm_backward(
     else:
         bias_grad = None
 
-    with torch_device_fn.device(input.device):
-        batch_norm_backward_kernel[(feat_dim, 1, 1)](
-            output_grad_3d,
-            input_3d,
-            save_mean,
-            save_invstd,
-            weight,
-            input_grad,
+    if n_slices == 0 or count == 0:
+        # Match torch: empty reductions yield 0-filled weight/bias grads.
+        if weight_grad is not None:
+            weight_grad.zero_()
+        if bias_grad is not None:
+            bias_grad.zero_()
+        return (
+            input_grad.view_as(input) if input_grad is not None else input_grad,
             weight_grad,
             bias_grad,
-            batch_dim,
-            spatial_dim,
-            *output_grad_3d.stride(),
-            *input_3d.stride(),
-            *input_grad.stride(),
-            *output_mask,
-            buffer_size_limit=2048,
         )
 
+    input_flat = input_3d.reshape(-1)
+    grad_flat = grad_3d.reshape(-1)
+    has_weight = weight is not None
+
+    if count <= BNB_FUSED_MAX_ELEMS:
+        # Small per-channel count: single launch, grid=(C,), two streaming passes.
+        with torch_device_fn.device(input.device):
+            batch_norm_backward_fused_kernel[(feat_dim,)](
+                grad_flat,
+                input_flat,
+                save_mean,
+                save_invstd,
+                weight if has_weight else input_flat,
+                input_grad if output_mask[0] else grad_flat,
+                weight_grad if output_mask[1] else grad_flat,
+                bias_grad if output_mask[2] else grad_flat,
+                batch_dim,
+                feat_dim,
+                spatial_dim,
+                HAS_WEIGHT=has_weight,
+                IG_MASK=output_mask[0],
+                WG_MASK=output_mask[1],
+                BG_MASK=output_mask[2],
+                TILE_S=128,
+                NEED_MASK=(spatial_dim % 128) != 0,
+                num_warps=4,
+                buffer_size_limit=2048,
+                isCloseVectorization=True,
+            )
+    else:
+        # Stage 1: per-(n, c) partial (term1, term2) over the contiguous spatial run.
+        tile_s, need_mask = _bn_train_tile_s(spatial_dim)
+        partial_batch_dim = (
+            triton.cdiv(batch_dim, 32) * 32 if batch_dim > 32 else batch_dim
+        )
+        if batch_dim > 32:
+            part_t1 = torch.zeros(
+                partial_batch_dim * feat_dim, device=input.device, dtype=torch.float32
+            )
+            part_t2 = torch.zeros_like(part_t1)
+        else:
+            part_t1 = torch.empty(
+                partial_batch_dim * feat_dim, device=input.device, dtype=torch.float32
+            )
+            part_t2 = torch.empty_like(part_t1)
+        term1 = torch.empty(feat_dim, device=input.device, dtype=torch.float32)
+        term2 = torch.empty(feat_dim, device=input.device, dtype=torch.float32)
+        with torch_device_fn.device(input.device):
+            max_programs = 4096
+            for slice_offset in range(0, n_slices, max_programs):
+                slice_count = min(max_programs, n_slices - slice_offset)
+                batch_norm_backward_stats_kernel[(slice_count,)](
+                    grad_flat[slice_offset * spatial_dim :],
+                    input_flat[slice_offset * spatial_dim :],
+                    save_mean,
+                    save_invstd,
+                    part_t1[slice_offset:],
+                    part_t2[slice_offset:],
+                    feat_dim,
+                    spatial_dim,
+                    TILE_S=tile_s,
+                    NEED_MASK=need_mask,
+                    num_warps=4,
+                    buffer_size_limit=2048,
+                    isCloseVectorization=True,
+                )
+            # Stage 2: reduce the batch partials -> per-channel term1 / term2.
+            combine_t1 = part_t1
+            combine_t2 = part_t2
+            combine_batch_dim = partial_batch_dim
+            while combine_batch_dim > 32:
+                reduced_batch_dim = triton.cdiv(combine_batch_dim, 32)
+                if reduced_batch_dim > 32:
+                    storage_batch_dim = triton.cdiv(reduced_batch_dim, 32) * 32
+                else:
+                    storage_batch_dim = triton.next_power_of_2(reduced_batch_dim)
+                reduced_t1 = torch.zeros(
+                    storage_batch_dim * feat_dim,
+                    device=input.device,
+                    dtype=torch.float32,
+                )
+                reduced_t2 = torch.zeros_like(reduced_t1)
+                batch_norm_reduce_partials_kernel[(reduced_batch_dim * feat_dim,)](
+                    combine_t1,
+                    combine_t2,
+                    reduced_t1,
+                    reduced_t2,
+                    combine_batch_dim,
+                    feat_dim,
+                    TILE_N=32,
+                    num_warps=4,
+                    buffer_size_limit=2048,
+                    isCloseVectorization=True,
+                )
+                combine_t1 = reduced_t1
+                combine_t2 = reduced_t2
+                combine_batch_dim = storage_batch_dim
+            batch_norm_backward_combine_kernel[(feat_dim,)](
+                combine_t1,
+                combine_t2,
+                term1,
+                term2,
+                weight_grad if output_mask[1] else combine_t1,
+                bias_grad if output_mask[2] else combine_t2,
+                combine_batch_dim,
+                feat_dim,
+                WG_MASK=output_mask[1],
+                BG_MASK=output_mask[2],
+                TILE_N=triton.next_power_of_2(combine_batch_dim),
+                num_warps=4,
+                buffer_size_limit=2048,
+                isCloseVectorization=True,
+            )
+            # Stage 3: per-(n, c) slice grad computation.
+            if output_mask[0]:
+                input_grad_flat = input_grad.reshape(-1)
+                for slice_offset in range(0, n_slices, max_programs):
+                    slice_count = min(max_programs, n_slices - slice_offset)
+                    batch_norm_backward_grad_kernel[(slice_count,)](
+                        grad_flat[slice_offset * spatial_dim :],
+                        input_flat[slice_offset * spatial_dim :],
+                        save_mean,
+                        save_invstd,
+                        term1,
+                        term2,
+                        weight if has_weight else input_flat,
+                        input_grad_flat[slice_offset * spatial_dim :],
+                        feat_dim,
+                        spatial_dim,
+                        count,
+                        HAS_WEIGHT=has_weight,
+                        TILE_S=tile_s,
+                        NEED_MASK=need_mask,
+                        num_warps=4,
+                        buffer_size_limit=2048,
+                        isCloseVectorization=True,
+                    )
+
     return (
-        input_grad.reshape(m, k, n).permute(0, 2, 1).view_as(input),
+        input_grad.view_as(input) if input_grad is not None else input_grad,
         weight_grad,
         bias_grad,
     )

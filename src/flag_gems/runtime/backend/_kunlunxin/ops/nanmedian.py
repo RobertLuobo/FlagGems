@@ -665,6 +665,7 @@ def median_count_chunk_kernel(
     pid = ext.program_id(0)
     chunk = pid % NCHUNK
     cols = tl.arange(0, CHUNK)
+    offsets = chunk * CHUNK + cols
     keys_v = tl.load(keys + pid * CHUNK + cols)
     mid_v = tl.load(mid + pid // NCHUNK)
     le = tl.sum((keys_v <= mid_v).to(tl.int32), axis=0)
@@ -749,6 +750,7 @@ def median_select_chunk_kernel(
     pid = ext.program_id(0)
     chunk = pid % NCHUNK
     cols = tl.arange(0, CHUNK)
+    offsets = chunk * CHUNK + cols
     sel = tl.load(sel_keys + pid // NCHUNK)
     keys_v = tl.load(keybuf + pid * CHUNK + cols)
     km = keys_v == sel
@@ -1041,7 +1043,7 @@ def _nanmedian_flat_chunked(flat, N, key_bits):
         lo_h = [_u64_of(lo, r) for r in range(M)]
         hi_h = [_u64_of(hi, r) for r in range(M)]
         for _ in range(key_bits + 6):
-            mid_h = [(lo + hi) // 2 for lo, hi in zip(lo_h, hi_h)]
+            mid_h = [(l + h) // 2 for l, h in zip(lo_h, hi_h)]
             if key_bits == 64:
                 mid_h = [m & 0xFFFFFFFFFFFFFFFF for m in mid_h]
             for r in range(M):

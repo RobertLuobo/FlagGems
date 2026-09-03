@@ -31,8 +31,10 @@ logger = logging.getLogger(__name__)
 #    2048, no kunlunAutoGrid, no unroll) -> BLOCK=512 1d tile, underutilized
 #    bandwidth. This reuses the proven memory-bound select/copy recipe shared
 #    by neg / view_copy / masked_fill (autoGrid + unroll8 + buffer 4096).
-#    Config sweep confirmed unroll16/buffer8192 and isCloseVectorization=True
-#    give no further gain on this kernel.
+#    Config sweep confirmed unroll16/buffer8192 give no further gain;
+#    isCloseVectorization=True is kept ON because on this body the xpufp
+#    vectorized int-compare path scalarizes anyway and the store spills —
+#    fully scalar loads (closevec) measure ~1.7x faster.
 #
 # 2. NaN detection: `_isnan(x.to(tl.float32))` (extern libdevice call) is the
 #    dominant cost on XPU — extern_elementwise lowers to a scalar/throughput-
@@ -55,7 +57,7 @@ config_ = CodeGenConfig(
     True,
     prefer_1d_tile=True,
     buffer_size_limit=4096,
-    isCloseVectorization=False,
+    isCloseVectorization=True,
     kunlunAutoGrid=True,
     unroll_num=8,
 )
@@ -91,3 +93,16 @@ def nan_to_num(A, nan=None, posinf=None, neginf=None):
     if nan is None:
         nan = 0.0
     return nan_to_num_func(A, nan, posinf, neginf)
+
+
+# nan_to_num_(Tensor self, float? nan=None, float? posinf=None, float? neginf=None) -> Tensor
+# In-place variant: same fast kernel, writing back into A (out0=A).
+def nan_to_num_(A, nan=None, posinf=None, neginf=None):
+    logger.debug("GEMS_KUNLUNXIN NAN_TO_NUM_")
+    if posinf is None:
+        posinf = torch.finfo(A.dtype).max
+    if neginf is None:
+        neginf = torch.finfo(A.dtype).min
+    if nan is None:
+        nan = 0.0
+    return nan_to_num_func(A, nan, posinf, neginf, out0=A)

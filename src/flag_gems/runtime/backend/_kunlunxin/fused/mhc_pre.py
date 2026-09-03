@@ -61,6 +61,7 @@ import torch
 import triton
 import triton.language as tl
 
+import flag_gems.fused.mhc.mhc_pre as _general_module
 from flag_gems.fused.mhc.mhc_pre import mhc_pre as _general_mhc_pre
 
 logger = logging.getLogger(__name__)
