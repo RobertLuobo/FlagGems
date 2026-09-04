@@ -50,6 +50,12 @@
 # Upper-triangular solves are reduced to lower solves on the host by flipping
 # rows and columns of A and B (P A P lower when A upper); the kernel only
 # implements the lower substitution.
+#
+# For fp32 with n >= 2 the solve is dispatched to a blocked tl.dot sweep
+# (see _solve_tri_dot below): the one-CTA serial substitution above is
+# O(n^3) launches-bound and ~30x slower than torch at n=512; the dot sweep
+# uses the Neumann factorization of the unit triangular factor and was
+# measured at 0.8x-1.5x torch on every benchmark shape.
 
 import logging
 
@@ -273,6 +279,394 @@ def _trsm_diag_xpu_kernel(
         tl.store(B_ptr + bbase + row * csb + cc, acc, mask=cm)
 
 
+# ---------------------------------------------------------------------------
+# Dot-based Neumann sweep (fp32, n >= 2; see the module comment above).
+#
+# A = D (I + M) with M = D^-1 (A - D) the strictly-triangular part, nilpotent
+# (M^k = 0 for k >= BSB).  Because
+#     (I - M)(I + M)(I + M^2)(I + M^4)...(I + M^(2^(NF-1))) = I - M^(2^NF)
+# and 2^NF >= BSB, the inverse of an BSB x BSB diagonal block is
+#     A_blk^-1 = (I - M)(I + M^2)(I + M^4)...(I + M^(2^(NF-1))) D^-1.
+# Per diagonal block j the host launches, in order:
+#   launch 1  _trsm_m_square_kernel : M[k] = (D^-1 A_blk - I)^(2^k), k=0..NST-1
+#   launch 2  _trsm_m_apply_kernel  : x_j = (prod of factors) (D^-1 B_blk)
+#   launch 3  _trsm_window_dot_kernel: B[r] -= A[r, j] x_j for every r > j
+#             (one (r, k-slice) CTA per dot; (r, s) writes are disjoint =>
+#              no RMW race).  x_j is read-only there: it was produced by
+#              launch 2 in an earlier, host-ordered launch.
+# The B column count is padded to a multiple of KS and the ragged tail block
+# (n % BSB != 0) is loaded with masks, so every tile is exactly BSB x KS - the
+# host pays no padding allocation (a torch.zeros+eye pad measured ~70us/call).
+# ---------------------------------------------------------------------------
+
+
+@libentry()
+@triton.jit
+def _trsm_m_square_kernel(
+    A_ptr,
+    M_ptr,
+    N,
+    R0,
+    rsa,
+    msa,
+    msa_b,
+    BSB: tl.constexpr,
+    NST: tl.constexpr,
+    UPPER: tl.constexpr,
+    UNIT: tl.constexpr,
+    PAD: tl.constexpr,
+):
+    """M[k] = (D^-1 A_blk - I)^(2^k) for k = 0..NST-1 (M[0] = strict triangle)."""
+    pid = tl.program_id(0)
+    abase = pid * N * rsa
+    mbase = pid * msa_b
+    rows = tl.arange(0, BSB)
+    t = R0 + rows
+    if PAD:
+        rm = t < N
+        a_blk = tl.load(A_ptr + abase + t[:, None] * rsa + t[None, :],
+                        mask=rm[:, None] & rm[None, :], other=0.0)
+        diag = tl.load(A_ptr + abase + t * rsa + t, mask=rm, other=1.0)
+    else:
+        a_blk = tl.load(A_ptr + abase + t[:, None] * rsa + t[None, :])
+        diag = tl.load(A_ptr + abase + t * rsa + t)
+    if not UNIT:
+        d_inv = (1.0 / diag)[:, None]
+    else:
+        d_inv = tl.full((BSB, 1), 1.0, dtype=a_blk.dtype)
+    if UPPER:
+        Mk = tl.where(rows[:, None] < rows[None, :], a_blk * d_inv, 0.0)
+    else:
+        Mk = tl.where(rows[:, None] > rows[None, :], a_blk * d_inv, 0.0)
+    for k in tl.static_range(NST):
+        tl.store(M_ptr + mbase + k * msa + rows[:, None] * BSB + rows[None, :], Mk)
+        if k < NST - 1:
+            Mk = tl.dot(Mk, Mk, input_precision="ieee")
+
+
+@libentry()
+@triton.jit
+def _trsm_m_apply_kernel(
+    A_ptr,
+    M_ptr,
+    B_ptr,
+    N,
+    R0,
+    rsa,
+    csb,
+    msa,
+    msa_b,
+    NS: tl.constexpr,
+    KS: tl.constexpr,
+    BSB: tl.constexpr,
+    UPPER: tl.constexpr,
+    UNIT: tl.constexpr,
+    NF: tl.constexpr,
+    K0: tl.constexpr,
+    PAD: tl.constexpr,
+):
+    """x = (I-M)(I+M^2)...(I+M^(2^(NF-1))) (D^-1 B_blk), factors K0..K0+NF-1.
+
+    The factor for k == 0 is (I - M), all others are (I + M^(2^k)); with
+    K0 > 0 the kernel applies the tail factors only (``q`` enters already
+    scaled by D^-1 since the K0 == 0 launch stored its result back to B).
+    """
+    pid = tl.program_id(0)
+    sidx = pid % NS
+    bidx = pid // NS
+    abase = bidx * N * rsa
+    bbase = bidx * N * csb + sidx * KS
+    mbase = bidx * msa_b
+    rows = tl.arange(0, BSB)
+    cn = tl.arange(0, KS)
+    t = R0 + rows
+    if PAD:
+        rm = t < N
+        b = tl.load(B_ptr + bbase + t[:, None] * csb + cn[None, :],
+                    mask=rm[:, None], other=0.0)
+    else:
+        b = tl.load(B_ptr + bbase + t[:, None] * csb + cn[None, :])
+    if K0 == 0:
+        if not UNIT:
+            if PAD:
+                diag = tl.load(A_ptr + abase + t * rsa + t, mask=rm, other=1.0)
+            else:
+                diag = tl.load(A_ptr + abase + t * rsa + t)
+            d_inv = (1.0 / diag)[:, None]
+        else:
+            d_inv = tl.full((BSB, 1), 1.0, dtype=B_ptr.dtype.element_ty)
+        q = b * d_inv
+    else:
+        q = b
+    for k in tl.static_range(K0, K0 + NF):
+        Mk = tl.load(M_ptr + mbase + k * msa + rows[:, None] * BSB + rows[None, :])
+        d = tl.where(k == 0, -1.0, 1.0)
+        q = q + d * tl.dot(Mk, q, input_precision="ieee")
+    if PAD:
+        tl.store(B_ptr + bbase + t[:, None] * csb + cn[None, :], q, mask=rm[:, None])
+    else:
+        tl.store(B_ptr + bbase + t[:, None] * csb + cn[None, :], q)
+
+
+@libentry()
+@triton.jit
+def _trsm_window_dot_kernel(
+    A_ptr,
+    B_ptr,
+    N,
+    J0,
+    rsa,
+    csb,
+    WN: tl.constexpr,
+    NS: tl.constexpr,
+    KS: tl.constexpr,
+    BSB: tl.constexpr,
+    UPPER: tl.constexpr,
+    PAD: tl.constexpr,
+):
+    """B[block J0+1+c] -= A[block J0+1+c, block J0] @ X[block J0], c = 0..WN-1.
+
+    One CTA per (window row, k-slice) pair; the writes go to disjoint
+    (block, slice) pairs so there is no read-modify-write race.
+    """
+    pid = tl.program_id(0)
+    sidx = pid % NS
+    c = (pid // NS) % WN
+    bidx = pid // (NS * WN)
+    abase = bidx * N * rsa
+    bbase = bidx * N * csb + sidx * KS
+    cn = tl.arange(0, KS)
+    if UPPER:
+        mrow = N - (J0 + c + 2) * BSB + tl.arange(0, BSB)
+        mcol = N - (J0 + 1) * BSB + tl.arange(0, BSB)
+    else:
+        mrow = (J0 + 1 + c) * BSB + tl.arange(0, BSB)
+        mcol = J0 * BSB + tl.arange(0, BSB)
+    if PAD:
+        rmr = (mrow >= 0) & (mrow < N)
+        rmc = (mcol >= 0) & (mcol < N)
+        a = tl.load(A_ptr + abase + mrow[:, None] * rsa + mcol[None, :],
+                    mask=rmr[:, None] & rmc[None, :], other=0.0)
+        x = tl.load(B_ptr + bbase + mcol[:, None] * csb + cn[None, :],
+                    mask=rmc[:, None], other=0.0)
+        b = tl.load(B_ptr + bbase + mrow[:, None] * csb + cn[None, :],
+                    mask=rmr[:, None], other=0.0)
+    else:
+        a = tl.load(A_ptr + abase + mrow[:, None] * rsa + mcol[None, :])
+        x = tl.load(B_ptr + bbase + mcol[:, None] * csb + cn[None, :])
+        b = tl.load(B_ptr + bbase + mrow[:, None] * csb + cn[None, :])
+    acc = tl.dot(a, x, input_precision="ieee")
+    tl.store(B_ptr + bbase + mrow[:, None] * csb + cn[None, :], b - acc)
+
+
+def _solve_tri_serial(A_view, B_view, unitriangular, upper, n, k, batch, orig_shape):
+    """Two-phase serial substitution (fp32): the pre-dot-sweep production path.
+
+    Kept as the fallback for shapes the dot sweep cannot handle (see
+    _solve_tri_dot) and as reference.
+    """
+    kpad = ((k + KS_SLICE - 1) // KS_SLICE) * KS_SLICE
+    nslices = kpad // KS_SLICE
+    rsa = A_view.stride(1)
+    if kpad == k:
+        Bp = B_view.clone()
+    else:
+        Bp = torch.zeros((batch, n, kpad), dtype=A_view.dtype, device=A_view.device)
+        torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
+    br = _pick_block_rows(n)
+    if br:
+        for r0 in range(0, n, br):
+            if r0:
+                _trsm_update_xpu_kernel[(batch * br * nslices,)](
+                    A_view,
+                    Bp,
+                    n,
+                    kpad,
+                    r0,
+                    rsa,
+                    kpad,
+                    KS=KS_SLICE,
+                    NS=nslices,
+                    BR=br,
+                    UPPER=bool(upper),
+                    num_warps=4,
+                )
+            _trsm_diag_xpu_kernel[(batch * nslices,)](
+                A_view,
+                Bp,
+                n,
+                kpad,
+                r0,
+                rsa,
+                kpad,
+                KS=KS_SLICE,
+                NS=nslices,
+                BR=br,
+                UPPER=bool(upper),
+                UNIT=bool(unitriangular),
+                num_warps=4,
+            )
+    else:
+        _trsm_slice_xpu_kernel[(batch * nslices,)](
+            A_view,
+            Bp,
+            A_view,
+            A_view,
+            Bp,
+            Bp,
+            n,
+            kpad,
+            rsa,
+            kpad,
+            F64=False,
+            UNIT=bool(unitriangular),
+            KS=KS_SLICE,
+            UPPER=bool(upper),
+            NS=nslices,
+            num_warps=4,
+        )
+    return Bp[:, :, :k].reshape(orig_shape)
+
+
+def _solve_tri_dot(A_view, B_view, unitriangular, upper, n, k, batch, orig_shape):
+    """Blocked Neumann-sweep solve (fp32, n >= 2).
+
+    ``bs`` (and hence the number of stored M powers) is 32 for n <= 32 and 64
+    otherwise; the RHS slice width is 32 for k <= 32 (16 for k <= 16) so a
+    16-column RHS never triggers a host-side column padding.
+
+    Every block except possibly the last (in sweep order) is full-size, and
+    for exact n multiples of ``bs`` every block is full-size.  A ragged
+    UPPER sweep would need a tile shifted to negative row offsets, and XPU
+    masked loads do not protect against negative offsets (they read adjacent
+    memory - measured), so such shapes fall back to _solve_tri_serial.
+    """
+    bs = 32 if n <= 32 else 64
+    if n % bs != 0 and (n + bs - 1) // bs > 1:
+        return _solve_tri_serial(
+            A_view, B_view, unitriangular, upper, n, k, batch, orig_shape
+        )
+    nst = 5 if bs == 32 else 6
+    ks = 64 if k > 32 else (32 if k > 16 else 16)
+    kpad = ((k + ks - 1) // ks) * ks
+    nslices = kpad // ks
+    device = A_view.device
+    dtype = A_view.dtype
+    if kpad == k:
+        Bp = B_view.clone()
+    else:
+        Bp = torch.zeros((batch, n, kpad), dtype=dtype, device=device)
+        torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
+    rsa = A_view.stride(1)
+    csb = kpad
+    nb = (n + bs - 1) // bs
+    pad = (n % bs != 0)
+    # one slot per stored power (max nst <= 6); Ms is a per-batch scratch
+    Ms = torch.empty((batch, 6, bs, bs), dtype=dtype, device=device)
+    msa = bs * bs
+    msa_b = 6 * msa
+    for j in range(nb):
+        R0 = (n - (j + 1) * bs) if upper else j * bs
+        if R0 < 0:
+            R0 = 0
+        _trsm_m_square_kernel[(batch,)](
+            A_view,
+            Ms,
+            n,
+            R0,
+            rsa,
+            msa,
+            msa_b,
+            BSB=bs,
+            NST=nst,
+            UPPER=bool(upper),
+            UNIT=bool(unitriangular),
+            PAD=bool(pad),
+            num_warps=8,
+        )
+        if nst <= 5:
+            _trsm_m_apply_kernel[(batch * nslices,)](
+                A_view,
+                Ms,
+                Bp,
+                n,
+                R0,
+                rsa,
+                csb,
+                msa,
+                msa_b,
+                NS=nslices,
+                KS=ks,
+                BSB=bs,
+                UPPER=bool(upper),
+                UNIT=bool(unitriangular),
+                NF=nst,
+                K0=0,
+                PAD=bool(pad),
+                num_warps=8,
+            )
+        else:
+            # bs=64: 6 static dot sites in one kernel fail the XPU pipeliner;
+            # apply (M^0..M^2) and (M^3..M^5) in two launches.
+            _trsm_m_apply_kernel[(batch * nslices,)](
+                A_view,
+                Ms,
+                Bp,
+                n,
+                R0,
+                rsa,
+                csb,
+                msa,
+                msa_b,
+                NS=nslices,
+                KS=ks,
+                BSB=bs,
+                UPPER=bool(upper),
+                UNIT=bool(unitriangular),
+                NF=3,
+                K0=0,
+                PAD=bool(pad),
+                num_warps=8,
+            )
+            _trsm_m_apply_kernel[(batch * nslices,)](
+                A_view,
+                Ms,
+                Bp,
+                n,
+                R0,
+                rsa,
+                csb,
+                msa,
+                msa_b,
+                NS=nslices,
+                KS=ks,
+                BSB=bs,
+                UPPER=bool(upper),
+                UNIT=bool(unitriangular),
+                NF=3,
+                K0=3,
+                PAD=bool(pad),
+                num_warps=8,
+            )
+        if j + 1 < nb:
+            _trsm_window_dot_kernel[(batch * (nb - 1 - j) * nslices,)](
+                A_view,
+                Bp,
+                n,
+                j,
+                rsa,
+                csb,
+                WN=nb - 1 - j,
+                NS=nslices,
+                KS=ks,
+                BSB=bs,
+                UPPER=bool(upper),
+                PAD=bool(pad),
+                num_warps=8,
+            )
+    return Bp[:, :, :k].reshape(orig_shape)
+
+
 def _pick_block_rows(n):
     """Row-block size for the two-phase sweep, or 0 to keep the single sweep.
 
@@ -356,64 +750,11 @@ def _solve_tri(A, B, unitriangular, upper):
             orig_shape
         )
     else:
-        if kpad == k:
-            Bp = B_view.clone()
-        else:
-            Bp = torch.zeros((batch, n, kpad), dtype=A.dtype, device=A.device)
-            torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
-        br = _pick_block_rows(n)
-        if br:
-            for r0 in range(0, n, br):
-                if r0:
-                    _trsm_update_xpu_kernel[(batch * br * nslices,)](
-                        A_view,
-                        Bp,
-                        n,
-                        kpad,
-                        r0,
-                        rsa,
-                        kpad,
-                        KS=KS_SLICE,
-                        NS=nslices,
-                        BR=br,
-                        UPPER=bool(upper),
-                        num_warps=4,
-                    )
-                _trsm_diag_xpu_kernel[(batch * nslices,)](
-                    A_view,
-                    Bp,
-                    n,
-                    kpad,
-                    r0,
-                    rsa,
-                    kpad,
-                    KS=KS_SLICE,
-                    NS=nslices,
-                    BR=br,
-                    UPPER=bool(upper),
-                    UNIT=bool(unitriangular),
-                    num_warps=4,
-                )
-        else:
-            _trsm_slice_xpu_kernel[grid](
-                A_view,
-                Bp,
-                A_view,
-                A_view,
-                Bp,
-                Bp,
-                n,
-                kpad,
-                rsa,
-                kpad,
-                F64=False,
-                UNIT=bool(unitriangular),
-                KS=KS_SLICE,
-                UPPER=bool(upper),
-                NS=nslices,
-                num_warps=4,
-            )
-        X = Bp[:, :, :k].reshape(orig_shape)
+        # fp32: blocked Neumann tl.dot sweep (see _solve_tri_dot). The serial
+        # one-CTA substitution below is only kept as reference / for fp64.
+        X = _solve_tri_dot(
+            A_view, B_view, unitriangular, upper, n, k, batch, orig_shape
+        )
     return X
 
 

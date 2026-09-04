@@ -1,49 +1,46 @@
+"""Kunlunxin special_erfinv / special_erfinv_out vendor override.
+
+Reuses the erfinv.py log-form body (`_erfinv_body`, see its module docstring
+for the math and XPU rationale): erfinv(x) = sgn(x)*sqrt(w)*H(w) with
+w = -log(1 - x^2) (series+min/max-ramp blend, no selects) and a degree-4 fit
+of H (fp32 max err ~1.8e-6 on |x| <= 0.99, atol 1e-4).  This replaces the
+previous deg-8 Horner in x^2 (only accurate on |x| <= 0.9) and the two
+selects, and is ~2x faster.  Edge semantics fall out of the arithmetic:
+|x| > 1 -> NaN, |x| == 1 -> sign(x)*inf, x == +-0 -> +-0 (see erfinv.py).
+"""
+
 import logging
 
 import torch
 import triton
 import triton.language as tl
 
+from .erfinv import _erfinv_body, _pick_block
+
 logger = logging.getLogger(__name__)
+
+UNROLL_NUM = 8
+BUFFER_SIZE_LIMIT = 8192
+IS_CLOSE_MEMORY_ASYNC = False
 
 
 @triton.jit
 def _special_erfinv_kernel(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
-
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
-    xf = x.to(tl.float32)
-    absx = tl.abs(xf)
-
-    # erfinv(x) ~= x * P(x^2), odd polynomial.  P is a least-squares fit of
-    # erfinv(x)/x over |x| <= 0.9 (max abs err ~1.3e-5 in fp32), evaluated in
-    # Horner form.  Compared with the classic A&S log+sqrt two-branch form
-    # this drops the transcendental math entirely.
-    ax2 = absx * absx
-    p = 11.150475
-    p = -35.22204 + p * ax2
-    p = 47.801117 + p * ax2
-    p = -35.59043 + p * ax2
-    p = 15.894029 + p * ax2
-    p = -4.1923985 + p * ax2
-    p = 0.75717944 + p * ax2
-    p = 0.07057473 + p * ax2
-    p = 0.2342005 + p * ax2
-    p = 0.8862025 + p * ax2
-
-    res = xf * p
-
-    # Natural propagation gives NaN for |x| > 1 (poly diverges but the
-    # |x| > 1 region is out-of-domain); keep the semantics explicit with two
-    # scalar selects: |x| > 1 -> NaN, |x| == 1 -> sign(x) * inf.
-    res = tl.where(absx > 1.0, float("nan"), res)
-    res = tl.where(absx == 1.0, xf * float("inf"), res)
-
-    y = res.to(x.dtype)
+    y = _erfinv_body(x.to(tl.float32)).to(x.dtype)
     tl.store(out_ptr + offsets, y, mask=mask)
+
+
+@triton.jit
+def _special_erfinv_kernel_unmasked(x_ptr, out_ptr, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(axis=0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    x = tl.load(x_ptr + offsets)
+    y = _erfinv_body(x.to(tl.float32)).to(x.dtype)
+    tl.store(out_ptr + offsets, y)
 
 
 def _launch_special_erfinv_kernel(x: torch.Tensor, out: torch.Tensor):
@@ -53,34 +50,40 @@ def _launch_special_erfinv_kernel(x: torch.Tensor, out: torch.Tensor):
     ), "Input and output must have the same number of elements"
     assert x.dtype == out.dtype, "Input and output must have the same dtype"
     n_elements = x.numel()
-    # Size-adaptive tile.  Large fixed blocks keep the grid small and avoid
-    # launch-bound overhead on XPU (large shapes), while small inputs use a
-    # modest tile so tiny tensors are not dominated by one oversized block.
-    # Block sweep (fp32/fp16/bf16, n in 2^16..2^26): >=2^18 elements are
-    # fastest at 16384; smaller inputs hit the ~20us launch floor at 1024.
-    # Note: keep the NaN compare as `~(xf == xf)` -- the `!=` form fails to
-    # lower at BLOCK_SIZE >= 1024 (LLVM "Cannot select" on setuo).
-    BLOCK_SIZE = 1024 if n_elements <= 131072 else 16384
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    _special_erfinv_kernel[grid](
-        x,
-        out,
-        n_elements,
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
+    if n_elements == 0:
+        return
+    block_size, num_warps, masked = _pick_block(n_elements)
+    if masked:
+        grid = (triton.cdiv(n_elements, block_size),)
+        _special_erfinv_kernel[grid](
+            x,
+            out,
+            n_elements,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
+            unroll_num=UNROLL_NUM,
+            buffer_size_limit=BUFFER_SIZE_LIMIT,
+            isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
+        )
+    else:
+        grid = (n_elements // block_size,)
+        _special_erfinv_kernel_unmasked[grid](
+            x,
+            out,
+            BLOCK_SIZE=block_size,
+            num_warps=num_warps,
+            unroll_num=UNROLL_NUM,
+            buffer_size_limit=BUFFER_SIZE_LIMIT,
+            isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
+        )
 
 
 def special_erfinv(x: torch.Tensor):
     """Special erfinv function"""
     logger.debug("GEMS KUNLUNXIN special_erfinv")
-    x_in = x
-    if not x_in.is_contiguous():
-        x_in = x_in.contiguous()
+    x_in = x if x.is_contiguous() else x.contiguous()
     out = torch.empty_like(x_in)
     _launch_special_erfinv_kernel(x_in, out)
-    # Match original shape/strides of input if needed
-    if out.shape != x.shape or out.stride() != x.stride():
-        out = out.reshape(x.shape).as_strided(x.size(), x.stride())
     return out
 
 
