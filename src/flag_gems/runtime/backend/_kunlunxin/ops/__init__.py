@@ -172,6 +172,7 @@ from .leaky_relu import leaky_relu, leaky_relu_, leaky_relu_out
 from .lerp import lerp_scalar, lerp_scalar_, lerp_tensor, lerp_tensor_
 from .less_equal import less_equal, less_equal_scalar
 from .lift_fresh_copy import lift_fresh_copy
+from .linalg_ldl_solve import linalg_ldl_solve
 from .linspace import linspace
 from .log import log
 from .log1p import log1p, log1p_
@@ -556,6 +557,7 @@ __all__ = [
     "less_equal",
     "less_equal_scalar",
     "lift_fresh_copy",
+    "linalg_ldl_solve",
     "linspace",
     "log",
     "log1p",
