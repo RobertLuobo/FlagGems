@@ -153,6 +153,7 @@ from .diag import diag
 from .diag_embed import diag_embed
 from .diagonal import diagonal_backward
 from .diff import diff
+from .digamma import digamma
 from .digamma_ import digamma_
 from .div import (
     div_mode,
@@ -171,7 +172,9 @@ from .dropout import dropout, dropout_backward
 from .elu import elu, elu_, elu_backward
 from .embedding import embedding, embedding_backward, embedding_dense_backward
 from .eq import eq, eq_, eq_scalar, eq_scalar_
-from .erf import erf, erf_
+from .erf import erf, erf_, special_erf
+from .erfinv import erfinv
+from .erfinv_ import erfinv_  # noqa: F401
 from .exp import exp, exp_, exp_out
 from .exp2 import exp2, exp2_
 from .expm1 import expm1, expm1_, expm1_out
@@ -219,6 +222,8 @@ from .heaviside_ import heaviside_  # noqa: F401
 from .hstack import hstack
 from .hypot import hypot
 from .igamma_ import igamma_  # noqa: F401
+from .igammac import igammac, igammac_out
+from .igammac_ import igammac_
 from .index import index
 from .index_add import index_add, index_add_
 from .index_put import index_put, index_put_
@@ -237,15 +242,27 @@ from .le import le, le_, le_scalar
 from .leaky_relu import leaky_relu, leaky_relu_, leaky_relu_backward, leaky_relu_out
 from .lerp import lerp_scalar, lerp_scalar_, lerp_tensor, lerp_tensor_
 from .less_equal import less_equal, less_equal_scalar
+from .lgamma import lgamma, lgamma_
 from .lift_fresh import lift_fresh  # noqa: F401
 from .lift_fresh_copy import lift_fresh_copy
 from .linspace import linspace
 from .log import log
 from .log1p import log1p, log1p_
+from .log2 import log2, log2_
+from .log10 import log10, log10_, log10_out  # noqa: F401
 from .log_ import log_  # noqa: F401
 from .log_sigmoid import log_sigmoid
-from .log_softmax import log_softmax, log_softmax_backward
+from .log_sigmoid_backward import log_sigmoid_backward, log_sigmoid_backward_out
+from .log_sigmoid_forward import log_sigmoid_forward
+from .log_softmax import (
+    log_softmax,
+    log_softmax_backward,
+    log_softmax_backward_out,
+    log_softmax_out,
+)
+from .logaddexp import logaddexp, logaddexp_out
 from .logaddexp2 import logaddexp2, logaddexp2_out
+from .logcumsumexp import logcumsumexp, logcumsumexp_out
 from .logical_and import logical_and, logical_and_
 from .logical_not import logical_not, logical_not_
 from .logical_or import logical_or, logical_or_
@@ -315,6 +332,7 @@ from .per_token_group_quant_fp8 import SUPPORTED_FP8_DTYPE, per_token_group_quan
 from .permute_copy import permute_copy
 from .pixel_unshuffle import pixel_unshuffle, pixel_unshuffle_out
 from .polar import polar
+from .polygamma import polygamma, polygamma_, polygamma_out
 from .pow import (
     pow_scalar,
     pow_tensor_scalar,
@@ -384,8 +402,49 @@ from .sparse_sampled_addmm import (  # noqa: F401
     sparse_sampled_addmm,
     sparse_sampled_addmm_out,
 )
+from .special_bessel_j0 import special_bessel_j0
+from .special_bessel_j1 import special_bessel_j1
+from .special_bessel_y0 import special_bessel_y0
+from .special_bessel_y1 import special_bessel_y1
+from .special_chebyshev_polynomial_u import special_chebyshev_polynomial_u
+from .special_chebyshev_polynomial_v import special_chebyshev_polynomial_v
+from .special_chebyshev_polynomial_w import (
+    special_chebyshev_polynomial_w,
+    special_chebyshev_polynomial_w_out,
+)
+from .special_digamma import special_digamma
+from .special_erfcx import special_erfcx
+from .special_erfinv import special_erfinv, special_erfinv_, special_erfinv_out
+from .special_exp2 import special_exp2
+from .special_gammainc import special_gammainc
+from .special_gammaincc import special_gammaincc
+from .special_gammaln import special_gammaln, special_gammaln_out
+from .special_i0e import special_i0e, special_i0e_out
+from .special_i1 import special_i1, special_i1_out  # noqa: F401
+from .special_legendre_polynomial_p import special_legendre_polynomial_p
+from .special_log1p import special_log1p_out
+from .special_log_ndtr import special_log_ndtr, special_log_ndtr_
 from .special_log_softmax import special_log_softmax
 from .special_logsumexp import special_logsumexp
+from .special_modified_bessel_k0 import (
+    special_modified_bessel_k0,
+    special_modified_bessel_k0_out,
+)
+from .special_multigammaln import special_multigammaln
+from .special_ndtri import special_ndtri
+from .special_shifted_chebyshev_polynomial_t import (
+    special_shifted_chebyshev_polynomial_t,
+)
+from .special_shifted_chebyshev_polynomial_u import (
+    special_shifted_chebyshev_polynomial_u,
+    special_shifted_chebyshev_polynomial_u_,
+)
+from .special_shifted_chebyshev_polynomial_v import (
+    special_shifted_chebyshev_polynomial_v,
+)
+from .special_shifted_chebyshev_polynomial_w import (
+    special_shifted_chebyshev_polynomial_w,
+)
 from .sqrt import sqrt, sqrt_
 from .square import square, square_, square_out
 from .stack import stack
@@ -997,4 +1056,59 @@ __all__ = [
     "softmax_out",
     "softplus_backward",
     "_weight_norm",
+    "digamma",
+    "special_gammainc",
+    "special_gammaincc",
+    "special_gammaln",
+    "special_gammaln_out",
+    "special_digamma",
+    "special_erfcx",
+    "special_log_ndtr",
+    "special_log_ndtr_",
+    "special_multigammaln",
+    "special_ndtri",
+    "erfinv",
+    "special_erf",
+    "special_erfinv",
+    "special_erfinv_",
+    "special_erfinv_out",
+    "special_exp2",
+    "lgamma",
+    "lgamma_",
+    "igammac",
+    "igammac_",
+    "igammac_out",
+    "special_modified_bessel_k0",
+    "special_modified_bessel_k0_out",
+    "special_bessel_j0",
+    "special_bessel_j1",
+    "special_bessel_y0",
+    "special_bessel_y1",
+    "special_i0e",
+    "special_i0e_out",
+    "special_legendre_polynomial_p",
+    "special_chebyshev_polynomial_u",
+    "special_chebyshev_polynomial_v",
+    "special_chebyshev_polynomial_w",
+    "special_chebyshev_polynomial_w_out",
+    "special_log1p_out",
+    "special_shifted_chebyshev_polynomial_t",
+    "special_shifted_chebyshev_polynomial_u",
+    "special_shifted_chebyshev_polynomial_u_",
+    "special_shifted_chebyshev_polynomial_v",
+    "special_shifted_chebyshev_polynomial_w",
+    "log2",
+    "log2_",
+    "log_sigmoid_backward",
+    "log_sigmoid_backward_out",
+    "log_sigmoid_forward",
+    "logcumsumexp",
+    "logcumsumexp_out",
+    "log_softmax_backward_out",
+    "log_softmax_out",
+    "logaddexp",
+    "logaddexp_out",
+    "polygamma",
+    "polygamma_",
+    "polygamma_out",
 ]
