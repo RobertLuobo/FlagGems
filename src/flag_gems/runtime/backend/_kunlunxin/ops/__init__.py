@@ -285,6 +285,7 @@ from .linalg_det import linalg_det, linalg_det_out
 from .linalg_householder_product import linalg_householder_product
 from .linalg_ldl_factor import ldl_factor
 from .linalg_ldl_factor_ex import ldl_factor_ex
+from .linalg_ldl_solve import linalg_ldl_solve
 from .linalg_lstsq import linalg_lstsq
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
@@ -369,6 +370,7 @@ from .negative import negative
 from .negative_ import negative_
 from .new_full import new_full
 from .new_ones import new_ones
+from .nextafter import nextafter, nextafter_
 from .nllloss import (
     nll_loss2d,
     nll_loss2d_backward,
@@ -513,6 +515,7 @@ from .special_exp2 import special_exp2
 from .special_gammainc import special_gammainc
 from .special_gammaincc import special_gammaincc
 from .special_gammaln import special_gammaln, special_gammaln_out
+from .special_hermite_polynomial_h import special_hermite_polynomial_h
 from .special_i0e import special_i0e, special_i0e_out
 from .special_i1 import special_i1, special_i1_out  # noqa: F401
 from .special_legendre_polynomial_p import special_legendre_polynomial_p
@@ -606,6 +609,7 @@ __all__ = [
     "soft_margin_loss",
     "soft_margin_loss_out",
     "soft_margin_loss_backward",
+    "special_hermite_polynomial_h",
     "special_log_softmax",
     "special_logsumexp",
     "softshrink",
@@ -817,6 +821,7 @@ __all__ = [
     "less_equal",
     "less_equal_scalar",
     "lift_fresh_copy",
+    "linalg_ldl_solve",
     "linspace",
     "log",
     "log1p",
@@ -879,6 +884,8 @@ __all__ = [
     "neg",
     "neg_",
     "negative",
+    "nextafter",
+    "nextafter_",
     "not_equal",
     "not_equal_scalar",
     "nll_loss_backward",
