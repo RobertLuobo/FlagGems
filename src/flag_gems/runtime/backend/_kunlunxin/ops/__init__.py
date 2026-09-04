@@ -369,7 +369,6 @@ from .negative import negative
 from .negative_ import negative_
 from .new_full import new_full
 from .new_ones import new_ones
-from .nextafter import nextafter, nextafter_
 from .nllloss import (
     nll_loss2d,
     nll_loss2d_backward,
