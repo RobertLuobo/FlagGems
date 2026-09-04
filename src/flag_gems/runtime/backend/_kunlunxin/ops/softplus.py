@@ -74,17 +74,27 @@ def softplus_backward_kernel(
     beta,
     threshold,
     BLOCK_SIZE: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset < n_elements
-    grad = tl.load(grad_ptr + offset, mask=mask, other=0.0)
-    x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    if NEED_MASK:
+        mask = offset < n_elements
+        grad = tl.load(grad_ptr + offset, mask=mask, other=0.0)
+        x = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
+    else:
+        grad = tl.load(grad_ptr + offset)
+        x = tl.load(x_ptr + offset).to(tl.float32)
     z = x * beta
     derivative = tl.where(z > threshold, 1.0, tl.sigmoid(z))
-    tl.store(
-        out_ptr + offset, (grad * derivative).to(out_ptr.dtype.element_ty), mask=mask
-    )
+    if NEED_MASK:
+        tl.store(
+            out_ptr + offset,
+            (grad * derivative).to(out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+    else:
+        tl.store(out_ptr + offset, (grad * derivative).to(out_ptr.dtype.element_ty))
 
 
 def softplus(self, beta=1.0, threshold=20.0):
@@ -113,6 +123,7 @@ def softplus_backward(grad_output, self, beta=1.0, threshold=20.0):
         return out
     block_size = _pick_backward_block(n_elements)
     grid = (triton.cdiv(n_elements, block_size),)
+    need_mask = (n_elements % block_size) != 0
     with torch_device_fn.device(grad.device):
         softplus_backward_kernel[grid](
             grad,
@@ -122,5 +133,6 @@ def softplus_backward(grad_output, self, beta=1.0, threshold=20.0):
             beta,
             threshold,
             BLOCK_SIZE=block_size,
+            NEED_MASK=need_mask,
         )
     return out

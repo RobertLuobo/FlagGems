@@ -34,6 +34,11 @@ from .matmul_bias_activation import matmul_bias_activation
 
 # mhc_pre vendor kernel (XPU): self-installs the direct-import entrypoint
 from .mhc_pre import mhc_pre
+from .mhc_bwd import mhc_bwd
+# hc_head_fused_kernel vendor kernel (XPU): self-installs the direct-import entrypoint
+from .hc_head_fused_kernel import hc_head_fused_kernel
+from .hc_split_sinkhorn import hc_split_sinkhorn
+from .bin_topk import bucket_sort_topk_xpu
 from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
 from .outer import outer
 from .reglu import dreglu, reglu
@@ -88,5 +93,9 @@ __all__ = [
     "dswiglu",
     "bincount",
     "mhc_pre",
+    "mhc_bwd",
+    "hc_head_fused_kernel",
+    "hc_split_sinkhorn",
+    "bucket_sort_topk_xpu",
     "fused_deepseek_v4_qnorm_rope_kv_rope_insert",
 ]

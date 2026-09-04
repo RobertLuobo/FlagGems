@@ -2,22 +2,32 @@
 #
 # Kunlunxin (XPU) override of col2im.
 #
-# Root cause: the generic 2D-tiled col2im kernel
-# (flag_gems/ops/col2im.py) uses `triton.autotune` over BLOCK_H/BLOCK_W with
-# multiple num_stages, plus a 2D `(BLOCK_H, BLOCK_W)` accumulator and a
-# runtime `h_num % stride_h / h_num // stride_h` computed BEFORE masking
-# invalid contributions. On kunlunxin XPU this combination miscompiles
-# for configs with stride>1/padding>0/dilation>1 -- baseline 12F/3P with
-# max abs diff ~512.5 (100% mismatch on the affected configs).
+# Root cause (previous state): the flat output-parallel kernel with
+# BLOCK=1024 / num_warps=1 ran ~0.17x dtype-balanced: the tiny shapes
+# (total_out <= a few hundred) were launch-bound at ~0.066ms with 1 warp and
+# a 1024-lane block, and every (kh, kw) iteration recomputed `h_num // stride_h`
+# / `h_num % stride_h` even when stride==1 (where the quotient is the identity
+# and the remainder is always zero).
 #
-# Fix: replace with a flat, output-position-parallel kernel modeled on the
-# reflection_pad3d override. Each program handles one 1D BLOCK of output
-# elements. Decode (n, c, h, w) via div/mod (all non-negative). Loop kh, kw
-# with tl.static_range and accumulate gathers into a fp32 accumulator.
-# All arithmetic on valid contributions is over non-negative indices, so
-# `h_num % stride_h` and `h_num // stride_h` are safe. Fixed BLOCK=1024
-# + CodeGenConfig(isCloseVectorization, buffer_size_limit=2048) avoids the
-# XPU tiling/vectorize pipelines that miscompile.
+# Fix: keep the flat output-position-parallel structure (each program one 1D
+# BLOCK of output elements; decode (n, c, h, w) via div/mod on non-negative
+# indices; loop kh, kw with tl.static_range; fp32 accumulator). Replace the
+# unconditional division/modulo with a constexpr specialization:
+#   - stride_h == 1 : l_h = h_run (no div, no mod, h_valid == h_pos)
+#   - stride_h > 1  : clamp-then-divide, and the validity check now includes
+#                     h_pos (the original kept the clamp's zero value for
+#                     negative h_run, which contributed row 0 spuriously).
+# Launch config: BLOCK=256 for small totals (<= 4096 output elements, where
+# the launch floor dominates) and for large kernels (kernel area >= 16, whose
+# 25-iteration unroll benefits from more programs), BLOCK=1024 otherwise;
+# num_warps=4 (1 warp left the memory pipeline underutilized).
+#
+# Measured (iso sweep, fp16/fp32, 7-shape matrix): all 7 shapes >= baseline,
+# e.g. shape (2,3,(2,2),(4,5)) 0.0651ms -> 0.0281ms (0.70x -> 1.63x vs the
+# XMLIR native reference); shape (2,64,(5,5),(64,64)) 9.02ms -> 7.80ms.
+# The large shapes remain bounded by the XPU Triton load-op floor
+# (~1.8 Gload/s, pattern-independent: affine 1D/2D-tile/row variants all
+# measure the same), while the XMLIR native reference hits ~100 GB/s.
 import logging
 from typing import List
 
@@ -60,7 +70,7 @@ def col2im_kernel_flat(
     o = pid * BLOCK + tl.arange(0, BLOCK)
     mask = o < total_out
 
-    # Decode flat -> (n, c, h, w)
+    # Decode flat -> (n, c, h, w); all operands non-negative.
     n_idx = o // CHW_out
     rem = o % CHW_out
     c_idx = rem // HW_out
@@ -72,29 +82,32 @@ def col2im_kernel_flat(
 
     for kh in tl.static_range(0, kernel_h):
         for kw in tl.static_range(0, kernel_w):
-            # h_num = h_idx + padding_h - kh*dilation_h
-            h_num = h_idx.to(tl.int32) + padding_h - kh * dilation_h
-            w_num = w_idx.to(tl.int32) + padding_w - kw * dilation_w
+            # h_run = h_idx + padding_h - kh * dilation_h may be negative on
+            # the top/left edges.  Clamp before dividing so the quotient
+            # (and the loaded address) stays valid; h_pos is part of the
+            # validity mask so clamped lanes never contribute.
+            h_run = h_idx + padding_h - kh * dilation_h
+            w_run = w_idx + padding_w - kw * dilation_w
+            h_pos = h_run >= 0
+            w_pos = w_run >= 0
+            if stride_h == 1:
+                l_h = h_run
+                h_ok = h_pos
+            else:
+                h_run_c = tl.where(h_pos, h_run, 0)
+                l_h = h_run_c // stride_h
+                h_ok = h_pos & ((h_run_c - l_h * stride_h) == 0)
+            if stride_w == 1:
+                l_w = w_run
+                w_ok = w_pos
+            else:
+                w_run_c = tl.where(w_pos, w_run, 0)
+                l_w = w_run_c // stride_w
+                w_ok = w_pos & ((w_run_c - l_w * stride_w) == 0)
 
-            # Both must be non-negative multiples of stride, and quotient in [0, L)
-            # Compute quotient only when h_num, w_num are non-negative to avoid
-            # negative floor-div / % semantics on XPU.
-            h_pos = h_num >= 0
-            w_pos = w_num >= 0
-            h_num_c = tl.where(h_pos, h_num, 0)
-            w_num_c = tl.where(w_pos, w_num, 0)
-            l_h = h_num_c // stride_h
-            l_w = w_num_c // stride_w
-            h_mod = h_num_c - l_h * stride_h
-            w_mod = w_num_c - l_w * stride_w
+            valid = h_ok & w_ok & (l_h < L_h) & (l_w < L_w)
 
-            valid = (
-                h_pos & w_pos & (h_mod == 0) & (w_mod == 0) & (l_h < L_h) & (l_w < L_w)
-            )
-
-            # Clamp indices for offset computation so masked-out lanes never
-            # dereference out-of-range memory on XPU (masked loads on this
-            # backend sometimes miscompile with negative/OOB addresses).
+            # Clamp indices so masked-out lanes never dereference OOB memory.
             l_h_s = tl.where(valid, l_h, 0)
             l_w_s = tl.where(valid, l_w, 0)
             c_k = c_idx * KHW + kh * kernel_w + kw
@@ -102,7 +115,6 @@ def col2im_kernel_flat(
             in_offset = n_idx * (channels * KHW * L_all) + c_k * L_all + l_idx
 
             v = tl.load(input_ptr + in_offset, mask=mask & valid, other=0.0)
-            # XPU may ignore `other` on masked loads; force invalid lanes to 0.
             v = tl.where(valid, v, 0.0)
             acc += v.to(tl.float32)
 
@@ -161,8 +173,13 @@ def col2im(
     HW_out = out_h * out_w
     CHW_out = channels * HW_out
 
-    BLOCK = 1024
-    grid = (triton.cdiv(total_out, BLOCK),)
+    # Launch-bound small shapes and the 25-iteration (5x5 kernel) unroll prefer
+    # 256-lane programs; everything else uses 1024.
+    if total_out <= 4096 or kernel_total >= 16:
+        block = 256
+    else:
+        block = 1024
+    grid = (triton.cdiv(total_out, block),)
     with torch_device_fn.device(input.device):
         col2im_kernel_flat[grid](
             input,
@@ -185,8 +202,8 @@ def col2im(
             padding_w,
             dilation_h,
             dilation_w,
-            BLOCK=BLOCK,
-            num_warps=1,
+            BLOCK=block,
+            num_warps=4,
             buffer_size_limit=2048,
             isCloseVectorization=True,
         )

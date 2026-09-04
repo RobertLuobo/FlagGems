@@ -1,5 +1,6 @@
 import logging
 
+import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
@@ -15,7 +16,7 @@ config_ = CodeGenConfig(
     True,
     prefer_1d_tile=True,
     buffer_size_limit=4096,
-    isCloseVectorization=False,
+    isCloseVectorization=True,
     kunlunAutoGrid=True,
     unroll_num=8,
 )
@@ -25,7 +26,9 @@ config_ = CodeGenConfig(
 @triton.jit
 def arcsinh_func(x):
     x32 = x.to(tl.float32)
-    return tl.log(x32 + tl.sqrt(x32 * x32 + 1.0)).to(x.dtype)
+    ax = tl.abs(x32)
+    y = tl.log(ax + tl.sqrt(ax * ax + 1.0))
+    return tl.where(x32 < 0.0, -y, y).to(x.dtype)
 
 
 def arcsinh(A):
@@ -38,4 +41,9 @@ def arcsinh_(A):
 
 
 def arcsinh_out(A, out):
+    # ATen arcsinh on integer inputs produces a float32 result; the kernel
+    # casts back to x.dtype, so promote an integer input to float32 here to
+    # avoid a silently truncated (wrong) value being written into a float out.
+    if not A.is_floating_point():
+        A = A.to(torch.float32)
     return arcsinh_func(A, out0=out)

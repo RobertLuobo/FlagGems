@@ -3,6 +3,7 @@ import logging
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+from flag_gems.utils.triton_lang_extension import div_rz
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
@@ -16,18 +17,27 @@ config_ = CodeGenConfig(
     prefer_1d_tile=True,
     buffer_size_limit=4096,
     isCloseVectorization=True,
-    kunlunAutoGrid=True,
+    # NOTE: kunlunAutoGrid must stay False.  When True the generated launcher
+    # falls back to a single CTA for every shape with sum(shape) <= 2048*64,
+    # which covers the whole fmod_ benchmark matrix (e.g. (4096,4096) has
+    # sum==8192) and measures ~11ms for 16.7M elements; the 12-CTA grid
+    # reaches ~0.2ms on the same shape (matches the tuned true_div config).
     unroll_num=8,
 )
 
 
 @triton.jit
 def _fmod(x, y):
-    x64 = x.to(tl.float64)
-    y64 = y.to(tl.float64)
-    quotient = x64 / y64
-    quotient = tl.where(quotient >= 0, tl.floor(quotient), -tl.floor(-quotient))
-    return x64 - y64 * quotient
+    # fmod(x, y) = x - trunc(x/y)*y.  div_rz is the native correctly-rounded
+    # round-toward-zero division: it never crosses an integer boundary, so the
+    # exact integer quotient is recovered by an int32-cast truncation (exact
+    # for |q| < 2^23; the guard falls back to q for huge ratios).  tl.fma
+    # keeps x - t*y single-rounded, i.e. exactly fmodf.  The old implementation
+    # computed the quotient in software-emulated fp64 (and a variant used
+    # tl.floor/ceil), both ~10-50x slower on XPU.
+    q = div_rz(x, y)
+    t = tl.where(tl.abs(q) < 8388608.0, tl.cast(q, tl.int32).to(tl.float32), q)
+    return tl.fma(t, -y, x)
 
 
 @pointwise_dynamic(

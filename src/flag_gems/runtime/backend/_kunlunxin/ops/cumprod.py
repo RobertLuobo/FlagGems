@@ -425,6 +425,25 @@ def cumprod_(inp, dim, *, dtype=None):
         return torch.ops.aten.cumprod_.default.redispatch(
             _FALLBACK_KEYSET, inp, dim, dtype=dtype
         )
-    out = cumprod_wrapper(inp, dim, inp.dtype)
-    inp.copy_(out)
+    if inp.numel() == 0:
+        return inp
+    assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
+    if inp.size(dim % inp.ndim) == 1:
+        # Inclusive prefix product over an axis of length 1 is the identity,
+        # so the in-place op needs no work at all.
+        return inp
+    if inp.is_contiguous():
+        # The aliasing is safe: every program loads its own chunk before
+        # storing to it (load-before-store within a program), and the
+        # multi-pass tiers (scan -> fan multiply) are separated by kernel
+        # boundaries. This avoids an extra empty_like allocation plus a full
+        # device-to-device copy on top of the scan. `cumprod_wrapper` calls
+        # `.contiguous()` internally, which is a no-op here.
+        cumprod_wrapper(inp, dim, inp.dtype, out=inp)
+    else:
+        # Non-contiguous self: scan the contiguous copy, then write back with
+        # the native strided-copy engine (`_copy_from` is not overridden by
+        # flag_gems, so this avoids recursing into the gems `copy_`).
+        result = cumprod_wrapper(inp, dim, inp.dtype)
+        torch.ops.aten._copy_from(result, inp, False)
     return inp
