@@ -323,7 +323,6 @@ from .special_exp2 import special_exp2
 from .special_gammainc import special_gammainc
 from .special_gammaincc import special_gammaincc
 from .special_gammaln import special_gammaln, special_gammaln_out
-from .special_hermite_polynomial_h import special_hermite_polynomial_h
 from .special_i0e import special_i0e, special_i0e_out
 from .special_i1 import special_i1, special_i1_out  # noqa: F401
 from .special_legendre_polynomial_p import special_legendre_polynomial_p
@@ -876,7 +875,6 @@ __all__ = [
     "special_chebyshev_polynomial_v",
     "special_chebyshev_polynomial_w",
     "special_chebyshev_polynomial_w_out",
-    "special_hermite_polynomial_h",
     "special_log1p_out",
     "special_shifted_chebyshev_polynomial_t",
     "special_shifted_chebyshev_polynomial_u",
