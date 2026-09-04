@@ -162,7 +162,6 @@ def _trsm_slice_xpu_kernel(
                 ph = q1 * dh
                 pl = tl.fma(q1, dh, -ph) + q1 * dl
                 r = out_h - ph
-                re = (out_h - r) - ph
                 q2 = r / dh
                 out_h = q1 + q2
                 out_l = (q1 - out_h) + q2
