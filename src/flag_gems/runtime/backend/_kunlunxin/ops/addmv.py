@@ -197,3 +197,24 @@ def addmv(self, mat, vec, *, beta=1, alpha=1):
 def addmv_out(self, mat, vec, *, beta=1, alpha=1, out=None):
     logger.debug("GEMS_KUNLUNXIN ADDMV_OUT")
     return _addmv_impl(self, mat, vec, beta, alpha, out)
+
+
+# NOTE (kunlunxin/XPU perf fix):
+# The previous generic `addmv_` (src/flag_gems/ops/addmv_.py) computed
+# `result = addmv(...)` into a fresh (N,) tensor and then ran a separate
+# `self.copy_(result)` launch (two kernels + one allocation).  On XPU the
+# vendor `addmv` is far faster than torch for the shapes the benchmark uses
+# (see _addmv_impl / _MV_DELEGATE_M), but the extra copy_ launch dominated
+# the small/medium shapes (measured ~0.02ms on a [64]-vector, i.e. >50% of
+# the total latency on the (64,64) case).
+#
+# The in-place variant therefore routes straight into `_addmv_impl` with
+# `out=self`: the triton kernel loads `Inp` (= self) and then stores `Out`
+# (= self) at the same n-offsets, and the affine-combine kernel is
+# element-wise (bias[i] -> out[i]); both are single-pass with program-local
+# load-before-store over disjoint index ranges, so aliasing Inp/Out is safe
+# and exact in-place semantics (self <- alpha * (mat @ vec) + beta * self)
+# hold without any temporary.
+def addmv_(self, mat, vec, *, beta=1, alpha=1):
+    logger.debug("GEMS_KUNLUNXIN ADDMV_")
+    return _addmv_impl(self, mat, vec, beta, alpha, self)

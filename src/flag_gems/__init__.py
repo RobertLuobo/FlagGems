@@ -69,6 +69,7 @@ current_work_registrar = None
 AUTOGRAD_DISPATCH_KEY = torch._C.DispatchKey.Autograd.name
 CONJUGATE_DISPATCH_KEY = torch._C.DispatchKey.Conjugate.name
 SPARSE_CSR_DISPATCH_KEY = "SparseCsr" + backend_info.dispatch_key
+QUANTIZED_DISPATCH_KEY = "Quantized" + backend_info.dispatch_key
 
 
 def torch_ge(v):
@@ -313,6 +314,7 @@ _FULL_CONFIG = (
     ("affine_grid_generator", affine_grid_generator),
     ("alias", alias),
     ("alias_copy", alias_copy),
+    ("alias_copy.out", alias_copy_out),
     ("all", all),
     ("all.dim", all_dim),
     ("all.dims", all_dims),
@@ -364,6 +366,7 @@ _FULL_CONFIG = (
     ("atan_", atan_),
     ("atanh", atanh),
     ("avg_pool1d", avg_pool1d),
+    ("atanh_", atanh_),
     ("avg_pool2d", avg_pool2d),
     ("avg_pool2d_backward", avg_pool2d_backward),
     ("avg_pool3d", avg_pool3d),
@@ -394,8 +397,8 @@ _FULL_CONFIG = (
     ("bitwise_or.Tensor", bitwise_or_tensor),
     ("bitwise_or_.Scalar", bitwise_or_scalar_),
     ("bitwise_or_.Tensor", bitwise_or_tensor_),
-    ("bitwise_right_shift", bitwise_right_shift),
-    ("bitwise_right_shift_", bitwise_right_shift_),
+    ("bitwise_right_shift.Tensor", bitwise_right_shift),
+    ("bitwise_right_shift_.Tensor", bitwise_right_shift_),
     ("bitwise_xor.Scalar", bitwise_xor_scalar),
     ("bitwise_xor.Scalar_Tensor", bitwise_xor_scalar_tensor),
     ("bitwise_xor.Tensor", bitwise_xor_tensor),
@@ -480,7 +483,7 @@ _FULL_CONFIG = (
     ("deg2rad.out", deg2rad_out),
     ("deg2rad_", deg2rad_),
     ("dequantize", dequantize),
-    ("dequantize.self", dequantize),
+    ("dequantize.self", dequantize, None, (QUANTIZED_DISPATCH_KEY,)),
     ("diag", diag),
     ("diag_embed", diag_embed),
     ("diagonal_backward", diagonal_backward),
@@ -876,6 +879,7 @@ _FULL_CONFIG = (
     ("new_full", new_full),
     ("new_ones", new_ones),
     ("nextafter", nextafter),
+    ("nextafter.out", nextafter),
     ("nextafter_", nextafter_),
     ("nll_loss2d", nll_loss2d),
     ("nll_loss2d_backward", nll_loss2d_backward),
@@ -905,6 +909,7 @@ _FULL_CONFIG = (
     ("ones", ones),
     ("ones_like", ones_like),
     ("ormqr", ormqr),
+    ("outer", outer),
     ("pad", pad),
     ("pairwise_distance", pairwise_distance),
     ("pdist", pdist),
@@ -978,7 +983,7 @@ _FULL_CONFIG = (
     ("resolve_conj", resolve_conj),
     ("resolve_neg", resolve_neg),
     ("rms_norm", rms_norm),
-    ("rnn_relu", rnn_relu),
+    ("rnn_relu.input", rnn_relu),
     ("roll", roll),
     ("rot90", rot90),
     ("round", round),
@@ -1158,6 +1163,7 @@ _FULL_CONFIG = (
     ("unbind.int", unbind),
     ("unbind_copy", unbind_copy),
     ("unflatten", unflatten),
+    ("unbind_copy.int", unbind_copy),
     ("unfold", unfold),
     ("unfold_backward", unfold_backward),
     ("unfold_copy", unfold_copy),
