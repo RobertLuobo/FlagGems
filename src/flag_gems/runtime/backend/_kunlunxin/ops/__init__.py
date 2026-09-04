@@ -53,6 +53,7 @@ from .addcmul import addcmul, addcmul_, addcmul_out
 from .addmm import addmm, addmm_dtype, addmm_dtype_out, addmm_out
 from .addmm_ import addmm_
 from .addmv import addmv, addmv_out
+from .addmv import addmv_
 from .addr import addr
 from .affine_grid_generator import affine_grid_generator
 from .alias_copy import alias_copy, alias_copy_out
@@ -527,6 +528,7 @@ from .special_i0e import special_i0e, special_i0e_out
 from .special_i1 import special_i1, special_i1_out
 from .special_legendre_polynomial_p import special_legendre_polynomial_p
 from .special_log1p import special_log1p_out
+from .special_log1p import special_log1p  # noqa: F401  (kunlunxin override)
 from .special_log_ndtr import special_log_ndtr, special_log_ndtr_
 from .special_log_softmax import special_log_softmax
 from .special_logsumexp import special_logsumexp
@@ -682,6 +684,7 @@ __all__ = [
     "addmm_",
     "addmm_out",
     "addmv",
+    "addmv_",
     "addmv_out",
     "addr",
     "alias_copy",
@@ -999,6 +1002,7 @@ __all__ = [
     "special_chebyshev_polynomial_w_out",
     "special_hermite_polynomial_h",
     "special_log1p_out",
+    "special_log1p",
     "special_shifted_chebyshev_polynomial_t",
     "special_shifted_chebyshev_polynomial_u",
     "special_shifted_chebyshev_polynomial_u_",
@@ -1349,4 +1353,16 @@ __all__ = [
     "zero_out",
     "zeros",
     "zeros_like",
+    "special_ndtr",
+    "special_round",
+    "special_round_out",
+    "add_relu",
+    "add_relu_",
+    "hardshrink",
+    "hardshrink_out",
 ]
+
+from .special_ndtr import special_ndtr
+from .special_round import special_round, special_round_out
+from .add_relu import _add_relu, _add_relu_
+from .hardshrink import hardshrink, hardshrink_out
