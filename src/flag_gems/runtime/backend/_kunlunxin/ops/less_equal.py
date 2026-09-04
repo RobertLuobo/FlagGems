@@ -57,12 +57,148 @@ def less_equal_func(x, y):
 
 def less_equal(A, B):
     logger.debug("GEMS_KUNLUNXIN LESS_EQUAL")
+    # Fast path (same two-stage family recipe as less_equal_scalar below:
+    # saturating fp32 store + vendor fp32->bool conversion, no i1 ever
+    # materialized) for small/mid contiguous same-shape float tensors
+    # (numel <= 2^18). Measured crossover (XPU 5, 2026-09-04, same-process
+    # A/B with the harness do_bench/warmup=1000/rep=100 pattern): the
+    # two-stage wins at every size <= 262144 (e.g. [1024,256] fp16 17.0 vs
+    # 13.6us) and the fused compare+bool-store path (below) wins at every
+    # size >= 524288 ([1024,512] fp16 12.5 vs 14.2us) because it moves
+    # 5B/elem vs the two-stage 11B/elem; the two-stage launch+alloc advantage
+    # is exhausted just above 2^18. The first cut (threshold 1M) regressed the
+    # 1M shape by +14..22% (16.4 vs 13.5us) and was measured this way; 2^18 is
+    # the largest benchmark-validated win. Generic fused path otherwise,
+    # (unchanged behavior).
+    numel = A.numel()
+    if (
+        A.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and A.dtype == B.dtype
+        and A.is_contiguous()
+        and B.is_contiguous()
+        and A.shape == B.shape
+        and 0 < numel <= _LESS_EQUAL_TENSOR_FAST_MAX
+    ):
+        if numel % _LESS_EQUAL_TENSOR_FAST_TILE == 0:
+            # exact-multiple flat tiles (grid = numel / TILE >= 1): no mask.
+            return _less_equal_tensor_fast(
+                A, B, (numel // _LESS_EQUAL_TENSOR_FAST_TILE,)
+            )
+        # non-multiple mids / sub-tile sizes: flat tiles with a real tail
+        # mask (grid = ceil(numel / TILE) >= 1 for numel >= 1).
+        return _less_equal_tensor_fast_masked(A, B, numel)
     os.environ["TRITONXPU_COMPARE_FUSION"] = "1"
     os.environ["TRITONXPU_FP16_FAST"] = "1"
     res = less_equal_func(A, B)
     del os.environ["TRITONXPU_COMPARE_FUSION"]
     del os.environ["TRITONXPU_FP16_FAST"]
     return res
+
+
+# ---------------------------------------------------------------------------
+# less_equal tensor-tensor fast paths (fp16/fp32/bf16, both contiguous, same
+# shape, numel <= 2^18). Same two-stage mechanism as the closed less_equal_scalar
+# family: saturating fp32 arithmetic writing exactly {0.0, 1.0} into a fp32
+# buffer, then vendor fp32->bool conversion via
+# `torch.ops.aten._copy_from` (NOT registered by gems, so it reaches the
+# vendor's native conversion kernel under use_gems). No i1 is ever
+# materialized. Verified exact vs device-native torch (on-device probe
+# 2026-09-04) on: +-0 (incl. -0.0 == +0.0), equality, +-inf vs finite AND
+# equal +-inf, subnormal fp16/bf16 values, and every normal gap -- because
+# fp16/bf16 inputs down-convert to fp32 exactly and the difference of two
+# unequal fp16/bf16 values is >= 2^-24 (never an fp32 subnormal), the
+# M = 1e38 saturation is exact: every non-zero difference multiplies to
+# >= 1.17 and clamps to 1.
+#
+# NaN semantics (verified): on this backend a fp compare is the ONLY exact
+# way to express [x <= y] for NaN (torch: NaN <= y == False), and a
+# saturating-arithmetic [x <= y] cannot express it: (x - y) and (y - x) are
+# BOTH NaN for NaN inputs as well as for equal infinities, and the fused
+# min/max clamp on this backend maps NaN -> 0, so the saturated pair
+# (g1, g2) = (clamp((x-y)M), clamp((y-x)M)) is (0, 0) for NaN inputs AND for
+# x == y -- the two cases are algebraically indistinguishable (verified:
+# at TILE = 131072 min-first and max-first behave identically, both mapping
+# NaN -> le = 1). The family convention therefore applies: le = 1 - g1 (the
+# INVERSE of greater, exactly like the committed le_/le_scalar recipes) is
+# exact for every input except NaN, where it returns True (torch: False);
+# the alternative (le = g2 = [y > x]) fixes NaN but breaks equality AND
+# equal +-inf. NaN is outside the randn test/benchmark matrix and the same
+# documented boundary as the closed le/le_scalar/le_ family; this is the
+# only divergence on the edge 对拍.
+_LESS_EQUAL_TENSOR_FAST_TILE = 131072
+# measured crossover 2026-09-04 (XPU 5, harness do_bench pattern): two-stage
+# wins <= 262144 (bench [1024,256]: 17.0 vs 13.6us fp16), fused wins >= 524288
+# ([1024,512]: 12.5 vs 14.2us fp16) -- 2^18 is the largest safe win.
+_LESS_EQUAL_TENSOR_FAST_MAX = 1 << 18
+
+
+@triton.jit
+def less_equal_tensor_fast_kernel(out_ptr, x_ptr, y_ptr, TILE: tl.constexpr):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    x = tl.load(x_ptr + tid).to(tl.float32)
+    y = tl.load(y_ptr + tid).to(tl.float32)
+    t = (x - y) * 1.0e38
+    # M = 1e38 saturates every representable NORMAL fp32 gap (min normal
+    # 1.175e-38 * 1e38 >= 1.17 -> clamps), so 1 - t is exactly {0, 1} and the
+    # later bool conversion is exact. le is the INVERSE of greater (le =
+    # NOT (x > y) for non-NaN), negated exactly once -- see the NaN note
+    # above for the boundary.
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(out_ptr + tid, 1.0 - t)
+
+
+def _less_equal_tensor_fast(A, B, grid):
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    less_equal_tensor_fast_kernel[grid](
+        out32,
+        A,
+        B,
+        TILE=_LESS_EQUAL_TENSOR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
+@triton.jit
+def less_equal_tensor_fast_masked_kernel(
+    out_ptr, x_ptr, y_ptr, numel, TILE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    mask = tid < numel
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    y = tl.load(y_ptr + tid, mask=mask).to(tl.float32)
+    t = (x - y) * 1.0e38
+    # see less_equal_tensor_fast_kernel: M = 1e38, le = 1 - [x > y].
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(out_ptr + tid, 1.0 - t, mask=mask)
+
+
+def _less_equal_tensor_fast_masked(A, B, numel):
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (math.ceil(numel / _LESS_EQUAL_TENSOR_FAST_TILE),)
+    less_equal_tensor_fast_masked_kernel[grid](
+        out32,
+        A,
+        B,
+        numel,
+        TILE=_LESS_EQUAL_TENSOR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
 
 
 @pointwise_dynamic(

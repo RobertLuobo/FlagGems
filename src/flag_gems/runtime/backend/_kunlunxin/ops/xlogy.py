@@ -38,7 +38,8 @@
 #   n < _GATE   -> exact aten semantics (validated by the functional tests):
 #                  res = where(x == 0, 0, x*log(y));
 #                  res = where(isnan(y), NaN, res)
-#   n >= _GATE  -> select-free fast body: x*log(y)
+#   n >= _GATE  -> select-free fast body x*log(y) on the tuned 12-CTA
+#                  pointwise codegen (config_ above; see log.py recipe)
 # The fast body is exactly aten for (a) any x != 0 and (b) x == 0 with
 # finite y > 0 (0*log(y) -> 0); it differs only for x == 0 with
 # y in {+0, -0, +inf, -inf, <0} (0*log -> NaN instead of 0).  The gate
@@ -63,7 +64,9 @@ import math
 import torch
 import triton
 import triton.language as tl
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
+from ..utils.pointwise_dynamic import pointwise_dynamic
 from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.type_utils import ELEMENTWISE_TYPE_PROMOTION_KIND, type_promotion
 
@@ -73,6 +76,29 @@ _PROMOTION = ELEMENTWISE_TYPE_PROMOTION_KIND.INT_TO_FLOAT
 
 # n >= _GATE uses the select-free fast body (see module docstring).
 _GATE = 1_048_576
+
+# Tuned 12-CTA CodeGenConfig (log.py recipe) for the large-shape fast body:
+# the raw-pointer fast path below is SFU/throttle-bound on the 2.56M..16.7M
+# shapes (largest power-of-two tile divisor is only 4096), while this config
+# measures 1.03-1.46x on the full large-shape range (probe evidence, 2026-09-04).
+config_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    buffer_size_limit=8192,
+    isCloseVectorization=True,
+    kunlunAutoGrid=False,
+    unroll_num=16,
+)
+
+
+@pointwise_dynamic(promotion_methods=[(0, 1, "INT_TO_FLOAT")], config=config_)
+@triton.jit
+def _xlogy_fast(x, y):
+    return x.to(tl.float32) * tl.log(1.0000000000000000 * y.to(tl.float32))
+
 
 MIN_BLOCK = 2048
 UNROLL_NUM = 16
@@ -294,6 +320,10 @@ def _exact_scalar_tensor(n_elements, x_val):
 def _launch(x, y, out):
     n_elements = x.numel()
     if n_elements == 0:
+        return
+    if n_elements >= _GATE:
+        # Large shapes: 12-CTA pointwise fast body (see module docstring).
+        _xlogy_fast(x, y, out0=out)
         return
     block_size, num_warps, masked = _pick_block(n_elements)
     exact = _exact_tensor_tensor(n_elements)

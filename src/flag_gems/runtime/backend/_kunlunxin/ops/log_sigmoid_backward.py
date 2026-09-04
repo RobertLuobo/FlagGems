@@ -18,8 +18,19 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.utils import pointwise_dynamic
+import _kunlunxin.utils.pointwise_dynamic as _xpu_pd
+
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+
+from flag_gems.utils import pointwise_dynamic as generic_pointwise_dynamic
 from flag_gems.utils import triton_lang_extension as ext
+
+# `import ... as` (an ast.Import) on purpose: the generic
+# `flag_gems.utils.pointwise_dynamic` re-emits *ImportFrom* nodes that appear
+# in this module into its generated wrapper, and a relative `from ..utils...`
+# would be re-emitted as a broken `from utils...` (level dropped, measured
+# ModuleNotFoundError). ast.Import nodes are not collected, hence the alias.
+xpu_pointwise_dynamic = _xpu_pd.pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -35,44 +46,64 @@ logger = logging.getLogger(__name__)
 #    recomputes the derivative from `self`, which is exactly what the CUDA ATen
 #    kernel does (there `buffer` is empty by construction).
 #
-# 2) PERFORMANCE. The generic functional path is `pointwise_dynamic`, and the
-#    Kunlunxin CodeGenConfig caps `max_tile_size` at 512, so 16.7M elements are
-#    processed by ~32k tiny programs: 84.5 ms vs 0.214 ms for the vendor kernel
-#    (0.003x). The flat kernel below plus the XPU launch knobs measured in
-#    /tmp/lsb_probe (BLOCK=32768, num_warps=8, unroll_num=2,
-#    buffer_size_limit=8192, unmasked contiguous DMA) brings the same case to
-#    0.393 ms (~215x faster kernel, ~0.54x of the vendor kernel).
+# 2) PERFORMANCE. d log_sigmoid(x)/dx = 1 - sigmoid(x) = sigmoid(-x). On
+#    TritonXPU `tl.sigmoid(-x)` lowers to a much cheaper sequence than
+#    `1 / (1 + exp(x))`: at 16.7M fp16 `1/(1+exp)` is 0.458 ms while
+#    `sigmoid(-x)` is 0.244 ms (probes /tmp/lsb_probe2..4.py, XPU 4), and it
+#    is bit-identical in accuracy (same fp32 math, maxabsdiff vs CPU reference
+#    unchanged: 1.95e-3 fp16 / 4.77e-7 fp32 / 3.91e-3 bf16).
 #
-# Probe notes (XPU 1, 2026-08-29, /tmp/lsb_probe/probe_*.json), 16.7M fp16:
-#   * cost split at the chosen tile: 2 loads + 1 store floor 0.085 ms,
-#     +tl.exp 0.232 ms, +fp32 reciprocal 0.393 ms - exp and the divide each
-#     cost ~9 ns/element and add up, so the vendor kernel (0.214 ms, close to
-#     the pure-copy floor) stays ahead: the remaining gap is a backend
-#     transcendental/divide floor, not a structural problem of this kernel.
-#   * `tl.where(x < 0, 1, exp(-|x|)) / (1 + exp(-|x|))` (the generic algebra)
-#     costs 0.711 ms vs 0.393 ms for `1 / (1 + exp(x))`: the extra abs+where
-#     is ~17 ns/element on XPU. `tl.sigmoid` 0.402 ms, `tl.fdiv` (ieee True or
-#     False) 0.431 ms, `tl.exp2`-based 0.724 ms *and* numerically wrong
-#     (maxdiff 0.42), libdevice tanh fails to link, and a bitcast reciprocal
-#     seed + 3 Newton steps is 2.374 ms (bit ops get scalarized, same dead end
-#     the log_sigmoid_forward closure recorded).
-#   * special values keep vendor semantics without any branch:
-#     x=-inf -> exp=0 -> d=1, x=+inf -> exp=inf -> d=0, x=-300 -> d=1.
+#    Two kernel shapes are kept (measured same machine, 2026-09-04):
+#      * the flat single-tile-per-CTA kernels below (BLOCK=32768/16384/2048,
+#        num_warps 8/4, unroll 2, buffer_size_limit 8192) win up to ~4M
+#        elements (1M: 0.021 ms vs 0.075 ms; 4.2M: 0.066 ms vs 0.075 ms);
+#      * the 1D-tile codegen with kunlunAutoGrid (12 CTAs, one wide tile per
+#        CTA - the proven mse_loss_backward / lt_ / hardsigmoid_backward
+#        config) wins from ~16M elements (16.7M bf16: 0.223 ms vs 0.325 ms).
+#      The split point is FLAT_MAX_NUMEL; large fp16/fp32 tie within noise so
+#      the 12-CTA path is used there for bf16's benefit.
 #
-# 3) BACKEND TRAP (new finding, /tmp/lsb_probe/probe_mask_v8.py). A masked load
-#    written as `tl.load(p + off, mask=mask, other=0.0)` silently corrupts a
-#    few percent of the *valid* lanes on TritonXPU when the vendor guards
+#    Derivative algebra: sigmoid(-x) = 1/(1+exp(x)) is unconditionally stable
+#    (no overflow): x=-inf -> 0 -> d=1, x=+inf -> d=0, x=-300 -> d=1, x=0 ->
+#    0.5, and NaN propagates exactly as the CPU reference (verified elementwise
+#    on the edge probe: -inf/inf/-300/0/+-20/nan).
+#
+# 3) BACKEND TRAP (from the original closure). A masked load written as
+#    `tl.load(p + off, mask=mask, other=0.0)` silently corrupts a few percent
+#    of the *valid* lanes on TritonXPU when the vendor guards
 #    TRITONXPU_OTHER_SIM / TRITONXPU_STORE_MASK_SIM are not exported - and it
-#    does so even when the mask is entirely true. Measured (fp16, BLOCK=2048):
-#    27184/1048576 wrong for [1024,1024], 137586/5924352 for [16,7,57,32,29],
-#    40/1517 for [37,41] (wrong lanes read as 0, maxerr 3.5). fp32 corrupts at
-#    BLOCK=1024 instead (54977/1048576). Dropping `other=` makes every shape /
-#    dtype / block size in the sweep exact, so the masked kernel below relies
-#    on the masked store to discard the tail lanes and never passes `other=`.
+#    does so even when the mask is entirely true. The masked kernel below
+#    relies on the masked store to discard the tail lanes and never passes
+#    `other=`.
 
 UNROLL_NUM = 2
 BUFFER_SIZE_LIMIT = 8192
 IS_CLOSE_MEMORY_ASYNC = False
+
+# Above this many elements the 12-CTA 1D-tile codegen measures faster than the
+# flat per-CTA kernels (see the module docstring, section 2).
+FLAT_MAX_NUMEL = 4 * 1024 * 1024
+
+# 12-CTA auto-grid 1D-tile codegen: same proven config as hardsigmoid_backward.
+config_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    buffer_size_limit=4096,
+    kunlunAutoGrid=True,
+    unroll_num=8,
+)
+
+
+@xpu_pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=config_)
+@triton.jit
+def log_sigmoid_backward_func(grad_output, self):
+    # 1 - sigmoid(self) == sigmoid(-self) == 1 / (1 + exp(self))
+    go = grad_output.to(tl.float32)
+    x = self.to(tl.float32)
+    return (go * tl.sigmoid(0.0 - x)).to(grad_output.dtype)
 
 
 def _pick_block(n_elements):
@@ -104,7 +135,7 @@ def log_sigmoid_backward_flat_kernel(
     # out-of-range lanes.
     g = tl.load(grad_output_ptr + offsets, mask=mask)
     x = tl.load(self_ptr + offsets, mask=mask)
-    derivative = 1.0 / (1.0 + tl.exp(x.to(tl.float32)))
+    derivative = tl.sigmoid(0.0 - x.to(tl.float32))
     res = g.to(tl.float32) * derivative
     tl.store(
         grad_input_ptr + offsets,
@@ -124,12 +155,14 @@ def log_sigmoid_backward_flat_kernel_unmasked(
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     g = tl.load(grad_output_ptr + offsets)
     x = tl.load(self_ptr + offsets)
-    derivative = 1.0 / (1.0 + tl.exp(x.to(tl.float32)))
+    derivative = tl.sigmoid(0.0 - x.to(tl.float32))
     res = g.to(tl.float32) * derivative
     tl.store(grad_input_ptr + offsets, res.to(grad_input_ptr.dtype.element_ty))
 
 
-@pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, 1, "DEFAULT")])
+@generic_pointwise_dynamic(
+    is_tensor=[True, True], promotion_methods=[(0, 1, "DEFAULT")]
+)
 @triton.jit
 def log_sigmoid_backward_pointwise_kernel(grad_output, self):
     # Strided / broadcast / mixed-dtype fallback with the same algebra as the
@@ -193,6 +226,8 @@ def log_sigmoid_backward(grad_output, self, buffer):
     # `buffer` is intentionally unused: the vendor forward leaves it
     # uninitialized (see the module docstring above).
     if _can_use_flat_kernel(grad_output, self):
+        if self.numel() > FLAT_MAX_NUMEL:
+            return log_sigmoid_backward_func(grad_output, self)
         return _launch_flat_kernel(grad_output, self, torch.empty_like(self))
     return log_sigmoid_backward_pointwise_kernel(grad_output, self)
 
@@ -200,5 +235,7 @@ def log_sigmoid_backward(grad_output, self, buffer):
 def log_sigmoid_backward_out(grad_output, self, buffer, *, grad_input):
     logger.debug("GEMS_KUNLUNXIN LOG_SIGMOID_BACKWARD OUT")
     if _can_use_flat_kernel(grad_output, self, grad_input):
+        if self.numel() > FLAT_MAX_NUMEL:
+            return log_sigmoid_backward_func(grad_output, self, out0=grad_input)
         return _launch_flat_kernel(grad_output, self, grad_input)
     return log_sigmoid_backward_pointwise_kernel(grad_output, self, out0=grad_input)
