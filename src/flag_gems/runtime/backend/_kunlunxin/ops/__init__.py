@@ -246,7 +246,6 @@ from .negative import negative
 from .negative_ import negative_
 from .new_full import new_full
 from .new_ones import new_ones
-from .nextafter import nextafter, nextafter_
 from .nllloss import (
     nll_loss2d_backward,
     nll_loss2d_forward,
@@ -870,8 +869,6 @@ __all__ = [
     "ne_",
     "ne_scalar_",
     "negative_",
-    "nextafter",
-    "nextafter_",
     "rrelu_with_noise_backward",
     "sign",
     "sign_out",
