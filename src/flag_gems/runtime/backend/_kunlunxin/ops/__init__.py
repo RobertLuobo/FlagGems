@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .__irshift__ import __irshift__
 from ._amp_foreach_non_finite_check_and_unscale_ import (
     _amp_foreach_non_finite_check_and_unscale_,
 )
 from ._batch_norm_impl_index import batch_norm_impl_index as _batch_norm_impl_index
 from ._batch_norm_no_update import _batch_norm_no_update
 from ._conj import _conj
+from .conj_physical_ import conj_physical_
 from ._dyn_quant_pack_4bit_weight import _dyn_quant_pack_4bit_weight
 from ._embedding_bag_dense_backward import _embedding_bag_dense_backward
 from ._euclidean_dist import _euclidean_dist
@@ -35,19 +37,23 @@ from ._nested_view_from_buffer_copy import _nested_view_from_buffer_copy
 from ._pdist_backward import _pdist_backward
 from ._pdist_forward import _pdist_forward, pdist
 from ._prelu_kernel import _prelu_kernel
+from ._prelu_kernel_backward import _prelu_kernel_backward
 from ._scaled_dot_product_fused_attention_overrideable import (
     _scaled_dot_product_fused_attention_overrideable,
 )
 from ._thnn_fused_lstm_cell_backward_impl import _thnn_fused_lstm_cell_backward_impl
 from ._unsafe_masked_index_put_accumulate import _unsafe_masked_index_put_accumulate
+from ._masked_scale import _masked_scale
 from ._upsample_bilinear2d_aa import _upsample_bilinear2d_aa
 from ._upsample_nearest_exact2d_backward import _upsample_nearest_exact2d_backward
 from .abs import abs, abs_
 from .absolute import absolute, absolute_
 from .acos import acos, acos_
+from .adaptive_avg_pool3d_backward import _adaptive_avg_pool3d_backward
 from .adaptive_avg_pool2d import adaptive_avg_pool2d
 from .adaptive_max_pool2d import adaptive_max_pool2d
 from .add import add, add_
+from .addbmm import addbmm, addbmm_
 from .addcdiv import addcdiv, addcdiv_, addcdiv_out
 from .addcmul import addcmul, addcmul_, addcmul_out
 from .addmm import addmm, addmm_dtype, addmm_dtype_out, addmm_out
@@ -65,6 +71,8 @@ from .angle import angle
 from .any import any, any_dim, any_dims
 from .apply_repetition_penalties import apply_repetition_penalties
 from .arange import arange, arange_start
+from .acosh import acosh, acosh_
+from .asinh_ import asinh_
 from .arccos import arccos, arccos_
 from .arccosh import arccosh_
 from .arcsin import arcsin, arcsin_, arcsin_out
@@ -137,6 +145,7 @@ from .broadcast_to import broadcast_to
 from .bucketize import bucketize
 from .cat import cat, cat_out
 from .cdist_backward import _cdist_backward
+from .chunk_gated_delta_rule_fwd import chunk_gated_delta_rule_fwd
 from .ceil import ceil, ceil_, ceil_out
 from .celu import celu, celu_
 from .cholesky_inverse import cholesky_inverse
@@ -227,6 +236,16 @@ from .floor import floor, floor_, floor_out
 from .fmax import fmax, fmax_out
 from .fmin import fmin, fmin_out
 from .fmod import fmod_scalar, fmod_scalar_, fmod_tensor, fmod_tensor_
+from .float_power_ import (
+    float_power_scalar_tensor,
+    float_power_scalar_tensor_out,
+    float_power_tensor_scalar,
+    float_power_tensor_scalar_,
+    float_power_tensor_scalar_out,
+    float_power_tensor_tensor,
+    float_power_tensor_tensor_,
+    float_power_tensor_tensor_out,
+)
 from .fractional_max_pool2d import fractional_max_pool2d, fractional_max_pool2d_backward
 from .full import full
 from .full_like import full_like
@@ -254,6 +273,8 @@ from .gt import gt, gt_scalar, gt_scalar_, gt_tensor_
 from .hadamard_transform import hadamard_transform
 from .hardsigmoid import hardsigmoid, hardsigmoid_out
 from .hardsigmoid_backward import hardsigmoid_backward
+from .hardtanh_backward import hardtanh_backward
+from .hardswish_ import hardswish_
 from .heaviside_ import heaviside_
 from .histc import histc
 from .hstack import hstack
@@ -265,6 +286,7 @@ from .im2col import im2col
 from .index import index
 from .index_add import index_add, index_add_
 from .index_copy_ import index_copy, index_copy_
+from .index_fill import index_fill, index_fill_
 from .index_put import index_put, index_put_
 from .index_put_impl import _index_put_impl_
 from .index_reduce import index_reduce_
@@ -354,6 +376,7 @@ from .min import min, min_dim
 from .minimum import minimum
 from .miopen_batch_norm_backward import miopen_batch_norm_backward
 from .mish_backward import mish_backward
+from .mish import mish, mish_
 from .mm import mm, mm_out
 from .mode import mode
 from .moe_sum import moe_sum
@@ -492,6 +515,7 @@ from .sgn_ import sgn_
 from .sigmoid import sigmoid, sigmoid_, sigmoid_backward
 from .sign import sign, sign_out
 from .signbit import signbit, signbit_out
+from .sinh import sinh, sinh_
 from .silu import silu, silu_, silu_backward
 from .sin import sin, sin_
 from .sinc import sinc, sinc_, special_sinc
@@ -609,11 +633,13 @@ from .zeros import zeros
 from .zeros_like import zeros_like
 
 __all__ = [
+    "__irshift__",
     "_amp_foreach_non_finite_check_and_unscale_",
     "_assert_async",
     "_batch_norm_impl_index",
     "_batch_norm_no_update",
     "_conj",
+    "conj_physical_",
     "_embedding_bag_dense_backward",
     "_functional_assert_async",
     "_functional_sym_constrain_range",
@@ -627,6 +653,7 @@ __all__ = [
     "_cdist_backward",
     "_dyn_quant_pack_4bit_weight",
     "_is_all_true",
+    "_masked_scale",
     "_scaled_dot_product_fused_attention_overrideable",
     "_thnn_fused_lstm_cell_backward_impl",
     "_upsample_nearest_exact2d_backward",
@@ -674,6 +701,8 @@ __all__ = [
     "acos_",
     "add",
     "add_",
+    "addbmm",
+    "addbmm_",
     "addcdiv",
     "addcdiv_",
     "addcdiv_out",
@@ -728,6 +757,7 @@ __all__ = [
     "atan2_out",
     "adaptive_avg_pool2d",
     "adaptive_max_pool2d",
+    "_adaptive_avg_pool3d_backward",
     "avg_pool2d",
     "avg_pool2d_backward",
     "avg_pool3d",
@@ -934,6 +964,7 @@ __all__ = [
     "hardsigmoid",
     "hardsigmoid_backward",
     "hardsigmoid_out",
+    "hardtanh_backward",
     "histc",
     "hypot",
     "im2col",
@@ -941,6 +972,8 @@ __all__ = [
     "index_add",
     "index_add_",
     "index_copy_",
+    "index_fill",
+    "index_fill_",
     "index_put",
     "index_put_",
     "_index_put_impl_",
@@ -1091,6 +1124,8 @@ __all__ = [
     "min_dim",
     "minimum",
     "mish_backward",
+    "mish",
+    "mish_",
     "miopen_batch_norm_backward",
     "mm",
     "mm_out",

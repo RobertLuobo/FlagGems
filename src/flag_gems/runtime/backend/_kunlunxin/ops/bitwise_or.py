@@ -49,7 +49,7 @@ def bitwise_or_tensor_(A, B):
     return bitwise_or_func(A, B, out0=A)
 
 
-@pointwise_dynamic(is_tensor=[True, False], promotion_methods=[(0, 1, "DEFAULT")])
+@pointwise_dynamic(is_tensor=[True, False], promotion_methods=[(0, 1, "DEFAULT")], config=config_)
 @triton.jit
 def bitwise_or_func_scalar(x, y):
     return x | y
