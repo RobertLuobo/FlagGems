@@ -182,7 +182,6 @@ from .linalg_det import linalg_det, linalg_det_out
 from .linalg_householder_product import linalg_householder_product
 from .linalg_ldl_factor import ldl_factor
 from .linalg_ldl_factor_ex import ldl_factor_ex
-from .linalg_ldl_solve import linalg_ldl_solve
 from .linalg_lstsq import linalg_lstsq
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
@@ -825,7 +824,6 @@ __all__ = [
     "linalg_householder_product",
     "ldl_factor",
     "ldl_factor_ex",
-    "linalg_ldl_solve",
     "linalg_lstsq",
     "linalg_lu_factor",
     "linalg_lu_factor_out",
