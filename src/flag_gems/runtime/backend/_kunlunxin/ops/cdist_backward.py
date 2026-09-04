@@ -14,16 +14,23 @@
 
 # XPU override for cdist_backward.
 #
-# The general kernel builds contrib as a 2D [BLOCK_N2, BLOCK_DIM] tile and
-# reduces along axis=0. XPU triton rejects axis=0 reductions on 2D+ tensors
-# ("axis must not be 0 for 2D+ shapes"). Swapping the layout to
-# [BLOCK_DIM, BLOCK_N2] with axis=1 reduce compiles but TritonXPUCoreTiling
-# still fails on 64x64 tiles.
+# grad_x1[b, i, :] = sum_j w[b, i, j] * (x1[b, i, :] - x2[b, j, :]),
+#   w[b, i, j] = grad[b, i, j] / (cdist[b, i, j] + eps).
 #
-# This override eliminates the 2D tile entirely: loop over n2 as a scalar
-# runtime loop, each step loading a 1D [BLOCK_DIM] x2 vector and scalar
-# grad/cdist. All ops stay 1D so XPU codegen is clean. n2 in the current
-# tests is small (n1//2+1 <= 33), so the scalar loop is not a hot spot.
+# Design constraints on this Triton-XPU fork (all verified by experiment):
+#   * tl.sum(axis=0) on 2D+ tiles is rejected by the backend.
+#   * tl.sum(axis=1) transposed layout dies in TritonXPUCoreTiling (uni_sram OOM).
+#   * tl.dot / register-tensor indexing (x[k, :]) / n2-split atomics all fail
+#     to compile, so the n2 reduction must stay a serial scalar loop, and the
+#     only degree of freedom left is the load count inside that loop.
+#   * BLOCK_DIM > 128 OOMs (uni_sram); BLOCK_DIM=128 is the widest safe tile
+#     and is ~2x faster than 64 because per-iteration loop overhead dominates.
+#
+# Hence the two-kernel scheme below:
+#   1) _cdist_backward_w_kernel: w = grad / (cdist + eps)  (1D elementwise;
+#      BLOCK=128; 1024-lane masked tails are unreliable on this backend).
+#   2) _cdist_backward_kernel: 2 loads per j-iteration (w scalar + x2 vector)
+#      instead of 3, which is ~1.4x faster than the inline 3-load version.
 
 import logging
 
@@ -36,14 +43,27 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
+_W_BLOCK = 128
+_BLOCK_DIM = 128
+
+
+@libentry()
+@triton.jit
+def _cdist_backward_w_kernel(grad_ptr, cdist_ptr, w_ptr, numel, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    off = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = off < numel
+    g = tl.load(grad_ptr + off, mask=mask, other=0.0).to(tl.float32)
+    c = tl.load(cdist_ptr + off, mask=mask, other=1.0).to(tl.float32)
+    tl.store(w_ptr + off, g / (c + 1e-12), mask=mask)
+
 
 @libentry()
 @triton.jit
 def _cdist_backward_kernel(
-    grad_ptr,
+    w_ptr,
     x1_ptr,
     x2_ptr,
-    cdist_ptr,
     grad_x1_ptr,
     batch_size,
     n1,
@@ -55,31 +75,25 @@ def _cdist_backward_kernel(
     pid_b = tl.program_id(0)
     pid_n1 = tl.program_id(1)
     pid_dim = tl.program_id(2)
+    n1_idx = pid_n1
 
     off_dim = pid_dim * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
     mask_dim = off_dim < dim
-    n1_idx = pid_n1
 
-    # x1[b, n1_idx, off_dim] : [BLOCK_DIM]
     x1_offset = pid_b * n1 * dim + n1_idx * dim + off_dim
     x1 = tl.load(x1_ptr + x1_offset, mask=mask_dim, other=0.0).to(tl.float32)
 
     grad_x1_acc = tl.zeros([BLOCK_DIM], dtype=tl.float32)
 
-    grad_base = pid_b * n1 * n2 + n1_idx * n2
+    w_base = pid_b * n1 * n2 + n1_idx * n2
     x2_base = pid_b * n2 * dim
 
-    eps = 1e-12
     for j in range(0, n2):
-        # scalar loads (broadcast a 1-element load)
-        gj = tl.load(grad_ptr + grad_base + j).to(tl.float32)
-        cj = tl.load(cdist_ptr + grad_base + j).to(tl.float32)
-        # x2[b, j, off_dim] : [BLOCK_DIM]
+        wj = tl.load(w_ptr + w_base + j).to(tl.float32)
         x2j = tl.load(
             x2_ptr + x2_base + j * dim + off_dim, mask=mask_dim, other=0.0
         ).to(tl.float32)
-        diff = x1 - x2j
-        grad_x1_acc += gj * diff / (cj + eps)
+        grad_x1_acc += wj * (x1 - x2j)
 
     store_offset = pid_b * n1 * dim + n1_idx * dim + off_dim
     tl.store(grad_x1_ptr + store_offset, grad_x1_acc, mask=mask_dim)
@@ -109,22 +123,30 @@ def _cdist_backward(grad, x1, x2, p, cdist):
     else:
         grad_x1_fp32 = torch.empty_like(x1)
 
-    BLOCK_DIM = 64
-    grid = (batch_size, n1, triton.cdiv(dim, BLOCK_DIM))
+    w = torch.empty((batch_size, n1, n2), dtype=torch.float32, device=x1.device)
+    numel = w.numel()
+
+    grid = (batch_size, n1, triton.cdiv(dim, _BLOCK_DIM))
 
     with torch_device_fn.device(x1.device):
-        _cdist_backward_kernel[grid](
+        _cdist_backward_w_kernel[(triton.cdiv(numel, _W_BLOCK),)](
             grad,
+            cdist,
+            w,
+            numel,
+            BLOCK=_W_BLOCK,
+        )
+        _cdist_backward_kernel[grid](
+            w,
             x1,
             x2,
-            cdist,
             grad_x1_fp32,
             batch_size,
             n1,
             n2,
             dim,
             float(p),
-            BLOCK_DIM=BLOCK_DIM,
+            BLOCK_DIM=_BLOCK_DIM,
         )
 
     if x1.dtype in (torch.float16, torch.bfloat16):

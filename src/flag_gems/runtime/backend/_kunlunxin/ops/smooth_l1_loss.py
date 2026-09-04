@@ -13,13 +13,25 @@
 # limitations under the License.
 
 import logging
+import os
 
 import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
-from flag_gems.utils import pointwise_dynamic
+from flag_gems.runtime import torch_device_fn
+# Vendor codegen (auto-grid, tl.constexpr strides) is ~50x faster than the
+# generic codegen (runtime strides -> discrete access) on this XPU backend.
+from _kunlunxin.utils.pointwise_dynamic import pointwise_dynamic
+from flag_gems.utils import libentry
+from flag_gems.utils import triton_lang_extension as ext
+
+# NOTE: absolute import (not `from ..utils...`): the pointwise_dynamic
+# codegen AST-parses this source file and re-emits every non-whitelisted
+# `ImportFrom` into the generated kernel module, where a relative `..utils`
+# path would be re-emitted without its import level and break the load.
+from _kunlunxin.utils.block_size_utils import get_block_size_1d
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +134,147 @@ def _loss_values(input, target, beta):
     return _smooth_loss(input, target, beta)
 
 
+@libentry()
+@triton.jit
+def _smooth_l1_loss_partial_sum_kernel(
+    inp, target, mid, M, beta: tl.constexpr, reduction: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Masked stage-1 (legacy path): one program sums BLOCK_SIZE elements of
+    # the smooth-l1 loss into mid[pid] (fp32 accumulation). Tail blocks are
+    # handled with mask + other=0 (needs TRITONXPU_OTHER_SIM=1 at launch).
+    pid = ext.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < M
+    inp_val = tl.load(inp + offset, mask=mask, other=0.0).to(tl.float32)
+    target_val = tl.load(target + offset, mask=mask, other=0.0).to(tl.float32)
+    diff = tl.abs(inp_val - target_val)
+    if beta == 0.0:
+        loss = diff
+    else:
+        loss = tl.where(diff < beta, 0.5 * diff * diff / beta, diff - 0.5 * beta)
+    if reduction == 1:
+        sum_val = tl.sum(loss) / M
+    else:
+        sum_val = tl.sum(loss)
+    tl.store(mid + pid, sum_val)
+
+
+@libentry()
+@triton.jit
+def _smooth_l1_loss_partial_sum_unmasked_kernel(
+    inp, target, mid, M, beta: tl.constexpr, reduction: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Unmasked stage-1 over a full 32768-lane block (M % BLOCK_SIZE == 0
+    # guaranteed by the host): skips the masked-memory path (3-4x on the
+    # large shapes). tl.sum at 32768 lanes is only complete with
+    # buffer_size_limit=2048 (enforced at launch); 32768 is the largest
+    # exact tl.sum tile on this backend.
+    pid = ext.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    inp_val = tl.load(inp + offset).to(tl.float32)
+    target_val = tl.load(target + offset).to(tl.float32)
+    diff = tl.abs(inp_val - target_val)
+    if beta == 0.0:
+        loss = diff
+    else:
+        loss = tl.where(diff < beta, 0.5 * diff * diff / beta, diff - 0.5 * beta)
+    if reduction == 1:
+        sum_val = tl.sum(loss) / M
+    else:
+        sum_val = tl.sum(loss)
+    tl.store(mid + pid, sum_val)
+
+
+@libentry()
+@triton.jit
+def _smooth_l1_loss_final_sum_kernel(mid, out, mid_size, BLOCK_MID: tl.constexpr):
+    offset = tl.arange(0, BLOCK_MID)
+    mid_ptrs = mid + offset
+    mask = offset < mid_size
+    mid_val = tl.load(mid_ptrs, mask=mask, other=0.0).to(tl.float32)
+    sum_val = tl.sum(mid_val)
+    tl.store(out, sum_val)
+
+
+# Unmasked stage-1 tile: the largest tl.sum tile that is exact on this XPU
+# with buffer_size_limit=2048 (see kunlunxin reduction notes).
+_FULL_BLOCK = 32768
+# Stage-2 must stay inside the 32768-lane tl.sum ceiling; grow stage-1 blocks
+# if the grid would exceed it (legacy MAX_MID rule).
+_MAX_MID = 32768
+
+
+def _smooth_l1_loss_reduce_fused(input, target, beta, reduction):
+    input = input.contiguous()
+    target = target.contiguous()
+    M = input.numel()
+    dtype = input.dtype
+
+    block_size = get_block_size_1d(M, input.element_size() * 2)
+
+    if (M > _FULL_BLOCK) and (M % _FULL_BLOCK == 0):
+        # Fully divisible by the 32768-lane tile: the unmasked stage-1 path
+        # skips the masked-memory penalty entirely. Non-divisible tensors
+        # keep the legacy masked path (masked tails at nonzero bases were
+        # probed unreliable on XPU, so they are not re-tiled here).
+        mid_size = M // _FULL_BLOCK
+        if mid_size <= _MAX_MID:
+            block_mid = triton.next_power_of_2(mid_size)
+            mid = torch.empty((mid_size,), dtype=torch.float32, device=input.device)
+            out = torch.empty([], dtype=dtype, device=input.device)
+            os.environ["TRITONXPU_OTHER_SIM"] = "1"
+            with torch_device_fn.device(input.device):
+                _smooth_l1_loss_partial_sum_unmasked_kernel[(mid_size,)](
+                    input,
+                    target,
+                    mid,
+                    M,
+                    beta,
+                    reduction,
+                    _FULL_BLOCK,
+                    buffer_size_limit=2048,
+                )
+                _smooth_l1_loss_final_sum_kernel[(1, 1, 1)](
+                    mid, out, mid_size, block_mid, buffer_size_limit=2048
+                )
+            if "TRITONXPU_OTHER_SIM" in os.environ:
+                del os.environ["TRITONXPU_OTHER_SIM"]
+            return out
+
+    # Legacy path: masked stage-1 blocks sized by get_block_size_1d, fp32 mid
+    # accumulation, masked stage-2. TRITONXPU_OTHER_SIM makes masked loads
+    # apply `other` via an explicit where (the XPU lowering otherwise ignores
+    # `other`).
+    mid_size = triton.cdiv(M, block_size)
+    if mid_size > _MAX_MID:
+        block_size = triton.next_power_of_2(triton.cdiv(M, _MAX_MID))
+        mid_size = triton.cdiv(M, block_size)
+    block_mid = triton.next_power_of_2(mid_size)
+
+    mid = torch.empty((mid_size,), dtype=torch.float32, device=input.device)
+    out = torch.empty([], dtype=dtype, device=input.device)
+
+    os.environ["TRITONXPU_OTHER_SIM"] = "1"
+    with torch_device_fn.device(input.device):
+        _smooth_l1_loss_partial_sum_kernel[(mid_size, 1, 1)](
+            input, target, mid, M, beta, reduction, block_size,
+            buffer_size_limit=2048,
+        )
+        if mid_size == 1:
+            if "TRITONXPU_OTHER_SIM" in os.environ:
+                del os.environ["TRITONXPU_OTHER_SIM"]
+            return mid.reshape([]).to(dtype)
+        _smooth_l1_loss_final_sum_kernel[(1, 1, 1)](
+            mid, out, mid_size, block_mid, buffer_size_limit=2048
+        )
+    if "TRITONXPU_OTHER_SIM" in os.environ:
+        del os.environ["TRITONXPU_OTHER_SIM"]
+
+    return out
+
+
 def smooth_l1_loss(input, target, reduction=1, beta: float = 1.0):
     logger.debug("GEMS KUNLUNXIN SMOOTH_L1_LOSS")
     reduction = _normalize_reduction(reduction)
@@ -137,13 +290,11 @@ def smooth_l1_loss(input, target, reduction=1, beta: float = 1.0):
             return torch.full((), float("nan"), device=input.device, dtype=input.dtype)
         return torch.zeros((), device=input.device, dtype=input.dtype)
 
-    loss = _loss_values(input_expanded, target_expanded, beta)
     if reduction == 0:
-        return loss
-    result = torch.sum(loss)
-    if reduction == 1:
-        result = result / loss.numel()
-    return result
+        # pointwise path handles broadcasting/stride internally
+        return _loss_values(input_expanded, target_expanded, beta)
+    input_b, target_b = torch.broadcast_tensors(input_expanded, target_expanded)
+    return _smooth_l1_loss_reduce_fused(input_b, target_b, beta, reduction)
 
 
 def smooth_l1_loss_out(input, target, reduction=1, beta: float = 1.0, *, out):

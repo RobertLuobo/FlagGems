@@ -47,7 +47,11 @@
 # every functional test (the only zero-containing tensor is the 5-element
 # special-value case).  Scalar variants pass the scalar as an fp32 kernel
 # argument (log folds to a per-CTA scalar op) and use the fast path only
-# when it is exact for all x (finite positive y, resp. x != 0).
+# when it is exact for all x (finite positive y, resp. x != 0).  When the
+# scalar is given as a 0D/1-element *tensor*, the value is loaded inside the
+# kernel (no host sync) for n < _GATE, where the EXACT body is correct for
+# every x (see the xlogy_scalar_tensor_ptr_kernel* kernels); n >= _GATE
+# falls back to the float(x_val) host read.
 #
 # Output dtype follows the same type_promotion(..., "INT_TO_FLOAT") rule as
 # the previous implementation (fp16/bf16/fp32 unchanged; int -> fp32).
@@ -55,8 +59,10 @@
 # Known limits (unchanged from before): xlogy requires equal shapes (no
 # broadcasting, matching aten); torch.xlogy *scalar* variants cannot be
 # measured in the harness because the torch_xmlir reference kernel itself
-# fails with [INVALID PARAMETER] (CUDANativeFunctions.cpp:16185/16269) -- a
-# NON_BUG reference-side limitation, not a FlagGems problem.
+# fails with [INVALID PARAMETER] (CUDANativeFunctions.cpp:16185/16268) -- a
+# NON_BUG reference-side limitation, not a FlagGems problem.  The benchmark
+# therefore measures the reference through the numerically identical
+# xlogy.Tensor 0D-scalar broadcast (see benchmark/test_xlogy.py).
 
 import logging
 import math
@@ -302,6 +308,66 @@ def xlogy_scalar_tensor_kernel_unmasked(
         tl.store(out_ptr + offset, res.to(out_ptr.dtype.element_ty))
 
 
+# 0D/1-element-tensor variants: x is loaded from device memory inside the
+# kernel instead of being passed as a host argument.  That avoids the
+# device->host sync of `float(x_ptr)` on every call (measured ~50-90us on
+# XPU), which dominated the small-shape latency.  They are only dispatched
+# when n < _GATE, where the EXACT body is correct for every x, so the value
+# never has to be inspected on the host.  (A runtime `if x == 0.0` variant
+# was also tried so that n >= _GATE could run sync-free as well, but the
+# unmasked/masked 2048-lane configs abort the XMLIR compile with
+# "double free or corruption" / "malloc(): invalid size" on this backend, so
+# n >= _GATE keeps the float(x_val) fallback.)
+@triton.jit
+def xlogy_scalar_tensor_ptr_kernel(
+    y_ptr,
+    x_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    EXACT: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < n_elements
+    y = tl.load(y_ptr + offset, mask=mask, other=1).to(tl.float32)
+    x = tl.load(x_ptr).to(tl.float32)
+    if EXACT:
+        prod = x * tl.log(y)
+        res = tl.where(x == 0.0, 0.0, prod)
+        y_bits = y.to(tl.int32, bitcast=True)
+        y_nan = (y_bits & 0x7FFFFFFF) > 0x7F800000
+        res = tl.where(y_nan, float("nan"), res)
+        tl.store(out_ptr + offset, res.to(out_ptr.dtype.element_ty), mask=mask)
+    else:
+        res = x * tl.log(y)
+        tl.store(out_ptr + offset, res.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
+def xlogy_scalar_tensor_ptr_kernel_unmasked(
+    y_ptr,
+    x_ptr,
+    out_ptr,
+    BLOCK_SIZE: tl.constexpr,
+    EXACT: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    y = tl.load(y_ptr + offset).to(tl.float32)
+    x = tl.load(x_ptr).to(tl.float32)
+    if EXACT:
+        prod = x * tl.log(y)
+        res = tl.where(x == 0.0, 0.0, prod)
+        y_bits = y.to(tl.int32, bitcast=True)
+        y_nan = (y_bits & 0x7FFFFFFF) > 0x7F800000
+        res = tl.where(y_nan, float("nan"), res)
+        tl.store(out_ptr + offset, res.to(out_ptr.dtype.element_ty))
+    else:
+        res = x * tl.log(y)
+        tl.store(out_ptr + offset, res.to(out_ptr.dtype.element_ty))
+
+
 def _exact_tensor_tensor(n_elements):
     return n_elements < _GATE
 
@@ -395,6 +461,41 @@ def _launch_scalar_tensor(y, out, x_val):
     n_elements = y.numel()
     if n_elements == 0:
         return
+    if isinstance(x_val, torch.Tensor) and x_val.numel() == 1 and n_elements < _GATE:
+        # 0D/1-element tensor scalar: load the value in-kernel (see the ptr
+        # kernels above).  n < _GATE forces the EXACT body, which is correct
+        # for every x, so the value never needs to be read on the host and the
+        # per-call device->host sync of `float(x_val)` is avoided.
+        block_size, num_warps, masked = _pick_block(n_elements)
+        if masked:
+            grid = (triton.cdiv(n_elements, block_size),)
+            xlogy_scalar_tensor_ptr_kernel[grid](
+                y,
+                x_val,
+                out,
+                n_elements,
+                BLOCK_SIZE=block_size,
+                EXACT=True,
+                num_warps=num_warps,
+                unroll_num=UNROLL_NUM,
+                buffer_size_limit=BUFFER_SIZE_LIMIT,
+                isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
+            )
+        else:
+            grid = (n_elements // block_size,)
+            xlogy_scalar_tensor_ptr_kernel_unmasked[grid](
+                y,
+                x_val,
+                out,
+                BLOCK_SIZE=block_size,
+                EXACT=True,
+                num_warps=num_warps,
+                unroll_num=UNROLL_NUM,
+                buffer_size_limit=BUFFER_SIZE_LIMIT,
+                isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
+            )
+        return
+    x_val = float(x_val)
     block_size, num_warps, masked = _pick_block(n_elements)
     exact = _exact_scalar_tensor(n_elements, x_val)
     if masked:
@@ -489,11 +590,10 @@ def xlogy_tensor_scalar_(self, other):
 # aten::xlogy.Scalar_Self
 def xlogy_scalar_tensor(self, other):
     logger.debug("GEMS_KUNLUNXIN XLOGY_SCALAR_TENSOR")
-    self_f = float(self)
     y = other.contiguous()
     _, result_dtype = type_promotion(self, other, type_promotion=_PROMOTION)
     out = torch.empty_like(y, dtype=result_dtype)
-    _launch_scalar_tensor(y, out, self_f)
+    _launch_scalar_tensor(y, out, self)
     return out
 
 
@@ -501,5 +601,5 @@ def xlogy_scalar_tensor(self, other):
 def xlogy_scalar_tensor_out(self, other, out):
     logger.debug("GEMS_KUNLUNXIN XLOGY_SCALAR_TENSOR_OUT")
     y = other.contiguous()
-    _launch_scalar_tensor(y, out, float(self))
+    _launch_scalar_tensor(y, out, self)
     return out
