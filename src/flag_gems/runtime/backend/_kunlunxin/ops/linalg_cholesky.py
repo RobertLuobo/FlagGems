@@ -103,21 +103,21 @@ def _lc_small_kernel(
 def _lc_prep_kernel(W_ptr, A_ptr, L_ptr, LT_ptr, N, r: tl.constexpr):
     """W[:,r] = A[:,rb] - sum_{k<r} L[:,kb] (L[rb,kb])^T  (32x32 dot acc)."""
     b = tl.program_id(0)
-    rows = tl.arange(0, 32)
-    cols = tl.arange(0, 32)
+    I = tl.arange(0, 32)
+    J = tl.arange(0, 32)
     acc = -tl.load(
-        A_ptr + b * N * N + r * 32 * N + r * 32 + rows[:, None] * N + cols[None, :]
+        A_ptr + b * N * N + r * 32 * N + r * 32 + I[:, None] * N + J[None, :]
     )
     for k in range(r):
         l1 = tl.load(
-            L_ptr + b * N * N + r * 32 * N + k * 32 + rows[:, None] * N + cols[None, :]
+            L_ptr + b * N * N + r * 32 * N + k * 32 + I[:, None] * N + J[None, :]
         )
         l2 = tl.load(
-            LT_ptr + b * N * N + k * 32 * N + r * 32 + rows[:, None] * N + cols[None, :]
+            LT_ptr + b * N * N + k * 32 * N + r * 32 + I[:, None] * N + J[None, :]
         )
         acc = tl.dot(l1, l2, acc, input_precision="ieee")
     tl.store(
-        W_ptr + b * 32768 + r * 1024 + rows[:, None] * 32 + cols[None, :],
+        W_ptr + b * 32768 + r * 1024 + I[:, None] * 32 + J[None, :],
         -acc,
     )
 
@@ -153,6 +153,7 @@ def _lc_inv_kernel(L_ptr, X_ptr, N, r: tl.constexpr):
     l0 = b * N * N + r * 32 * N + r * 32
     x0 = b * 32768 + r * 1024
     J = tl.arange(0, 32)
+    dtype = L_ptr.dtype.element_ty
     for i in range(32):
         acc = tl.where(J == i, 1.0, 0.0)
         for k in range(i):
@@ -173,24 +174,22 @@ def _lc_off_kernel(
 ):
     """L[:,m][:,r] = (A[m,r] - sum_{k<r} L[m,k] (L[r,k])^T) @ (L_rr^{-1})^T."""
     b = tl.program_id(0)
-    rows = tl.arange(0, 32)
-    cols = tl.arange(0, 32)
+    I = tl.arange(0, 32)
+    J = tl.arange(0, 32)
     acc = -tl.load(
-        A_ptr + b * N * N + m * 32 * N + r * 32 + rows[:, None] * N + cols[None, :]
+        A_ptr + b * N * N + m * 32 * N + r * 32 + I[:, None] * N + J[None, :]
     )
     for k in range(r):
         l1 = tl.load(
-            L_ptr + b * N * N + m * 32 * N + k * 32 + rows[:, None] * N + cols[None, :]
+            L_ptr + b * N * N + m * 32 * N + k * 32 + I[:, None] * N + J[None, :]
         )
         l2 = tl.load(
-            LT_ptr + b * N * N + k * 32 * N + r * 32 + rows[:, None] * N + cols[None, :]
+            LT_ptr + b * N * N + k * 32 * N + r * 32 + I[:, None] * N + J[None, :]
         )
         acc = tl.dot(l1, l2, acc, input_precision="ieee")
-    xt = tl.load(XT_ptr + b * 32768 + r * 1024 + rows[:, None] * 32 + cols[None, :])
+    xt = tl.load(XT_ptr + b * 32768 + r * 1024 + I[:, None] * 32 + J[None, :])
     out = tl.dot(-acc, xt, input_precision="ieee")
-    tl.store(
-        L_ptr + b * N * N + m * 32 * N + r * 32 + rows[:, None] * N + cols[None, :], out
-    )
+    tl.store(L_ptr + b * N * N + m * 32 * N + r * 32 + I[:, None] * N + J[None, :], out)
 
 
 def _chol_blocked(work, batch, n):

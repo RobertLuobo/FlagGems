@@ -98,22 +98,22 @@ def _use_flat(A):
     return True
 
 
-def _launch_flat(A, out):
+def _launch_flat(A, O):
     n_elements = A.numel()
     if n_elements == 0:
-        return out
+        return O
     block, warps = _pick_tier(n_elements)
     need_mask = (n_elements % block) != 0
     grid = (triton.cdiv(n_elements, block),)
     selu_flat_kernel[grid](
         A.reshape(-1),
-        out,
+        O,
         n_elements,
         BLOCK_SIZE=block,
         NEED_MASK=need_mask,
         num_warps=warps,
     )
-    return out
+    return O
 
 
 def selu(A):

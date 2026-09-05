@@ -12,11 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public quantized-linear APIs with backend-specific implementations."""
-
-from flag_gems.runtime.backend._arm.quantized_linear import (
-    pack_rhs_qsi4c128p,
-    w4a8_g128_linear,
-)
-
-__all__ = ["pack_rhs_qsi4c128p", "w4a8_g128_linear"]
+mul:
+  - config:
+    param_map:
+      META:
+        BLOCK_SIZE: block_size
+      num_stages: stages
+      num_warps: warps
+    block_size:
+      - 128
+      - 256
+      - 512
+      - 1024
+      - 2048
+      - 4096
+      - 8192
+    stages:
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+    warps:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+  - strategy:
+      n_elements: align32
+      n_cols: default
+      dtype: default

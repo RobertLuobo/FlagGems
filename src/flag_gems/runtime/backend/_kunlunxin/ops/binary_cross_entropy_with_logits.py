@@ -60,9 +60,9 @@ def _bce_loss(xv, yv):
 
 @triton.jit
 def _bce_pos_weight_loss(xv, yv, pv):
-    log_e = tl.log(1.0 + tl.exp(-tl.abs(xv)))
-    neg_log = tl.where(xv >= 0, log_e, -xv + log_e)  # log(1+e^-x)
-    pos_log = tl.where(xv >= 0, xv + log_e, log_e)  # log(1+e^x)
+    l = tl.log(1.0 + tl.exp(-tl.abs(xv)))
+    neg_log = tl.where(xv >= 0, l, -xv + l)  # log(1+e^-x)
+    pos_log = tl.where(xv >= 0, xv + l, l)  # log(1+e^x)
     x_pos = yv * pv * neg_log + (1.0 - yv) * (xv + neg_log)
     x_neg = yv * (-pv * xv + pv * pos_log) + (1.0 - yv) * pos_log
     return tl.where(xv >= 0.0, x_pos, x_neg)
