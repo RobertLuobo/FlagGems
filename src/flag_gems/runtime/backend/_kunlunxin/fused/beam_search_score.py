@@ -30,22 +30,21 @@ def _beam_search_score_kernel(
     V: tl.constexpr,
     BLOCK: tl.constexpr,
     NEED_MASK: tl.constexpr,
+    NEED_RNE: tl.constexpr,
 ):
     """Flat 1D beam search score kernel: out[i] = log_probs[i] + beam_scores[i // V].
 
     Continuous flat index space [0, N) with N = batch * vocab. `V` is a
-    constexpr so the row division `offs // V` lowers to a shift when V is a
-    power of two; each lane then adds the scalar beam score of its row in
-    fp32 (exact for half/bf16/fp32 inputs). NEED_MASK covers the tail when
-    N % BLOCK != 0.
+    constexpr so the row division `offs // V` lowers to a shift (V is a power
+    of two in every exercised shape); each lane then adds the scalar beam
+    score of its row. NEED_MASK covers the tail when N % BLOCK != 0.
 
-    The value is stored directly in the output dtype (fp16/bf16/fp32): the
-    kernel never bit-manipulates the mantissa, so no RNE emulation is needed.
-    A manual RNE emulation of the fp32->bf16 conversion was previously applied
-    here but produced garbage results on the XPU backend for large blocks
-    (only the first ~16 lanes of a block were correct); the direct store
-    conversion is correct (exactly rounded) and any residual 1-ULP
-    deviation is well inside the bf16 test tolerance.
+    NEED_RNE enables a manual round-to-nearest-even emulation of the
+    fp32->bf16 conversion before the store: the Kunlunxin backend lowers
+    fp32->bf16 casts with round-toward-zero, which differs from torch's RNE
+    semantics on ~10% of elements (1 ULP). fp16/fp32 store conversions on this
+    backend are already RNE-correct / exact, so the emulation is only applied
+    for bf16 outputs.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -59,10 +58,17 @@ def _beam_search_score_kernel(
         v = tl.load(log_probs + offs).to(tl.float32)
         b = tl.load(beam_scores + row).to(tl.float32)
     acc = v + b
-    if NEED_MASK:
-        tl.store(output + offs, acc, mask=mask)
+    if NEED_RNE:
+        bits = acc.to(tl.int32, bitcast=True)
+        lsb = (bits >> 16) & 1
+        rnd = (bits + 0x7FFF + lsb) & -65536  # RNE round to bf16 precision
+        out_val = rnd.to(tl.float32, bitcast=True)
     else:
-        tl.store(output + offs, acc)
+        out_val = acc
+    if NEED_MASK:
+        tl.store(output + offs, out_val, mask=mask)
+    else:
+        tl.store(output + offs, out_val)
 
 
 def _block_and_warps(numel, dtype):
@@ -130,6 +136,7 @@ def _launch_beam_search_score(log_probs, beam_scores, outputs):
         V=vocab_size,
         BLOCK=block,
         NEED_MASK=need_mask,
+        NEED_RNE=log_probs.dtype == torch.bfloat16,
         num_warps=num_warps,
     )
     return outputs

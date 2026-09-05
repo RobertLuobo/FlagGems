@@ -278,17 +278,16 @@ def _scatter_reduce_2d_kernel(
         if INCLUDE_SELF:
             reduced += self_value
     elif REDUCE == 1:
-        # A fully unrolled static_range(BLOCK) loop (BLOCK up to 512+) blows the
-        # XPU per-core stack budget and the buffer_size_limit retune loop fails
-        # ("Failed to tune buffer size."). Runtime while loop keeps the kernel
-        # small, mirroring _scatter_reduce_prod_3d_kernel.
         reduced = 1.0
-        offset = 0
-        while offset < dim_size:
-            matched = tl.load(index + index_base + offset * index_stride) == destination
-            value = tl.load(src + src_base + offset * src_stride).to(tl.float32)
-            reduced = tl.where(matched, reduced * value, reduced)
-            offset += 1
+        for offset in tl.static_range(BLOCK):
+            valid_offset = valid_base & (offset < dim_size)
+            index_value = tl.load(
+                index + index_base + offset * index_stride, mask=valid_offset, other=-1
+            )
+            value = tl.load(
+                src + src_base + offset * src_stride, mask=valid_offset, other=1.0
+            ).to(tl.float32)
+            reduced *= tl.where(valid_offset & (index_value == destination), value, 1.0)
         if INCLUDE_SELF:
             reduced *= self_value
     elif REDUCE == 2:

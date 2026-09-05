@@ -27,14 +27,10 @@ import torch
 
 from .igammac import igammac
 
-# The shared accuracy test (tests/test_igammac_.py, marker special_gammaincc)
-# asserts on the *generic* logger name and message to prove the gems
-# implementation ran, so log there (same convention as
-# special_multigammaln).
-logger = logging.getLogger("flag_gems.ops.special_gammaincc")
+logger = logging.getLogger(__name__)
 
 
 def special_gammaincc(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
     """Regularized upper incomplete gamma function Q(a, x) on Kunlunxin XPU."""
-    logger.debug("GEMS SPECIAL_GAMMAINCC")
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_GAMMAINCC")
     return igammac(self, other)

@@ -36,6 +36,12 @@ def _pdist_forward_kernel(
 
     if P_IS_INF:
         distance = tl.max(difference, axis=0)
+    elif P == 0.0:
+        distance = 0.0
+        for column in tl.static_range(M):
+            lhs_value = tl.load(input + i * M + column).to(tl.float32)
+            rhs_value = tl.load(input + j * M + column).to(tl.float32)
+            distance += tl.where(lhs_value != rhs_value, 1.0, 0.0)
     elif P == 1.0:
         distance = tl.sum(difference, axis=0)
     elif P == 2.0:
@@ -71,14 +77,9 @@ def _pdist_general_partial_kernel(
     rhs = tl.load(input + j * M + columns, mask=mask, other=0.0).to(tl.float32)
     difference = tl.abs(lhs - rhs)
     active = mask & (difference > 0.0)
-    if P == 0.0:
-        # p=0 counts coordinates where the two rows differ; padded lanes
-        # (difference == 0.0) contribute 0.
-        partial = tl.sum(tl.where(active, 1.0, 0.0), axis=0)
-    else:
-        safe_difference = tl.where(active, difference, 1.0)
-        powered = tl.where(active, tl.exp(P * tl.log(safe_difference)), 0.0)
-        partial = tl.sum(powered, axis=0)
+    safe_difference = tl.where(active, difference, 1.0)
+    powered = tl.where(active, tl.exp(P * tl.log(safe_difference)), 0.0)
+    partial = tl.sum(powered, axis=0)
     tl.store(partials + output_offset * N_CHUNKS + chunk, partial)
 
 
@@ -100,11 +101,8 @@ def _pdist_general_finalize_kernel(
     power_sum = 0.0
     for chunk in tl.static_range(N_CHUNKS):
         power_sum += tl.load(partials + output_offset * N_CHUNKS + chunk)
-    if P == 0.0:
-        distance = power_sum
-    else:
-        safe_sum = tl.where(power_sum > 0.0, power_sum, 1.0)
-        distance = tl.where(power_sum > 0.0, tl.exp(tl.log(safe_sum) / P), 0.0)
+    safe_sum = tl.where(power_sum > 0.0, power_sum, 1.0)
+    distance = tl.where(power_sum > 0.0, tl.exp(tl.log(safe_sum) / P), 0.0)
     tl.store(output + output_offset, distance)
 
 
@@ -128,9 +126,7 @@ def _pdist_forward(input, p=2.0):
     input_contiguous = input.contiguous()
     block_m = triton.next_power_of_2(feature_count)
     grid = (row_count, row_count)
-    # p=0 is routed through the chunked general kernels: the compare+select
-    # pattern at BLOCK_M >= 256 exhausts uni_sram in the forward kernel.
-    is_general = not math.isinf(p) and p not in (1.0, 2.0)
+    is_general = not math.isinf(p) and p not in (0.0, 1.0, 2.0)
     with torch_device_fn.device(input.device):
         if is_general:
             general_block_m = min(128, block_m)

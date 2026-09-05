@@ -21,22 +21,16 @@
 #   * tl.sum(axis=0) on 2D+ tiles is rejected by the backend.
 #   * tl.sum(axis=1) transposed layout dies in TritonXPUCoreTiling (uni_sram OOM).
 #   * tl.dot / register-tensor indexing (x[k, :]) / n2-split atomics all fail
-#     to compile (tl.dot compiles but produces wrong fp32 results), so the n2
-#     reduction must stay a serial scalar loop over j.
-#   * BLOCK_DIM=128 (even with loop_unroll_factor=1) dies in
-#     TritonXPUUnrollControl with "out of resource: uni_sram", so 64 is the
-#     widest safe tile.
+#     to compile, so the n2 reduction must stay a serial scalar loop, and the
+#     only degree of freedom left is the load count inside that loop.
+#   * BLOCK_DIM > 128 OOMs (uni_sram); BLOCK_DIM=128 is the widest safe tile
+#     and is ~2x faster than 64 because per-iteration loop overhead dominates.
 #
 # Hence the two-kernel scheme below:
 #   1) _cdist_backward_w_kernel: w = grad / (cdist + eps)  (1D elementwise;
-#      BLOCK=128).
-#   2) _cdist_backward_kernel: 8-way j-unroll with 8 independent accumulators.
-#      Each j-iteration costs one w scalar load + one x2 vector load; the
-#      dependent-accumulator chain is what serializes the loop on this
-#      single-lane-per-core backend, so independent accumulators batch 8
-#      loads+FMAs per iteration and give ~1.5x (small n2) to ~1.7x (large n2)
-#      over the plain scalar loop, with at most 7 remaining iterations in the
-#      masked-free tail.
+#      BLOCK=128; 1024-lane masked tails are unreliable on this backend).
+#   2) _cdist_backward_kernel: 2 loads per j-iteration (w scalar + x2 vector)
+#      instead of 3, which is ~1.4x faster than the inline 3-load version.
 
 import logging
 
@@ -50,7 +44,7 @@ from flag_gems.utils import libentry
 logger = logging.getLogger(__name__)
 
 _W_BLOCK = 128
-_BLOCK_DIM = 64
+_BLOCK_DIM = 128
 
 
 @libentry()
@@ -89,69 +83,17 @@ def _cdist_backward_kernel(
     x1_offset = pid_b * n1 * dim + n1_idx * dim + off_dim
     x1 = tl.load(x1_ptr + x1_offset, mask=mask_dim, other=0.0).to(tl.float32)
 
-    acc0 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
-    acc1 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
-    acc2 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
-    acc3 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
-    acc4 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
-    acc5 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
-    acc6 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
-    acc7 = tl.zeros([BLOCK_DIM], dtype=tl.float32)
+    grad_x1_acc = tl.zeros([BLOCK_DIM], dtype=tl.float32)
 
     w_base = pid_b * n1 * n2 + n1_idx * n2
     x2_base = pid_b * n2 * dim
 
-    nmain = n2 // 8 * 8
-    for j in range(0, nmain, 8):
-        w0 = tl.load(w_ptr + w_base + j).to(tl.float32)
-        w1 = tl.load(w_ptr + w_base + j + 1).to(tl.float32)
-        w2 = tl.load(w_ptr + w_base + j + 2).to(tl.float32)
-        w3 = tl.load(w_ptr + w_base + j + 3).to(tl.float32)
-        w4 = tl.load(w_ptr + w_base + j + 4).to(tl.float32)
-        w5 = tl.load(w_ptr + w_base + j + 5).to(tl.float32)
-        w6 = tl.load(w_ptr + w_base + j + 6).to(tl.float32)
-        w7 = tl.load(w_ptr + w_base + j + 7).to(tl.float32)
-        x2_0 = tl.load(
-            x2_ptr + x2_base + (j + 0) * dim + off_dim, mask=mask_dim, other=0.0
-        ).to(tl.float32)
-        x2_1 = tl.load(
-            x2_ptr + x2_base + (j + 1) * dim + off_dim, mask=mask_dim, other=0.0
-        ).to(tl.float32)
-        x2_2 = tl.load(
-            x2_ptr + x2_base + (j + 2) * dim + off_dim, mask=mask_dim, other=0.0
-        ).to(tl.float32)
-        x2_3 = tl.load(
-            x2_ptr + x2_base + (j + 3) * dim + off_dim, mask=mask_dim, other=0.0
-        ).to(tl.float32)
-        x2_4 = tl.load(
-            x2_ptr + x2_base + (j + 4) * dim + off_dim, mask=mask_dim, other=0.0
-        ).to(tl.float32)
-        x2_5 = tl.load(
-            x2_ptr + x2_base + (j + 5) * dim + off_dim, mask=mask_dim, other=0.0
-        ).to(tl.float32)
-        x2_6 = tl.load(
-            x2_ptr + x2_base + (j + 6) * dim + off_dim, mask=mask_dim, other=0.0
-        ).to(tl.float32)
-        x2_7 = tl.load(
-            x2_ptr + x2_base + (j + 7) * dim + off_dim, mask=mask_dim, other=0.0
-        ).to(tl.float32)
-        acc0 += w0 * (x1 - x2_0)
-        acc1 += w1 * (x1 - x2_1)
-        acc2 += w2 * (x1 - x2_2)
-        acc3 += w3 * (x1 - x2_3)
-        acc4 += w4 * (x1 - x2_4)
-        acc5 += w5 * (x1 - x2_5)
-        acc6 += w6 * (x1 - x2_6)
-        acc7 += w7 * (x1 - x2_7)
-
-    for j in range(nmain, n2):
+    for j in range(0, n2):
         wj = tl.load(w_ptr + w_base + j).to(tl.float32)
         x2j = tl.load(
             x2_ptr + x2_base + j * dim + off_dim, mask=mask_dim, other=0.0
         ).to(tl.float32)
-        acc0 += wj * (x1 - x2j)
-
-    grad_x1_acc = ((acc0 + acc1) + (acc2 + acc3)) + ((acc4 + acc5) + (acc6 + acc7))
+        grad_x1_acc += wj * (x1 - x2j)
 
     store_offset = pid_b * n1 * dim + n1_idx * dim + off_dim
     tl.store(grad_x1_ptr + store_offset, grad_x1_acc, mask=mask_dim)

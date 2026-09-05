@@ -17,17 +17,45 @@ from typing import List, Tuple, Union
 import torch
 import triton
 import triton.language as tl
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+
+from flag_gems.utils.tensor_wrapper import StridedBuffer
+
+from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
-# Historical note: the general (any tensor count) path below used to copy
-# through a StridedBuffer + pointwise_dynamic `copy_func` (config_ with
-# is_cat=True / buffer_size_limit=512).  That is gone: for inner-dim cat the
-# path ran a gems `contiguous()` on the permuted source whose strided
-# copy_slice kernel faults with an illegal memory access for fp16 shapes in
-# the 196608 < numel <= 393216 band (test_concatenate [dtype0-shape15-1]).
-# The general path now uses the exact same native `_copy_from` + narrow-view
-# recipe as `cat_out` below (and the 3-equal-shape dim-0 S>2**18 branch),
-# which cannot overrun the output for any dtype.
+# NOTE: is_cat=True makes the pointwise codegen emit buffer_size_limit=512 for the
+# strided copy. Without it (default buffer_size_limit=2048), an inner-dim cat whose
+# output row-stride is not vector-aligned (e.g. fp32 cat along the last dim
+# producing an odd width like 25) makes the vectorized store over-run the output
+# buffer -> `error code=700, illegal memory access`. is_cat helps fp16/fp32/bf16/
+# int16 but int32 inner-dim cat STILL overruns even with it (config knobs
+# isCloseVectorization / buffer_size_limit=256 do not help either). The generic
+# gems copy_ has the SAME strided-store bug, so a torch copy_ fallback also crashes.
+# See the concatenate/cat family (harness/perf_ir_3/ir-concatenate-dev7.log).
+#
+# Robust fix: the illegal access ONLY happens when the triton copy writes into a
+# NON-CONTIGUOUS output slab (inner-dim cat). So we always arrange writes to hit a
+# CONTIGUOUS dim-0 slab:
+#   * dim==0 (the benchmark case): each input already maps to a contiguous block ->
+#     tuned triton block-DMA copy straight into the fresh output (fast path).
+#   * dim>0: permute the cat dim to the front, copy into a contiguous permuted
+#     buffer (every write target is a contiguous dim-0 slab -> no overrun for any
+#     dtype), then permute the result back to the original layout.
+config_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    is_cat=True,
+)
+
+
+@pointwise_dynamic(is_tensor=[True], promotion_methods=[(0, "DEFAULT")], config=config_)
+@triton.jit
+def copy_func(x):
+    return x
 
 
 @triton.jit
@@ -256,23 +284,44 @@ def cat(
         )
         return out0
 
-    # General path (any tensor count, dim-0 or inner-dim): write each source
-    # directly into the fresh output through a narrow view using the native
-    # ATen strided-copy engine (`_copy_from` is never overridden by gems) --
-    # the exact same recipe as the `cat_out` branches and the 3-equal-shape
-    # dim-0 S>2**18 branch.  The previous StridedBuffer + `copy_func` triton
-    # path ran a gems `contiguous()` on the permuted source in the inner-dim
-    # case, whose strided `copy_slice` kernel (dtype=float16, 196608 < numel
-    # <= 393216 -> 19-CTA 16384-lane tile after the 32768-lane guard) faults
-    # with an illegal memory access on XPU (repro: test_concatenate
-    # [dtype0-shape15-1]).
-    out0 = torch.empty(out_shape, dtype=A[0].dtype, device=A[0].device)
+    nd = A[0].ndim
+    if dim == 0:
+        # Fast path (benchmark case): each input maps to a CONTIGUOUS output slab
+        # -> tuned triton block-DMA copy straight into the fresh output.
+        out0 = torch.empty(out_shape, dtype=A[0].dtype, device=A[0].device)
+        out0_strides = out0.stride()
+        start = 0
+        for a in A:
+            w = a.shape[0]
+            in_view = StridedBuffer(a, a.shape, a.stride())
+            out_view = StridedBuffer(
+                out0, a.shape, out0_strides, offset=start * out0_strides[0]
+            )
+            copy_func.instantiate(a.ndim)(in_view, out0=out_view)
+            start += w
+        return out0
+
+    # Inner-dim cat: permute the cat dim to the front so every write target is a
+    # CONTIGUOUS dim-0 slab (avoids the strided-store overrun for all dtypes),
+    # then permute the result back to the original layout.
+    perm = [dim] + [i for i in range(nd) if i != dim]
+    inv = [0] * nd
+    for i, p in enumerate(perm):
+        inv[p] = i
+    outp_shape = [out_shape[p] for p in perm]
+    outp = torch.empty(outp_shape, dtype=A[0].dtype, device=A[0].device)
+    outp_strides = outp.stride()
     start = 0
     for a in A:
-        w = a.shape[dim]
-        torch.ops.aten._copy_from(a, out0.narrow(dim, start, w), False)
+        ap = a.permute(perm).contiguous()
+        w = ap.shape[0]
+        in_view = StridedBuffer(ap, ap.shape, ap.stride())
+        out_view = StridedBuffer(
+            outp, ap.shape, outp_strides, offset=start * outp_strides[0]
+        )
+        copy_func.instantiate(ap.ndim)(in_view, out0=out_view)
         start += w
-    return out0
+    return outp.permute(inv)
 
 
 def cat_out(

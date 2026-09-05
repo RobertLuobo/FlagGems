@@ -66,15 +66,6 @@ def repeat_interleave_self_int(inp, repeats, dim=None, *, output_size=None):
     if repeats == 0:
         return output
 
-    # On XPU the generated 1d-tile copy kernel mis-lowers the strided gather
-    # when the input is a non-contiguous view (illegal memory access; e.g.
-    # input[::2] yields large non-unit strides combined with the inserted
-    # stride-0 dim). Materialize a C-contiguous copy so only the unit-stride
-    # plus 0-stride pattern remains, which the kernel handles correctly.
-    if not inp.is_contiguous():
-        inp = inp.contiguous()
-        inp_stride = list(inp.stride())
-
     in_view_stride = inp_stride[: dim + 1] + [0] + inp_stride[dim + 1 :]
     out_view_shape = inp_shape[: dim + 1] + [repeats] + inp_shape[dim + 1 :]
     out_view_stride = c_contiguous_stride(out_view_shape)

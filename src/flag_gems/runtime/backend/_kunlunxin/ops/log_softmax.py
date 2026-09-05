@@ -185,7 +185,6 @@ def log_softmax_kernel_singlepass(
     N: tl.constexpr,
     TILE_M: tl.constexpr,
     NEED_MASK: tl.constexpr,
-    USE_KEY: tl.constexpr,
 ):
     pid_m = ext.program_id(0)
     m_offsets = pid_m * TILE_M + tl.arange(0, TILE_M)
@@ -198,14 +197,9 @@ def log_softmax_kernel_singlepass(
         )
     else:
         inp = tl.load(input_ptr + offsets).to(tl.float32)
-    if USE_KEY:
-        bits = inp.to(tl.uint32, bitcast=True)
-        m = _k_fwd_decode_key(tl.max(_k_fwd_key_u32(bits), 1))
-    else:
-        # bf16 input: the int-key/bitcast max path miscompiles on XPU (the
-        # decoded m used in arithmetic differs from the stored m, maxdiff
-        # ~0.25-0.44) -> use the fp max, which is exact for bf16.
-        m = tl.max(inp, 1)
+    bits = inp.to(tl.uint32, bitcast=True)
+    m_key = tl.max(_k_fwd_key_u32(bits), 1)
+    m = _k_fwd_decode_key(m_key)
     e = tl.exp(inp - m[:, None])
     z = tl.sum(e, 1)
     out = inp - m[:, None] - tl.log(z)[:, None]
@@ -234,7 +228,6 @@ def log_softmax_kernel_singlepass_tail(
     ROW_START,
     N,
     TILE_N: tl.constexpr,
-    USE_KEY: tl.constexpr,
 ):
     """Masked tail rows of the singlepass tile: one program per row, grid =
     M - ROW_START. 1D per-row masked load/store (exact on XPU), unlike the
@@ -244,12 +237,8 @@ def log_softmax_kernel_singlepass_tail(
     off = (ROW_START + pid) * N + n_offsets
     mask = n_offsets < N
     x = tl.load(input_ptr + off, mask=mask, other=-float("inf")).to(tl.float32)
-    if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
-    else:
-        m = tl.max(x, 0)
+    m_key = tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
+    m = _k_fwd_decode_key(m_key)
     z = tl.sum(tl.exp(x - m), 0)
     out = x - m - tl.log(z)
     tl.store(output_ptr + off, out, mask=mask)
@@ -264,7 +253,6 @@ def log_softmax_kernel_chunk(
     C_FULL,
     C,
     BLOCK_N: tl.constexpr,
-    USE_KEY: tl.constexpr,
 ):
     """Flat (row*C_FULL + c) grid; offsets = pid*BN (BN constexpr -> the
     [M*C_FULL, BN] read is contiguous, block DMA on XPU). Partial (m_c, z_c)
@@ -275,12 +263,8 @@ def log_softmax_kernel_chunk(
     n_offsets = tl.arange(0, BLOCK_N)
     off = pid * BLOCK_N + n_offsets
     x = tl.load(input_ptr + off).to(tl.float32)
-    if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
-    else:
-        m = tl.max(x, 0)
+    m_key = tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
+    m = _k_fwd_decode_key(m_key)
     z = tl.sum(tl.exp(x - m), 0)
     tl.store(partial_m_ptr + row * C + c, m)
     tl.store(partial_z_ptr + row * C + c, z)
@@ -342,7 +326,6 @@ def log_softmax_chunk_strided(
     C_FULL,
     C,
     BLOCK_N: tl.constexpr,
-    USE_KEY: tl.constexpr,
 ):
     """Flat (row*C_FULL + c) grid with per-row base offsets (needed when
     N % BN != 0: the flat pid*BN form drifts by the row tail)."""
@@ -352,12 +335,8 @@ def log_softmax_chunk_strided(
     n_offsets = tl.arange(0, BLOCK_N)
     off = row * N + c * BLOCK_N + n_offsets
     x = tl.load(input_ptr + off).to(tl.float32)
-    if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
-    else:
-        m = tl.max(x, 0)
+    m_key = _k_fwd_key_u32(x.to(tl.uint32, bitcast=True))
+    m = _k_fwd_decode_key(tl.max(m_key, 0))
     z = tl.sum(tl.exp(x - m), 0)
     tl.store(partial_m_ptr + row * C + c, m)
     tl.store(partial_z_ptr + row * C + c, z)
@@ -398,7 +377,6 @@ def log_softmax_tail_piece_partial(
     T_SLOT,
     TAIL_BASE,
     PLEN: tl.constexpr,
-    USE_KEY: tl.constexpr,
 ):
     """Partial (m, z) over one exact power-of-2 tail piece of width PLEN<=4096
     (fully inside the row, so loads/stores are UNMASKED). The old masked 1D
@@ -410,12 +388,8 @@ def log_softmax_tail_piece_partial(
     n_offsets = TAIL_BASE + tl.arange(0, PLEN)
     off = pid * N + n_offsets
     x = tl.load(input_ptr + off).to(tl.float32)
-    if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
-    else:
-        m = tl.max(x, 0)
+    m_key = _k_fwd_key_u32(x.to(tl.uint32, bitcast=True))
+    m = _k_fwd_decode_key(tl.max(m_key, 0))
     z = tl.sum(tl.exp(x - m), 0)
     po = pid * C_STRIDE + T_SLOT
     tl.store(partial_m_ptr + po, m)
@@ -455,7 +429,6 @@ def log_softmax_tail_masked_partial(
     T_SLOT,
     TAIL_BASE,
     TAIL_LEN,
-    USE_KEY: tl.constexpr,
 ):
     """Masked 64-lane piece for the <64 column remainder of a row tail.
     A 64-wide masked tile with <64 real lanes is the exact form the previous
@@ -467,12 +440,8 @@ def log_softmax_tail_masked_partial(
     within = n_offsets < TAIL_LEN
     off = pid * N + TAIL_BASE + n_offsets
     x = tl.load(input_ptr + off, mask=within, other=float("-inf")).to(tl.float32)
-    if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
-    else:
-        m = tl.max(x, 0)
+    m_key = _k_fwd_key_u32(x.to(tl.uint32, bitcast=True))
+    m = _k_fwd_decode_key(tl.max(m_key, 0))
     z = tl.sum(tl.exp(x - m), 0)
     po = pid * C_STRIDE + T_SLOT
     tl.store(partial_m_ptr + po, m)
@@ -542,7 +511,6 @@ def _fwd_n1_flat(out, inp):
 
 
 def _fwd_singlepass(out, inp, M, N):
-    use_key = inp.dtype != torch.bfloat16
     if (N & (N - 1)) != 0 and N >= 64:
         # Non-pow2 N in [64, 4096] (e.g. 65/97/99/101/127/129/193/254/255/
         # 257/511/513/1023/1025 ...): the [TILE_M, N] 2D tile silently
@@ -580,7 +548,6 @@ def _fwd_singlepass(out, inp, M, N):
         N,
         TILE_M=tile_m,
         NEED_MASK=False,
-        USE_KEY=use_key,
         buffer_size_limit=2048,
         num_warps=8,
     )
@@ -596,7 +563,6 @@ def _fwd_singlepass(out, inp, M, N):
             nfull * tile_m,
             N,
             TILE_N=triton.next_power_of_2(N),
-            USE_KEY=use_key,
             buffer_size_limit=2048,
             num_warps=8,
         )
@@ -623,7 +589,6 @@ def _pow2_tail_pieces(n, cap=FWD_TAIL_PIECE):
 
 
 def _fwd_chunk_split(out, inp, M, N):
-    use_key = inp.dtype != torch.bfloat16
     c_full = N // FWD_CHUNK_BN
     taillen = N - c_full * FWD_CHUNK_BN
     pieces, rrem = _pow2_tail_pieces(taillen) if taillen else ([], 0)
@@ -646,7 +611,6 @@ def _fwd_chunk_split(out, inp, M, N):
             c_full + slot,
             base,
             PLEN=plen,
-            USE_KEY=use_key,
             num_warps=8,
         )
         base += plen
@@ -660,7 +624,6 @@ def _fwd_chunk_split(out, inp, M, N):
             c_full + len(pieces),
             base,
             rrem,
-            USE_KEY=use_key,
             num_warps=8,
         )
     if c_full:
@@ -673,7 +636,6 @@ def _fwd_chunk_split(out, inp, M, N):
                 c_full,
                 C,
                 BLOCK_N=FWD_CHUNK_BN,
-                USE_KEY=use_key,
                 buffer_size_limit=2048,
                 num_warps=8,
             )
@@ -685,7 +647,6 @@ def _fwd_chunk_split(out, inp, M, N):
                 c_full,
                 C,
                 BLOCK_N=FWD_CHUNK_BN,
-                USE_KEY=use_key,
                 buffer_size_limit=2048,
                 num_warps=8,
             )

@@ -1032,14 +1032,7 @@ class WrapperGenerator:
                 code.writeline("num_warps=num_warps,")
                 if self.config.is_scatter_slice:
                     code.writeline("buffer_size_limit=512,")
-                    # NOTE: isCloseOffsetAnalysis must stay OFF for the masked
-                    # 1d-tile strided-gather kernel. On this XPU the flag drives
-                    # a mis-lowering (illegal memory access) for masked 1d-tile
-                    # gathers with stride patterns like (128, 8192, 1) at the
-                    # 16384-lane tile (einsum "ijk->j" -> sum_dim -> dim_compress
-                    # -> contiguous -> copy_slice; also the 16M-element [::2]
-                    # view). Without the flag the same kernel is correct and
-                    # measurably faster (1.91ms vs crash for the 16M [::2] copy).
+                    code.writeline("isCloseOffsetAnalysis=True,")
                 elif self.config.is_cat:
                     code.writeline("buffer_size_limit=512,")
                 elif self.config.buffer_size_limit:
@@ -1108,14 +1101,7 @@ class WrapperGenerator:
                 code.writeline("num_warps=num_warps,")
                 if self.config.is_scatter_slice:
                     code.writeline("buffer_size_limit=512,")
-                    # NOTE: isCloseOffsetAnalysis must stay OFF for the masked
-                    # 1d-tile strided-gather kernel. On this XPU the flag drives
-                    # a mis-lowering (illegal memory access) for masked 1d-tile
-                    # gathers with stride patterns like (128, 8192, 1) at the
-                    # 16384-lane tile (einsum "ijk->j" -> sum_dim -> dim_compress
-                    # -> contiguous -> copy_slice; also the 16M-element [::2]
-                    # view). Without the flag the same kernel is correct and
-                    # measurably faster (1.91ms vs crash for the 16M [::2] copy).
+                    code.writeline("isCloseOffsetAnalysis=True,")
                 elif self.config.is_cat:
                     code.writeline("buffer_size_limit=512,")
                 elif self.config.buffer_size_limit:

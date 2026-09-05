@@ -184,7 +184,7 @@ def pow_scalar_fast_kernel(x_ptr, out_ptr, lnb, BLOCK: tl.constexpr):
     pid = ext.program_id(0)
     offset = pid * BLOCK + tl.arange(0, BLOCK)
     y = tl.load(x_ptr + offset).to(tl.float32)
-    r = tl.exp(y * lnb)
+    r = tl.exp2(y * lnb)
     tl.store(out_ptr + offset, r.to(out_ptr.dtype.element_ty))
 
 
@@ -194,7 +194,7 @@ def pow_scalar_fast_kernel_masked(x_ptr, out_ptr, n_elements, lnb, BLOCK: tl.con
     offset = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offset < n_elements
     y = tl.load(x_ptr + offset, mask=mask, other=0.0).to(tl.float32)
-    r = tl.exp(y * lnb)
+    r = tl.exp2(y * lnb)
     tl.store(out_ptr + offset, r.to(out_ptr.dtype.element_ty), mask=mask)
 
 

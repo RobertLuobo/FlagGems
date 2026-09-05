@@ -1080,17 +1080,7 @@ def sort_stable(inp, *, stable, dim=-1, descending=False):
     if dim < 0:
         dim = dim + inp.ndim
     if dim != inp.ndim - 1:
-        # NOTE(kunlunxin): the vendor strided copy_ (pointwise copy_slice
-        # codegen) raises a device kernel exception (status 700) for some
-        # transposed 2-byte shapes (measured: (4, 65536) fp16/bf16 ->
-        # (65536, 4) -> kernel exception, while (4, 32768) / (8, 65536) /
-        # (4, 131072) / fp32 are fine), so materialise the transposed copy
-        # with the native engine (aten._copy_from is never overridden by the
-        # gems copy_/copy) instead of .contiguous() -- the same workaround
-        # as renorm.py::_native_transposed_copy.
-        view = torch.movedim(inp, dim, -1)
-        inp = torch.empty(view.shape, device=inp.device, dtype=inp.dtype)
-        torch.ops.aten._copy_from(view, inp, False)
+        inp = torch.movedim(inp, dim, -1).contiguous()
     else:
         inp = inp.contiguous()
 

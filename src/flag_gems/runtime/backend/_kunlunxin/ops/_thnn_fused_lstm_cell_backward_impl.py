@@ -99,35 +99,18 @@ def _bias_grad_kernel(
     grad_biases_ptr,
     B,
     M,
-    BLOCK_B: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
     # grad_biases[j] = sum_b grad_gates[b, j]  for j in [0, M)
-    #
-    # The old shape (1D fp32 acc + masked load inside a dynamic-trip-count
-    # loop) is what TritonXPUUnrollControl rejects with `out of resource:
-    # uni_sram` on this XPU. Mirror the validated _sum_row_full_kernel
-    # (sum.py) pattern instead: (BLOCK_M, BLOCK_B) 2-D tile (reduce dim
-    # LAST - XPU's tl.sum only supports axis=1), UNMASKED loads with clamped
-    # row/col indices (the col tail past M and the row tail past B re-read
-    # the last valid element and are zeroed by tl.where), 2-D loop-carried
-    # accumulation, and a single tl.sum AFTER the loop.
     pid = tl.program_id(0)
-    offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     m_mask = offs < M
-    offs_c = tl.minimum(offs, M - 1)
-    b_off = tl.arange(0, BLOCK_B)[None, :]
-    acc = tl.zeros((BLOCK_M, BLOCK_B), dtype=tl.float32)
-    for b0 in range(0, B, BLOCK_B):
-        cols = b0 + b_off
-        cols_c = tl.minimum(cols, B - 1)
-        val = tl.load(grad_gates_ptr + cols_c * M + offs_c)
-        val = tl.where(m_mask & (cols < B), val, 0.0)
-        acc += val
-    s = tl.sum(acc, axis=1)
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for b in range(B):
+        acc += tl.load(grad_gates_ptr + b * M + offs, mask=m_mask, other=0.0)
     tl.store(
         grad_biases_ptr + offs,
-        s.to(grad_biases_ptr.dtype.element_ty)[:, None],
+        acc.to(grad_biases_ptr.dtype.element_ty),
         mask=m_mask,
     )
 
@@ -181,19 +164,13 @@ def _thnn_fused_lstm_cell_backward_impl(
                 (4 * hidden_size,), device=cx.device, dtype=cx.dtype
             )
             if batch_size > 0:
-                # BLOCK_M=128 / BLOCK_B=16: a single program covers
-                # batch<=16 x hidden<=32 in one tile (<=2048 lanes, the
-                # validated exact tl.sum point on this XPU); larger B is
-                # handled by the kernel's BLOCK_B-chunked serial loop.
                 BLOCK_M = 128
-                BLOCK_B = 16
                 grid = (triton.cdiv(4 * hidden_size, BLOCK_M),)
                 _bias_grad_kernel[grid](
                     grad_input_gates,
                     grad_biases,
                     batch_size,
                     4 * hidden_size,
-                    BLOCK_B,
                     BLOCK_M,
                     num_warps=4,
                 )

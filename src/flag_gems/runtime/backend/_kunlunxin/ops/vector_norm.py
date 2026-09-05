@@ -266,58 +266,6 @@ def min_norm_kernel_2(
     tl.store(Out, out)
 
 
-# ---------------------------------------------------------------------------
-# Row-wise min-|.| for the partial-dim path (ord == -inf, reduced dims are NOT
-# all dims).
-#
-# The generic 2D min tile (min_norm_kernel) is NOT usable on this XPU:
-# `tl.min` / min-accumulate over a 2D tile is silently mis-lowered by
-# TritonXPU -- even a mask-free l2-style [BLOCK_M, BLOCK_N] tile with
-# `tl.min(x, axis=1)` returns wrong values (measured 2026-09-04, (1025, 128)
-# bf16: 1025/1025 rows wrong, maxabs 4.6; meanwhile tl.sum (l2) and tl.max
-# (max) on the identical tile are exact), and the 2D `other=inf` masked load
-# is equally unreliable.  Chunked approaches are also unusable: a compound
-# `row*N + chunk*BLOCK + arange` address (chunk derived from pid % MID_SIZE,
-# MID_SIZE non-pow2) is mis-lowered (values shifted by a constant offset in
-# pid; measured 23751/24600 bad on (600, 40999)).  The ONLY pattern measured
-# exact (0/24600 bad on (600, 40999) and (3, 8199800)) is one program per
-# row walking the row with dynamic `tl.range` chunks of a 1D unmasked load
-# plus an axis-free `tl.min`/`tl.minimum`, followed by a scalar tail loop --
-# the shape of min_norm_rows_kernel below.
-_MIN_ROWS_BLOCK = 1024  # 1D tl.min lane count (safe <= 8192, cf. _L2_BLOCK)
-
-
-@libentry()
-@triton.jit
-def min_norm_rows_kernel(
-    X,
-    Out,
-    M,
-    N,
-    BLOCK: tl.constexpr,
-    buffer_size_limit: tl.constexpr,
-):
-    """One program per row: exact unmasked 1D min-|.| in BLOCK-wide dynamic
-    `tl.range` chunks plus a scalar tail -- the only min pattern TritonXPU
-    lowers correctly."""
-    row = ext.program_id(0).to(tl.int64)
-    x_base = X + row * N
-    total = float("inf")
-    full = (N // BLOCK) * BLOCK
-    for off in tl.range(0, full, BLOCK):
-        v = tl.load(x_base + off + tl.arange(0, BLOCK)).to(tl.float32)
-        total = tl.minimum(total, tl.min(tl.abs(v)))
-    for off in tl.range(0, N - full):
-        v = tl.load(x_base + full + off).to(tl.float32)
-        total = tl.minimum(total, tl.abs(v))
-    tl.store(Out + row, total, mask=row < M)
-
-
-def _min_norm_rows(x, out, M, N):
-    """||x||_{-inf} over the flat (M, N) row layout into the flat M-slot `out`."""
-    min_norm_rows_kernel[(M,)](x, out, M, N, _MIN_ROWS_BLOCK, buffer_size_limit=2048)
-
-
 @libentry()
 # @triton.autotune(configs=runtime.get_tuned_config("vector_norm"), key=["M", "N"])
 @triton.heuristics(
@@ -512,24 +460,13 @@ def l1_norm_rows_tail_kernel(
     N,
     MID_SIZE: tl.constexpr,
     TAIL_OFFSET: tl.constexpr,
-    TAIL_N,
+    TAIL_SIZE: tl.constexpr,
     buffer_size_limit: tl.constexpr,
 ):
-    # TAIL_N (was a constexpr) is a runtime arg: the old `tl.static_range(TAIL_SIZE)`
-    # fully unrolled (TAIL_SIZE can reach 1023), blowing the XPU ELF kernel stack
-    # ("Failed to tune buffer size", even at buffer_size_limit=16).  Two dynamic
-    # loops (8-wide chunks + <= 7 scalar lanes) -- the exact shape of
-    # l2_norm_tail_kernel, which compiles on this backend.
     row = ext.program_id(0).to(tl.int64)
     total = 0.0
-    full_size = (TAIL_N // 8) * 8
-    for offset in tl.range(0, full_size, 8):
-        values = tl.load(X + row * N + TAIL_OFFSET + offset + tl.arange(0, 8)).to(
-            tl.float32
-        )
-        total += tl.sum(tl.abs(values))
-    for offset in tl.range(0, TAIL_N - full_size):
-        value = tl.load(X + row * N + TAIL_OFFSET + full_size + offset).to(tl.float32)
+    for offset in tl.static_range(TAIL_SIZE):
+        value = tl.load(X + row * N + TAIL_OFFSET + offset).to(tl.float32)
         total += tl.abs(value)
     tl.store(Mid + row * MID_SIZE + MID_SIZE - 1, total, mask=row < M)
 
@@ -566,23 +503,13 @@ def l1_norm_rows_reduce_tail_kernel(
     MID_SIZE: tl.constexpr,
     NEXT_SIZE: tl.constexpr,
     TAIL_OFFSET: tl.constexpr,
-    TAIL_N,
+    TAIL_SIZE: tl.constexpr,
     buffer_size_limit: tl.constexpr,
 ):
-    # Same dynamic-loop fix as l1_norm_rows_tail_kernel (see above).
     row = ext.program_id(0).to(tl.int64)
     total = 0.0
-    full_size = (TAIL_N // 8) * 8
-    for offset in tl.range(0, full_size, 8):
-        total += tl.sum(
-            tl.load(Mid + row * MID_SIZE + TAIL_OFFSET + offset + tl.arange(0, 8)).to(
-                tl.float32
-            )
-        )
-    for offset in tl.range(0, TAIL_N - full_size):
-        total += tl.load(Mid + row * MID_SIZE + TAIL_OFFSET + full_size + offset).to(
-            tl.float32
-        )
+    for offset in tl.static_range(TAIL_SIZE):
+        total += tl.load(Mid + row * MID_SIZE + TAIL_OFFSET + offset).to(tl.float32)
     tl.store(Next + row * NEXT_SIZE + NEXT_SIZE - 1, total, mask=row < M)
 
 
@@ -1243,7 +1170,7 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
             elif ord == float("inf"):
                 max_norm_kernel[grid](x, out, M, N)
             elif ord == -float("inf"):
-                _min_norm_rows(x, out, M, N)
+                min_norm_kernel[grid](x, out, M, N)
             elif ord == 0:
                 l0_norm_kernel[grid](x, out, M, N)
             elif ord == 1 and N > 1024:

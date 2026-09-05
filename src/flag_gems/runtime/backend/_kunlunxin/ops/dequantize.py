@@ -51,14 +51,7 @@ def _dequantize_kernel(
     # valid lanes. Lanes past n_elements read undefined bytes and land in
     # the padded tail of `out_ptr`, which the caller never exposes.
     raw = tl.load(x_ptr + offsets, mask=offsets < n_elements)
-    # A single i8 -> f32 cast lowers to triton_xpu.vsitofp whose source (2
-    # elements/thread) and result (8 elements/thread) cluster layouts differ,
-    # and the LLVM struct pack in ConvertTritonXPUToLLVM aborts with
-    # "size mismatch when packing elements for LLVM struct expected 8 but got
-    # 2". Widening through i32 first (arith.extsi) keeps the source layout
-    # intact and makes the subsequent i32 -> f32 cast resolve to a single
-    # layout, so the whole kernel compiles.
-    values = raw.to(tl.int32).to(tl.float32)
+    values = raw.to(tl.float32)
     if UNSIGNED:
         values = tl.where(values < 0.0, values + 256.0, values)
     tl.store(out_ptr + offsets, (values - zero_point) * scale)
