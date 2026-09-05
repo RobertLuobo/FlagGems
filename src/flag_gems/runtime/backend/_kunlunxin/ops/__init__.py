@@ -46,12 +46,16 @@ from ._unsafe_masked_index_put_accumulate import _unsafe_masked_index_put_accumu
 from ._masked_scale import _masked_scale
 from ._upsample_bilinear2d_aa import _upsample_bilinear2d_aa
 from ._upsample_nearest_exact2d_backward import _upsample_nearest_exact2d_backward
+from ._upsample_nearest_exact3d import _upsample_nearest_exact3d
 from .abs import abs, abs_
 from .absolute import absolute, absolute_
 from .acos import acos, acos_
 from .adaptive_avg_pool3d_backward import _adaptive_avg_pool3d_backward
 from .adaptive_avg_pool2d import adaptive_avg_pool2d
 from .adaptive_max_pool2d import adaptive_max_pool2d
+from .adaptive_max_pool2d_backward import adaptive_max_pool2d_backward
+from .adaptive_max_pool3d import adaptive_max_pool3d
+from .adaptive_max_pool3d_backward import adaptive_max_pool3d_backward
 from .add import add, add_
 from .addbmm import addbmm, addbmm_
 from .addcdiv import addcdiv, addcdiv_, addcdiv_out
@@ -191,6 +195,7 @@ from .diagonal_copy import diagonal_copy
 from .diagonal_scatter import diagonal_scatter
 from .diff import diff
 from .digamma import digamma
+from .dist import dist
 from .digamma_ import digamma_
 from .div import (
     div_mode,
@@ -278,7 +283,7 @@ from .hardswish_ import hardswish_
 from .heaviside_ import heaviside_
 from .histc import histc
 from .hstack import hstack
-from .hypot import hypot
+from .hypot import hypot, hypot_
 from .igamma_ import igamma_
 from .igammac import igammac, igammac_out
 from .igammac_ import igammac_
@@ -318,14 +323,17 @@ from .linalg_ldl_factor import ldl_factor, ldl_factor_ex
 from .linalg_ldl_factor_ex import ldl_factor_ex
 from .linalg_ldl_solve import linalg_ldl_solve
 from .linalg_lstsq import linalg_lstsq
+from .linalg_lu import linalg_lu, linalg_lu_out
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
 from .linalg_matrix_norm import linalg_matrix_norm
+from .linalg_norm import linalg_norm
 from .linalg_slogdet import linalg_slogdet
 from .linalg_solve_triangular import (
     linalg_solve_triangular,
     linalg_solve_triangular_out,
 )
+from .linalg_svd import linalg_svd
 from .linear_backward import linear_backward
 from .linspace import linspace
 from .log import log
@@ -377,6 +385,7 @@ from .minimum import minimum
 from .miopen_batch_norm_backward import miopen_batch_norm_backward
 from .mish_backward import mish_backward
 from .mish import mish, mish_
+from .mkldnn_rnn_layer import mkldnn_rnn_layer
 from .mm import mm, mm_out
 from .mode import mode
 from .moe_sum import moe_sum
@@ -657,6 +666,7 @@ __all__ = [
     "_scaled_dot_product_fused_attention_overrideable",
     "_thnn_fused_lstm_cell_backward_impl",
     "_upsample_nearest_exact2d_backward",
+    "_upsample_nearest_exact3d",
     "_conv_depthwise2d",
     "_safe_softmax",
     "digamma",
@@ -757,6 +767,9 @@ __all__ = [
     "atan2_out",
     "adaptive_avg_pool2d",
     "adaptive_max_pool2d",
+    "adaptive_max_pool2d_backward",
+    "adaptive_max_pool3d",
+    "adaptive_max_pool3d_backward",
     "_adaptive_avg_pool3d_backward",
     "avg_pool2d",
     "avg_pool2d_backward",
@@ -859,6 +872,7 @@ __all__ = [
     "diagonal_copy",
     "diagonal_scatter",
     "diff",
+    "dist",
     "div_mode",
     "div_mode_",
     "divide",
@@ -1049,13 +1063,17 @@ __all__ = [
     "ldl_factor_ex",
     "linalg_ldl_solve",
     "linalg_lstsq",
+    "linalg_lu",
+    "linalg_lu_out",
     "linalg_lu_factor",
     "linalg_lu_factor_out",
     "linalg_lu_factor_ex",
     "linalg_lu_factor_ex_out",
     "linalg_matrix_norm",
+    "linalg_norm",
     "linalg_slogdet",
     "linalg_solve_triangular",
+    "linalg_svd",
     "linalg_solve_triangular_out",
     "linear_backward",
     "linspace",
@@ -1127,6 +1145,7 @@ __all__ = [
     "mish",
     "mish_",
     "miopen_batch_norm_backward",
+    "mkldnn_rnn_layer",
     "mm",
     "mm_out",
     "mode",
@@ -1401,3 +1420,73 @@ from .special_ndtr import special_ndtr
 from .special_round import special_round, special_round_out
 from .add_relu import _add_relu, _add_relu_
 from .hardshrink import hardshrink, hardshrink_out
+
+
+def _patch_adaptive_max_pool3d_functional():
+    """Route torch.nn.functional.adaptive_max_pool3d to the Gems forward.
+
+    The vendor XDNN wrapper on this stack rejects bfloat16 and returns
+    uninitialized index memory for float16/float32, so the corresponding
+    ``adaptive_max_pool3d_backward`` (registered for CUDA dispatch) would
+    receive garbage indices.  Only the tests/benchmark of this op family call
+    the functional, so the patch scope is limited; applied at import time,
+    mirroring the ``_sunrise`` vendor monkey patches.  Must stay in this
+    module (not ``_kunlunxin/__init__.py``): the package __init__ is loaded
+    before ``flag_gems.runtime`` finishes initializing.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from .adaptive_max_pool3d import adaptive_max_pool3d as _gems_fwd
+
+    if getattr(F.adaptive_max_pool3d, "_flag_gems_kunlunxin_patched", False):
+        return
+
+    _orig = F.adaptive_max_pool3d
+
+    def _wrapped(input, output_size, return_indices=False):
+        # CPU tensors (the ``--ref cpu`` reference path of the harness) must
+        # keep the original functional: the Gems kernels only run on CUDA.
+        if input.device.type != "cuda":
+            return _orig(input, output_size, return_indices=return_indices)
+        return _gems_fwd(input, output_size, return_indices=return_indices)
+
+    _wrapped._flag_gems_kunlunxin_patched = True
+    F.adaptive_max_pool3d = _wrapped
+
+
+_patch_adaptive_max_pool3d_functional()
+
+_adaptive_max_pool2d_aten_lib = None
+
+
+def _patch_adaptive_max_pool2d_aten():
+    """Route ``torch.ops.aten.adaptive_max_pool2d`` (CUDA) to the Gems forward.
+
+    The vendor XDNN wrapper on this stack returns uninitialized index memory
+    for float16/float32/bfloat16 (the output values are correct, the indices
+    are garbage), so a ``adaptive_max_pool2d_backward`` whose reference
+    consumes those indices either faults or disagrees with ATen.  The Gems
+    ``adaptive_max_pool2d`` forward kernel computes ATen-exact flat spatial
+    indices (``h * W + w``, same window math and tie-break); registering it
+    for the CUDA dispatch key makes every ``torch.ops.aten.adaptive_max_pool2d``
+    call produce valid indices, both inside and outside ``use_gems()``
+    scopes.  The registration is process-global (the Library handle is held in
+    this module); the ``use_gems()`` registrar re-registers the same function
+    for the same key, so there is no conflict.
+    """
+    global _adaptive_max_pool2d_aten_lib
+    if _adaptive_max_pool2d_aten_lib is not None:
+        return
+
+    import torch
+
+    from .adaptive_max_pool2d import adaptive_max_pool2d as _gems_fwd
+
+    _adaptive_max_pool2d_aten_lib = torch.library.Library("aten", "IMPL")
+    _adaptive_max_pool2d_aten_lib.impl(
+        "adaptive_max_pool2d", _gems_fwd, "CUDA", allow_override=True
+    )
+
+
+_patch_adaptive_max_pool2d_aten()

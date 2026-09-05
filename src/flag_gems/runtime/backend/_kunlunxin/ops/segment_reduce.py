@@ -130,10 +130,15 @@ def _validate_lengths(data, lengths, axis, unsafe):
     _check_index_tensor(data, lengths, "lengths", axis)
     if unsafe:
         return
-    lengths_detached = lengths.detach()
-    if torch.any(lengths_detached < 0).item():
+    # Validate on a CPU copy: while `use_gems` is active, device-side
+    # `sum(dim=-1)` on this xpu platform dispatches to the flag_gems
+    # `sum.dim_IntList` row-reduce kernels, which fault (illegal memory
+    # access) on small int64 inputs. The lengths tensor is tiny, so the
+    # host-side validation cost is negligible.
+    lengths_cpu = lengths.detach().to("cpu")
+    if torch.any(lengths_cpu < 0).item():
         raise RuntimeError("lengths contains negative value!")
-    valid_lengths = torch.all(lengths_detached.sum(dim=-1) == data.size(axis)).item()
+    valid_lengths = torch.all(lengths_cpu.sum(dim=-1) == data.size(axis)).item()
     if not valid_lengths:
         raise RuntimeError(
             "segment_reduce(): Expected all rows of lengths along axis to sum to "
@@ -1011,6 +1016,9 @@ def _segment_reduce_backward_element_kernel(
         include = in_segment & (segment_offsets != axis_idx)
         included = tl.where(include, value, 1.0)
         product = tl.reduce(included, axis=0, combine_fn=_multiply)
+        # forward: output = INITIAL_PROD_VALUE * prod(segment), so the
+        # gradient carries the same initial factor (1.0 when initial=None).
+        product *= INITIAL_PROD_VALUE
         result = tl.where(valid_segment, grad_value * product, 0.0)
 
     tl.store(grad_input + pid, result)
@@ -1104,8 +1112,20 @@ def segment_reduce(
     segment_count = output_shape[axis]
     inner_size = _prod(data_contig.shape[axis + 1 :])
     data_size_axis = data_contig.shape[axis]
+    # Iterate over the segment, not the whole data axis: the kernel carries
+    # `acc` as a loop-carried scalar, which TritonXPU miscompiles once the
+    # loop spans a large offset range (illegal memory access when
+    # MAX_BLOCKS > 32 at BLOCK_SIZE >= 512). A segment-based iteration count
+    # keeps the loop at one block for all sectioned inputs (segments are
+    # shorter than BLOCK_SIZE) while remaining correct for longer segments.
+    segment_lengths = offsets_contig[..., 1:] - offsets_contig[..., :-1]
+    if segment_lengths.numel() > 0:
+        max_segment_length = int(segment_lengths.max().item())
+    else:
+        max_segment_length = 0
     block_size = min(
-        _get_block_size(data.device), triton.next_power_of_2(max(data_size_axis, 32))
+        _get_block_size(data.device),
+        triton.next_power_of_2(max(data_size_axis, 32)),
     )
     has_initial, initial_value = _make_initial(reduce, initial)
     grid = (output.numel(),)
@@ -1125,7 +1145,7 @@ def segment_reduce(
             reduce == "prod",
             has_initial,
             initial_value,
-            MAX_BLOCKS=triton.cdiv(data_size_axis, block_size),
+            MAX_BLOCKS=triton.cdiv(max_segment_length, block_size),
             BLOCK_SIZE=block_size,
         )
     return output
