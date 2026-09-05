@@ -48,6 +48,14 @@ logger = logging.getLogger(__name__)
 #   and total_out >= 2^31 fall back to the flat clamp kernel (int32 / int64
 #   variants). The native XPU engine itself asserts pad >= 0 on crops, so the
 #   crop cases are only reachable through the flat kernels.
+# - Correctness fix (2026-09-05): the vendor `_copy_from` segment path used
+#   `x[a:b, ...]` slicing for its source/destination views. Under use_gems()
+#   the registered ("slice.Tensor", slice) Python impl is called by the ATen
+#   dispatcher with only 4 positional args (self, dim, start, stop) and raises
+#     TypeError: slice() missing 1 required positional argument: 'step'
+#   for any non-full slice, so every mid/large shape (total_out >= 200K)
+#   crashed. The segment views now use torch.narrow (zero-copy as_strided view)
+#   instead, matching the quantized_lstm / nansum / renorm fix pattern.
 @triton.jit
 def _replication_pad2d_kernel_clamp_i64(
     x_ptr,
@@ -246,34 +254,42 @@ def launch_replication_pad2d(input: torch.Tensor, padding, out: torch.Tensor = N
     # Fast path: 5 vendor strided-copy segments (interior + 2 column edges + 2
     # row edges). Segment order matters: interior first, then column edges,
     # then row edges (row sources read the already-padded columns).
+    #
+    # Segment views are built with torch.narrow (zero-copy as_strided view)
+    # instead of `x[a:b, ...]` slicing: under use_gems() the registered
+    # ("slice.Tensor", slice) Python impl is invoked by the ATen dispatcher
+    # with only 4 positional args (self, dim, start, stop) and raises
+    #     TypeError: slice() missing 1 required positional argument: 'step'
+    # for any non-full slice — same pattern as the quantized_lstm / nansum /
+    # renorm / avg_pool3d_backward fixes. torch.narrow is dispatched to the
+    # registered narrow impl, a zero-copy view (torch.as_strided), so the
+    # _copy_from segments see identical shapes/strides.
     with torch_device_fn.device(x.device):
         # 1. interior block
         torch.ops.aten._copy_from(
-            x, out4[:, :, pad_t : pad_t + H_in, pad_l : pad_l + W_in]
+            x, torch.narrow(torch.narrow(out4, 2, pad_t, H_in), 3, pad_l, W_in)
         )
         # 2-3. W edges (left / right first-interior-column replicated)
         if pad_l:
             torch.ops.aten._copy_from(
-                out4[:, :, :, pad_l : pad_l + 1].expand(N, C, H_out, pad_l),
-                out4[:, :, :, :pad_l],
+                torch.narrow(out4, 3, pad_l, 1).expand(N, C, H_out, pad_l),
+                torch.narrow(out4, 3, 0, pad_l),
             )
         if pad_r:
             torch.ops.aten._copy_from(
-                out4[:, :, :, pad_l + W_in - 1 : pad_l + W_in].expand(
-                    N, C, H_out, pad_r
-                ),
-                out4[:, :, :, pad_l + W_in :],
+                torch.narrow(out4, 3, pad_l + W_in - 1, 1).expand(N, C, H_out, pad_r),
+                torch.narrow(out4, 3, pad_l + W_in, pad_r),
             )
         # 4-5. H rows (top / bottom row replicated)
         if pad_t:
             torch.ops.aten._copy_from(
-                out4[:, :, pad_t : pad_t + 1].expand(N, C, pad_t, W_out),
-                out4[:, :, :pad_t],
+                torch.narrow(out4, 2, pad_t, 1).expand(N, C, pad_t, W_out),
+                torch.narrow(out4, 2, 0, pad_t),
             )
         if pad_b:
             torch.ops.aten._copy_from(
-                out4[:, :, pad_t + H_in - 1 : pad_t + H_in].expand(N, C, pad_b, W_out),
-                out4[:, :, pad_t + H_in :],
+                torch.narrow(out4, 2, pad_t + H_in - 1, 1).expand(N, C, pad_b, W_out),
+                torch.narrow(out4, 2, pad_t + H_in, pad_b),
             )
 
     return out4.squeeze(0) if is_3d else out4

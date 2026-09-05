@@ -26,16 +26,47 @@ logger = logging.getLogger(__name__)
 #     branch is recovered exactly by identity log(1+e^x) = x + log(1+e^-x).
 #     (2-exp + 2-log variant measured identical: the memory path, not the
 #     transcendental count, is the wall on this backend.)
-#  3. reduction=mean/sum no longer routes through the single-CTA mean kernel
-#     (BLOCK up to 65536, one CTA -> tens-of-ms for 1e7+ elements).  A
-#     two-stage fp32 split reduction (static-unrolled parallel partials +
-#     tiny fold) is used and the pointwise tensor is never materialized.
+#  3. reduction=mean/sum: no zero-pad / second-buffer schemes are used.
+#     Measured (2026-09-05, use_gems environment, CUDA-event timing): the
+#     zero-padding + `_copy_from` + host `mid.sum() - pad*log(2)` pipeline
+#     costs ~0.4 ms fixed (2 zeros 0.11 + 2 copies 0.06 + sum/sub/div/cast
+#     caught by the generic registered kernels 0.35), while the native op is
+#     a single ~0.02 ms kernel.  Instead a masked split reduction is used and
+#     the whole mean/sum costs ONE launch for N<=16384 (scalar kernel) or TWO
+#     launches beyond: an unmasked full-block stage-1 (grid = N//16384 CTAs)
+#     plus a single-CTA kernel that folds the fp32 partials and adds the
+#     partial tail loss over [Nbase, N) directly, then applies *1/N + cast.
+#
+#     CRITICAL backend hazard (isolated, 2026-09-05): a partial-masked tail
+#     CTA inside a *reduction* tl.sum miscompiles once the grid exceeds ~12
+#     CTAs -- `idx < N` collapses to all-true, the OOB lanes read past the
+#     tensor and their garbage loss is accumulated (N=5,924,352 measured
+#     +5.3e3 relative 1.1e-3 error; N=96,000/grid<=12 correct; the flat
+#     pointwise kernels and all grid<=12 cases are unaffected).  Hence the
+#     two-stage shape above: stage-1 CTAs are never partially masked and the
+#     tail is handled by a separate single-CTA launch, which was verified
+#     correct for tail in {1, ..., 16383}.
+#
+#     Notes on the masked-load hazards found during this work (all verified
+#     in isolation with minimal kernels):
+#      a. `tl.sum(tl.where(m, v, 0.0))` (predicate fused into the reduction)
+#         returns 0 for N < BLOCK on this backend; the accumulation form
+#         `acc; acc += tl.where(m, v, 0.0); tl.sum(acc)` is correct.
+#      b. bf16 masked loads return 0 for the *valid* lanes when only a single
+#         element is masked in of a 16384-lane tile (N=1).  fp16/fp32 are
+#         unaffected.  Consequently N <= _SMALL_N (2048) keeps the generic
+#         pointwise path, and a bf16 N % 16384 == 1 (tail==1) also falls back
+#         to it; no benchmark/test shape below 2048 exists besides the
+#         ()/(1,) functional cases.
+#      c. `tl.load(..., other=0.0)` applied to bf16 tiles also zeroes the
+#         valid lanes; the masked without-`other` + where form is used.
+#  4. The pointwise tensor is never materialized for mean/sum.
 # ---------------------------------------------------------------------------
 
-# tl.sum safety cap on this backend is 8192 (no buffer) / 32768 (with
+# tl.sum safety cap on this backend: 8192 (no buffer) / 32768 (with
 # buffer_size_limit=2048).  BLOCK=16384 + buffer_size_limit fulfils it.
-_RED_BLOCK = 16384
-_RED_U = 4
+_BULK_BLOCK = 16384
+_SMALL_N = 2048
 _FLAT_BLOCK = 2048
 _FLAT_U = 8
 
@@ -60,111 +91,222 @@ def _bce_loss(xv, yv):
 
 @triton.jit
 def _bce_pos_weight_loss(xv, yv, pv):
-    l = tl.log(1.0 + tl.exp(-tl.abs(xv)))
-    neg_log = tl.where(xv >= 0, l, -xv + l)  # log(1+e^-x)
-    pos_log = tl.where(xv >= 0, xv + l, l)  # log(1+e^x)
+    log_e = tl.log(1.0 + tl.exp(-tl.abs(xv)))
+    neg_log = tl.where(xv >= 0, log_e, -xv + log_e)  # log(1+e^-x)
+    pos_log = tl.where(xv >= 0, xv + log_e, log_e)  # log(1+e^x)
     x_pos = yv * pv * neg_log + (1.0 - yv) * (xv + neg_log)
     x_neg = yv * (-pv * xv + pv * pos_log) + (1.0 - yv) * pos_log
     return tl.where(xv >= 0.0, x_pos, x_neg)
 
 
-# -------------------- fused reduction kernels (static-unroll) ---------------
+# ----------- unmasked full-block stage-1 kernels (N>16384) ------------------
+# grid * BLOCK * U covers exactly the first `full` blocks of N (N % (BLOCK*U)
+# elements handled by the fused finalize+tail kernel below).  No mask at all:
+# masked tails in a >12-CTA reduction miscompile on this backend (the last
+# CTA's lanes read past N and the mask/where are dropped), see
+# harness/solution/performance/binary_cross_entropy_with_logits_xpu3_*.md.
 
 
 @triton.jit
-def _bce_reduce_kernel(
-    x, y, mid, N, BLOCK: tl.constexpr, U: tl.constexpr, NEED_MASK: tl.constexpr
-):
+def _bce_reduce_full_kernel(x, y, mid, BLOCK: tl.constexpr, U: tl.constexpr):
     pid = tl.program_id(0)
     base = pid * BLOCK * U
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     for i in tl.static_range(U):
         idx = base + i * BLOCK + tl.arange(0, BLOCK)
-        if NEED_MASK:
-            m = idx < N
-            xv = tl.load(x + idx, mask=m, other=0.0).to(tl.float32)
-            yv = tl.load(y + idx, mask=m, other=0.0).to(tl.float32)
-        else:
-            xv = tl.load(x + idx).to(tl.float32)
-            yv = tl.load(y + idx).to(tl.float32)
+        xv = tl.load(x + idx).to(tl.float32)
+        yv = tl.load(y + idx).to(tl.float32)
         acc += _bce_loss(xv, yv)
     tl.store(mid + pid, tl.sum(acc))
 
 
 @triton.jit
-def _bce_weight_reduce_kernel(
-    x, y, w, mid, N, BLOCK: tl.constexpr, U: tl.constexpr, NEED_MASK: tl.constexpr
-):
+def _bce_weight_reduce_full_kernel(x, y, w, mid, BLOCK: tl.constexpr, U: tl.constexpr):
     pid = tl.program_id(0)
     base = pid * BLOCK * U
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     for i in tl.static_range(U):
         idx = base + i * BLOCK + tl.arange(0, BLOCK)
-        if NEED_MASK:
-            m = idx < N
-            xv = tl.load(x + idx, mask=m, other=0.0).to(tl.float32)
-            yv = tl.load(y + idx, mask=m, other=0.0).to(tl.float32)
-            wv = tl.load(w + idx, mask=m, other=0.0).to(tl.float32)
-        else:
-            xv = tl.load(x + idx).to(tl.float32)
-            yv = tl.load(y + idx).to(tl.float32)
-            wv = tl.load(w + idx).to(tl.float32)
+        xv = tl.load(x + idx).to(tl.float32)
+        yv = tl.load(y + idx).to(tl.float32)
+        wv = tl.load(w + idx).to(tl.float32)
         acc += _bce_loss(xv, yv) * wv
     tl.store(mid + pid, tl.sum(acc))
 
 
 @triton.jit
-def _bce_pos_weight_reduce_kernel(
-    x, y, pw, mid, N, BLOCK: tl.constexpr, U: tl.constexpr, NEED_MASK: tl.constexpr
+def _bce_pos_weight_reduce_full_kernel(
+    x, y, pw, mid, BLOCK: tl.constexpr, U: tl.constexpr
 ):
     pid = tl.program_id(0)
     base = pid * BLOCK * U
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     for i in tl.static_range(U):
         idx = base + i * BLOCK + tl.arange(0, BLOCK)
-        if NEED_MASK:
-            m = idx < N
-            xv = tl.load(x + idx, mask=m, other=0.0).to(tl.float32)
-            yv = tl.load(y + idx, mask=m, other=0.0).to(tl.float32)
-            pv = tl.load(pw + idx, mask=m, other=0.0).to(tl.float32)
-        else:
-            xv = tl.load(x + idx).to(tl.float32)
-            yv = tl.load(y + idx).to(tl.float32)
-            pv = tl.load(pw + idx).to(tl.float32)
+        xv = tl.load(x + idx).to(tl.float32)
+        yv = tl.load(y + idx).to(tl.float32)
+        pv = tl.load(pw + idx).to(tl.float32)
         acc += _bce_pos_weight_loss(xv, yv, pv)
     tl.store(mid + pid, tl.sum(acc))
 
 
 @triton.jit
-def _bce_weight_pos_weight_reduce_kernel(
-    x,
-    y,
-    w,
-    pw,
-    mid,
-    N,
-    BLOCK: tl.constexpr,
-    U: tl.constexpr,
-    NEED_MASK: tl.constexpr,
+def _bce_weight_pos_weight_reduce_full_kernel(
+    x, y, w, pw, mid, BLOCK: tl.constexpr, U: tl.constexpr
 ):
     pid = tl.program_id(0)
     base = pid * BLOCK * U
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     for i in tl.static_range(U):
         idx = base + i * BLOCK + tl.arange(0, BLOCK)
-        if NEED_MASK:
-            m = idx < N
-            xv = tl.load(x + idx, mask=m, other=0.0).to(tl.float32)
-            yv = tl.load(y + idx, mask=m, other=0.0).to(tl.float32)
-            wv = tl.load(w + idx, mask=m, other=0.0).to(tl.float32)
-            pv = tl.load(pw + idx, mask=m, other=0.0).to(tl.float32)
-        else:
-            xv = tl.load(x + idx).to(tl.float32)
-            yv = tl.load(y + idx).to(tl.float32)
-            wv = tl.load(w + idx).to(tl.float32)
-            pv = tl.load(pw + idx).to(tl.float32)
+        xv = tl.load(x + idx).to(tl.float32)
+        yv = tl.load(y + idx).to(tl.float32)
+        wv = tl.load(w + idx).to(tl.float32)
+        pv = tl.load(pw + idx).to(tl.float32)
         acc += _bce_pos_weight_loss(xv, yv, pv) * wv
     tl.store(mid + pid, tl.sum(acc))
+
+
+# ------------- single-launch scalar kernels (N<=16384, mean/sum) ------------
+# One CTA covers the whole input; the result (with *1/N and dtype cast) is
+# written straight to the output tensor so mean/sum costs exactly one launch.
+
+
+@triton.jit
+def _bce_scalar_kernel(x, y, out, N, inv_n, BLOCK: tl.constexpr, U: tl.constexpr):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_loss(xv, yv), 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
+
+
+@triton.jit
+def _bce_weight_scalar_kernel(
+    x, y, w, out, N, inv_n, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        wv = tl.load(w + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_loss(xv, yv) * wv, 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
+
+
+@triton.jit
+def _bce_pos_weight_scalar_kernel(
+    x, y, pw, out, N, inv_n, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        pv = tl.load(pw + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_pos_weight_loss(xv, yv, pv), 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
+
+
+@triton.jit
+def _bce_weight_pos_weight_scalar_kernel(
+    x, y, w, pw, out, N, inv_n, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        wv = tl.load(w + idx, mask=m).to(tl.float32)
+        pv = tl.load(pw + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_pos_weight_loss(xv, yv, pv) * wv, 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
+
+
+# ------------- stage-1b tail kernels (grid=1, masked) -----------------------
+# Covers the partial tail [Nbase, N) (N - Nbase < BLOCK) of an N>16384 input.
+# Kept as a *separate* single-CTA launch: an earlier merged fold+tail kernel
+# (two masked sections in one kernel) miscompiled on this backend even when
+# the tail section was entirely masked off.
+
+
+@triton.jit
+def _bce_tail_kernel(x, y, mid, Nbase, N, BLOCK: tl.constexpr, U: tl.constexpr):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = Nbase + i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_loss(xv, yv), 0.0)
+    tl.store(mid, tl.sum(acc))
+
+
+@triton.jit
+def _bce_weight_tail_kernel(
+    x, y, w, mid, Nbase, N, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = Nbase + i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        wv = tl.load(w + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_loss(xv, yv) * wv, 0.0)
+    tl.store(mid, tl.sum(acc))
+
+
+@triton.jit
+def _bce_pos_weight_tail_kernel(
+    x, y, pw, mid, Nbase, N, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = Nbase + i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        pv = tl.load(pw + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_pos_weight_loss(xv, yv, pv), 0.0)
+    tl.store(mid, tl.sum(acc))
+
+
+@triton.jit
+def _bce_weight_pos_weight_tail_kernel(
+    x, y, w, pw, mid, Nbase, N, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = Nbase + i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        wv = tl.load(w + idx, mask=m).to(tl.float32)
+        pv = tl.load(pw + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_pos_weight_loss(xv, yv, pv) * wv, 0.0)
+    tl.store(mid, tl.sum(acc))
+
+
+# ------------- stage-2 fold kernel (grid=1, fp32 partials) ------------------
+
+
+@triton.jit
+def _bce_finalize_kernel(mid, out, G, inv_n, BLOCK: tl.constexpr, U: tl.constexpr):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < G
+        v = tl.load(mid + idx, mask=m, other=0.0)
+        acc += tl.where(m, v, 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
 
 
 # -------------------- flat pointwise kernels (reduction=0) -------------------
@@ -344,11 +486,10 @@ def _bce_weight_pos_weight_kernel(x, y, weight, pos_weight):
 
 # --------------------------------- wrapper ----------------------------------
 
-# Small tensors go through the generic path: masked bulk tiles (other=0) are
-# silently not honored on this backend for tiny N (verified in isolation), so
-# the small region keeps the long-proven pointwise_dynamic + mean/sum path.
-_SMALL_N = 16384
-_BULK_BLOCK = 16384
+# Non-contiguous inputs and tiny tensors (N <= _SMALL_N, where the masked-load
+# of a bf16 single element miscompiles) go through the generic pointwise
+# path.  Contiguous inputs with N > _SMALL_N use the masked split reduction
+# (no padding, no extra copies); N <= _BULK_BLOCK runs in a single launch.
 
 
 def binary_cross_entropy_with_logits(
@@ -370,9 +511,15 @@ def binary_cross_entropy_with_logits(
     )
     N = self.numel()
 
-    if not use_flat or N == 0 or N <= _SMALL_N:
+    if (
+        not use_flat
+        or N == 0
+        or N <= _SMALL_N
+        or (self.dtype == torch.bfloat16 and N % _BULK_BLOCK == 1)
+    ):
         # fallback: pointwise_dynamic handles arbitrary layouts/strides;
-        # small tensors keep the proven generic path.
+        # tiny N (<= _SMALL_N) keeps the numerically-safe generic path;
+        # N == 0 returns the reduction identity below.
         if has_w and has_pw:
             out = _bce_weight_pos_weight_kernel(self, target, weight, pos_weight)
         elif has_w:
@@ -385,27 +532,13 @@ def binary_cross_entropy_with_logits(
         if reduction == 2:
             if N == 0:
                 return torch.zeros((), dtype=self.dtype, device=self.device)
-            flat = out.to(torch.float32).reshape(-1)
-            chunk_size = 65536
-            full_chunks = flat.numel() // chunk_size
-            if full_chunks:
-                total = (
-                    flat[: full_chunks * chunk_size]
-                    .reshape(full_chunks, chunk_size)
-                    .sum(dim=1)
-                    .sum()
-                )
-            else:
-                total = torch.zeros((), dtype=torch.float32, device=flat.device)
-            if full_chunks * chunk_size < flat.numel():
-                total = total + flat[full_chunks * chunk_size :].sum()
-            return total.to(self.dtype)
+            return out.to(torch.float32).reshape(-1).sum().to(self.dtype)
         if reduction == 1:
             if N == 0:
                 return torch.full(
                     (), float("nan"), dtype=self.dtype, device=self.device
                 )
-            return out.mean()
+            return (out.to(torch.float32).reshape(-1).sum() / N).to(self.dtype)
         return out
 
     # ---- fast path: contiguous inputs ----
@@ -460,87 +593,165 @@ def binary_cross_entropy_with_logits(
                 )
         return out
 
-    # mean (1) / sum (2): fused fp32 split reduction.
-    # Masked loads (other=0) silently miscompile on this backend for several
-    # tail geometries (device-wide status 700), so the reduce runs UNMASKED
-    # over a zero-padded copy: pad elements (x=0, y=0, w=1, pw=0) contribute
-    # exactly log(2) each, subtracted from the total afterwards.
-    pad = (-N) % _BULK_BLOCK
-    if pad:
-        inp = torch.zeros(N + pad, dtype=self.dtype, device=self.device)
-        targ = torch.zeros(N + pad, dtype=target.dtype, device=self.device)
-        # gem copy_ override is slow on this backend; _copy_from is not
-        # overridden and reaches the native copy engine.
-        torch.ops.aten._copy_from(self.reshape(-1), inp[:N], False)
-        torch.ops.aten._copy_from(target.reshape(-1), targ[:N], False)
-        if has_w:
-            rn = torch.ones(N + pad, dtype=weight.dtype, device=self.device)
-            torch.ops.aten._copy_from(weight.reshape(-1), rn[:N], False)
-        else:
-            rn = None
-        if has_pw:
-            pwz = torch.zeros(N + pad, dtype=pos_weight.dtype, device=self.device)
-            torch.ops.aten._copy_from(pos_weight.reshape(-1), pwz[:N], False)
-        else:
-            pwz = None
-        total_n = N + pad
-    else:
-        inp, targ = self, target
-        rn, pwz = weight, pos_weight
-        total_n = N
-    grid = (total_n // _BULK_BLOCK,)
-    mid = torch.empty((grid[0],), dtype=torch.float32, device=self.device)
+    # mean (1) / sum (2): masked single- or two-stage reduction.
+    inv_n = 1.0 / N if reduction == 1 else 1.0
+    out = torch.empty((), dtype=self.dtype, device=self.device)
     with torch_device_fn.device(self.device):
-        if has_w and has_pw:
-            _bce_weight_pos_weight_reduce_kernel[grid](
-                inp,
-                targ,
-                rn,
-                pwz,
-                mid,
-                total_n,
-                BLOCK=_BULK_BLOCK,
-                U=1,
-                NEED_MASK=False,
-                buffer_size_limit=2048,
-            )
-        elif has_w:
-            _bce_weight_reduce_kernel[grid](
-                inp,
-                targ,
-                rn,
-                mid,
-                total_n,
-                BLOCK=_BULK_BLOCK,
-                U=1,
-                NEED_MASK=False,
-                buffer_size_limit=2048,
-            )
-        elif has_pw:
-            _bce_pos_weight_reduce_kernel[grid](
-                inp,
-                targ,
-                pwz,
-                mid,
-                total_n,
-                BLOCK=_BULK_BLOCK,
-                U=1,
-                NEED_MASK=False,
-                buffer_size_limit=2048,
-            )
-        else:
-            _bce_reduce_kernel[grid](
-                inp,
-                targ,
-                mid,
-                total_n,
-                BLOCK=_BULK_BLOCK,
-                U=1,
-                NEED_MASK=False,
-                buffer_size_limit=2048,
-            )
+        if N <= _BULK_BLOCK:
+            # one launch: whole input in a single CTA (BLOCK=16384, U=1)
+            if has_w and has_pw:
+                _bce_weight_pos_weight_scalar_kernel[(1,)](
+                    self,
+                    target,
+                    weight,
+                    pos_weight,
+                    out,
+                    N,
+                    inv_n,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            elif has_w:
+                _bce_weight_scalar_kernel[(1,)](
+                    self,
+                    target,
+                    weight,
+                    out,
+                    N,
+                    inv_n,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            elif has_pw:
+                _bce_pos_weight_scalar_kernel[(1,)](
+                    self,
+                    target,
+                    pos_weight,
+                    out,
+                    N,
+                    inv_n,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            else:
+                _bce_scalar_kernel[(1,)](
+                    self,
+                    target,
+                    out,
+                    N,
+                    inv_n,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            return out
 
-    total = mid.sum() - pad * 0.6931471805599453
-    if reduction == 2:
-        return total.to(self.dtype)
-    return (total / N).to(self.dtype)
+        full = N // _BULK_BLOCK
+        tail = N - full * _BULK_BLOCK
+        nbase = full * _BULK_BLOCK
+        grid = full + (1 if tail else 0)
+        mid = torch.empty((grid,), dtype=torch.float32, device=self.device)
+        if full:
+            if has_w and has_pw:
+                _bce_weight_pos_weight_reduce_full_kernel[(full,)](
+                    self,
+                    target,
+                    weight,
+                    pos_weight,
+                    mid,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            elif has_w:
+                _bce_weight_reduce_full_kernel[(full,)](
+                    self,
+                    target,
+                    weight,
+                    mid,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            elif has_pw:
+                _bce_pos_weight_reduce_full_kernel[(full,)](
+                    self,
+                    target,
+                    pos_weight,
+                    mid,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            else:
+                _bce_reduce_full_kernel[(full,)](
+                    self,
+                    target,
+                    mid,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+        if tail:
+            if has_w and has_pw:
+                _bce_weight_pos_weight_tail_kernel[(1,)](
+                    self,
+                    target,
+                    weight,
+                    pos_weight,
+                    mid[full:],
+                    nbase,
+                    N,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            elif has_w:
+                _bce_weight_tail_kernel[(1,)](
+                    self,
+                    target,
+                    weight,
+                    mid[full:],
+                    nbase,
+                    N,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            elif has_pw:
+                _bce_pos_weight_tail_kernel[(1,)](
+                    self,
+                    target,
+                    pos_weight,
+                    mid[full:],
+                    nbase,
+                    N,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+            else:
+                _bce_tail_kernel[(1,)](
+                    self,
+                    target,
+                    mid[full:],
+                    nbase,
+                    N,
+                    BLOCK=_BULK_BLOCK,
+                    U=1,
+                    buffer_size_limit=2048,
+                )
+        u2 = (grid + _BULK_BLOCK - 1) // _BULK_BLOCK
+        _bce_finalize_kernel[(1,)](
+            mid,
+            out,
+            grid,
+            inv_n,
+            BLOCK=_BULK_BLOCK,
+            U=u2,
+            buffer_size_limit=2048,
+        )
+    return out

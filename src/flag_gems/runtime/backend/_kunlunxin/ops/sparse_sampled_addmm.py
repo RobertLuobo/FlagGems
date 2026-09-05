@@ -29,23 +29,19 @@ _SAMPLED_ADDMM_DTYPES = {
 # _DENSE_ALIGN has to be adjusted too, otherwise the unmasked GEMM store runs
 # past the end of `dense`.
 _DENSE_ALIGN = 256
-# Tile widths for the two auxiliary passes.  Both were swept on device; the pos
-# pass follows the average row occupancy, the combine pass is nearly flat.
-_POS_BLOCK_MIN = 256
-_POS_BLOCK_MAX = 1024
+# Tile width for the fused gather pass.  Swept on device; 4096 wins for large
+# per-batch nnz, 2048 for small ones (the MASKED tail is at most one block).
 _COMBINE_BLOCK_SMALL = 2048
-_COMBINE_BLOCK_LARGE = 8192
-_COMBINE_LARGE_NNZ = 4 * 1024 * 1024
+_COMBINE_BLOCK_LARGE = 4096
+_COMBINE_LARGE_NNZ = 64 * 1024
 
 
-def _pos_block(nnz_per_batch, M):
-    avg = max(1, nnz_per_batch // max(1, M))
-    blk = triton.next_power_of_2(2 * avg)
-    return max(_POS_BLOCK_MIN, min(_POS_BLOCK_MAX, blk))
-
-
-def _combine_block(nnz):
-    return _COMBINE_BLOCK_LARGE if nnz > _COMBINE_LARGE_NNZ else _COMBINE_BLOCK_SMALL
+def _combine_block(nnz_per_batch):
+    return (
+        _COMBINE_BLOCK_LARGE
+        if nnz_per_batch > _COMBINE_LARGE_NNZ
+        else _COMBINE_BLOCK_SMALL
+    )
 
 
 def _heur_group_m(args):
@@ -175,69 +171,50 @@ def _ssa_gemm_kernel(
 
 
 @libentry()
-@triton.jit
-def _ssa_pos_kernel(
-    crow_ptr,
-    col_ptr,
-    pos_ptr,
-    M,
-    nnz_per_batch,
-    OUT_ROW_STRIDE,
-    OUT_BATCH_STRIDE,
-    BLOCK: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    b = pid // M
-    r = pid % M
-    b64 = b.to(tl.int64)
-
-    crow_base = crow_ptr + b64 * (M + 1)
-    row_start = tl.load(crow_base + r).to(tl.int64)
-    row_end = tl.load(crow_base + r + 1).to(tl.int64)
-
-    col_base = col_ptr + b64 * nnz_per_batch
-    out_base = pos_ptr + b64 * nnz_per_batch
-    dense_base = b64 * OUT_BATCH_STRIDE + r.to(tl.int64) * OUT_ROW_STRIDE
-
-    for start in range(row_start, row_end, BLOCK):
-        e = start + tl.arange(0, BLOCK)
-        keep = e < row_end
-        # Plain boundary mask, affine address.  Clamping the offset with
-        # `tl.where` instead (safe = where(keep, e, row_start)) keeps the values
-        # identical but makes the address non-affine, which degrades the block
-        # DMA into a per-lane gather and costs 1.7x on this backend
-        # (27.18 ms vs 15.95 ms measured at B=16, M=N=4096, BLOCK=256).
-        c = tl.load(col_base + e, mask=keep, other=0).to(tl.int64)
-        tl.store(out_base + e, dense_base + c, mask=keep)
-
-
-@libentry()
 @triton.jit(do_not_specialize=["alpha", "beta"])
 def _ssa_combine_kernel(
-    pos_ptr,
+    row_ptr,
+    col_ptr,
     dense_ptr,
     val_ptr,
+    nnz_per_batch,
+    start,
+    OUT_ROW_STRIDE,
+    OUT_BATCH_STRIDE,
     alpha,
     beta,
-    n,
     BLOCK: tl.constexpr,
     MASKED: tl.constexpr,
 ):
-    off = ext.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # Flat (per-batch) gather: element `off` of batch `b` is the row's `rows`
+    # array index, its column comes from `col`, and `dense` holds the dense
+    # product.  out_val[off] = alpha * dense[b, row, col] + beta * val[off].
+    # The row identity comes from a precomputed int32 `rows` array (one entry
+    # per element) instead of per-row programs; the per-row kernel launch
+    # overhead is the dominant cost on this backend.
+    b = ext.program_id(1).to(tl.int64)
+    off = start + ext.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    base = b * nnz_per_batch
     if MASKED:
-        keep = off < n
+        keep = off < nnz_per_batch
         safe = tl.where(keep, off, 0)
-        p = tl.load(pos_ptr + safe)
-        d = tl.load(dense_ptr + p)
-        v = tl.load(val_ptr + safe)
+        r = tl.load(row_ptr + base + safe).to(tl.int64)
+        c = tl.load(col_ptr + base + safe).to(tl.int64)
+        d = tl.load(
+            dense_ptr + b * OUT_BATCH_STRIDE + r * OUT_ROW_STRIDE + c,
+            mask=keep,
+            other=0.0,
+        )
+        v = tl.load(val_ptr + base + safe)
         res = alpha * d + beta * v.to(tl.float32)
-        tl.store(val_ptr + off, res.to(v.dtype), mask=keep)
+        tl.store(val_ptr + base + off, res.to(v.dtype), mask=keep)
     else:
-        p = tl.load(pos_ptr + off)
-        d = tl.load(dense_ptr + p)
-        v = tl.load(val_ptr + off)
+        r = tl.load(row_ptr + base + off).to(tl.int64)
+        c = tl.load(col_ptr + base + off).to(tl.int64)
+        d = tl.load(dense_ptr + b * OUT_BATCH_STRIDE + r * OUT_ROW_STRIDE + c)
+        v = tl.load(val_ptr + base + off)
         res = alpha * d + beta * v.to(tl.float32)
-        tl.store(val_ptr + off, res.to(v.dtype))
+        tl.store(val_ptr + base + off, res.to(v.dtype))
 
 
 def _align_up(x, a):
@@ -347,11 +324,11 @@ def _sparse_sampled_addmm_impl(input, mat1, mat2, *, beta=1.0, alpha=1.0, out=No
     dense = torch.empty((B, Mp, Np), dtype=torch.float32, device=input.device)
 
     # pos[b * nnz_per_batch + e] = flat offset of value e inside `dense`.
-    # Over-allocated by one block so that the row-tail store can never touch
-    # memory outside this buffer.
-    pos_block = _pos_block(nnz_per_batch, M)
-    combine_block = _combine_block(nnz)
-    pos = torch.empty(nnz + pos_block, dtype=torch.int64, device=input.device)
+    # The row identity is materialized once per batch as an int32 array over
+    # all non-zeros (row_arr[e]) with a single repeat_interleave; a flat
+    # per-batch kernel then gathers dense[b, row_arr[e], col[e]] directly,
+    # avoiding the per-row program launch chain that dominates on this backend.
+    combine_block = _combine_block(nnz_per_batch)
 
     logger.debug(
         "GEMS_KUNLUNXIN SPARSE_SAMPLED_ADDMM, [shape info]: batch=%s, M=%s, N=%s, "
@@ -370,20 +347,15 @@ def _sparse_sampled_addmm_impl(input, mat1, mat2, *, beta=1.0, alpha=1.0, out=No
         triton.cdiv(N, meta["TILE_N"]),
         B,
     )
-    n_full = nnz // combine_block
+    n_full = nnz_per_batch // combine_block
     tail = n_full * combine_block
 
     with torch_device_fn.device(input.device):
-        _ssa_pos_kernel[(B * M,)](
-            crow_2d,
-            col_2d,
-            pos,
-            M,
-            nnz_per_batch,
-            Np,
-            Mp * Np,
-            BLOCK=pos_block,
-        )
+        # Row identity: row_arr[b * nnz_per_batch + e] == row of element e.
+        lengths = (crow_2d[:, 1:] - crow_2d[:, :-1]).to(torch.int32).reshape(-1)
+        rows = torch.arange(M, dtype=torch.int32, device=input.device)
+        rows = rows.expand(B, M).reshape(-1)
+        row_arr = torch.repeat_interleave(rows, lengths, output_size=nnz)
         _ssa_gemm_kernel[grid_gemm](
             mat1_f,
             mat2_f,
@@ -395,24 +367,32 @@ def _sparse_sampled_addmm_impl(input, mat1, mat2, *, beta=1.0, alpha=1.0, out=No
             Mp * Np,
         )
         if n_full > 0:
-            _ssa_combine_kernel[(n_full,)](
-                pos,
+            _ssa_combine_kernel[(n_full, B)](
+                row_arr,
+                col_2d,
                 dense,
                 val_f,
+                nnz_per_batch,
+                0,
+                Np,
+                Mp * Np,
                 alpha,
                 beta,
-                nnz,
                 BLOCK=combine_block,
                 MASKED=False,
             )
-        if tail < nnz:
-            _ssa_combine_kernel[(1,)](
-                pos[tail:],
+        if tail < nnz_per_batch:
+            _ssa_combine_kernel[(1, B)](
+                row_arr,
+                col_2d,
                 dense,
-                val_f[tail:],
+                val_f,
+                nnz_per_batch,
+                tail,
+                Np,
+                Mp * Np,
                 alpha,
                 beta,
-                nnz - tail,
                 BLOCK=combine_block,
                 MASKED=True,
             )

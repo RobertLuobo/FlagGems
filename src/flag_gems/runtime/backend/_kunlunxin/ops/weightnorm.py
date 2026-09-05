@@ -395,19 +395,22 @@ def _wn_bwd_multi_row_kernel(
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
-def _wn_bwd_row1d_kernel(v_grad, g_grad, w_grad, v, g, norm, N: tl.constexpr, eps):
-    rel = tl.arange(0, N)
+def _wn_bwd_row1d_kernel(
+    v_grad, g_grad, w_grad, v, g, norm, N: tl.constexpr, R: tl.constexpr, eps
+):
+    rel = tl.arange(0, R)
+    mask = rel < N
     base = tl.program_id(0) * N
-    wc = tl.load(w_grad + base + rel).to(tl.float32)
-    vv = tl.load(v + base + rel).to(tl.float32)
-    vw_sum = tl.sum(wc * vv, axis=0)
+    wc = tl.load(w_grad + base + rel, mask=mask).to(tl.float32)
+    vv = tl.load(v + base + rel, mask=mask).to(tl.float32)
+    vw_sum = tl.sum(tl.where(mask, wc * vv, 0.0), axis=0)
     nrm = tl.load(norm + tl.program_id(0)).to(tl.float32)
     gv = tl.load(g + tl.program_id(0)).to(tl.float32)
     nrm3 = nrm * nrm * nrm + eps
     one_n = 1.0 / (nrm + eps)
     vg = gv * (wc * one_n - vv * (vw_sum / nrm3))
     tl.store(g_grad + tl.program_id(0), vw_sum * one_n)
-    tl.store(v_grad + base + rel, vg)
+    tl.store(v_grad + base + rel, vg, mask=mask)
 
 
 def _weight_norm_bwd_multi_row(
@@ -441,6 +444,10 @@ def _weight_norm_bwd_multi_row(
     else:
         # 1-row program: correct for tile==1 and non-pow2 N (avoids the XPU
         # 2D-tile non-pow2 layout bug and the 1-row 2D-tile lowering bug).
+        # R = next_pow2(N) with an explicit mask + tl.where reduction: the
+        # unmasked 1D tl.sum codegen path is broken on XPU for small N
+        # (measured wrong for M>=3 programs, e.g. (5,4,3) dim=0 v_grad off by
+        # ~100%), while the masked/where path is exact for every M x N probed.
         grid = (M,)
         with torch_device_fn.device(saved_v.device):
             _wn_bwd_row1d_kernel[grid](
@@ -451,6 +458,7 @@ def _weight_norm_bwd_multi_row(
                 saved_g,
                 saved_norms,
                 N,
+                triton.next_power_of_2(N),
                 eps,
                 num_warps=2,
             )
@@ -476,8 +484,12 @@ def _weight_norm_bwd_partial_dot_kernel(
     if NEED_MASK:
         mask = (row < M) & (cols < N)
         dot = tl.sum(
-            tl.load(w + offsets, mask=mask).to(tl.float32)
-            * tl.load(v + offsets, mask=mask).to(tl.float32),
+            tl.where(
+                mask,
+                tl.load(w + offsets, mask=mask).to(tl.float32)
+                * tl.load(v + offsets, mask=mask).to(tl.float32),
+                0.0,
+            ),
             axis=0,
         )
     else:
@@ -557,13 +569,22 @@ def _weight_norm_bwd_large_n(
     # N in (8192, 32768]: the 8192-chunk pipeline benches faster on XPU;
     # larger N benefits from 32768 blocks (fewer launches, higher BW).
     block_n = 8192 if N <= 32768 else _WN_BWD_LARGE_N_TILE
-    num_chunks = triton.cdiv(N, block_n)
+    # The dot-reduction stage must cap its tile at 8192 lanes AND apply an
+    # explicit tl.where(mask, w*v, 0.0): on XPU a >8192-lane 1D tl.sum
+    # mis-reduces (a 32768-lane sum of 24693 ones returns 32768), and a plain
+    # masked load feeds garbage from the masked-off lanes into the product
+    # (measured tail-chunk dot -8.119 vs torch -7.698 at 8192 lanes; g_grad
+    # ~70% off for N=122997). Both 8192-cap and tl.where are exact together.
+    # The pure elementwise v_grad stage below has no reduction and its output
+    # store is masked, so it can keep the wider 32768 block.
+    dot_block = min(block_n, _WN_BWD_MULTI_MAX_LANES)
+    num_chunks = triton.cdiv(N, dot_block)
     partial_dots = torch.empty(
         (M, num_chunks), device=saved_v.device, dtype=torch.float32
     )
     row_dots = torch.empty(M, device=saved_v.device, dtype=torch.float32)
     eps = torch.finfo(torch.float32).tiny
-    need_mask_p = (N % block_n) != 0
+    need_mask_p = (N % dot_block) != 0
     v_block = 8192 if N <= 32768 else _WN_BWD_LARGE_N_TILE
     need_mask_v = (M * N) % v_block != 0
     launch_kw = {"buffer_size_limit": 2048} if block_n == 32768 else {}
@@ -575,7 +596,7 @@ def _weight_norm_bwd_large_n(
             M,
             N,
             num_chunks,
-            BLOCK_N=block_n,
+            BLOCK_N=dot_block,
             NEED_MASK=need_mask_p,
             **launch_kw,
         )

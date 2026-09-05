@@ -305,10 +305,14 @@ def _pad_gate_matrix(w, hidden_size, gate_step, pad_k):
     if gate_step == hidden_size and pad_k == w.shape[1] and w.is_contiguous():
         return w
     out = torch.zeros((4 * gate_step, pad_k), device=w.device, dtype=w.dtype)
+    # NOTE: no ``out[a:b, :c] = ...`` slicing here. Under ``use_gems()`` the
+    # registered ``slice.Tensor`` python impl is invoked with 4 positional
+    # args and ``t[:c]`` raises ``TypeError: slice() missing ... 'step'``, so
+    # partial slices must go through torch.narrow (zero-copy view) + copy_.
     for g in range(4):
-        out[g * gate_step : g * gate_step + hidden_size, : w.shape[1]] = w[
-            g * hidden_size : (g + 1) * hidden_size
-        ]
+        out.narrow(0, g * gate_step, hidden_size).narrow(1, 0, w.shape[1]).copy_(
+            w.narrow(0, g * hidden_size, hidden_size)
+        )
     return out
 
 
@@ -317,9 +321,9 @@ def _pad_gate_vector(v, hidden_size, gate_step):
         return v
     out = torch.zeros((4 * gate_step,), device=v.device, dtype=v.dtype)
     for g in range(4):
-        out[g * gate_step : g * gate_step + hidden_size] = v[
-            g * hidden_size : (g + 1) * hidden_size
-        ]
+        out.narrow(0, g * gate_step, hidden_size).copy_(
+            v.narrow(0, g * hidden_size, hidden_size)
+        )
     return out
 
 
@@ -404,7 +408,10 @@ def _run_direction(x, h0, c0, w_ih, w_hh, b_ih, b_hh, geo, reverse):
     x_flat = x.reshape(m_rows, input_size)
     if pad_m != m_rows or pad_kin != input_size:
         padded = torch.zeros((pad_m, pad_kin), device=device, dtype=dtype)
-        padded[:m_rows, :input_size] = x_flat
+        # ``padded[:m_rows, :input_size] = x_flat`` would hit the registered
+        # ``slice.Tensor`` python impl (missing 'step' arg) under use_gems();
+        # torch.narrow is the zero-copy equivalent.
+        padded.narrow(0, 0, m_rows).narrow(1, 0, input_size).copy_(x_flat)
         x_flat = padded
     elif not x_flat.is_contiguous():
         x_flat = x_flat.contiguous()
@@ -442,10 +449,14 @@ def _run_direction(x, h0, c0, w_ih, w_hh, b_ih, b_hh, geo, reverse):
     n_total = pad_mb * gate_step
     hs = torch.empty((seq_len, pad_mb, gate_step), device=device, dtype=dtype)
     c_buf = torch.zeros((2, pad_mb, gate_step), device=device, dtype=dtype)
-    c_buf[0, :batch_size, :hidden_size] = c0
+    # Slices below are expressed via torch.narrow (zero-copy view) because the
+    # ``slice.Tensor`` python impl registered under use_gems() raises
+    # ``TypeError: slice() missing 1 required positional argument: 'step'``
+    # whenever a slice does not cover the full extent.
+    c_buf[0].narrow(0, 0, batch_size).narrow(1, 0, hidden_size).copy_(c0)
     if pad_mb != batch_size or gate_step != hidden_size:
         h = torch.zeros((pad_mb, gate_step), device=device, dtype=dtype)
-        h[:batch_size, :hidden_size] = h0
+        h.narrow(0, 0, batch_size).narrow(1, 0, hidden_size).copy_(h0)
     else:
         h = h0 if h0.is_contiguous() else h0.contiguous()
 
@@ -496,9 +507,13 @@ def _run_direction(x, h0, c0, w_ih, w_hh, b_ih, b_hh, geo, reverse):
         h, cur = hy, nxt
         h_s0, h_s1 = gate_step, 1
 
-    hn = h[:batch_size, :hidden_size]
-    cn = c_buf[cur, :batch_size, :hidden_size]
-    return hs[:, :batch_size, :hidden_size], hn, cn
+    hn = h.narrow(0, 0, batch_size).narrow(1, 0, hidden_size)
+    cn = c_buf[cur].narrow(0, 0, batch_size).narrow(1, 0, hidden_size)
+    return (
+        hs.narrow(1, 0, batch_size).narrow(2, 0, hidden_size),
+        hn,
+        cn,
+    )
 
 
 def quantized_lstm(

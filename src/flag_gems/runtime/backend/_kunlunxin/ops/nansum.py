@@ -225,9 +225,21 @@ def _nansum_global(inp, out_dtype):
         if tail:
             tail_buf = torch.zeros(chunk, dtype=cd, device=inp.device)
             flat = inp.reshape(-1)
-            torch.ops.aten._copy_from(flat[full * chunk :], tail_buf[:tail], False)
+            # NOTE: use torch.narrow, not `x[a:b]` slicing: with use_gems()
+            # active, aten::slice.Tensor is underpinned by a registered Python
+            # impl the dispatcher calls with only 4 positional args (step is
+            # dropped), raising "TypeError: slice() missing 1 required
+            # positional argument: 'step'".
+            torch.ops.aten._copy_from(
+                torch.narrow(flat, 0, full * chunk, tail),
+                torch.narrow(tail_buf, 0, 0, tail),
+                False,
+            )
             nansum_chunk_kernel[(1, 1, 1)](
-                tail_buf, partial[full:], chunk, buffer_size_limit=2048
+                tail_buf,
+                torch.narrow(partial, 0, full, nb - full),
+                chunk,
+                buffer_size_limit=2048,
             )
         if nb == 1:
             torch.ops.aten._copy_from(partial, out, False)
@@ -242,7 +254,7 @@ def _nansum_global(inp, out_dtype):
         else:
             if nb != _CHUNK:
                 big = torch.zeros(_CHUNK, dtype=cd, device=inp.device)
-                torch.ops.aten._copy_from(partial, big[:nb], False)
+                torch.ops.aten._copy_from(partial, torch.narrow(big, 0, 0, nb), False)
                 partial = big
             nansum_chunk_kernel[(1, 1, 1)](partial, out, _CHUNK, buffer_size_limit=2048)
     return out

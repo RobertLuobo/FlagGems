@@ -231,5 +231,10 @@ def avg_pool3d_backward(
             HAS_DIVISOR=divisor_override is not None,
             BLOCK=block,
         )
-    grad_input = padded[:total].view(x.shape)
+    # ``padded[:total]`` must not be used: inside use_gems()/enable() the
+    # registered ``slice.Tensor`` python impl is invoked without the ``step``
+    # argument (4-arg form) -> TypeError for any non-full slice.  ``narrow``
+    # is a zero-copy as_strided view and dispatches correctly (same fix as
+    # binary_cross_entropy_backward.py / mm.py / quantized_lstm.py).
+    grad_input = torch.narrow(padded, 0, 0, total).view(x.shape)
     return grad_input.squeeze(0) if was_unbatched else grad_input

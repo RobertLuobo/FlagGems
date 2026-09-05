@@ -49,13 +49,17 @@ def _kthvalue_packed_kernel(
     # pack (key, index) into int64: shift key into signed range so the
     # int64 comparison keeps value ordering and breaks ties by index
     keys = (((u.to(tl.int64) & 0xFFFFFFFF) - 2147483648) << 32) | col_offs.to(tl.int64)
+    # exclusion sentinel: must be strictly greater than every valid key.
+    # valid keys are in [-2**63, (2**31 - 1) << 32 | (BLOCK_N - 1)],
+    # so int64 max is a safe upper bound (values > 2.0f would otherwise
+    # produce keys above 2**62 and let the old sentinel win the min).
     for ki in tl.static_range(K):
         m = tl.min(keys, axis=0)
         if ki != K - 1:
             idx = m.to(tl.int32)  # low 32 bits carry the index
             keys = tl.where(
                 (col_offs.to(tl.int64) & 0xFFFFFFFF) == idx.to(tl.int64),
-                (1 << 62),
+                0x7FFFFFFFFFFFFFFF,
                 keys,
             )
     idx = m.to(tl.int32)

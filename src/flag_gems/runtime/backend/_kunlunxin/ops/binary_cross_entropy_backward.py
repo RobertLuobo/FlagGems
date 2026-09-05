@@ -28,8 +28,13 @@ logger = logging.getLogger(__name__)
 #   - the tail is handled by zero-free PADDING: out is allocated at the next
 #     multiple of BLOCK, the kernel never masks (masked memory paths are slow
 #     and silently unreliable on this backend), and the writer returns the
-#     padded frontier view out[:N].view(shape) — the padding lanes are never
-#     read by the caller;
+#     padded frontier view via torch.narrow(0, 0, N).view(shape) — the padding
+#     lanes are never read by the caller. NOTE: plain out[:N] slicing must not
+#     be used here: with flag_gems.use_gems() active, aten::slice.Tensor is
+#     underpinned by a registered Python impl that the dispatcher calls with
+#     only 4 positional args (step is dropped), raising
+#     "TypeError: slice() missing 1 required positional argument: 'step'".
+#     torch.narrow is a zero-copy as_strided view and dispatches correctly.
 #   - reduction=mean folds the 1/N normalisation into the kernel (one pass
 #     instead of two);
 #   - numerical formula matches the generic kernel exactly on the tested
@@ -152,4 +157,4 @@ def binary_cross_entropy_backward(grad_output, self, target, weight=None, reduct
                 norm,
                 BLOCK=_BLK,
             )
-    return out[:N].view(self.shape)
+    return torch.narrow(out, 0, 0, N).view(self.shape)

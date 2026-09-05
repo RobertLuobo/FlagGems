@@ -70,32 +70,24 @@ def _can_use_last_write_rows(inp, indices, values, accumulate):
 
 @libentry()
 @triton.jit
-def _mask_count_kernel(mask_ptr, counts_ptr, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    off = pid * BLOCK + tl.arange(0, BLOCK)
-    m = tl.load(mask_ptr + off) != 0
-    tl.store(counts_ptr + pid, tl.sum(tl.where(m, 1, 0)))
-
-
-@libentry()
-@triton.jit
-def _mask_scan_kernel(counts_ptr, base_ptr, TILE: tl.constexpr):
-    i = tl.arange(0, TILE)
-    c = tl.load(counts_ptr + i)
-    tl.store(base_ptr + i, tl.cumsum(c, axis=0) - c)
-
-
-@libentry()
-@triton.jit
-def _mask_blend_kernel(
+def _mask_scatter_full_kernel(
     inp_ptr,
     mask_ptr,
+    rank_ptr,
     values_ptr,
-    base_ptr,
     IS_ACCUMULATE: tl.constexpr,
     SCALAR_VALUES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    # Full blocks only (grid = numel // BLOCK, exact division): every lane is
+    # in-bounds, so mask/load/store addresses stay affine and the compiler can
+    # keep the block-DMA path (a runtime `safe` index tears it down to a
+    # ~2.4x-slower generic gather).
+    #
+    # Scan-free read-blend-write: the global rank of every masked lane is
+    # precomputed on the host with torch.cumsum (the in-kernel `tl.cumsum` scan
+    # is non-deterministic on this backend and produced ~50% wrong results), so
+    # the kernel needs no prefix state at all.
     pid = tl.program_id(0)
     off = pid * BLOCK + tl.arange(0, BLOCK)
     m = tl.load(mask_ptr + off) != 0
@@ -103,9 +95,8 @@ def _mask_blend_kernel(
     if SCALAR_VALUES:
         v = tl.load(values_ptr)
     else:
-        one = tl.where(m, 1, 0)
-        rank = tl.cumsum(one, axis=0) - one + tl.load(base_ptr + pid)
-        v = tl.load(values_ptr + tl.where(m, rank, 0))
+        r = tl.load(rank_ptr + off)
+        v = tl.load(values_ptr + tl.where(m, r, 0))
     if IS_ACCUMULATE:
         out = tl.where(m, cur + v, cur)
     else:
@@ -113,16 +104,39 @@ def _mask_blend_kernel(
     tl.store(inp_ptr + off, out)
 
 
-def _bool_blend_block(numel):
-    """Largest power-of-two block in [64, 8192] that divides numel exactly."""
-    if numel < 64:
-        return 0
-    block = 8192
-    while block >= 64:
-        if numel % block == 0:
-            return block
-        block //= 2
-    return 0
+@libentry()
+@triton.jit(do_not_specialize=["numel", "n_main"])
+def _mask_scatter_tail_kernel(
+    inp_ptr,
+    mask_ptr,
+    rank_ptr,
+    values_ptr,
+    numel,
+    n_main,
+    IS_ACCUMULATE: tl.constexpr,
+    SCALAR_VALUES: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Remainder block (numel % BLOCK != 0), launched once.  Masked stores are
+    # not honoured on this backend, so OOB lanes (off >= numel) are redirected
+    # to lane 0 with `safe = tl.where(off < numel, off, 0)` and replicate its
+    # address and payload exactly; the (unmasked) store is therefore idempotent.
+    # The non-affine indexing is confined to this single block.
+    pid = tl.program_id(0)
+    off = n_main + pid * BLOCK + tl.arange(0, BLOCK)
+    safe = tl.where(off < numel, off, 0)
+    m = tl.load(mask_ptr + safe) != 0
+    cur = tl.load(inp_ptr + safe)
+    if SCALAR_VALUES:
+        v = tl.load(values_ptr)
+    else:
+        r = tl.load(rank_ptr + safe)
+        v = tl.load(values_ptr + tl.where(m, r, 0))
+    if IS_ACCUMULATE:
+        out = tl.where(m, cur + v, cur)
+    else:
+        out = tl.where(m, v, cur)
+    tl.store(inp_ptr + safe, out)
 
 
 def _can_use_bool_blend(inp, indices, values):
@@ -139,36 +153,48 @@ def _can_use_bool_blend(inp, indices, values):
         return False
     if values.numel() != 1 and values.ndim > 1:
         return False
-    return _bool_blend_block(inp.numel()) != 0
+    # Any non-empty size works now: unlike the old block-splitting design, the
+    # scan-free kernels have no power-of-two block constraint, so every
+    # bool-mask shape stays off the generic `torch.where` -> nonzero_numpy path
+    # (which crashes for sizes with no large power-of-two divisor, e.g.
+    # numel == 100, and for every single-bound slice under the enabled dispatch
+    # mode).
+    return inp.numel() > 0
 
 
 def _bool_blend(inp, mask, values, accumulate):
     numel = inp.numel()
-    block = _bool_blend_block(numel)
-    nb = numel // block
-    tile = max(64, triton.next_power_of_2(nb + 1))
+    K = int(mask.sum().item())
+    if K != values.numel() and values.numel() != 1:
+        return None
+    rank = torch.cumsum(mask.to(torch.int64).view(-1), dim=0) - 1
     scalar_values = values.numel() == 1
-
+    v = values if scalar_values else values.view(-1)
+    block = 1024
+    n_full, rem = numel // block, numel % block
     with torch_device_fn.device(inp.device):
-        if scalar_values:
-            base = inp  # unused by the kernel, keep a valid pointer
-        else:
-            counts = torch.zeros((tile,), dtype=torch.int32, device=inp.device)
-            base = torch.empty((tile,), dtype=torch.int32, device=inp.device)
-            _mask_count_kernel[(nb,)](mask, counts, BLOCK=block)
-            _mask_scan_kernel[(1,)](counts, base, TILE=tile)
-            selected = int(base[nb].item())
-            if values.numel() != selected:
-                return None
-        _mask_blend_kernel[(nb,)](
-            inp,
-            mask,
-            values.view(-1) if not scalar_values else values,
-            base,
-            IS_ACCUMULATE=bool(accumulate),
-            SCALAR_VALUES=scalar_values,
-            BLOCK=block,
-        )
+        if n_full > 0:
+            _mask_scatter_full_kernel[(n_full,)](
+                inp,
+                mask,
+                rank,
+                v,
+                IS_ACCUMULATE=bool(accumulate),
+                SCALAR_VALUES=scalar_values,
+                BLOCK=block,
+            )
+        if rem > 0:
+            _mask_scatter_tail_kernel[(1,)](
+                inp,
+                mask,
+                rank,
+                v,
+                numel,
+                n_full * block,
+                IS_ACCUMULATE=bool(accumulate),
+                SCALAR_VALUES=scalar_values,
+                BLOCK=block,
+            )
     return inp
 
 
