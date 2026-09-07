@@ -1533,6 +1533,40 @@ def simple_unique_flat(
     return data_out[:out_size], inverse_indices, counts
 
 
+# Per-program tile of the fused boundary kernel.  4096 is the largest tile
+# qualified on this backend for linear (non-reduce) kernels; smaller N gets
+# the tile clamped at next_power_of_2 so single-tile shapes stay launch-light.
+_BOUND_BLOCK = 4096
+
+
+@libentry()
+@triton.jit
+def _unique2_boundary_kernel(
+    data_ptr,
+    ne_ptr,
+    cum_ptr,
+    N: int,
+    BLOCK: tl.constexpr,
+):
+    """Fused boundary flags for _unique2 (see caller comment).
+
+    For each lane: ne[i] = (i == 0) | (data[i] != data[i-1]);
+    cum[0] = 0 and cum[i] = ne[i] (i > 0).  `data` is already sorted, so the
+    comparison is done on the native dtype (any int/float width) with no
+    cast pass and no `others`/`other=` dependence: the prev load for lane 0
+    is clamped to lane 0 (its value is unused because the OR forces True).
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    a = tl.load(data_ptr + offs, mask=mask)
+    p_offs = tl.where(offs > 0, offs - 1, 0)
+    b = tl.load(data_ptr + p_offs, mask=mask)
+    is_b = (offs == 0) | ((a != b) & (offs > 0))
+    tl.store(ne_ptr + offs, is_b, mask=mask)
+    tl.store(cum_ptr + offs, tl.where(offs == 0, 0, is_b.to(tl.int64)), mask=mask)
+
+
 def _unique2(
     in0: torch.Tensor,
     sorted: bool = True,
@@ -1588,23 +1622,33 @@ def _unique2(
             counts,
         )
 
+    # XPU boundary mask + cumsum input in ONE fused kernel.  The previous
+    # chain (torch.ones + `ne[1:] = cmp[1:] != cmp[:-1]` + ne.to(int64))
+    # costs ~70 ms per 16 M elements on XPU (two full-tensor strided view
+    # passes + a type convert).  The kernel writes both the bool boundary
+    # mask (for nonzero) and the int64 cumsum input (cum[0] = 0,
+    # cum[i] = ne[i]) so that cumsum(cum_input)[i] is already the 0-based
+    # run/group id: the `- 1` sub and the `.to(int64)` pass disappear.
+    # int16 compare is done in the kernel on the native dtype (no int32
+    # cast pass needed) - Triton int16 arithmetic is exact.
     sorted_data, sorted_indices = torch.sort(flat)
-
-    # Boundary mask: True where element differs from its predecessor. The XPU
-    # eager `ne` is unimplemented for int16, so compare through an int32 view
-    # (lossless for the small int dtypes unique handles).
-    cmp = (
-        sorted_data
-        if sorted_data.dtype in (torch.int32, torch.int64)
-        else sorted_data.to(torch.int32)
-    )
-    ne = torch.ones(N, dtype=torch.bool, device=flat.device)
-    if N > 1:
-        ne[1:] = cmp[1:] != cmp[:-1]
+    ne = torch.empty(N, dtype=torch.bool, device=flat.device)
+    cum_input = torch.empty(N, dtype=torch.int64, device=flat.device)
+    with torch_device_fn.device(flat.device):
+        _unique2_boundary_kernel[(triton.cdiv(N, _BOUND_BLOCK),)](
+            sorted_data, ne, cum_input, N, BLOCK=_BOUND_BLOCK, num_warps=8
+        )
 
     # Unique starts + unique values.
     start = torch.nonzero(ne).ravel()
-    data_out = torch.index_select(sorted_data, 0, start)
+    n_unique = start.numel()
+    if n_unique == N:
+        # all-distinct fast path: unique values are exactly the sorted data
+        # (index_select of N distinct positions == identity); skips the
+        # 16-27 ms gather on the benchmark's uniform full-range inputs.
+        data_out = sorted_data
+    else:
+        data_out = torch.index_select(sorted_data, 0, start)
 
     inverse_indices = None
     counts = None
@@ -1613,7 +1657,7 @@ def _unique2(
         # unique-id per sorted position (0-based run index), scattered back to
         # the original order. `cum` and this scatter_ are exact on device at all
         # tested N (plain scatter_ has unique indices -> no atomic contention).
-        cum = torch.cumsum(ne.to(torch.int64), 0) - 1
+        cum = torch.cumsum(cum_input, 0)
         inverse_indices = torch.empty(N, dtype=torch.int64, device=flat.device)
         inverse_indices.scatter_(0, sorted_indices, cum)
 
