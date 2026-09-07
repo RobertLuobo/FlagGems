@@ -17,14 +17,7 @@ import torch
 
 import flag_gems
 
-from . import base
-
-# bf16 excluded: XPU native reference (torch_xmlir xdnn_pytorch_wrapper/
-# hardswish.cpp:30) reports "scalar type of ret: kbfloat16 is unsupported"
-# -> [NOT IMPLEMENTED] error code=4 for BOTH hardswish_/hardswish/hardswish.out
-# on the reference-side latency_base path (NON_BUG, pre-existing, same family as
-# acosh/sinh/cosh/mish). bf16 correctness is covered by tests/test_hardswish.py
-# --ref cpu (57P incl. bf16).
+from . import base, consts
 
 
 @pytest.mark.hardswish_
@@ -35,7 +28,7 @@ def test_hardswish_inplace():
     bench = base.UnaryPointwiseBenchmark(
         op_name="hardswish_",
         torch_op=torch.ops.aten.hardswish_,
-        dtypes=[torch.float16, torch.float32],
+        dtypes=consts.FLOAT_DTYPES,
         is_inplace=True,
     )
     bench.run()
@@ -46,7 +39,7 @@ def test_hardswish():
     bench = base.UnaryPointwiseBenchmark(
         op_name="hardswish",
         torch_op=torch.nn.functional.hardswish,
-        dtypes=[torch.float16, torch.float32],
+        dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
 
@@ -56,6 +49,6 @@ def test_hardswish_out():
     bench = base.UnaryPointwiseOutBenchmark(
         op_name="hardswish_out",
         torch_op=torch.ops.aten.hardswish.out,
-        dtypes=[torch.float16, torch.float32],
+        dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()

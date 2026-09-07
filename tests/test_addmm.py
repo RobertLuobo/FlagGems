@@ -348,6 +348,7 @@ def test_addmm_dtype_fp32_accum(M, N, K):
 
 
 @pytest.mark.addmm_dtype
+@_addmm_beta_zero_only
 @pytest.mark.skipif(
     version.parse(torch.__version__) < version.parse("2.8"),
     reason="The operator addmm.dtype was added starting from 2.8.0",
@@ -402,6 +403,7 @@ def test_addmm_dtype_out_fp32_accum(M, N, K):
 
 
 @pytest.mark.addmm_dtype_out
+@_addmm_beta_zero_only
 @pytest.mark.skipif(
     version.parse(torch.__version__) < version.parse("2.8"),
     reason="The operator addmm.dtype_out was added starting from 2.8.0",
