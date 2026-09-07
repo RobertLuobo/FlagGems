@@ -473,6 +473,7 @@ from .segment_reduce import (
 )
 from .select_backward import select_backward
 from .select_scatter import select_scatter
+from .special_erfinv import special_erfinv, special_erfinv_out
 from .selu import selu, selu_
 from .sgn import sgn, sgn_out
 from .sgn_ import sgn_
