@@ -19,10 +19,16 @@ MAX_UNPOOL3D_SHAPES = [
 @pytest.mark.parametrize("shape", MAX_UNPOOL3D_SHAPES)
 @pytest.mark.parametrize("dtype", utils.FLOAT_DTYPES)
 def test_max_unpool3d(shape, dtype):
-    # Generate input for max_pool3d first, then unpool
+    # Generate input for max_pool3d first, then unpool.
+    # On kunlunxin/XPU the native MaxPool3d(return_indices=True) (torch_xmlir
+    # kernel, outside use_gems) returns all-zero indices, which makes the
+    # unpool input meaningless; use the verified-correct flag_gems
+    # max_pool3d_with_indices inside use_gems() to generate valid indices.
+    # The operator under test (max_unpool3d) still runs entirely on XPU.
     input = torch.randn(shape, dtype=dtype, device=flag_gems.device)
     pool = torch.nn.MaxPool3d(kernel_size=2, stride=2, return_indices=True)
-    output, indices = pool(input)
+    with flag_gems.use_gems():
+        output, indices = pool(input)
 
     ref_input = utils.to_reference(input)
     ref_pool = torch.nn.MaxPool3d(kernel_size=2, stride=2, return_indices=True)
