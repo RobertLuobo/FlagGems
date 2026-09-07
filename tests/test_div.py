@@ -569,11 +569,24 @@ def test_div_mode_tensor(shape, rounding_mode, dtype):
     else:
         res_out = flag_gems.ops.div_mode(inp1, inp2, rounding_mode=rounding_mode)
 
+    # kunlunxin: for fp16/bf16 the XPU kernel returns the exact floor of the fp32
+    # quotient (bit-identical to torch's own XPU div.Tensor_mode). torch's CPU Half
+    # kernel instead rounds every intermediate of the numpy divmod chain back to
+    # fp16 and then applies numpy's `div - floor(div) > 0.5` snap, which degenerates
+    # into round-half-up for ~0.01% of the elements (x=2.021, y=0.00167 -> exact
+    # quotient 1210.55, exact floor 1210, torch CPU 1211). The divergence is always
+    # exactly one quotient step, so allow atol=1 on this reference pairing.
+    if (
+        flag_gems.vendor_name == "kunlunxin"
+        and rounding_mode == "floor"
+        and dtype in (torch.float16, torch.bfloat16)
+    ):
+        utils.gems_assert_close(res_out, ref_out, dtype, equal_nan=True, atol=1)
     # mthreads: floor/trunc division with float16/bfloat16 produces ±1~5 integer
     # boundary errors due to float16 not representing small divisors exactly (e.g.
     # 0.001 becomes 0.0010004 in fp16) and different rounding paths between the
     # Triton kernel and CPU/mthreads native implementations. Use atol=5 for these cases.
-    if (
+    elif (
         flag_gems.vendor_name == "mthreads"
         and rounding_mode in ("floor", "trunc")
         and dtype in (torch.float16, torch.bfloat16)
@@ -603,8 +616,15 @@ def test_div_mode_scalar(shape, scalar, rounding_mode, dtype):
     # differ from both CPU and f64 references. Casting the scalar to the same
     # dtype gives the correct IEEE 754 result that our kernel matches.
     if rounding_mode == "trunc" and isinstance(scalar, float):
+        # The Tensor_mode reference has to be evaluated entirely on the reference
+        # device: with `--ref cpu` `ref_inp` lives on CPU, so a scalar tensor built
+        # on flag_gems.device makes aten raise "Expected all tensors to be on the
+        # same device" (or silently return a device tensor for 0-d inputs, which
+        # then trips the to_cpu() assertion in accuracy_utils).
         scalar_device = (
-            ref_inp.device if flag_gems.vendor_name == "cambricon" else flag_gems.device
+            ref_inp.device
+            if flag_gems.vendor_name in ("cambricon", "kunlunxin")
+            else flag_gems.device
         )
         scalar_tensor = torch.tensor(scalar, dtype=dtype, device=scalar_device)
         ref_out = torch.ops.aten.div.Tensor_mode(
@@ -683,11 +703,22 @@ def test_div_mode_tensor_(shape, rounding_mode, dtype):
     else:
         res_out = flag_gems.ops.div_mode_(inp1, inp2, rounding_mode=rounding_mode)
 
+    # kunlunxin: same fp16/bf16 floor divergence as test_div_mode_tensor -- the XPU
+    # kernel returns the exact floor of the fp32 quotient (bit-identical to torch's
+    # own XPU div_.Tensor_mode) while torch's CPU Half kernel rounds the numpy
+    # divmod intermediates back to fp16 and then snaps `div - floor(div) > 0.5`,
+    # differing by exactly one quotient step on ~0.01% of the elements.
+    if (
+        flag_gems.vendor_name == "kunlunxin"
+        and rounding_mode == "floor"
+        and dtype in (torch.float16, torch.bfloat16)
+    ):
+        utils.gems_assert_close(res_out, ref_out, dtype, equal_nan=True, atol=1)
     # mthreads: floor/trunc division with float16/bfloat16 produces ±1~5 integer
     # boundary errors due to float16 not representing small divisors exactly (e.g.
     # 0.001 becomes 0.0010004 in fp16) and different rounding paths between the
     # Triton kernel and CPU/mthreads native implementations. Use atol=5 for these cases.
-    if (
+    elif (
         flag_gems.vendor_name == "mthreads"
         and rounding_mode in ("floor", "trunc")
         and dtype in (torch.float16, torch.bfloat16)
@@ -714,8 +745,15 @@ def test_div_mode_scalar_(shape, scalar, rounding_mode, dtype):
     # float scalars in trunc mode to avoid aten CUDA's approximate-division
     # inaccuracy on the Scalar_mode path.
     if rounding_mode == "trunc" and isinstance(scalar, float):
+        # The Tensor_mode reference has to be evaluated entirely on the reference
+        # device: with `--ref cpu` `ref_inp` lives on CPU, so a scalar tensor built
+        # on flag_gems.device makes aten raise "Expected all tensors to be on the
+        # same device" (or silently return a device tensor for 0-d inputs, which
+        # then trips the to_cpu() assertion in accuracy_utils).
         scalar_device = (
-            ref_inp.device if flag_gems.vendor_name == "cambricon" else flag_gems.device
+            ref_inp.device
+            if flag_gems.vendor_name in ("cambricon", "kunlunxin")
+            else flag_gems.device
         )
         scalar_tensor = torch.tensor(scalar, dtype=dtype, device=scalar_device)
         ref_out = torch.ops.aten.div.Tensor_mode(
