@@ -1314,7 +1314,9 @@ def sorted_indices_unique_flat(
             # print(f"tile_sum.shape = {tile_sum.shape}")
             # print(f'tile_sum.cpu() = {tile_sum.cpu()}')
             next_multiple = ((num_tasks // 2048) + 1) * 2048
-            cumsum_out = torch.zeros(next_multiple)
+            cumsum_out = torch.zeros(
+                next_multiple, dtype=torch.int64, device=sorted_data.device
+            )
             os.environ["TRITONXPU_OTHER_SIM"] = "1"
             os.environ["TRITONXPU_STORE_MASK_SIM"] = "1"
             os.environ["TRITONXPU_INTERLEAVE"] = "0"
@@ -1531,6 +1533,40 @@ def simple_unique_flat(
     return data_out[:out_size], inverse_indices, counts
 
 
+# Per-program tile of the fused boundary kernel.  4096 is the largest tile
+# qualified on this backend for linear (non-reduce) kernels; smaller N gets
+# the tile clamped at next_power_of_2 so single-tile shapes stay launch-light.
+_BOUND_BLOCK = 4096
+
+
+@libentry()
+@triton.jit
+def _unique2_boundary_kernel(
+    data_ptr,
+    ne_ptr,
+    cum_ptr,
+    N: int,
+    BLOCK: tl.constexpr,
+):
+    """Fused boundary flags for _unique2 (see caller comment).
+
+    For each lane: ne[i] = (i == 0) | (data[i] != data[i-1]);
+    cum[0] = 0 and cum[i] = ne[i] (i > 0).  `data` is already sorted, so the
+    comparison is done on the native dtype (any int/float width) with no
+    cast pass and no `others`/`other=` dependence: the prev load for lane 0
+    is clamped to lane 0 (its value is unused because the OR forces True).
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    a = tl.load(data_ptr + offs, mask=mask)
+    p_offs = tl.where(offs > 0, offs - 1, 0)
+    b = tl.load(data_ptr + p_offs, mask=mask)
+    is_b = (offs == 0) | ((a != b) & (offs > 0))
+    tl.store(ne_ptr + offs, is_b, mask=mask)
+    tl.store(cum_ptr + offs, tl.where(offs == 0, 0, is_b.to(tl.int64)), mask=mask)
+
+
 def _unique2(
     in0: torch.Tensor,
     sorted: bool = True,
@@ -1548,7 +1584,22 @@ def _unique2(
     #   (unique values); inverse via cumsum + scatter_. Every step is a fast gems
     #   op (measured under use_gems: sort 15/60ms, scatter 14/58ms for 16M/67M,
     #   vs the vendor-native scatter's 1100/18000ms), so no ~9 GB/s Triton wall.
-    flat = in0.ravel()
+    # ATen's sorted flag is accepted for schema compatibility. XPU unique always
+    # emits the sorted order, matching the backend's existing contract.
+    #
+    # 2026-08-22 NOTE(kunlunxin): the intermediate "dedicated" path
+    # (radix_sort_low_mem -> sorted_indices_unique_flat, committed in
+    # 173744521) was never runtime-verified on XPU and is now known broken:
+    # (1) its radix chain trips cumsum_row_kernel's unparenthesised
+    # "is_int64() or is_uint64() or is_fp64()" BoolOp chain, which the current
+    # flagtree triton AST visitor rejects at compile time (fixed separately in
+    # cumsum.py); (2) even with that fixed, radix corrupts the scatter stage at
+    # N >= ~33.5M (grid_n >= ~65534, shared-chain defect archived under sort /
+    # isin) which the unique2 shape (16,128,64,1280) = 168M hits. Reverted to
+    # the primitive chain below, which was fully verified 40/40 (incl. 168M
+    # return_counts=True) on 2026-07-16 and passes on the fixed radix chain.
+    _ = sorted
+    flat = in0.contiguous().view(-1)
     N = flat.numel()
 
     if N == 0:
@@ -1571,23 +1622,33 @@ def _unique2(
             counts,
         )
 
+    # XPU boundary mask + cumsum input in ONE fused kernel.  The previous
+    # chain (torch.ones + `ne[1:] = cmp[1:] != cmp[:-1]` + ne.to(int64))
+    # costs ~70 ms per 16 M elements on XPU (two full-tensor strided view
+    # passes + a type convert).  The kernel writes both the bool boundary
+    # mask (for nonzero) and the int64 cumsum input (cum[0] = 0,
+    # cum[i] = ne[i]) so that cumsum(cum_input)[i] is already the 0-based
+    # run/group id: the `- 1` sub and the `.to(int64)` pass disappear.
+    # int16 compare is done in the kernel on the native dtype (no int32
+    # cast pass needed) - Triton int16 arithmetic is exact.
     sorted_data, sorted_indices = torch.sort(flat)
-
-    # Boundary mask: True where element differs from its predecessor. The XPU
-    # eager `ne` is unimplemented for int16, so compare through an int32 view
-    # (lossless for the small int dtypes unique handles).
-    cmp = (
-        sorted_data
-        if sorted_data.dtype in (torch.int32, torch.int64)
-        else sorted_data.to(torch.int32)
-    )
-    ne = torch.ones(N, dtype=torch.bool, device=flat.device)
-    if N > 1:
-        ne[1:] = cmp[1:] != cmp[:-1]
+    ne = torch.empty(N, dtype=torch.bool, device=flat.device)
+    cum_input = torch.empty(N, dtype=torch.int64, device=flat.device)
+    with torch_device_fn.device(flat.device):
+        _unique2_boundary_kernel[(triton.cdiv(N, _BOUND_BLOCK),)](
+            sorted_data, ne, cum_input, N, BLOCK=_BOUND_BLOCK, num_warps=8
+        )
 
     # Unique starts + unique values.
     start = torch.nonzero(ne).ravel()
-    data_out = torch.index_select(sorted_data, 0, start)
+    n_unique = start.numel()
+    if n_unique == N:
+        # all-distinct fast path: unique values are exactly the sorted data
+        # (index_select of N distinct positions == identity); skips the
+        # 16-27 ms gather on the benchmark's uniform full-range inputs.
+        data_out = sorted_data
+    else:
+        data_out = torch.index_select(sorted_data, 0, start)
 
     inverse_indices = None
     counts = None
@@ -1596,7 +1657,7 @@ def _unique2(
         # unique-id per sorted position (0-based run index), scattered back to
         # the original order. `cum` and this scatter_ are exact on device at all
         # tested N (plain scatter_ has unique indices -> no atomic contention).
-        cum = torch.cumsum(ne.to(torch.int64), 0) - 1
+        cum = torch.cumsum(cum_input, 0)
         inverse_indices = torch.empty(N, dtype=torch.int64, device=flat.device)
         inverse_indices.scatter_(0, sorted_indices, cum)
 

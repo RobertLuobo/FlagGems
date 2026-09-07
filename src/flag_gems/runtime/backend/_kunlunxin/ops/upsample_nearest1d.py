@@ -47,30 +47,19 @@ def upsample_nearest1d_kernel(
         pid = tl.program_id(axis=0)
     else:
         pid = tl.program_id(axis=0).to(tl.int64)
-    nc_stride = tl.num_programs(axis=1)
-    NC = N * C
-    nc_iter = tl.program_id(axis=1)
-    pid = tl.program_id(axis=0)
     idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    nc = idx // OL
     ol = idx % OL
-    if SAME_L:
+    if SAME_L and reciprocal_scale_l == 1.0:
         il = ol
     else:
         il = tl.minimum(
             tl.math.floor(ol.to(tl.float32) * reciprocal_scale_l).to(tl.int32), IL - 1
         )
 
-    offset_o = nc_iter * OL + ol
-    offset_i = nc_iter * IL + il
-    src_index_stride = nc_stride * IL
-    dst_index_stride = nc_stride * OL
-
-    while nc_iter < NC:
-        data = tl.load(ptr_i + offset_i)
-        tl.store(ptr_o + offset_o, data)
-        ptr_i += src_index_stride
-        ptr_o += dst_index_stride
-        nc_iter += nc_stride
+    mask = idx < N * C * OL
+    data = tl.load(ptr_i + nc * IL + il, mask=mask)
+    tl.store(ptr_o + idx, data, mask=mask)
 
 
 def upsample_nearest1d(
@@ -88,7 +77,9 @@ def upsample_nearest1d(
     OL = output_size[0] if output_size is not None else int(input.shape[2] * scales)
     N, C, IL = input.shape
 
-    if scales is not None:
+    # ATen (compute_scales_value): scales only takes effect when provided and
+    # > 0; otherwise the index scale degenerates to float32(IL)/OL.
+    if scales is not None and scales > 0:
         reciprocal_scale_l = float(
             torch.tensor(1.0 / scales, dtype=torch.float32).item()
         )
@@ -103,11 +94,23 @@ def upsample_nearest1d(
 
     # allocate output
     output = torch.empty((N, C, OL), device=input.device, dtype=input.dtype)
-    total_threads = OL
-    grid = lambda meta: (
-        triton.cdiv(total_threads, meta["BLOCK_SIZE"]),
-        triton.cdiv(N * C, 4),
-    )
+
+    # The exact 2x mapping out[2j] = out[2j+1] = in[j] is only valid when the
+    # *effective* index scale is exactly 0.5 (scales is None with OL == 2*IL,
+    # or scales == 2.0). With an explicit scales != 2.0 (even when
+    # output_size == 2*IL) ATen still indexes with 1.0/scales, so the fast
+    # path must not be taken.
+    if OL == 2 * IL and reciprocal_scale_l == 0.5:
+        # Exact 2x upsampling: out[2j] = out[2j+1] = in[j] (the nearest floor
+        # index with scale IL/OL == 0.5 is exact in float32). Two strided
+        # native copies avoid the per-element div/mod gather kernel and the
+        # index-kernel launch anomaly observed on XPU.
+        torch.ops.aten._copy_from(input, output[:, :, 0::2], False)
+        torch.ops.aten._copy_from(input, output[:, :, 1::2], False)
+        return output
+
+    total_threads = N * C * OL
+    grid = lambda meta: (triton.cdiv(total_threads, meta["BLOCK_SIZE"]),)
 
     with torch_device_fn.device(input.device):
         upsample_nearest1d_kernel[grid](

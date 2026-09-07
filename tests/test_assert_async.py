@@ -24,8 +24,10 @@ from flag_gems.runtime import torch_device_fn
     "shape, value, expected_err, match_str",
     [
         ((), 1.0, None, None),
+        ((), 0.0, RuntimeError, "Assertion failed!"),
         ((2,), 1.0, RuntimeError, "is ambiguous"),
         ((1,), 1.0, None, None),
+        ((1,), 0.0, RuntimeError, "Assertion failed!"),
     ],
 )
 def test_assert_async(shape, value, expected_err, match_str):
