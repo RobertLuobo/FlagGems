@@ -20,10 +20,15 @@ class MaxUnpool3dBenchmark(base.Benchmark):
 
     def get_input_iter(self, cur_dtype):
         for shape in self.shapes:
-            # Generate pooled input and indices from max_pool3d
+            # Generate pooled input and indices from max_pool3d.
+            # On kunlunxin/XPU the native MaxPool3d(return_indices=True)
+            # (torch_xmlir kernel, outside use_gems) returns all-zero indices;
+            # use the verified-correct flag_gems max_pool3d_with_indices
+            # inside use_gems() so the benchmark feeds valid indices.
             x = torch.randn(shape, dtype=cur_dtype, device=self.device)
             pool = torch.nn.MaxPool3d(kernel_size=2, stride=2, return_indices=True)
-            output, indices = pool(x)
+            with flag_gems.use_gems():
+                output, indices = pool(x)
             # Output size should be the original input shape
             yield output, indices, 2, 2, 0, shape[
                 2:

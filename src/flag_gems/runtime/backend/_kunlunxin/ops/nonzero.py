@@ -29,7 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 def nonzero_kernel_heur_block_size(args):
-    return triton.next_power_of_2(triton.cdiv(args["n_elements"], 12))  # cluster_num
+    # NOTE(kunlunxin): the unbounded next_pow2(cdiv(n, 12)) tile is an IR bomb:
+    # at 16 M elements it lowers a 2 M-lane tile (compile minutes + giant LLVM
+    # expansion, see HARNESS_SUMMARY 2.1).  The kernel is linear (3 memory ops
+    # + an ndim-loop), so any tile >= 64 is semantics-identical; cap at 4096
+    # (the largest tile qualified for linear kernels on this backend; the
+    # grid becomes cdiv(n, 4096) programs either way).
+    return min(triton.next_power_of_2(triton.cdiv(args["n_elements"], 12)), 4096)
 
 
 @libentry()
