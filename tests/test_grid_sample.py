@@ -59,48 +59,6 @@ except Exception:
     gpu_memory_available = 32 * 1024**3
 
 
-def _reference_grid_sample(
-    input, grid, mode="bilinear", padding_mode="zeros", align_corners=False
-):
-    """Reference (oracle) implementation of ``grid_sample``.
-
-    Honors the harness ``--ref cpu`` convention: when the reference runs on
-    CPU, the inputs are moved to CPU. float16/bfloat16 inputs are computed in
-    float32 and cast back to the input dtype (see the inline note). The
-    on-device vendor reference of this stack (torch_xmlir/XDNN) does not
-    implement 5D ``grid_sampler_3d`` for nearest / reflection modes, so the
-    CPU oracle is the stable reference for those cases.
-    """
-    if cfg.TO_CPU:
-        if input.dtype in (torch.float16, torch.bfloat16):
-            # Compute the reference in float32 and cast back to the input
-            # dtype: the vendor CPU bf16 3D kernel disagrees with the f32/f16
-            # kernels at exact 0.5 ties (rounding quirk), while the Triton
-            # implementation computes in f32 internally, so the f32 upstream
-            # reference is the exact oracle (0.0 max-diff, verified offline).
-            ref = torch.nn.functional.grid_sample(
-                input.cpu().float(),
-                grid.cpu().float(),
-                mode=mode,
-                padding_mode=padding_mode,
-                align_corners=align_corners,
-            )
-            return ref.to(input.dtype).to(input.device)
-        return (
-            torch.nn.functional.grid_sample(
-                input.cpu(),
-                grid.cpu(),
-                mode=mode,
-                padding_mode=padding_mode,
-                align_corners=align_corners,
-            )
-            .to(input.device)
-        )
-    return torch.nn.functional.grid_sample(
-        input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners
-    )
-
-
 def assert_close(actual, expected, rtol=1e-4, atol=None, dtype=torch.float32):
     """
     Verify precision using torch.allclose (competition requirement standards)
@@ -150,7 +108,7 @@ class TestGridSampleNearest4D:
         y_gems = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
 
@@ -174,7 +132,7 @@ class TestGridSampleNearest4D:
         y_gems = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
 
@@ -203,7 +161,7 @@ class TestGridSampleNearest4D:
             padding_mode=padding_mode,
             align_corners=align_corners,
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x,
             grid,
             mode="nearest",
@@ -233,7 +191,7 @@ class TestGridSampleNearest4D:
         y_gems = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
 
@@ -254,7 +212,7 @@ class TestGridSampleNearest4D:
         y_gems = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
 
@@ -280,7 +238,7 @@ class TestGridSampleEdgeCases:
         y_gems = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
 
@@ -303,7 +261,7 @@ class TestGridSampleEdgeCases:
         y_gems = grid_sample(
             x, grid, mode="nearest", padding_mode="border", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="border", align_corners=False
         )
 
@@ -326,7 +284,7 @@ class TestGridSampleEdgeCases:
         y_gems = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
 
@@ -348,7 +306,7 @@ class TestGridSampleEdgeCases:
         y_true = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=True
         )
-        y_true_torch = _reference_grid_sample(
+        y_true_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=True
         )
 
@@ -356,7 +314,7 @@ class TestGridSampleEdgeCases:
         y_false = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
-        y_false_torch = _reference_grid_sample(
+        y_false_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
 
@@ -382,7 +340,7 @@ class TestGridSampleEdgeCases:
         y_gems = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
 
@@ -462,7 +420,7 @@ class TestGridSampleBilinear4D:
         y_gems = grid_sample(
             x, grid, mode="bilinear", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="bilinear", padding_mode="zeros", align_corners=False
         )
 
@@ -487,7 +445,7 @@ class TestGridSampleBilinear4D:
         y_gems = grid_sample(
             x, grid, mode="bilinear", padding_mode="zeros", align_corners=True
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="bilinear", padding_mode="zeros", align_corners=True
         )
 
@@ -517,7 +475,7 @@ class TestGridSampleBilinear4D:
             padding_mode=padding_mode,
             align_corners=align_corners,
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x,
             grid,
             mode="bilinear",
@@ -546,7 +504,7 @@ class TestGridSampleBilinear4D:
         y_gems = grid_sample(
             x, grid, mode="bilinear", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="bilinear", padding_mode="zeros", align_corners=False
         )
 
@@ -571,7 +529,7 @@ class TestGridSampleBilinear4D:
         y_gems = grid_sample(
             x, grid, mode="bilinear", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="bilinear", padding_mode="zeros", align_corners=False
         )
 
@@ -599,7 +557,7 @@ class TestGridSampleBicubic4D:
         y_gems = grid_sample(
             x, grid, mode="bicubic", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="bicubic", padding_mode="zeros", align_corners=False
         )
 
@@ -627,7 +585,7 @@ class TestGridSampleBicubic4D:
             padding_mode=padding_mode,
             align_corners=align_corners,
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x,
             grid,
             mode="bicubic",
@@ -662,7 +620,7 @@ class TestGridSample5D:
         y_gems = grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode="nearest", padding_mode="zeros", align_corners=False
         )
 
@@ -691,7 +649,7 @@ class TestGridSample5D:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners
         )
 
@@ -745,7 +703,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners
         )
 
@@ -770,7 +728,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
 
@@ -796,7 +754,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
 
@@ -823,7 +781,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
 
@@ -851,7 +809,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
 
@@ -881,7 +839,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
 
@@ -913,7 +871,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
 
@@ -944,7 +902,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
 
@@ -975,7 +933,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode=padding_mode, align_corners=False
         )
 
@@ -1004,7 +962,7 @@ class TestGridSampleExtremeSizes:
         y_gems = grid_sample(
             x, grid, mode=mode, padding_mode="zeros", align_corners=False
         )
-        y_torch = _reference_grid_sample(
+        y_torch = torch.nn.functional.grid_sample(
             x, grid, mode=mode, padding_mode="zeros", align_corners=False
         )
 
