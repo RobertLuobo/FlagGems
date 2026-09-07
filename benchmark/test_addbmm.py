@@ -25,7 +25,6 @@ def test_addbmm():
         op_name="addbmm",
         input_fn=_input_fn,
         torch_op=torch.addbmm,
-        # bf16 excluded: native reference raises [NOT IMPLEMENTED] on XPU
-        dtypes=consts.FLOAT_DTYPES[:2],
+        dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()

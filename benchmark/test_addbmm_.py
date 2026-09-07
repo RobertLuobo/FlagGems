@@ -25,7 +25,6 @@ def test_addbmm_():
         op_name="addbmm_",
         input_fn=_input_fn,
         torch_op=lambda bias, inp1, inp2: bias.addbmm_(inp1, inp2),
-        # bf16 excluded: native reference raises [NOT IMPLEMENTED] on XPU
-        dtypes=consts.FLOAT_DTYPES[:2],
+        dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
