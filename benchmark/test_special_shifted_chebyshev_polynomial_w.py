@@ -1,12 +1,16 @@
 import pytest
 import torch
 
+import flag_gems
+
 from . import base
 
 
-# Multi-backend: the previous `vendor_name not in ("nvidia", "thead")` skipif was stale.
-# Verified on kunlunxin (XPU, 2026-08-31) with the body below unchanged: all 13 shape
-# cells run SUCCESS, so no vendor gate is needed here.
+# TODO: Reference GitHub issue for multi-backend support
+@pytest.mark.skipif(
+    flag_gems.vendor_name not in ("nvidia", "thead"),
+    reason="Only nvidia and thead backends support this op",
+)
 @pytest.mark.special_shifted_chebyshev_polynomial_w
 def test_special_shifted_chebyshev_polynomial_w():
     bench = base.BinaryPointwiseBenchmark(
