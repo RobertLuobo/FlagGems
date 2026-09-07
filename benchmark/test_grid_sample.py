@@ -168,36 +168,26 @@ class GridSampleBenchmark(base.Benchmark):
             # Reduced mode combinations to avoid CI benchmark timeout.
             # Original had 11-14 yields per shape; now reduced to 4-5 core cases.
 
-            # Vendor torch (torch_xmlir/XDNN) 5D grid_sampler_3d support on XPU:
-            #  - f16/bf16 are rejected entirely (scalar type unsupported)
-            #  - f32 nearest / reflection are not implemented
-            # => only f32 bilinear (zeros/border) can produce a torch baseline
-            #    (latency_base). Guard the 5D yields below accordingly.
-            can_bench_5d = cur_dtype == torch.float32
-
-            # 1. Nearest neighbor - zeros padding (5D: no torch baseline)
-            if not is_5d:
-                yield inp, grid, {
-                    "mode": "nearest",
-                    "padding_mode": "zeros",
-                    "align_corners": False,
-                }
+            # 1. Nearest neighbor - zeros padding
+            yield inp, grid, {
+                "mode": "nearest",
+                "padding_mode": "zeros",
+                "align_corners": False,
+            }
 
             # 2. Bilinear - zeros padding (most common)
-            if not is_5d or can_bench_5d:
-                yield inp, grid, {
-                    "mode": "bilinear",
-                    "padding_mode": "zeros",
-                    "align_corners": False,
-                }
+            yield inp, grid, {
+                "mode": "bilinear",
+                "padding_mode": "zeros",
+                "align_corners": False,
+            }
 
             # 3. Bilinear - border padding
-            if not is_5d or can_bench_5d:
-                yield inp, grid, {
-                    "mode": "bilinear",
-                    "padding_mode": "border",
-                    "align_corners": True,
-                }
+            yield inp, grid, {
+                "mode": "bilinear",
+                "padding_mode": "border",
+                "align_corners": True,
+            }
 
             # 4. Bicubic (4D only)
             if not is_5d:

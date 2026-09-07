@@ -15,35 +15,25 @@
 import pytest
 import torch
 
-from . import base
+from . import base, consts
 
 
 @pytest.mark.sinh
 def test_sinh():
-    # bf16 is excluded: vendor native torch.sinh (xdnn_pytorch_wrapper
-    # sinh.cpp:30) reports [NOT IMPLEMENTED] for kbfloat16 on XPU, so the
-    # benchmark's latency_base (native reference) has no bf16 baseline.
-    # bf16 correctness is covered by tests/test_sinh.py --ref cpu.
-    # Same pattern as benchmark/test_mish.py / test_cosh.py.
     bench = base.UnaryPointwiseBenchmark(
         op_name="sinh",
         torch_op=torch.sinh,
-        dtypes=[torch.float16, torch.float32],
+        dtypes=consts.FLOAT_DTYPES,
     )
     bench.run()
 
 
 @pytest.mark.sinh_
 def test_sinh_inplace():
-    # bf16 is excluded: vendor native torch.sinh_ (xdnn_pytorch_wrapper
-    # sinh.cpp:30) reports [NOT IMPLEMENTED] for kbfloat16 on XPU, so the
-    # benchmark's latency_base (native reference) has no bf16 baseline.
-    # bf16 correctness is covered by tests/test_sinh.py --ref cpu.
-    # Same pattern as benchmark/test_mish.py / test_cosh.py.
     bench = base.UnaryPointwiseBenchmark(
         op_name="sinh_",
         torch_op=lambda a: a.sinh_(),
-        dtypes=[torch.float16, torch.float32],
+        dtypes=consts.FLOAT_DTYPES,
         is_inplace=True,
     )
     bench.run()
