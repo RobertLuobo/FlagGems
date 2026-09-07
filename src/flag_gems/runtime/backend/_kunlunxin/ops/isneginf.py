@@ -23,7 +23,18 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 logger = logging.getLogger(__name__)
 
 # A direct comparison with -inf has the same floating-point semantics as
-# isinf(x) & (x < 0), but avoids the libdevice isinf extern call.
+# isinf(x) & (x < 0), but avoids the libdevice isinf extern call.  The
+# fp32-widened `== -inf` compare itself still measures ~0.37-1.50 ms on
+# numel > 2^16 on this backend; the pure integer bit-pattern equality below
+# (x == -inf <=> IEEE bits == {sign=1, exp=all-ones, mant=0}) measures
+# ~3.3-3.8x faster for fp16/fp32 (probe see harness/solution/isneginf/
+# kunlunxin_performance_fix_20260904.md) while staying exact for every float
+# bit pattern (NaN / +inf / +-0 / subnormal all differ from the single -inf
+# pattern).
+# bf16 must keep the fp32 compare: its integer bit-pattern variant needs an
+# fp32 widen whose uint32 compare measures neutral-to-slower, and direct
+# int16/uint16 bitcast fails the XPU TritonXPUDtypeConvert pass in the
+# vectorized path (same known limitation as the isposinf/signbit families).
 _config = CodeGenConfig(
     512,
     (65536, 65536, 65536),
@@ -36,10 +47,28 @@ _config = CodeGenConfig(
 )
 
 
+@triton.jit
+def _isneginf_body(x):
+    if tl.constexpr(x.dtype.is_fp32()):
+        xi = x.to(tl.int32, bitcast=True)
+        return xi == -(1 << 23)  # 0xFF800000 as signed int32 (-inf)
+    elif tl.constexpr(x.dtype.is_fp16()):
+        xi = x.to(tl.int16, bitcast=True)
+        return xi == -(1 << 10)  # 0xFC00 as signed int16 (-inf)
+    elif tl.constexpr(x.dtype.is_bf16()):
+        return x.to(tl.float32) == -float("inf")
+    elif tl.constexpr(x.dtype.is_fp64()):
+        xi = x.to(tl.int64, bitcast=True)
+        return xi == -(1 << 52)  # 0xFFF0000000000000 as signed int64 (-inf)
+    else:
+        # integers / other dtypes: widen and compare (finite -> False)
+        return x.to(tl.float32) == -float("inf")
+
+
 @pointwise_dynamic(promotion_methods=[(0, "ALWAYS_BOOL")], config=_config)
 @triton.jit
 def isneginf_func(x):
-    return x.to(tl.float32) == -float("inf")
+    return _isneginf_body(x)
 
 
 def isneginf(A):

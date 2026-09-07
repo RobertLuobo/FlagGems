@@ -17,7 +17,7 @@ def _lu_find_pivot_main_kernel(
     M,
     N,
     K,
-    J: tl.constexpr,
+    J,
     BLOCKS: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
@@ -27,6 +27,12 @@ def _lu_find_pivot_main_kernel(
     masked load / no tail garbage: XPU mis-compiles tl.argmax when the masked
     vector length is smaller than the block size (see solution notes), and the
     block-parallel partial results are merged by _lu_finish_pivot_kernel.
+
+    NOTE: J is deliberately a runtime scalar (not constexpr): the step index
+    changes every iteration of the elimination loop, so a constexpr J would
+    force one Triton recompilation per step (and per kernel), which for a
+    512x512 factorization means ~2-3k JIT compilations and minutes of dead
+    time. With J as a plain argument the kernels compile once per shape.
     """
     pid = tl.program_id(0)
     batch = pid // BLOCKS
@@ -50,13 +56,15 @@ def _lu_find_pivot_tail_kernel(
     M,
     N,
     K,
-    J: tl.constexpr,
+    J,
     TAIL_START: tl.constexpr,
     BLOCK_M: tl.constexpr,
     SLOT: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
     # Tail segment: rows [TAIL_START, M), BLOCK_M == M - TAIL_START exactly.
+    # J is a runtime scalar for the same reason as _lu_find_pivot_main_kernel:
+    # one compilation per shape instead of one per elimination step.
     batch = tl.program_id(0)
     rows = TAIL_START + tl.arange(0, BLOCK_M)
     values = tl.load(LU + batch * M * N + rows * N + J)
@@ -75,12 +83,12 @@ def _lu_finish_pivot_kernel(
     PARTIAL_ROWS,
     PIVOTS,
     K,
-    J: tl.constexpr,
+    J,
     BLOCK_P: tl.constexpr,
 ):
     # BLOCK_P = next_pow2(slots); pad slots are pre-filled with -inf so the
     # full-block argmax below selects a real slot even when slots < BLOCK_P
-    # (no masked reduce involved).
+    # (no masked reduce involved). J is a runtime scalar (see main kernel).
     batch = tl.program_id(0)
     blocks = tl.arange(0, BLOCK_P)
     values = tl.load(PARTIAL_VALUES + batch * BLOCK_P + blocks)
@@ -91,8 +99,10 @@ def _lu_finish_pivot_kernel(
 
 @triton.jit
 def _lu_swap_rows_kernel(
-    LU, PIVOTS, M, N, K, J: tl.constexpr, BLOCKS: tl.constexpr, BLOCK_N: tl.constexpr
+    LU, PIVOTS, M, N, K, J, BLOCKS: tl.constexpr, BLOCK_N: tl.constexpr
 ):
+    # J is a runtime scalar (see _lu_find_pivot_main_kernel): with a constexpr
+    # J every elimination step would recompile the kernel.
     pid = tl.program_id(0)
     batch = pid // BLOCKS
     block = pid % BLOCKS
@@ -107,8 +117,9 @@ def _lu_swap_rows_kernel(
 
 @triton.jit
 def _lu_scale_column_kernel(
-    LU, M, N, J: tl.constexpr, BLOCKS: tl.constexpr, BLOCK_M: tl.constexpr
+    LU, M, N, J, BLOCKS: tl.constexpr, BLOCK_M: tl.constexpr
 ):
+    # J is a runtime scalar (see _lu_find_pivot_main_kernel).
     pid = tl.program_id(0)
     batch = pid // BLOCKS
     block = pid % BLOCKS
@@ -124,23 +135,42 @@ def _lu_update_trailing_kernel(
     LU,
     M,
     N,
-    J: tl.constexpr,
-    ROWS: tl.constexpr,
-    BLOCKS: tl.constexpr,
+    J,
+    ROW_BLOCKS: tl.constexpr,
+    COL_BLOCKS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    """Trailing rank-1 update A[J+1:, J+1:] -= L[/, J] * U[J, /] on a 2D tile.
+
+    One program covers a [BLOCK_M, BLOCK_N] tile (4x128).  The 2D form with a
+    [BLOCK_M, BLOCK_N] mask is REQUIRED on XPU: the 1-row form whose store mask
+    is `(scalar < M) & (vector < N)` with J as a runtime scalar silently
+    mis-compiles on this backend (rows of the trailing block are updated with
+    garbage column-0 values; verified 2026-09-04).  Larger tiles (64x128) were
+    measured slower here (large int64 offset-tile expansion in
+    ConvertTritonXPUToLLVM), so 4x128 is the sweet spot: identical per-row work
+    to the 1-row form but 4x fewer programs.
+
+    J is a runtime scalar (see _lu_find_pivot_main_kernel): a constexpr J would
+    force one recompilation per elimination step.
+    """
     pid = tl.program_id(0)
-    batch = pid // (ROWS * BLOCKS)
-    row = J + 1 + (pid // BLOCKS) % ROWS
-    block = pid % BLOCKS
-    columns = J + 1 + block * BLOCK_N + tl.arange(0, BLOCK_N)
+    batch = pid // (ROW_BLOCKS * COL_BLOCKS)
+    block = pid % (ROW_BLOCKS * COL_BLOCKS)
+    bm = block // COL_BLOCKS
+    bn = block % COL_BLOCKS
+    rows = J + 1 + bm * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = J + 1 + bn * BLOCK_N + tl.arange(0, BLOCK_N)
     base = LU + batch * M * N
-    mask = (row < M) & (columns < N)
-    multiplier = tl.load(base + row * N + J, mask=row < M, other=0.0)
-    pivot_row = tl.load(base + J * N + columns, mask=columns < N, other=0.0)
-    offsets = base + row * N + columns
+    row_mask = rows < M
+    col_mask = cols < N
+    mask = row_mask[:, None] & col_mask[None, :]
+    multiplier = tl.load(base + rows * N + J, mask=row_mask, other=0.0)
+    pivot_row = tl.load(base + J * N + cols, mask=col_mask, other=0.0)
+    offsets = base + rows[:, None] * N + cols[None, :]
     values = tl.load(offsets, mask=mask, other=0.0)
-    tl.store(offsets, values - multiplier * pivot_row, mask=mask)
+    tl.store(offsets, values - multiplier[:, None] * pivot_row[None, :], mask=mask)
 
 
 def _check_linalg_lu_factor(input, pivot):
@@ -258,15 +288,16 @@ def _linalg_lu_factor(input, pivot):
                     num_warps=4,
                 )
             if j + 1 < m and j + 1 < n:
-                trailing_rows = m - j - 1
-                trailing_blocks = triton.cdiv(n - j - 1, 128)
-                _lu_update_trailing_kernel[(batch * trailing_rows * trailing_blocks,)](
+                row_blocks = triton.cdiv(m - j - 1, 4)
+                col_blocks = triton.cdiv(n - j - 1, 128)
+                _lu_update_trailing_kernel[(batch * row_blocks * col_blocks,)](
                     lu,
                     m,
                     n,
                     j,
-                    ROWS=trailing_rows,
-                    BLOCKS=trailing_blocks,
+                    ROW_BLOCKS=row_blocks,
+                    COL_BLOCKS=col_blocks,
+                    BLOCK_M=4,
                     BLOCK_N=128,
                     num_warps=4,
                 )

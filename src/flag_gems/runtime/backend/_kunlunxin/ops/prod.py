@@ -197,6 +197,70 @@ def prod_final(inp, out, WIDTH: tl.constexpr, ACC32: tl.constexpr):
     tl.store(out, p)
 
 
+def _bm_tail(tr):
+    # largest power of two dividing tr (> 0): a tail block of this height is
+    # fully in-bounds, so the tail launch stays mask-free.
+    b = 1
+    while tr % (b * 2) == 0:
+        b *= 2
+    return b
+
+
+@libentry()
+@triton.jit
+def prod_dim_chunk(
+    inp,
+    part,
+    N,
+    B0,
+    C0,
+    C: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # program (c, mb): partial[rows, C0 + c] = prod(inp[rows, B0 + c*CHUNK : B0 + (c+1)*CHUNK]).
+    # inp is [R, N] row-major; the host guarantees every row block is fully
+    # in-bounds (two-level row split), so the kernel is 100% mask-free.
+    c = ext.program_id(0)
+    mb = ext.program_id(1)
+    # keep the tile index in i32: i64 tensor index arithmetic OOMs the
+    # uni_sram budget on this backend (rows*N <= 2^31 is enforced by the host)
+    rows = (mb * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int32)[:, None]
+    inp = inp + rows * N + B0 + c * CHUNK
+    acc = tl.full([BLOCK_M, 1], value=1.0, dtype=tl.float32)
+    for off in range(0, CHUNK, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        a = tl.load(inp + cols).to(tl.float32)
+        blk = tl.reduce(a, axis=1, combine_fn=reduce_mul)[:, None]
+        acc = acc * blk
+    tl.store(part + rows * C + C0 + c, acc)
+
+
+@libentry()
+@triton.jit
+def prod_dim_single(
+    inp,
+    out,
+    N,
+    CHUNK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # single-chunk (C == 1) variant: the whole reduction fits one chunk, so
+    # store straight into `out` (implicit f32 -> out dtype cast).
+    mb = ext.program_id(1)
+    rows = (mb * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int32)[:, None]
+    inp = inp + rows * N
+    acc = tl.full([BLOCK_M, 1], value=1.0, dtype=tl.float32)
+    for off in range(0, CHUNK, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        a = tl.load(inp + cols).to(tl.float32)
+        blk = tl.reduce(a, axis=1, combine_fn=reduce_mul)[:, None]
+        acc = acc * blk
+    tl.store(out + rows, acc)
+
+
 def _pow2_decomp(r):
     parts = []
     while r:
@@ -365,46 +429,187 @@ def prod_dim(inp, dim=None, keepdim=False, *, dtype=None):
 
     rows = M * K
     out_flat = out.reshape(rows)
-    is_fp32 = dtype == torch.float32
-    acc32 = dtype.is_floating_point
-    # TREE16 is only used on the flat path: the dim path is launch/latency
-    # bound and the fp16 native trees with the 512-lane cap measurably
-    # regress mid-size rows (e.g. (1024,4096)/(1024,1048576) fp16).
-    tree16 = False
+    src = src.reshape(rows, N) if src.dim() > 2 else src
+    if (not inp.dtype.is_floating_point) or (rows * N >= 2**31):
+        # ints (int64 exact accumulator) or >2^31-element reductions (the
+        # split-K kernels use i32 tile indices): keep the generic row kernel
+        is_fp32 = dtype == torch.float32
+        acc32 = dtype.is_floating_point
+        tree16 = False
+        with torch_device_fn.device(inp.device):
+            tile = _pick_fast_tile(rows, N, is_fp32)
+            if tile is not None and (not tree16 or N % _TREE16_BLOCK == 0):
+                bm, bn = tile
+                if tree16:
+                    bn = _TREE16_BLOCK  # fp16 native trees: BN <= 512
+                prod_row2d[(max(rows // bm, 1), 1)](
+                    src,
+                    out_flat,
+                    rows,
+                    N,
+                    bm,
+                    bn,
+                    False,
+                    acc32,
+                    tree16,
+                    buffer_size_limit=2048,
+                )
+            else:
+                bn = min(triton.next_power_of_2(N), _REDUCE_BLOCK)
+                if tree16:
+                    bn = min(bn, _TREE16_BLOCK)
+                bm = triton.next_power_of_2(min(triton.cdiv(rows, 12), 65536 // bn))
+                grid = (triton.cdiv(rows, bm),)
+                prod_row2d[grid](
+                    src,
+                    out_flat,
+                    rows,
+                    N,
+                    bm,
+                    bn,
+                    True,
+                    acc32,
+                    tree16,
+                    buffer_size_limit=2048,
+                )
+        if not keepdim:
+            out = torch.squeeze(out, d)
+        return out
+
+    # ---- float path: split-K with a mask-free two-level row tiling ---------
+    # The previous single-launch row kernel either loops the whole N
+    # sequentially in one program (rows == 1: ~0.5 s for a 2^28 reduction) or
+    # is launch-bound when the row count has only small power-of-two divisors.
+    # Instead: (1) split the reduced dim into 8192-wide (or pow2-tail) column
+    # chunks, one 2D-grid launch per distinct chunk width, writing [rows, C]
+    # fp32 partials; (2) reduce the C partial columns per row with the
+    # existing prod_row2d. Rows are split into full BLOCK_M blocks plus one
+    # tail block whose height is the largest power-of-two divisor of the tail,
+    # so every load/store is in-bounds and compiles mask-free (the masked
+    # memory path costs ~2x on this backend).
+    if rows == 1:
+        # whole-tensor product: identical to the flat path (M == K == 1)
+        with torch_device_fn.device(inp.device):
+            _prod_flat(src, out_flat.reshape(()), inp.device)
+        if not keepdim:
+            out = torch.squeeze(out, d)
+        return out
+
+    BM = 64
+    BN = 512
+    CHUNK = _REDUCE_BLOCK
+    main = N // CHUNK
+    r = N % CHUNK
+    tail = _pow2_decomp(r) if r else []
+    C = main + len(tail)
+    nb = rows // BM
+    tr = rows - nb * BM
+    bmt = _bm_tail(tr) if tr else 1
     with torch_device_fn.device(inp.device):
-        tile = _pick_fast_tile(rows, N, is_fp32)
-        if tile is not None and (not tree16 or N % _TREE16_BLOCK == 0):
-            bm, bn = tile
-            if tree16:
-                bn = _TREE16_BLOCK  # fp16 native trees: BN <= 512
-            prod_row2d[(max(rows // bm, 1), 1)](
-                src,
-                out_flat,
-                rows,
-                N,
-                bm,
-                bn,
-                False,
-                acc32,
-                tree16,
-                buffer_size_limit=2048,
-            )
+        if C == 1:
+            w = CHUNK if main else tail[0]
+            if nb:
+                prod_dim_single[(1, nb)](
+                    src,
+                    out_flat,
+                    N,
+                    w,
+                    BM,
+                    min(BN, w),
+                    num_warps=8,
+                    buffer_size_limit=2048,
+                )
+            if tr:
+                prod_dim_single[(1, 1)](
+                    src[nb * BM :],
+                    out_flat[nb * BM :],
+                    N,
+                    w,
+                    bmt,
+                    min(BN, w),
+                    num_warps=8,
+                    buffer_size_limit=2048,
+                )
         else:
-            bn = min(triton.next_power_of_2(N), _REDUCE_BLOCK)
-            if tree16:
-                bn = min(bn, _TREE16_BLOCK)
-            bm = triton.next_power_of_2(min(triton.cdiv(rows, 12), 65536 // bn))
-            grid = (triton.cdiv(rows, bm),)
-            prod_row2d[grid](
-                src,
+            part = torch.empty((rows, C), dtype=torch.float32, device=inp.device)
+            if main:
+                if nb:
+                    prod_dim_chunk[(main, nb)](
+                        src,
+                        part,
+                        N,
+                        0,
+                        0,
+                        C,
+                        CHUNK,
+                        BM,
+                        BN,
+                        num_warps=8,
+                        buffer_size_limit=2048,
+                    )
+                if tr:
+                    prod_dim_chunk[(main, 1)](
+                        src[nb * BM :],
+                        part[nb * BM :],
+                        N,
+                        0,
+                        0,
+                        C,
+                        CHUNK,
+                        bmt,
+                        BN,
+                        num_warps=8,
+                        buffer_size_limit=2048,
+                    )
+            bpos = main * CHUNK
+            for i, w in enumerate(tail):
+                if nb:
+                    prod_dim_chunk[(1, nb)](
+                        src,
+                        part,
+                        N,
+                        bpos,
+                        main + i,
+                        C,
+                        w,
+                        BM,
+                        min(BN, w),
+                        num_warps=8,
+                        buffer_size_limit=2048,
+                    )
+                if tr:
+                    prod_dim_chunk[(1, 1)](
+                        src[nb * BM :],
+                        part[nb * BM :],
+                        N,
+                        bpos,
+                        main + i,
+                        C,
+                        w,
+                        bmt,
+                        min(BN, w),
+                        num_warps=8,
+                        buffer_size_limit=2048,
+                    )
+                bpos += w
+            # stage 2: per-row product of the C partial columns; pad C to a
+            # power of two with 1.0s (product identity) so the reduce is exact.
+            CP = 1 << (C - 1).bit_length()
+            if CP != C:
+                part2 = torch.ones((rows, CP), dtype=torch.float32, device=inp.device)
+                torch.ops.aten._copy_from(part, part2[:, :C], False)
+                part = part2
+            prod_row2d[((rows + 63) // 64,)](
+                part,
                 out_flat,
                 rows,
-                N,
-                bm,
-                bn,
+                CP,
+                64,
+                min(1024, CP),
+                rows % 64 != 0,
                 True,
-                acc32,
-                tree16,
+                False,
+                num_warps=8,
                 buffer_size_limit=2048,
             )
     if not keepdim:

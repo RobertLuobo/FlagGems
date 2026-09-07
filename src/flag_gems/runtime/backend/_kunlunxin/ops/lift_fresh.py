@@ -1,35 +1,34 @@
+# Kunlunxin (XPU) override of lift_fresh.
+#
+# aten::lift_fresh(Tensor(a) self) -> Tensor(a) is the autograd boundary
+# "lift" identity.  The schema's alias annotation (a) on BOTH the input and the
+# output declares that the result aliases the input storage, and torch's own
+# CompositeExplicitAutograd kernel simply returns `self` unchanged (verified:
+# torch.ops.aten.lift_fresh(x) is x on the reference backend; the torch
+# baseline in benchmark/test_lift_fresh.py is a shape-independent ~3.2us
+# no-op, while a data-copy kernel would scale with numel).
+#
+# The previous implementation materialized a full on-device copy
+# (pointwise_dynamic identity kernel under the copy-family CodeGenConfig),
+# which measured 0.037-2.35ms on 16M-655M element tensors
+# (0.0012x-0.086x torch, ~450-800x slower than the no-op reference) and
+# additionally detached the result from the input storage, deviating from the
+# alias contract.  This override is a pure pass-through, mirroring the sibling
+# aten::lift implementation (src/flag_gems/ops/lift.py).
 import logging
 
 import torch
-import triton  # noqa: F401
-import triton.language as tl  # noqa: F401
-from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
-
-from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
 
-config_ = CodeGenConfig(
-    512,
-    (65536, 65536, 65536),
-    32,
-    True,
-    prefer_1d_tile=True,
-    buffer_size_limit=4096,
-    isCloseVectorization=False,
-    kunlunAutoGrid=True,
-    unroll_num=8,
-)
-
-
-@pointwise_dynamic(is_tensor=[True], promotion_methods=[(0, "DEFAULT")], config=config_)
-@triton.jit
-def lift_fresh_func(x):
-    return x
-
 
 def lift_fresh(x: torch.Tensor):
+    """Implements aten::lift_fresh(Tensor self) -> Tensor.
+
+    ``lift_fresh`` lifts its argument into a "fresh" autograd leaf without
+    touching the data: the returned tensor is the input itself (same storage,
+    same values), exactly as torch's native CompositeExplicitAutograd kernel
+    (``return self``) and the sibling ``ops/lift.py`` pass-through do.
+    """
     logger.debug("GEMS_KUNLUNXIN LIFT_FRESH")
-    if x.numel() == 0:
-        return torch.empty_like(x)
-    return lift_fresh_func(x)
+    return x

@@ -579,6 +579,7 @@ def median_count_le_kernel(
 ):
     pid = ext.program_id(0)
     cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
     keys_v = tl.load(keys + pid * BLOCK_N + cols)
     lo_v = tl.load(lo + pid)
     hi_v = tl.load(hi + pid)
@@ -1027,7 +1028,7 @@ def _median_key_select_chunked(rows, N, key_bits):
         lo_h = [_u32_of(lo, r) for r in range(M)]
         hi_h = [_u32_of(hi, r) for r in range(M)]
         for _ in range(key_bits + 6):
-            mid_h = [(lo + hi) // 2 for lo, hi in zip(lo_h, hi_h)]
+            mid_h = [(l + h) // 2 for l, h in zip(lo_h, hi_h)]
             if key_bits == 64:
                 mid_h = [m & 0xFFFFFFFFFFFFFFFF for m in mid_h]
             for r in range(M):

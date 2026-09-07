@@ -76,8 +76,11 @@ def _check_lu_factor_errors(info):
 
     # Extract the first non-zero info on-device: the Kunlunxin copy/`to`
     # overrides reject cross-device .cpu() copies, so avoid them here.
-    first_idx = torch.argmax(failed.to(torch.int32).flatten()).item()
-    first_info = int(first_idx) + 1
+    # `info` holds the LAPACK-style 1-indexed position of the first zero/NaN
+    # pivot (per batch element); report the value of the first failed element
+    # (matches the generic/ATen semantics, which use the actual info value).
+    first_idx = int(torch.argmax(failed.to(torch.int32).flatten()).item())
+    first_info = int(info.flatten()[first_idx].item())
     raise RuntimeError(
         "torch.linalg.lu_factor_ex: U[{},{}] is zero and using it on lu_solve "
         "would result in a division by zero. If you still want to perform the "

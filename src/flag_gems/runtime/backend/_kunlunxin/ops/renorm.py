@@ -150,7 +150,12 @@ def _padded_flat(shape, dtype, device):
     for s in shape:
         numel *= s
     buf = torch.empty_strided((numel + _TILE_PAD,), (1,), dtype=dtype, device=device)
-    return buf[:numel].view(shape)
+    # `buf[:numel]` would lower to aten::slice.Tensor, which under use_gems()
+    # dispatches to the registered ("slice.Tensor", slice) python impl and
+    # raises TypeError (see avg_pool3d_backward / nansum).  torch.narrow is a
+    # zero-copy view that gems never overrides (same fix pattern as
+    # quantized_lstm / nansum / avg_pool3d_backward).
+    return torch.narrow(buf, 0, 0, numel).view(shape)
 
 
 def _launch_rows(x_flat, out_flat, M, N, p, maxnorm, inflate):

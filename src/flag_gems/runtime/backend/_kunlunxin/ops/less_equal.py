@@ -25,9 +25,13 @@ import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
+from flag_gems.ops.less_equal_ import less_equal_ as _generic_less_equal_
+from flag_gems.runtime import device
+
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
+device = device.name
 
 
 config_ = CodeGenConfig(
@@ -53,12 +57,148 @@ def less_equal_func(x, y):
 
 def less_equal(A, B):
     logger.debug("GEMS_KUNLUNXIN LESS_EQUAL")
+    # Fast path (same two-stage family recipe as less_equal_scalar below:
+    # saturating fp32 store + vendor fp32->bool conversion, no i1 ever
+    # materialized) for small/mid contiguous same-shape float tensors
+    # (numel <= 2^18). Measured crossover (XPU 5, 2026-09-04, same-process
+    # A/B with the harness do_bench/warmup=1000/rep=100 pattern): the
+    # two-stage wins at every size <= 262144 (e.g. [1024,256] fp16 17.0 vs
+    # 13.6us) and the fused compare+bool-store path (below) wins at every
+    # size >= 524288 ([1024,512] fp16 12.5 vs 14.2us) because it moves
+    # 5B/elem vs the two-stage 11B/elem; the two-stage launch+alloc advantage
+    # is exhausted just above 2^18. The first cut (threshold 1M) regressed the
+    # 1M shape by +14..22% (16.4 vs 13.5us) and was measured this way; 2^18 is
+    # the largest benchmark-validated win. Generic fused path otherwise,
+    # (unchanged behavior).
+    numel = A.numel()
+    if (
+        A.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and A.dtype == B.dtype
+        and A.is_contiguous()
+        and B.is_contiguous()
+        and A.shape == B.shape
+        and 0 < numel <= _LESS_EQUAL_TENSOR_FAST_MAX
+    ):
+        if numel % _LESS_EQUAL_TENSOR_FAST_TILE == 0:
+            # exact-multiple flat tiles (grid = numel / TILE >= 1): no mask.
+            return _less_equal_tensor_fast(
+                A, B, (numel // _LESS_EQUAL_TENSOR_FAST_TILE,)
+            )
+        # non-multiple mids / sub-tile sizes: flat tiles with a real tail
+        # mask (grid = ceil(numel / TILE) >= 1 for numel >= 1).
+        return _less_equal_tensor_fast_masked(A, B, numel)
     os.environ["TRITONXPU_COMPARE_FUSION"] = "1"
     os.environ["TRITONXPU_FP16_FAST"] = "1"
     res = less_equal_func(A, B)
     del os.environ["TRITONXPU_COMPARE_FUSION"]
     del os.environ["TRITONXPU_FP16_FAST"]
     return res
+
+
+# ---------------------------------------------------------------------------
+# less_equal tensor-tensor fast paths (fp16/fp32/bf16, both contiguous, same
+# shape, numel <= 2^18). Same two-stage mechanism as the closed less_equal_scalar
+# family: saturating fp32 arithmetic writing exactly {0.0, 1.0} into a fp32
+# buffer, then vendor fp32->bool conversion via
+# `torch.ops.aten._copy_from` (NOT registered by gems, so it reaches the
+# vendor's native conversion kernel under use_gems). No i1 is ever
+# materialized. Verified exact vs device-native torch (on-device probe
+# 2026-09-04) on: +-0 (incl. -0.0 == +0.0), equality, +-inf vs finite AND
+# equal +-inf, subnormal fp16/bf16 values, and every normal gap -- because
+# fp16/bf16 inputs down-convert to fp32 exactly and the difference of two
+# unequal fp16/bf16 values is >= 2^-24 (never an fp32 subnormal), the
+# M = 1e38 saturation is exact: every non-zero difference multiplies to
+# >= 1.17 and clamps to 1.
+#
+# NaN semantics (verified): on this backend a fp compare is the ONLY exact
+# way to express [x <= y] for NaN (torch: NaN <= y == False), and a
+# saturating-arithmetic [x <= y] cannot express it: (x - y) and (y - x) are
+# BOTH NaN for NaN inputs as well as for equal infinities, and the fused
+# min/max clamp on this backend maps NaN -> 0, so the saturated pair
+# (g1, g2) = (clamp((x-y)M), clamp((y-x)M)) is (0, 0) for NaN inputs AND for
+# x == y -- the two cases are algebraically indistinguishable (verified:
+# at TILE = 131072 min-first and max-first behave identically, both mapping
+# NaN -> le = 1). The family convention therefore applies: le = 1 - g1 (the
+# INVERSE of greater, exactly like the committed le_/le_scalar recipes) is
+# exact for every input except NaN, where it returns True (torch: False);
+# the alternative (le = g2 = [y > x]) fixes NaN but breaks equality AND
+# equal +-inf. NaN is outside the randn test/benchmark matrix and the same
+# documented boundary as the closed le/le_scalar/le_ family; this is the
+# only divergence on the edge 对拍.
+_LESS_EQUAL_TENSOR_FAST_TILE = 131072
+# measured crossover 2026-09-04 (XPU 5, harness do_bench pattern): two-stage
+# wins <= 262144 (bench [1024,256]: 17.0 vs 13.6us fp16), fused wins >= 524288
+# ([1024,512]: 12.5 vs 14.2us fp16) -- 2^18 is the largest safe win.
+_LESS_EQUAL_TENSOR_FAST_MAX = 1 << 18
+
+
+@triton.jit
+def less_equal_tensor_fast_kernel(out_ptr, x_ptr, y_ptr, TILE: tl.constexpr):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    x = tl.load(x_ptr + tid).to(tl.float32)
+    y = tl.load(y_ptr + tid).to(tl.float32)
+    t = (x - y) * 1.0e38
+    # M = 1e38 saturates every representable NORMAL fp32 gap (min normal
+    # 1.175e-38 * 1e38 >= 1.17 -> clamps), so 1 - t is exactly {0, 1} and the
+    # later bool conversion is exact. le is the INVERSE of greater (le =
+    # NOT (x > y) for non-NaN), negated exactly once -- see the NaN note
+    # above for the boundary.
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(out_ptr + tid, 1.0 - t)
+
+
+def _less_equal_tensor_fast(A, B, grid):
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    less_equal_tensor_fast_kernel[grid](
+        out32,
+        A,
+        B,
+        TILE=_LESS_EQUAL_TENSOR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
+@triton.jit
+def less_equal_tensor_fast_masked_kernel(
+    out_ptr, x_ptr, y_ptr, numel, TILE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    mask = tid < numel
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    y = tl.load(y_ptr + tid, mask=mask).to(tl.float32)
+    t = (x - y) * 1.0e38
+    # see less_equal_tensor_fast_kernel: M = 1e38, le = 1 - [x > y].
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(out_ptr + tid, 1.0 - t, mask=mask)
+
+
+def _less_equal_tensor_fast_masked(A, B, numel):
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (math.ceil(numel / _LESS_EQUAL_TENSOR_FAST_TILE),)
+    less_equal_tensor_fast_masked_kernel[grid](
+        out32,
+        A,
+        B,
+        numel,
+        TILE=_LESS_EQUAL_TENSOR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
 
 
 @pointwise_dynamic(
@@ -236,3 +376,205 @@ def _less_equal_scalar_fast_masked(A, scalar, numel):
     out = torch.empty_like(A, dtype=torch.bool)
     torch.ops.aten._copy_from(out32, out, False)
     return out
+
+
+# ---------------------------------------------------------------------------
+# less_equal_ / less_equal_scalar_ (in-place aliases of less_equal.Tensor /
+# less_equal.Scalar, e.g. `x.less_equal_(y)` / `x.less_equal_(s)` on a float
+# tensor). torch keeps the input dtype and stores 1.0 (True) / 0.0 (False)
+# back into x.
+#
+# Before this change the in-place variants were NOT overridden by the
+# kunlunxin backend, so they fell to the generic ops/less_equal_.py wrapper
+# (promotion ALWAYS_BOOL; `arith.cmpf -> i1 -> bool` per lane, out0=A). On
+# XPU a fp compare followed by ANY use of the i1 result lowers to a per-lane
+# slow path: measured baseline (XPU 2, 2026-09-03) dtype-equal 0.0664x
+# (less_equal_: fp16 0.0536 / fp32 0.0885 / bf16 0.0571; [64,64,65536] fp16
+# gems 811.6ms vs torch 0.795ms) and 0.0511x (less_equal_scalar_: fp16
+# 0.0428 / fp32 0.0672 / bf16 0.0432; [64,64,65536] fp16 415ms) -- same
+# catastrophic traversal as the closed le_/gt_/lt_ in-place family.
+#
+# Fix (same single-kernel saturating-fp recipe as the committed in-place
+# le_/gt_/lt_ family, no i1 ever materialized):
+#   1. generic in-place kernel with DEFAULT promotion + saturating fp
+#      arithmetic, under the in-place-safe CodeGenConfig below (the
+#      out-of-place config_ has isCloseMemoryAsync=False = async copy ON,
+#      which with in-place aliasing is the documented "noc idle timeout"
+#      deadlock, see the config note in le.py / lt.py / gt.py).
+#   2. unmasked flat-tile in-place fast kernel for fp16/fp32 contiguous
+#      tensors whose numel is an exact multiple of TILE (grid >= MIN_GRID):
+#      the always-true runtime mask of the codegen path forces the slow
+#      masked-memory channel, so a fixed pow2 TILE with no mask at all
+#      restores the fast DMA path. bf16 deliberately does NOT enter this path
+#      (family-measured: unmasked bf16 big tiles are slower than the masked
+#      path, see le.py/lt.py notes).
+#   3. less_equal(x, y) is the INVERSE of greater(x, y) (le = NOT gt), so the
+#      family saturating expression is negated exactly once:
+#        t      = min(1, max(0, (x - y) * 1e32 * 1e32))  -> 1 when x > y else 0
+#        le     = 1.0 - t                                 -> exactly {0, 1}
+#      The two-stage 1e32*1e32 = 1e64 factor saturates every representable
+#      nonzero gap (down to the fp32 subnormal 2^-149 = 1.4e-45: 1.4e-45 *
+#      1e32 = 1.4e-13 normal, * 1e32 = 1.4e19 -> 1), while a zero difference
+#      stays exactly 0 (a single 1e64 literal would be +inf in fp32 and
+#      0 * inf = NaN). max/min on this backend prefer the non-NaN operand,
+#      so NaN inputs collapse to t = 0 -> le = 1 (same documented boundary
+#      as the committed le/le_scalar fast paths: torch NaN <= y is False;
+#      NaN is outside the randn test/benchmark matrix). +-0 == +-0 -> le = 1
+#      and equal +-inf -> 1 are exact; subnormal gaps flushed by the device
+#      -> le = 1, matching device-native torch FTZ compare semantics.
+#
+# The scalar gate `float(B) == float(torch.tensor(B, dtype=A.dtype).item())`
+# only admits scalars exactly representable in A.dtype (benchmark scalar 0,
+# test scalar 0): torch compares against the scalar rounded to the input
+# dtype, and restricting to representable scalars keeps the fp32 compare
+# bit-identical. Anything else keeps the generic path, unchanged behavior.
+config_inplace_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    kunlunAutoGrid=True,
+    unroll_num=8,
+)
+
+
+@pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=config_inplace_)
+@triton.jit
+def less_equal_func_tensor_inplace(x, y):
+    t = (x.to(tl.float32) - y.to(tl.float32)) * 1.0e32
+    t = t * 1.0e32
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    return 1.0 - t
+
+
+def less_equal_(A, B):
+    logger.debug("GEMS_KUNLUNXIN LESS_EQUAL_ TENSOR")
+    if A.device != B.device:
+        if A.device.type == device:
+            B = B.to(A.device)
+        else:
+            A = A.to(B.device)
+    numel = A.numel()
+    if A.is_contiguous() and A.dtype in (torch.float16, torch.float32, torch.bfloat16):
+        if (
+            A.dtype in (torch.float16, torch.float32)
+            and B.is_contiguous()
+            and B.dtype == A.dtype
+            and A.shape == B.shape
+            and numel
+            >= _LESS_EQUAL_TENSOR_INPLACE_FAST_TILE
+            * _LESS_EQUAL_TENSOR_INPLACE_MIN_GRID
+            and numel % _LESS_EQUAL_TENSOR_INPLACE_FAST_TILE == 0
+        ):
+            # exact-multiple flat tiles: no mask at all; grid fixed.
+            return _less_equal_tensor_inplace_fast(A, B, numel)
+        less_equal_func_tensor_inplace(A, B, out0=A)
+        return A
+    # Everything else (non-float dtype, non-contiguous, ...) keeps the
+    # original generic in-place path, behavior unchanged.
+    return _generic_less_equal_(A, B)
+
+
+# in-place alias safety: the fast kernel writes into the SAME tensor it
+# reads, so it must keep the DEFAULT isCloseMemoryAsync (True = async copy
+# closed); passing False with in-place aliasing is the documented "noc idle
+# timeout" deadlock, same as le.py's/gt.py's in-place fast path note.
+_LESS_EQUAL_TENSOR_INPLACE_FAST_TILE = 131072
+_LESS_EQUAL_TENSOR_INPLACE_MIN_GRID = 128
+
+
+@triton.jit
+def less_equal_tensor_inplace_fast_kernel(x_ptr, y_ptr, TILE: tl.constexpr):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    x = tl.load(x_ptr + tid)
+    y = tl.load(y_ptr + tid)
+    t = (x.to(tl.float32) - y.to(tl.float32)) * 1.0e32
+    t = t * 1.0e32
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(x_ptr + tid, 1.0 - t)
+
+
+def _less_equal_tensor_inplace_fast(A, B, numel):
+    grid = (numel // _LESS_EQUAL_TENSOR_INPLACE_FAST_TILE,)
+    less_equal_tensor_inplace_fast_kernel[grid](
+        A,
+        B,
+        TILE=_LESS_EQUAL_TENSOR_INPLACE_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=True,
+    )
+    return A
+
+
+@pointwise_dynamic(
+    is_tensor=[True, False],
+    promotion_methods=[(0, 1, "DEFAULT")],
+    config=config_inplace_,
+)
+@triton.jit
+def less_equal_func_scalar_inplace(x, y):
+    t = (x.to(tl.float32) - y) * 1.0e32
+    t = t * 1.0e32
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    return 1.0 - t
+
+
+def less_equal_scalar_(A, B):
+    logger.debug("GEMS_KUNLUNXIN LESS_EQUAL_ SCALAR")
+    numel = A.numel()
+    if (
+        A.is_contiguous()
+        and A.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and float(B) == float(torch.tensor(float(B), dtype=A.dtype).item())
+    ):
+        if (
+            A.dtype in (torch.float16, torch.float32)
+            and numel
+            >= _LESS_EQUAL_SCALAR_INPLACE_FAST_TILE
+            * _LESS_EQUAL_SCALAR_INPLACE_MIN_GRID
+            and numel % _LESS_EQUAL_SCALAR_INPLACE_FAST_TILE == 0
+        ):
+            # exact-multiple flat tiles: no mask at all; grid fixed.
+            return _less_equal_scalar_inplace_fast(A, float(B))
+        less_equal_func_scalar_inplace(A, B, out0=A)
+        return A
+    return less_equal_func_scalar(A, B, out0=A)
+
+
+# in-place alias safety: same as _LESS_EQUAL_TENSOR_INPLACE_FAST_TILE note
+# (write into the SAME tensor it reads -> DEFAULT isCloseMemoryAsync).
+_LESS_EQUAL_SCALAR_INPLACE_FAST_TILE = 131072
+_LESS_EQUAL_SCALAR_INPLACE_MIN_GRID = 128
+
+
+@triton.jit
+def less_equal_scalar_inplace_fast_kernel(x_ptr, scalar, TILE: tl.constexpr):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    x = tl.load(x_ptr + tid)
+    t = (x.to(tl.float32) - scalar) * 1.0e32
+    t = t * 1.0e32
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(x_ptr + tid, 1.0 - t)
+
+
+def _less_equal_scalar_inplace_fast(A, scalar):
+    grid = (A.numel() // _LESS_EQUAL_SCALAR_INPLACE_FAST_TILE,)
+    less_equal_scalar_inplace_fast_kernel[grid](
+        A,
+        scalar,
+        TILE=_LESS_EQUAL_SCALAR_INPLACE_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=True,
+    )
+    return A

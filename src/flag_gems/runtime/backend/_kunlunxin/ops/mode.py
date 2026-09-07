@@ -17,6 +17,7 @@ import math
 from collections import namedtuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -237,9 +238,15 @@ def _mode_sorted_rows_kernel(
     output_values,
     output_indices,
     columns,
+    RS: tl.constexpr,
 ):
     row = tl.program_id(0)
-    row_offset = row * columns
+    # rows live in an over-allocated (M, RS) buffer (RS = N + block padding);
+    # the scan only reads the first `columns` elements of each row, so the row
+    # pitch is RS, not columns. Reading the (M, columns) strided view via a
+    # host-side .contiguous() would hit the XPU strided-source copy bug
+    # (KL_XID), so the scan kernel consumes the (M, RS) buffer directly.
+    row_offset = row * RS
     current_value = tl.load(sorted_values + row_offset)
     current_index = tl.load(sorted_indices + row_offset)
     best_value = current_value
@@ -285,15 +292,24 @@ def _mode_sort_rows(rows):
     NB = max(1, (N + BLK - 1) // BLK)
     RS = N + BLK
 
-    values = torch.zeros((M, RS), dtype=dtype, device=rows.device)
-    values[:, :N] = rows.contiguous()
-    indices = torch.zeros((M, RS), dtype=torch.int64, device=rows.device)
-    indices[:, :N] = (
-        torch.arange(N, dtype=torch.int64, device=rows.device)
-        .reshape(1, N)
-        .expand(M, N)
-        .contiguous()
-    )
+    # Build the padded (M, RS) row buffers (RS = N + BLK, tail never read).
+    # For XPU the elements of row r must live at [r*RS, r*RS+N), i.e. pitch RS:
+    #   * the 2-D strided slice-assign (values[:, :N] = ...) raises an
+    #     illegal-memory-access kernel exception for some (M, N) combos
+    #     (e.g. (16, 131072) int32) -- see mode_xpu7_20260830 p4 + 2026-09-04;
+    #   * a 1-D view fill of [0, M*N) (pitch N) is the WRONG layout;
+    #   * per-row 1-D slice-assign (iview[r*RS:r*RS+N] = iflat) crashes the
+    #     device through the gems `_copy_flat_kernel`: for N < 65536 the grid
+    #     is a single program whose 65536-lane masked tail is not honored on
+    #     XPU, reading up to ~480 KB past the source (KL_XID, 2026-09-04
+    #     reproducer: int32 (4096,256) dim=0).
+    # F.pad lowers to vendor `_constant_pad_fast`: torch.empty + fill_ +
+    # aten::_copy_from (native strided-copy engine, safe for arbitrary src
+    # strides, incl. the 0-stride expand view) -- verified for (256,4096) int32
+    # and (16, 131072) int32.
+    values = F.pad(rows, (0, BLK))
+    iflat = torch.arange(N, dtype=torch.int64, device=rows.device)
+    indices = F.pad(iflat.expand(M, N), (0, BLK))
     out_v = torch.empty_like(values)
     out_i = torch.empty_like(indices)
 
@@ -326,7 +342,11 @@ def _mode_sort_rows(rows):
             )
             values, out_v = out_v, values
             indices, out_i = out_i, indices
-    return values[:, :N].contiguous(), indices[:, :N].contiguous()
+    # Return the full (M, RS) over-allocated buffers: slicing to (M, N) and
+    # materializing via .contiguous() is a strided-source copy that triggers a
+    # KL_XID kernel exception on XPU (see mode_xpu7_20260830 p4); the scan
+    # kernel consumes the (M, RS) buffers directly with RS as the row pitch.
+    return values, indices, RS
 
 
 @libentry()
@@ -401,14 +421,14 @@ def _mode_impl(inp, dim, keepdim):
         # direct kernel cannot be compiled by the XPU backend (frontend rejects
         # the scalar-pointer block-mask load, and the fallback block idiom
         # trips TritonXPUVectorize), so it is not used on this vendor.
-        sorted_v, sorted_i = _mode_sort_rows(rows)
+        sorted_v, sorted_i, srs = _mode_sort_rows(rows)
         if sorted_v.dtype == torch.bfloat16:
             # scan kernel comparisons on bf16 trip an MLIR scf.while type
             # mismatch on XPU; promote to fp32 first (exact mapping)
             sorted_v = sorted_v.to(torch.float32)
         with torch_device_fn.device(inp.device):
             _mode_sorted_rows_kernel[(M,)](
-                sorted_v, sorted_i, flat_values, flat_indices, N
+                sorted_v, sorted_i, flat_values, flat_indices, N, RS=srs
             )
 
     if not keepdim:

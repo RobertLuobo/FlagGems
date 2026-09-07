@@ -256,6 +256,135 @@ def _sweep_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Multi-column sweeps: CC output columns per program, sharing the v_i / u_i
+# loads of every iteration and interleaving CC independent reductions for ILP.
+#
+# Benchmark measurements on this platform (fp32, MP=128, validator compares the
+# valid [0:N, 0:M] region against the single-column sweep):
+#
+#   ( m,  n)   k   cc=1 (us)   cc=2   cc=4   cc=8
+#   (  4,  3)   3     31        34    -      -
+#   ( 16,  8)   8     38        32    -      -
+#   ( 32, 16)  16     54        38    57     -
+#   ( 64, 32)  32    154       129    98    155
+#   (128, 64)  64    578       387   367    310
+#   ( 65, 65)  65    584        -     -     320
+#   (127,127) 127   2018        -     -    1206
+#
+# i.e. the sweet spot grows with n up to 8 (cc=16 is *worse* again, 555us on
+# (128,64)), and the v/u loads are amortised CC-fold.  The compile envelope is
+# not monotonic (see the docstring caveat above), so only CC in {1, 2, 4, 8}
+# are used; the exact rule (by n) lives in linalg_householder_product.
+# ---------------------------------------------------------------------------
+@libentry()
+@triton.jit
+def _sweep_cc2_kernel(
+    W,
+    V,
+    U,
+    K,
+    N,
+    M,
+    WB,
+    VB,
+    MP: tl.constexpr,
+):
+    b = tl.program_id(0)
+    c0 = tl.program_id(1) * 2
+    r = tl.arange(0, MP)
+    q0 = tl.where((c0 < N) & (r < M) & (r == c0), 1.0, 0.0)
+    q1 = tl.where((c0 + 1 < N) & (r < M) & (r == c0 + 1), 1.0, 0.0)
+    for t in range(0, K):
+        i = K - 1 - t
+        v = tl.load(V + b * VB + i * MP + r)
+        u = tl.load(U + b * VB + i * MP + r)
+        q0 = q0 - tl.sum(q0 * v) * u
+        q1 = q1 - tl.sum(q1 * v) * u
+    tl.store(W + b * WB + c0 * MP + r, q0)
+    tl.store(W + b * WB + (c0 + 1) * MP + r, q1)
+
+
+@libentry()
+@triton.jit
+def _sweep_cc4_kernel(
+    W,
+    V,
+    U,
+    K,
+    N,
+    M,
+    WB,
+    VB,
+    MP: tl.constexpr,
+):
+    b = tl.program_id(0)
+    c0 = tl.program_id(1) * 4
+    r = tl.arange(0, MP)
+    q0 = tl.where((c0 < N) & (r < M) & (r == c0), 1.0, 0.0)
+    q1 = tl.where((c0 + 1 < N) & (r < M) & (r == c0 + 1), 1.0, 0.0)
+    q2 = tl.where((c0 + 2 < N) & (r < M) & (r == c0 + 2), 1.0, 0.0)
+    q3 = tl.where((c0 + 3 < N) & (r < M) & (r == c0 + 3), 1.0, 0.0)
+    for t in range(0, K):
+        i = K - 1 - t
+        v = tl.load(V + b * VB + i * MP + r)
+        u = tl.load(U + b * VB + i * MP + r)
+        q0 = q0 - tl.sum(q0 * v) * u
+        q1 = q1 - tl.sum(q1 * v) * u
+        q2 = q2 - tl.sum(q2 * v) * u
+        q3 = q3 - tl.sum(q3 * v) * u
+    tl.store(W + b * WB + (c0 + 0) * MP + r, q0)
+    tl.store(W + b * WB + (c0 + 1) * MP + r, q1)
+    tl.store(W + b * WB + (c0 + 2) * MP + r, q2)
+    tl.store(W + b * WB + (c0 + 3) * MP + r, q3)
+
+
+@libentry()
+@triton.jit
+def _sweep_cc8_kernel(
+    W,
+    V,
+    U,
+    K,
+    N,
+    M,
+    WB,
+    VB,
+    MP: tl.constexpr,
+):
+    b = tl.program_id(0)
+    c0 = tl.program_id(1) * 8
+    r = tl.arange(0, MP)
+    q0 = tl.where((c0 < N) & (r < M) & (r == c0), 1.0, 0.0)
+    q1 = tl.where((c0 + 1 < N) & (r < M) & (r == c0 + 1), 1.0, 0.0)
+    q2 = tl.where((c0 + 2 < N) & (r < M) & (r == c0 + 2), 1.0, 0.0)
+    q3 = tl.where((c0 + 3 < N) & (r < M) & (r == c0 + 3), 1.0, 0.0)
+    q4 = tl.where((c0 + 4 < N) & (r < M) & (r == c0 + 4), 1.0, 0.0)
+    q5 = tl.where((c0 + 5 < N) & (r < M) & (r == c0 + 5), 1.0, 0.0)
+    q6 = tl.where((c0 + 6 < N) & (r < M) & (r == c0 + 6), 1.0, 0.0)
+    q7 = tl.where((c0 + 7 < N) & (r < M) & (r == c0 + 7), 1.0, 0.0)
+    for t in range(0, K):
+        i = K - 1 - t
+        v = tl.load(V + b * VB + i * MP + r)
+        u = tl.load(U + b * VB + i * MP + r)
+        q0 = q0 - tl.sum(q0 * v) * u
+        q1 = q1 - tl.sum(q1 * v) * u
+        q2 = q2 - tl.sum(q2 * v) * u
+        q3 = q3 - tl.sum(q3 * v) * u
+        q4 = q4 - tl.sum(q4 * v) * u
+        q5 = q5 - tl.sum(q5 * v) * u
+        q6 = q6 - tl.sum(q6 * v) * u
+        q7 = q7 - tl.sum(q7 * v) * u
+    tl.store(W + b * WB + (c0 + 0) * MP + r, q0)
+    tl.store(W + b * WB + (c0 + 1) * MP + r, q1)
+    tl.store(W + b * WB + (c0 + 2) * MP + r, q2)
+    tl.store(W + b * WB + (c0 + 3) * MP + r, q3)
+    tl.store(W + b * WB + (c0 + 4) * MP + r, q4)
+    tl.store(W + b * WB + (c0 + 5) * MP + r, q5)
+    tl.store(W + b * WB + (c0 + 6) * MP + r, q6)
+    tl.store(W + b * WB + (c0 + 7) * MP + r, q7)
+
+
+# ---------------------------------------------------------------------------
 # Transpose back into a flat, contiguous output.
 #
 # A transposing STORE would write its own values correctly and corrupt an
@@ -327,10 +456,16 @@ def linalg_householder_product(A, tau):
     BT = _LANES
     npad = triton.cdiv(total, BT) * BT
 
+    # NOTE: NP = max(_LANES, next_pow2(n)), so W has (NP - n) padding rows
+    # beyond the valid [0, n) columns.  The _sweep_cc{2,4,8}_kernel stores are
+    # intentionally *unmasked*: a tail program (c0 = last CC-block) whose
+    # columns c0+j >= n writes the unit-initialized q=0 rows into this padding
+    # (q0..q7 are 0 there because the `c0+j < N` init mask is False), and the
+    # output is sliced back to [0, n) below.  Any change to NP (or a transition
+    # to a non-padded W) must add a column mask to those stores.
     W = torch.empty((batch, NP, MP), dtype=dt, device=dev)
     V = torch.empty((batch, KP, MP), dtype=dt, device=dev)
     U = torch.empty((batch, KP, MP), dtype=dt, device=dev)
-    S = torch.empty((batch, NP), dtype=dt, device=dev)
     OUT = torch.empty((npad,), dtype=dt, device=dev)
 
     WB = NP * MP
@@ -357,8 +492,27 @@ def linalg_householder_product(A, tau):
                 MP=MP,
             )
             if MP == _SWEEP_ROW:
-                _sweep_kernel[(batch, n)](W, V, U, k, n, m, WB, VB, MP=MP)
+                # n < 8 -> 1 column per program; n < 32 -> 2; n < 64 -> 4;
+                # else 8.  Measured on this platform: the sweet spot grows with
+                # n (see the table above the _sweep_cc*_kernel definitions),
+                # and CC=16 regresses again, so the envelope is a validated
+                # white-list, not a formula.
+                if n >= 64:
+                    _sweep_cc8_kernel[(batch, triton.cdiv(n, 8))](
+                        W, V, U, k, n, m, WB, VB, MP=MP, num_warps=2
+                    )
+                elif n >= 32:
+                    _sweep_cc4_kernel[(batch, triton.cdiv(n, 4))](
+                        W, V, U, k, n, m, WB, VB, MP=MP, num_warps=2
+                    )
+                elif n >= 8:
+                    _sweep_cc2_kernel[(batch, triton.cdiv(n, 2))](
+                        W, V, U, k, n, m, WB, VB, MP=MP, num_warps=2
+                    )
+                else:
+                    _sweep_kernel[(batch, n)](W, V, U, k, n, m, WB, VB, MP=MP)
             else:
+                S = torch.empty((batch, NP), dtype=dt, device=dev)
                 _init_w_kernel[(batch, nb)](W, n, m, WB, BC=_LANES, MP=MP)
                 for i in range(k - 1, -1, -1):
                     _dot_kernel[(batch, nb)](

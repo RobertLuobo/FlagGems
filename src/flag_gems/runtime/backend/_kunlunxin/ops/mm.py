@@ -372,11 +372,16 @@ def _pad_k(a, b, M, K, N, blk_k, device):
     kp = triton.cdiv(K, blk_k) * blk_k
     if (a.stride(0), a.stride(1)) != (K, 1) or kp != K:
         ap = torch.zeros((M, kp), device=device, dtype=a.dtype)
-        torch.ops.aten._copy_from(a, ap[:, :K], False)
+        # ``ap[:, :K]`` must not be used: inside use_gems()/enable() the python
+        # slice dispatches ``slice.Tensor``, and on this torch the registered
+        # python slice impl is invoked without the ``step`` argument (4-arg
+        # form) -> TypeError.  ``narrow`` (registered zero-copy as_strided
+        # view) is used instead, matching cat.py.
+        torch.ops.aten._copy_from(a, ap.narrow(1, 0, K), False)
         a = ap
     if (b.stride(0), b.stride(1)) != (N, 1) or kp != K:
         bp = torch.zeros((kp, N), device=device, dtype=b.dtype)
-        torch.ops.aten._copy_from(b, bp[:K, :], False)
+        torch.ops.aten._copy_from(b, bp.narrow(0, 0, K), False)
         b = bp
     return a, b, kp
 
@@ -510,8 +515,14 @@ def mm(a, b):
     if not needs_copy:
         return c
     # torch.mm returns a contiguous (M, N) tensor; the padded buffer view is
-    # strided (storage M_pad x N_pad), so materialise the exact shape.
-    return c[:M, :N].contiguous()
+    # strided (storage M_pad x N_pad), so materialise the exact shape.  The
+    # slice uses ``narrow`` (zero-copy view) instead of python ``[:M, :N]``,
+    # which dispatches slice.Tensor without ``step`` under use_gems(); the
+    # copy goes through the native ``_copy_from`` engine, not ``contiguous()``
+    # (registered ``_to_copy`` mis-handles strided sources).
+    out = torch.empty((M, N), device=device, dtype=c.dtype)
+    torch.ops.aten._copy_from(c.narrow(0, 0, M).narrow(1, 0, N), out, False)
+    return out
 
 
 def mm_out(a, b, *, out):
@@ -537,5 +548,7 @@ def mm_out(a, b, *, out):
         a, b, out, M, K, N, _block_m(M), _block_n(N), tl.float32, out.device
     )
     if needs_copy:
-        torch.ops.aten._copy_from(c[:M, :N], out, False)
+        # ``narrow`` instead of python ``[:M, :N]``: the latter dispatches
+        # slice.Tensor without ``step`` under use_gems() (see _pad_k).
+        torch.ops.aten._copy_from(c.narrow(0, 0, M).narrow(1, 0, N), out, False)
     return out

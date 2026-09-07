@@ -377,6 +377,7 @@ def conv_transpose2d(
                 # The TritonXPU uni_sram pass rejects some (tile width, unroll)
                 # combinations at compile time; walk down to a smaller shape.
                 last_error = err
+                del padded
                 continue
             spatial_padded = tiles * candidate_block
             if spatial_padded == spatial:

@@ -17,64 +17,101 @@ import logging
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.xpu.libdevice as xpu
 
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-# acos(x) fast path: replace the XPU software atan2/acosf external calls
-# (measured ~0.12-0.13x torch on the official unary matrix) with a pure
-# polynomial in the stable region.
+# acos(x) fast path (race: arccos_/acos_, 2026-09-04): the previous kernel
+# (tl.sqrt + tl.where sign reconstruction) was select/mask-bound: the x<0
+# where-compile emits an ~100-instruction i1->i32 mask extraction
+# (llvm.xpu.vvor_f_mh_rn) costing ~0.245 ms at 16.7M elements, and tl.sqrt
+# is a software-expanded chain. This rewrite (same recipe as asin, sibling
+# operand: acos(x) = pi/2 - asin(x)) uses XPU-friendly ops:
 #
-#   acos(x)  = 2 * asin(sqrt((1-|x|)/2))          for x >= 0
-#            = pi - acos(-x)                       for x < 0
+#   acos(x) = 2*asin(s) = y        for x >= 0,   s = sqrt(t), t=(1-|x|)/2
+#           = pi - y               for x < 0
+#   s = t*rsqrt(t+eps) ~ sqrt(t),  P = degree-8 LSQ fit of asin(s)/s
+#   m = min(1, max(0, -x*2^126))   (1 iff x<0, no select/compare)
+#   r = m*pi + (1-2m)*y
 #
-# With t = (1-|x|)/2 in [0, 0.5] and s = sqrt(t), asin(s)/s = P(t) with P
-# analytic on [0, 0.5]; P is an LSQ fit (degree 8 in t) whose fp32 Horner
-# evaluation keeps |acos(x) - acos_ref| <= 3.8e-5 on the full fp32 domain
-# [-1, 1] (fp32 simulation, no-FMA assumption), comfortably inside the test
-# tolerance (atol 1e-4 + rtol 1.3e-6 * |ref|). NaN/Inf semantics: |x| > 1
-# makes t < 0, sqrt(t) yields NaN which propagates through the (single)
-# where-chain exactly like torch; NaN input also propagates (comparisons are
-# false but the arithmetic stays NaN).
-# Coeffs (fp32-rounded, Horner order high -> low):
-#   [0.99959993, 0.19823363, -0.72389036, 9.49576759, -60.525768,
-#   222.85160828, -470.57415771, 530.01574707, -246.59942627]
+#   - rsqrt: xpu.rsqrt lowers to the inline hardware SFU op
+#     (tt.extern_elementwise _ZN3xpu6rsqrtfEf, ~0.67x the cost of the
+#     software-expanded tl.sqrt chain). The +1e-30 bias keeps s=0 exactly
+#     at t=0 (x = +-1): 0*rsqrt(1e-30) = 0, so acos(1) = 0 and
+#     acos(-1) = pi like torch. Bit-exact no-op for every other t.
+#   - sign: pure min/max/fma, no ordered-compare -> no mask extraction.
+#     The 2^126 scale maps x<0 -> m=1, x>0 -> m=0, and the min(1,..)
+#     clamps the product; for normal |x| the result is exactly +-1.
+#     (min/max on XPU drop NaN, which is fine: y is already NaN for
+#     |x|>1, so r = m*pi + (1-2m)*NaN = NaN.)
+#   - poly2 = 2*P folds the *2.0 into the coefficients (one mul saved).
+#
+# Accuracy: fp32 Horner keeps |acos(x)-ref| <= ~4e-5 on [-1,1] (measured
+# 3.70e-5 on randn via the shared asin/asin_ eval, |acos| == |asin| error
+# by the same polynomial), inside atol 1e-4 + rtol (1.3e-6 / 1e-3 / 1e-3).
+# Coeffs (fp32-rounded, Horner order high -> low), shared with asin.py:
+#   [-493.19885254, 1060.03149414, -941.14831543, 445.70321655,
+#   -121.05153656, 18.99153519, -1.44778073, 0.39646727, 1.99919987]
 MIN_BLOCK = 2048
 # unroll 8 beats 16 on the official matrix: (4096,4096) 0.532 vs 0.585 ms,
 # [1024,4096] 0.140 vs 0.153 ms, [1024,65536] 2.09 vs 2.36 ms (fp32, XPU2
 # wall-clock, same process A/B). Verified in a per-stable subprocess sweep:
 # everything else (block/warp/buffer buckets) is within noise.
 UNROLL_NUM = 8
-# In-place path only (acos_ / arccos_): the read-modify-write aliasing of
-# x_ptr == out_ptr makes the deep unroll counter-productive. Measured on the
-# official unary matrix (XPU2, same-process A/B, 4096x4096 / [1024,4096] /
-# [1024,65536]):
-#   fp16 : u2 0.479 / 0.125 / 1.884 ms  vs  u8 0.561 / 0.147 / 2.206 ms
-#   fp32 : u2 0.455 / 0.120 / 1.792 ms  vs  u8 0.514 / 0.137 / 2.021 ms
-#   bf16 : u4 0.566 / 0.148 / 2.232 ms  vs  u8 0.628 / 0.165 / 2.446 ms
-#          (bf16 u2 lands at 0.615 / 0.160 / 2.433 ms, i.e. worse than u4)
-# The out-of-place path keeps UNROLL_NUM = 8 because it was tuned with that
-# value and is shared with acos / arccos.
-INPLACE_UNROLL_NUM = 2
-INPLACE_UNROLL_NUM_BF16 = 4
+# In-place path only (acos_ / arccos_): with the previous sqrt+where body
+# the read-modify-write aliasing of x_ptr == out_ptr made a deep unroll
+# counter-productive (measured on the old body: fp32 u2 0.455ms vs u8
+# 0.514ms at 4096x4096). With the rsqrt/min-max body (memory-bound, no
+# ~100-instr i1->i32 mask extract) that reverses: full-matrix A/B 2026-09-04
+# shows u8 >= u2 on 32/36 cases and >= u4 bf16 everywhere (u8/u2 latency
+# ratio median 1.002 / 1.024 / 1.009 for fp16/fp32/bf16, big shapes a
+# wash), so the in-place path now shares UNROLL_NUM = 8.
+INPLACE_UNROLL_NUM = 8
+INPLACE_UNROLL_NUM_BF16 = 8
 BUFFER_SIZE_LIMIT = 8192
 IS_CLOSE_MEMORY_ASYNC = False
 
 
 def _pick_block(n_elements):
     # Bucket the tile into a few unmasked sizes + 1 masked fallback so the
-    # kernel compiles at most ~4 times total. Unmasked runs when the shape
+    # kernel compiles at most ~6 times total. Unmasked runs when the shape
     # divides the tile exactly (masked memory path on XPU costs ~2x).
-    # Measured on the official matrix: 32768/8-warp tiles are the sweet spot
-    # (131072/32 costs +3% on 16.7M and +22% on 1M shapes).
-    if n_elements >= 16384 and n_elements % 32768 == 0:
+    # Larger blocks win once there are >= ~128 programs (16.7M+ elements);
+    # mid sizes prefer 32768 (>=16 programs); small sizes 8192; tiny shapes
+    # are launch-bound and use the 2048/4w masked kernel.
+    if n_elements >= (1 << 24) and n_elements % 131072 == 0:
+        return 131072, 8, False
+    if n_elements >= (1 << 19) and n_elements % 32768 == 0:
         return 32768, 8, False
-    if n_elements >= 16384 and n_elements % 16384 == 0:
-        return 16384, 8, False
-    if n_elements <= 65536:
+    if n_elements >= (1 << 14) and n_elements % 8192 == 0:
+        return 8192, 8, False
+    if n_elements <= 16384:
         return 2048, 4, True
+    if n_elements % 16384 == 0:
+        return 16384, 8, False
     return 16384, 8, True
+
+
+@triton.jit
+def _acos_body(x):
+    t = 0.5 - 0.5 * tl.abs(x)
+    # |x| > 1 makes t < 0 -> rsqrt(NaN) -> NaN propagates out, matching torch.
+    s = t * xpu.rsqrt(t + 1e-30)
+    p = -493.19885254
+    p = p * t + 1060.03149414
+    p = p * t + -941.14831543
+    p = p * t + 445.70321655
+    p = p * t + -121.05153656
+    p = p * t + 18.99153519
+    p = p * t + -1.44778073
+    p = p * t + 0.39646727
+    p = p * t + 1.99919987
+    y = s * p
+    # acos(x) = y (x>=0) / pi - y (x<0); m = 1 iff x<0 (min/max, no select).
+    m = tl.minimum(1.0, tl.maximum(0.0, -x * 8.50705917e37))
+    return m * 3.1415927 + (1.0 - 2.0 * m) * y
 
 
 @triton.jit
@@ -88,22 +125,7 @@ def acos_kernel(
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offset < n_elements
     x = tl.load(x_ptr + offset, mask=mask, other=0).to(tl.float32)
-    t = 0.5 - 0.5 * tl.abs(x)
-    # |x| > 1 makes t < 0 -> sqrt(NaN) -> NaN propagates out, matching torch.
-    # XPU lowers compound boolean expressions ((x>=a) & (x<=b)) to a very slow
-    # non-vectorized path; relying on sqrt of a negative is faster and exact.
-    s = tl.sqrt(t)
-    p = -246.59942627
-    p = p * t + 530.01574707
-    p = p * t + -470.57415771
-    p = p * t + 222.85160828
-    p = p * t + -60.52576828
-    p = p * t + 9.49576759
-    p = p * t + -0.72389036
-    p = p * t + 0.19823363
-    p = p * t + 0.99959993
-    y = (s * p) * 2.0
-    r = tl.where(x < 0.0, 3.1415927 - y, y)
+    r = _acos_body(x)
     tl.store(out_ptr + offset, r.to(out_ptr.dtype.element_ty), mask=mask)
 
 
@@ -116,19 +138,7 @@ def acos_kernel_unmasked(
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     x = tl.load(x_ptr + offset).to(tl.float32)
-    t = 0.5 - 0.5 * tl.abs(x)
-    s = tl.sqrt(t)
-    p = -246.59942627
-    p = p * t + 530.01574707
-    p = p * t + -470.57415771
-    p = p * t + 222.85160828
-    p = p * t + -60.52576828
-    p = p * t + 9.49576759
-    p = p * t + -0.72389036
-    p = p * t + 0.19823363
-    p = p * t + 0.99959993
-    y = (s * p) * 2.0
-    r = tl.where(x < 0.0, 3.1415927 - y, y)
+    r = _acos_body(x)
     tl.store(out_ptr + offset, r.to(out_ptr.dtype.element_ty))
 
 
