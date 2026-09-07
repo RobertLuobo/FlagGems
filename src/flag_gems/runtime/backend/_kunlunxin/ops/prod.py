@@ -197,6 +197,70 @@ def prod_final(inp, out, WIDTH: tl.constexpr, ACC32: tl.constexpr):
     tl.store(out, p)
 
 
+def _bm_tail(tr):
+    # largest power of two dividing tr (> 0): a tail block of this height is
+    # fully in-bounds, so the tail launch stays mask-free.
+    b = 1
+    while tr % (b * 2) == 0:
+        b *= 2
+    return b
+
+
+@libentry()
+@triton.jit
+def prod_dim_chunk(
+    inp,
+    part,
+    N,
+    B0,
+    C0,
+    C: tl.constexpr,
+    CHUNK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # program (c, mb): partial[rows, C0 + c] = prod(inp[rows, B0 + c*CHUNK : B0 + (c+1)*CHUNK]).
+    # inp is [R, N] row-major; the host guarantees every row block is fully
+    # in-bounds (two-level row split), so the kernel is 100% mask-free.
+    c = ext.program_id(0)
+    mb = ext.program_id(1)
+    # keep the tile index in i32: i64 tensor index arithmetic OOMs the
+    # uni_sram budget on this backend (rows*N <= 2^31 is enforced by the host)
+    rows = (mb * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int32)[:, None]
+    inp = inp + rows * N + B0 + c * CHUNK
+    acc = tl.full([BLOCK_M, 1], value=1.0, dtype=tl.float32)
+    for off in range(0, CHUNK, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        a = tl.load(inp + cols).to(tl.float32)
+        blk = tl.reduce(a, axis=1, combine_fn=reduce_mul)[:, None]
+        acc = acc * blk
+    tl.store(part + rows * C + C0 + c, acc)
+
+
+@libentry()
+@triton.jit
+def prod_dim_single(
+    inp,
+    out,
+    N,
+    CHUNK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # single-chunk (C == 1) variant: the whole reduction fits one chunk, so
+    # store straight into `out` (implicit f32 -> out dtype cast).
+    mb = ext.program_id(1)
+    rows = (mb * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int32)[:, None]
+    inp = inp + rows * N
+    acc = tl.full([BLOCK_M, 1], value=1.0, dtype=tl.float32)
+    for off in range(0, CHUNK, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        a = tl.load(inp + cols).to(tl.float32)
+        blk = tl.reduce(a, axis=1, combine_fn=reduce_mul)[:, None]
+        acc = acc * blk
+    tl.store(out + rows, acc)
+
+
 def _pow2_decomp(r):
     parts = []
     while r:

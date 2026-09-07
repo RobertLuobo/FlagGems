@@ -96,6 +96,15 @@ def _mask_blend_kernel(
     SCALAR_VALUES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    # Full blocks only (grid = numel // BLOCK, exact division): every lane is
+    # in-bounds, so mask/load/store addresses stay affine and the compiler can
+    # keep the block-DMA path (a runtime `safe` index tears it down to a
+    # ~2.4x-slower generic gather).
+    #
+    # Scan-free read-blend-write: the global rank of every masked lane is
+    # precomputed on the host with torch.cumsum (the in-kernel `tl.cumsum` scan
+    # is non-deterministic on this backend and produced ~50% wrong results), so
+    # the kernel needs no prefix state at all.
     pid = tl.program_id(0)
     off = pid * BLOCK + tl.arange(0, BLOCK)
     m = tl.load(mask_ptr + off) != 0

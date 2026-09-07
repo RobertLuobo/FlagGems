@@ -665,6 +665,7 @@ def median_count_chunk_kernel(
     pid = ext.program_id(0)
     chunk = pid % NCHUNK
     cols = tl.arange(0, CHUNK)
+    offsets = chunk * CHUNK + cols
     keys_v = tl.load(keys + pid * CHUNK + cols)
     mid_v = tl.load(mid + pid // NCHUNK)
     le = tl.sum((keys_v <= mid_v).to(tl.int32), axis=0)
@@ -749,6 +750,7 @@ def median_select_chunk_kernel(
     pid = ext.program_id(0)
     chunk = pid % NCHUNK
     cols = tl.arange(0, CHUNK)
+    offsets = chunk * CHUNK + cols
     sel = tl.load(sel_keys + pid // NCHUNK)
     keys_v = tl.load(keybuf + pid * CHUNK + cols)
     km = keys_v == sel

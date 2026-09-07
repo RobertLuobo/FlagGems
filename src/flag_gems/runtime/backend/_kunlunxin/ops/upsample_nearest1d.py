@@ -50,7 +50,7 @@ def upsample_nearest1d_kernel(
     idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     nc = idx // OL
     ol = idx % OL
-    if SAME_L:
+    if SAME_L and reciprocal_scale_l == 1.0:
         il = ol
     else:
         il = tl.minimum(
@@ -77,7 +77,9 @@ def upsample_nearest1d(
     OL = output_size[0] if output_size is not None else int(input.shape[2] * scales)
     N, C, IL = input.shape
 
-    if scales is not None:
+    # ATen (compute_scales_value): scales only takes effect when provided and
+    # > 0; otherwise the index scale degenerates to float32(IL)/OL.
+    if scales is not None and scales > 0:
         reciprocal_scale_l = float(
             torch.tensor(1.0 / scales, dtype=torch.float32).item()
         )

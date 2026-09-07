@@ -258,3 +258,26 @@ def _lt_scalar_inplace_fast(A):
         isCloseMemoryAsync=True,
     )
     return A
+
+
+# ---------------------------------------------------------------------------
+# less_ / less_scalar_ are the PyTorch ALIAS names of lt_ / lt_scalar_
+# (torch.ops.aten.less_.Tensor == torch.ops.aten.lt_.Tensor). They were NOT
+# overridden by kunlunxin, so `less_` / `less_scalar_` stayed bound to the
+# generic flag_gems/ops/less_.py -- a bare @pointwise_dynamic with NO
+# CodeGenConfig -> discrete/launch-bound slow path on XPU (measured baseline
+# [4096,4096] fp16: 49.1 ms gem vs 0.056 ms torch; [64,64,65536] fp16:
+# 809 ms vs 0.80 ms; [10000,65536] less_scalar_ fp16: 1692 ms vs 1.21 ms;
+# ~1000x regression, while the same-op lt_/lt_scalar_ are already tuned).
+#
+# Fix: export less_ / less_scalar_ from the kunlunxin ops module so
+# SpecOpRegistrar shadows the generic names (same mechanism as le_/gt_/...).
+# They simply delegate to the tuned in-place lt_ / lt_scalar_ recipes
+# (config_inplace_ + unmasked flat-tile fast paths); kernel body/algorithm
+# unchanged (zero correctness risk, aliases of the exact same ATen op).
+def less_(A, B):
+    return lt_(A, B)
+
+
+def less_scalar_(A, B):
+    return lt_scalar_(A, B)

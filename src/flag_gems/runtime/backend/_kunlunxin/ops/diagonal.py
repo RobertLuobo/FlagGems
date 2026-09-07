@@ -54,6 +54,46 @@ def diag_bwd_scatter_kernel(
     tl.store(out_ptr + row_off + col_off, val, mask=mask)
 
 
+# Column-major variant (large `rows`): grid = (D, cdiv(rows, BLOCK_R)), one
+# CTA per (column, row-block).  The output band is only dense along the ROW
+# direction (consecutive rows are `row_stride` elements apart, typically
+# small), so a CTA covering BLOCK_R rows of a single column turns the store
+# side into a dense run while the (L2-resident) gradient gather stays small.
+# This removes the per-row program launch chain that dominates when `rows` is
+# huge (e.g. 65536 CTAs for a [100, 65536, 100] diagonal -> ~8ms on XPU).
+#
+# NOTE (XPU): this kernel MUST NOT use a boundary mask on the discrete load
+# `grad_ptr + rows*D + pid_col`.  A masked load of a data-dependent (strided)
+# address is miscompiled by the XPU triton backend into an 8-lane group
+# broadcast (all lanes of a group read the group's first lane address), which
+# silently shifts the written values by whole rows.  Probe-verified
+# 2026-09-06: BLOCK_R in {128..4096} and dropping `other=` do NOT fix it; only
+# removing the mask from the discrete LOAD does.  Fix: start each block at
+# `base = min(pid_row*BLOCK_R, ROWS - BLOCK_R)` so every lane's row is
+# in-bounds, and issue fully unmasked loads/stores.  Dispatch guarantees
+# BLOCK_R <= ROWS, so `ROWS - BLOCK_R >= 0`; if ROWS % BLOCK_R != 0 the last
+# block overlaps the previous one and re-issues identical values (benign
+# same-value duplicate writes, all in-band).
+@triton.jit
+def diag_bwd_scatter_col_kernel(
+    grad_ptr,
+    out_ptr,
+    col_tab_ptr,
+    row_out_ptr,
+    D,
+    ROWS,
+    BLOCK_R: tl.constexpr,
+):
+    pid_col = tl.program_id(0)
+    pid_row = tl.program_id(1)
+    base = tl.minimum(pid_row * BLOCK_R, ROWS - BLOCK_R)
+    rows = base + tl.arange(0, BLOCK_R)
+    row_off = tl.load(row_out_ptr + rows)
+    col_off = tl.load(col_tab_ptr + pid_col)
+    val = tl.load(grad_ptr + rows * D + pid_col)
+    tl.store(out_ptr + row_off + col_off, val)
+
+
 def _prewarm(device):
     """Precompile kernel specializations so benchmark single-rep timing is not
     polluted by the JIT compile (~100ms per specialization on XPU)."""

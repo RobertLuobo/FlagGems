@@ -38,7 +38,45 @@ def _nested_view_from_buffer_copy(
     offsets: torch.Tensor,
 ):
     logger.debug("GEMS_KUNLUNXIN _NESTED_VIEW_FROM_BUFFER_COPY")
+    num_components = nested_size.shape[0]
 
+    if (
+        self.dim() == 1
+        and nested_size.dim() == 2
+        and nested_size.shape[1] == 1
+        and nested_size.dtype == torch.int64
+        and nested_strides.dtype == torch.int64
+        and offsets.dtype == torch.int64
+        and all(s == 1 for s in nested_strides.reshape(-1).tolist())
+    ):
+        # One flat copy of the whole buffer (copy semantics of the op; the
+        # nested tensor then is a vi ew of `values`).
+        values = torch.empty_strided(
+            self.shape, self.stride(), dtype=self.dtype, device=self.device
+        )
+        torch.ops.aten._copy_from(self, values, False)
+        # Jagged offsets must have num_components+1 entries; with explicit
+        # `lengths` the trailing entry is not used for component sizes, so the
+        # input offsets (padded by one element) are passed through unchanged.
+        full_offsets = torch.empty_strided(
+            (num_components + 1,), (1,), dtype=torch.int64, device=self.device
+        )
+        torch.ops.aten._copy_from(offsets, full_offsets[:num_components], False)
+        torch.ops.aten._copy_from(offsets[:1], full_offsets[num_components:], False)
+        from torch.nested._internal.nested_tensor import (
+            nested_view_from_values_offsets_lengths,
+        )
+
+        return nested_view_from_values_offsets_lengths(
+            values,
+            full_offsets,
+            nested_size[:, 0],
+            ragged_idx=1,
+            min_seqlen=None,
+            max_seqlen=None,
+        )
+
+    # Generic fallback: per-component as_strided views of a snapshot copy.
     snapshot = torch.empty_strided(
         self.shape, self.stride(), dtype=self.dtype, device=self.device
     )

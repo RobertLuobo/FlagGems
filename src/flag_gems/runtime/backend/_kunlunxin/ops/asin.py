@@ -17,6 +17,7 @@ import logging
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.xpu.libdevice as xpu
 
 from flag_gems.utils import triton_lang_extension as ext
 
@@ -61,6 +62,25 @@ def _pick_block(n_elements):
     if n_elements <= 65536:
         return 2048, 4, True
     return 16384, 8, True
+
+
+@triton.jit
+def _asin_body(x):
+    t = 0.5 - 0.5 * tl.abs(x)
+    # |x| > 1 makes t < 0 -> rsqrt(NaN) -> NaN propagates out, matching torch.
+    s = t * xpu.rsqrt(t + 1e-30)
+    p = -493.19885254
+    p = p * t + 1060.03149414
+    p = p * t + -941.14831543
+    p = p * t + 445.70321655
+    p = p * t + -121.05153656
+    p = p * t + 18.99153519
+    p = p * t + -1.44778073
+    p = p * t + 0.39646727
+    p = p * t + 1.99919987
+    q = 1.5707964 - s * p
+    m = tl.minimum(1.0, tl.maximum(0.0, -x * 8.50705917e37))
+    return q * (1.0 - 2.0 * m)
 
 
 @triton.jit

@@ -10,12 +10,8 @@ from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-# The generic diff uses @libtuner (key=["M","N"] with 45 configs on kunlunxin)
-# so every distinct (M, N) shape re-autotunes all configs -> huge compile +
-# IR explosion (13.6M-line dump). Worse, its diff_kernel_2d addresses a 2D
-# strided tile `M_offsets[:,None]*M_STRIDE + offs` whose runtime row stride
-# defeats XPU contiguity analysis -> fully discrete access (0.003-0.03x torch
-# on every 2D/3D shape).
+# ---------------------------------------------------------------------------
+# Design notes (kunlunxin XPU)
 #
 # Fix (no libtuner, fixed BLOCK): drive one program per (row, chunk) with a
 # pre-offset base pointer so each program does a purely contiguous 1D block-DMA
@@ -27,34 +23,26 @@ BLOCK = 1024
 
 @libentry()
 @triton.jit
-def diff_kernel_1d(in_ptr, out_ptr, N_OUT, BLOCK: tl.constexpr):
-    pid = tle.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N_OUT
-    a = tl.load(in_ptr + offs, mask)
-    b = tl.load(in_ptr + offs + 1, mask)
-    tl.store(out_ptr + offs, b - a, mask)
-
-
-@libentry()
-@triton.jit
-def diff_kernel_2d(
+def diff_flat_kernel(
     in_ptr,
     out_ptr,
-    N_OUT,
-    M_STRIDE_IN,
-    M_STRIDE_OUT,
+    N_COMP,
     BLOCK: tl.constexpr,
+    CAST16: tl.constexpr,
 ):
-    pid_m = tle.program_id(0)
-    pid_c = tle.program_id(1)
-    row_in = in_ptr + pid_m * M_STRIDE_IN
-    row_out = out_ptr + pid_m * M_STRIDE_OUT
-    offs = pid_c * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < N_OUT
-    a = tl.load(row_in + offs, mask)
-    b = tl.load(row_in + offs + 1, mask)
-    tl.store(row_out + offs, b - a, mask)
+    # out[p] = in[p+1] - in[p] for p < N_COMP (N_COMP = numel_in - 1).
+    # in[.] is a contiguous 1-D stream; the caller guarantees the only
+    # out-of-range access (in[N_COMP]) is masked off.
+    pid = tle.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N_COMP
+    a = tl.load(in_ptr + offs, mask=mask)
+    b = tl.load(in_ptr + offs + 1, mask=mask)
+    if CAST16:
+        d = (b.to(tl.int32) - a.to(tl.int32)).to(a.dtype)
+    else:
+        d = b - a
+    tl.store(out_ptr + offs, d, mask=mask)
 
 
 def diff(input, n=1, dim=-1, prepend=None, append=None) -> torch.Tensor:
@@ -76,31 +64,47 @@ def diff(input, n=1, dim=-1, prepend=None, append=None) -> torch.Tensor:
         empty_tensor = torch.tensor([], dtype=input.dtype, device=input.device)
         return torch.reshape(empty_tensor, shape[:dim] + [0] + shape[(dim + 1) :])
 
+    # (M, N) contiguous with the diff dimension last.
     input = dim_compress(input, dim)
     N = reduce_len
     M = input.numel() // N
+    total = M * N
 
-    is_1d = len(shape) == 1
+    if total == 0:
+        return torch.empty(
+            shape[:dim] + [N - n] + shape[(dim + 1) :],
+            dtype=input.dtype,
+            device=input.device,
+        )
 
-    def _launch(src, dst, in_stride_m, out_stride_m, n_bound):
-        n_out = n_bound - 1
-        with torch_device_fn.device(src.device):
-            if is_1d:
-                grid = (triton.cdiv(n_out, BLOCK),)
-                diff_kernel_1d[grid](src, dst, n_out, BLOCK=BLOCK)
-            else:
-                grid = (M, triton.cdiv(n_out, BLOCK))
-                diff_kernel_2d[grid](
-                    src, dst, n_out, in_stride_m, out_stride_m, BLOCK=BLOCK
-                )
+    src = input.reshape(-1)
 
-    out_shape = list(input.shape)
-    out_shape[-1] = N - n
-    output = torch.empty(out_shape, device=input.device, dtype=input.dtype)
+    def _launch_flat(s, d, n_comp):
+        with torch_device_fn.device(s.device):
+            diff_flat_kernel[(triton.cdiv(n_comp, FLAT_BLOCK),)](
+                s,
+                d,
+                n_comp,
+                BLOCK=FLAT_BLOCK,
+                CAST16=bool(s.dtype == torch.int16),
+            )
 
     if n == 1:
-        _launch(input, output, N, N - 1, N)
-        return torch.moveaxis(output, -1, dim)
+        buf = torch.empty(total, device=input.device, dtype=input.dtype)
+        _launch_flat(src, buf, total - 1)
+    else:
+        # Ping-pong between two full-size scratch buffers; stage k writes
+        # total-(k+1) valid elements, and consecutive stages are ordered on the
+        # current stream (no host sync required).
+        bufs = [
+            torch.empty(total, device=input.device, dtype=input.dtype)
+            for _ in range(2)
+        ]
+        for k in range(n):
+            n_comp = total - (k + 1)
+            _launch_flat(src, bufs[k % 2], n_comp)
+            src = bufs[k % 2]
+        buf = src
 
     # n >= 2: ping-pong between two scratch buffers, writing the last iteration
     # directly into `output` (size N-n).

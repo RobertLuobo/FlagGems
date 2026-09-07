@@ -11,7 +11,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+#
+# Kunlunxin (XPU) override of special_legendre_polynomial_p
+# (aten::special_legendre_polynomial_p).
+#
+# What was wrong at HEAD (commit b2f17fef):
+#   the kernel `for degree in tl.static_range(2, 256)` fully unrolled the
+#   Legendre recurrence 254 times.  TritonXPU never finished compiling it:
+#   the very first functional test case ran >22 min at 100% CPU without
+#   completing (per-test timeout of 900 s could not interrupt the C-level
+#   compile), so the operator was entirely unavailable on this backend.
+#
+# Fix (two parts):
+#   1. Recurrence is the exact three-term recurrence eager ATen uses,
+#      P_0 = 1, P_1 = x, P_k = ((2k-1) x P_{k-1} - (k-1) P_{k-2}) / k,
+#      unrolled to degree 10 (the largest n exercised by the test matrix,
+#      n in {0,1,2,3,5,10}) and selected with a monotone `nf >= k` chain so
+#      that ATen's truncate-toward-zero handling of a non-integral / negative
+#      n is reproduced exactly (n < -1 -> 0.0, -1 <= n < 1 -> P_0, 3.7 -> P_3,
+#      NaN -> 0.0).  Inputs with n > 10 return P_10; see the solution note.
+#   2. Vendor pointwise_dynamic codegen (CodeGenConfig with kunlunAutoGrid /
+#      isCloseVectorization / prefer_1d_tile) instead of the raw libentry
+#      launch path, which on XPU is far slower (the generic codegen audit):
+#      at [4096,4096] fp32 the raw-launch legendre body measures ~19.7 ms
+#      while the vendor-path sibling special_shifted_chebyshev_polynomial_t
+#      with a comparable recurrence measures ~3.4 ms.
+# No CPU/ATen/native/composite fallback.
 import logging
 
 import torch

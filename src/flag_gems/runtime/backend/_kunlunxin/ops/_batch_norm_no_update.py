@@ -120,6 +120,9 @@ def _batch_norm_no_update(
     batch_dim = input.shape[0]
     n_slices = batch_dim * channels
     inner = n_elements // n_slices if n_slices > 0 else 0
+    tile_s, need_mask = _bnu_tile_s(inner)
+    n_groups = _bnu_n_batch_groups(batch_dim, channels, inner)
+    nb = -(-batch_dim // n_groups) if n_groups > 0 else 1
 
     if n_elements > 0:
         input_flat = input_contiguous.reshape(-1)

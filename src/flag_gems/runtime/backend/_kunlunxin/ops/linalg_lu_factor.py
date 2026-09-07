@@ -27,6 +27,12 @@ def _lu_find_pivot_main_kernel(
     masked load / no tail garbage: XPU mis-compiles tl.argmax when the masked
     vector length is smaller than the block size (see solution notes), and the
     block-parallel partial results are merged by _lu_finish_pivot_kernel.
+
+    NOTE: J is deliberately a runtime scalar (not constexpr): the step index
+    changes every iteration of the elimination loop, so a constexpr J would
+    force one Triton recompilation per step (and per kernel), which for a
+    512x512 factorization means ~2-3k JIT compilations and minutes of dead
+    time. With J as a plain argument the kernels compile once per shape.
     """
     pid = tl.program_id(0)
     batch = pid // BLOCKS
@@ -57,6 +63,8 @@ def _lu_find_pivot_tail_kernel(
     BLOCK_P: tl.constexpr,
 ):
     # Tail segment: rows [TAIL_START, M), BLOCK_M == M - TAIL_START exactly.
+    # J is a runtime scalar for the same reason as _lu_find_pivot_main_kernel:
+    # one compilation per shape instead of one per elimination step.
     batch = tl.program_id(0)
     rows = TAIL_START + tl.arange(0, BLOCK_M)
     values = tl.load(LU + batch * M * N + rows * N + J)

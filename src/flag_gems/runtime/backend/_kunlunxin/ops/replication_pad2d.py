@@ -48,6 +48,14 @@ logger = logging.getLogger(__name__)
 #   and total_out >= 2^31 fall back to the flat clamp kernel (int32 / int64
 #   variants). The native XPU engine itself asserts pad >= 0 on crops, so the
 #   crop cases are only reachable through the flat kernels.
+# - Correctness fix (2026-09-05): the vendor `_copy_from` segment path used
+#   `x[a:b, ...]` slicing for its source/destination views. Under use_gems()
+#   the registered ("slice.Tensor", slice) Python impl is called by the ATen
+#   dispatcher with only 4 positional args (self, dim, start, stop) and raises
+#     TypeError: slice() missing 1 required positional argument: 'step'
+#   for any non-full slice, so every mid/large shape (total_out >= 200K)
+#   crashed. The segment views now use torch.narrow (zero-copy as_strided view)
+#   instead, matching the quantized_lstm / nansum / renorm fix pattern.
 @triton.jit
 def _replication_pad2d_kernel_clamp_i64(
     x_ptr,

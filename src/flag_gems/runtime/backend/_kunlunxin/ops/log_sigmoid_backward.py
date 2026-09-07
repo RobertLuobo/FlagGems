@@ -74,6 +74,31 @@ UNROLL_NUM = 2
 BUFFER_SIZE_LIMIT = 8192
 IS_CLOSE_MEMORY_ASYNC = False
 
+# Above this many elements the 12-CTA 1D-tile codegen measures faster than the
+# flat per-CTA kernels (see the module docstring, section 2).
+FLAT_MAX_NUMEL = 4 * 1024 * 1024
+
+# 12-CTA auto-grid 1D-tile codegen: same proven config as hardsigmoid_backward.
+config_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    buffer_size_limit=4096,
+    kunlunAutoGrid=True,
+    unroll_num=8,
+)
+
+
+@xpu_pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=config_)
+@triton.jit
+def log_sigmoid_backward_func(grad_output, self):
+    # 1 - sigmoid(self) == sigmoid(-self) == 1 / (1 + exp(self))
+    go = grad_output.to(tl.float32)
+    x = self.to(tl.float32)
+    return (go * tl.sigmoid(0.0 - x)).to(grad_output.dtype)
+
 
 def _pick_block(n_elements):
     # Keep the number of compiled variants small: two unmasked tiles for the
@@ -193,6 +218,8 @@ def log_sigmoid_backward(grad_output, self, buffer):
     # `buffer` is intentionally unused: the vendor forward leaves it
     # uninitialized (see the module docstring above).
     if _can_use_flat_kernel(grad_output, self):
+        if self.numel() > FLAT_MAX_NUMEL:
+            return log_sigmoid_backward_func(grad_output, self)
         return _launch_flat_kernel(grad_output, self, torch.empty_like(self))
     return log_sigmoid_backward_pointwise_kernel(grad_output, self)
 

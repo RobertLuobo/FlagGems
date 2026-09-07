@@ -382,6 +382,8 @@ def block_diag(*tensors):
     src_tensors = []  # Keep references to prevent GC
     cur_row = 0
     cur_col = 0
+    max_rows = 0
+    max_cols = 0
     max_numel = 0
 
     for t in tensors_2d:
@@ -398,6 +400,8 @@ def block_diag(*tensors):
             src_tensors.append(src)
         else:
             ptrs_list.append(0)
+        max_rows = max(max_rows, rows)
+        max_cols = max(max_cols, cols)
         max_numel = max(max_numel, numel)
         cur_row += rows
         cur_col += cols

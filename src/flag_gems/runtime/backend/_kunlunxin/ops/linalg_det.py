@@ -21,6 +21,65 @@ _MIN_LDA = 64
 _MAX_BLK = 4096
 
 
+@libentry()
+@triton.jit
+def _det4_kernel(A, OUT, TOT: tl.constexpr):
+    """Closed-form 4x4 determinant.
+
+    The cofactor expansion is evaluated directly in registers: the matrix is
+    fetched with 16 scalar loads (one per entry; TOT == 16) and the formula
+    only does multiplies/subtracts.  There is no working-buffer store/load
+    round trip, so this path is immune to the backend's unsafe in-kernel
+    store->load reordering (the reason every other kernel is launched once per
+    step).
+    """
+    b = tle.program_id(0).to(tl.int64)
+    base = b * TOT
+    a00 = tl.load(A + base + 0)
+    a01 = tl.load(A + base + 1)
+    a02 = tl.load(A + base + 2)
+    a03 = tl.load(A + base + 3)
+    a10 = tl.load(A + base + 4)
+    a11 = tl.load(A + base + 5)
+    a12 = tl.load(A + base + 6)
+    a13 = tl.load(A + base + 7)
+    a20 = tl.load(A + base + 8)
+    a21 = tl.load(A + base + 9)
+    a22 = tl.load(A + base + 10)
+    a23 = tl.load(A + base + 11)
+    a30 = tl.load(A + base + 12)
+    a31 = tl.load(A + base + 13)
+    a32 = tl.load(A + base + 14)
+    a33 = tl.load(A + base + 15)
+    det = (
+        a00
+        * (
+            a11 * (a22 * a33 - a23 * a32)
+            - a12 * (a21 * a33 - a23 * a31)
+            + a13 * (a21 * a32 - a22 * a31)
+        )
+        - a01
+        * (
+            a10 * (a22 * a33 - a23 * a32)
+            - a12 * (a20 * a33 - a23 * a30)
+            + a13 * (a20 * a32 - a22 * a30)
+        )
+        + a02
+        * (
+            a10 * (a21 * a33 - a23 * a31)
+            - a11 * (a20 * a33 - a23 * a30)
+            + a13 * (a20 * a31 - a21 * a30)
+        )
+        - a03
+        * (
+            a10 * (a21 * a32 - a22 * a31)
+            - a11 * (a20 * a32 - a22 * a30)
+            + a12 * (a20 * a31 - a21 * a30)
+        )
+    )
+    tl.store(OUT + b, det)
+
+
 @triton.jit
 def _reduce_mul(a, b):
     return a * b
@@ -53,6 +112,45 @@ def _det_pack_kernel(
     idx = tl.where(live, row * N + col, 0)
     val = tl.load(SRC + b * N * N + idx)
     tl.store(DST + b * TOT + e, tl.where(live, val, 0.0))
+
+
+@libentry()
+@triton.jit
+def _det_step0_kernel(SRC, W, DG, N, LDA: tl.constexpr, TOT: tl.constexpr):
+    """Elimination step K=0 with the pack fused in.
+
+    Only valid when W is a separate (padded) buffer: every read comes from SRC
+    (contiguous N*N) and W is written only, so this one launch replaces the
+    pack kernel plus step 0.  The sum-based ``akk``/``apk`` extraction is kept
+    (a scalar load of the runtime ``prow`` address races against the stores of
+    the previous launch on this backend).
+    """
+    b = tle.program_id(0).to(tl.int64)
+    base = b * TOT
+    sbase = b * N * N
+    e = tl.arange(0, TOT)
+    row = e // LDA
+    col = e % LDA
+    live = (row < N) & (col < N)
+    idx = tl.where(live, row * N + col, 0)
+    w = tl.load(SRC + sbase + idx)
+    cand = tl.where((col == 0) & (row < N), tl.abs(w), -1.0)
+    best = tl.max(cand, axis=0)
+    prow = tl.min(tl.where(cand == best, row, TOT), axis=0)
+    akk = tl.sum(tl.where((row == 0) & (col == 0), w, 0.0), axis=0)
+    apk = tl.sum(tl.where((row == prow) & (col == 0), w, 0.0), axis=0)
+    cidx = tl.where(col < N, col, 0)
+    ridx = tl.where(row < N, row, 0)
+    row_k = tl.load(SRC + sbase + cidx)
+    row_p = tl.load(SRC + sbase + prow * N + cidx)
+    col_k = tl.load(SRC + sbase + ridx * N)
+    swapped = tl.where(row == 0, row_p, tl.where(row == prow, row_k, w))
+    lcol = tl.where(row == 0, apk, tl.where(row == prow, akk, col_k))
+    safe = tl.where(apk == 0.0, 1.0, apk)
+    mult = tl.where((row > 0) & (row < N), lcol / safe, 0.0)
+    urow = tl.where(col > 0, row_p, 0.0)
+    tl.store(W + base + e, swapped - mult * urow)
+    tl.store(DG + b * LDA, tl.where(prow != 0, -apk, apk))
 
 
 @libentry()

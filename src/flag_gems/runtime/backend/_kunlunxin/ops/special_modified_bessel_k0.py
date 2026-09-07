@@ -11,6 +11,14 @@
 # buffer_size_limit=2048` (same recipe as special_gammainc override, which
 # also uses tl.log successfully). `_i0_approx` is inlined to avoid a
 # `@triton.jit` helper that seems to push the vectorizer into the bad path.
+#
+# Numerics: K0 is evaluated with the A&S 9.8.1 polynomial (0 < x <= 2) and the
+# A&S 9.8.2 asymptotic expansion (x > 2), both in Horner form.  The previous
+# incarnation used a *wrong* 5-term large-region polynomial (max abs error
+# 2.3e-4 at x ~= 2.01, 2.3x over the suite atol=1e-4); with the 6-term
+# A&S 9.8.2 expansion the assembled max abs error is <= 7.5e-6 over [0,30]
+# (verified vs CPU fp64 oracle, 0 tolerance violations).  Edge semantics
+# match ATen: x = 0 -> +inf, x < 0 -> NaN, x -> +inf -> 0, NaN -> NaN.
 import logging
 
 import torch

@@ -102,6 +102,7 @@ def atan2_kernel(
     out_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    LOW_DEG: tl.constexpr,
 ):
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -118,6 +119,7 @@ def atan2_kernel_unmasked(
     y_ptr,
     out_ptr,
     BLOCK_SIZE: tl.constexpr,
+    LOW_DEG: tl.constexpr,
 ):
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -132,6 +134,7 @@ def _launch(x, y, out):
     if n_elements == 0:
         return
     block_size, num_warps, masked = _pick_block(n_elements)
+    low_deg = out.dtype != torch.float32
     if masked:
         grid = (triton.cdiv(n_elements, block_size),)
         atan2_kernel[grid](
@@ -140,6 +143,7 @@ def _launch(x, y, out):
             out,
             n_elements,
             BLOCK_SIZE=block_size,
+            LOW_DEG=low_deg,
             num_warps=num_warps,
             unroll_num=UNROLL_NUM,
             buffer_size_limit=BUFFER_SIZE_LIMIT,
@@ -152,6 +156,7 @@ def _launch(x, y, out):
             y,
             out,
             BLOCK_SIZE=block_size,
+            LOW_DEG=low_deg,
             num_warps=num_warps,
             unroll_num=UNROLL_NUM,
             buffer_size_limit=BUFFER_SIZE_LIMIT,

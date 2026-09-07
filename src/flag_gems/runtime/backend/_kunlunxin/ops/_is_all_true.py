@@ -31,6 +31,48 @@ def _heur_block_n(args):
     return triton.next_power_of_2(max(block_n, 1))
 
 
+# Packed all-True word pattern: PyTorch bool tensors store 0x00/0x01 bytes, so
+# four consecutive bools form one int32 "word" that is all-True iff it equals
+# 0x01010101. 0x01010101 is also the value loaded for masked-out lanes
+# (`other=16843009`), which makes `word == 16843009` True for them WITHOUT a
+# tl.select: the old `tl.where(mask, ...)` + `other=1` formulation measured
+# ~45% slower on XPU (1G: 7.47ms -> 4.15ms from the select alone).
+_WORD_MAGIC = tl.constexpr(16843009)  # 0x01010101
+
+
+def _pick_word_block(n_words):
+    """Word-tile width measured on XPU (P800).
+
+    Exact (mask-free) tiles are ~1.5x faster than masked ones at equal width, so
+    the heuristic prefers the largest power-of-two width that divides n_words:
+      - n_words < 4096: 2048-word tile, single program (no stage-2 launch).
+      - n_words < 32768: largest exact tile in {4096..16384} -> still one program.
+      - n_words < 2^24: ~8-128 programs; 32768-word exact tiles measure best
+        (16777216/65536 are ~5% faster with 65536, hence the larger band below),
+        with 8192/16384 as exact-fit fallbacks and 32768 masked as last resort.
+      - n_words >= 2^24: 65536-word exact tiles (1G: 2572us vs 2783us @32768).
+    """
+    if n_words < 4096:
+        return 2048
+    if n_words < 32768:
+        for b in (16384, 8192, 4096):
+            if n_words % b == 0:
+                return b
+        return 4096
+    if n_words < (1 << 24):
+        target = min(n_words // 8, 32768)
+        b = 32768
+        while b >= 4096:
+            if n_words % b == 0 and b <= target:
+                return b
+            b //= 2
+        return 32768
+    for b in (65536, 32768, 16384, 8192):
+        if n_words % b == 0:
+            return b
+    return 32768
+
+
 def _heur_block_m(args):
     block_n = _heur_block_n(args)
     block_m = min(triton.cdiv(args["M"], 12), 64)
@@ -69,8 +111,9 @@ def is_all_true_kernel_1(
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offset < n_elements
     val = tl.load(inp + offset, mask=mask, other=1)
-    # masked-out lanes must be True (identity for AND); do not rely on `other`.
-    nz = tl.where(mask, val != 0, True)
+    # masked-out lanes load 1, so `val != 0` is already True for them (identity
+    # for AND) and no tl.select is required.
+    nz = val != 0
     result = tl.reduce(nz, axis=0, combine_fn=reduce_all)
     tl.store(mid + pid, result)
 
@@ -105,7 +148,8 @@ def is_all_true_kernel_2(mid, out, mid_size, BLOCK_MID: tl.constexpr):
     offset = tl.arange(0, BLOCK_MID)
     mask = offset < mid_size
     val = tl.load(mid + offset, mask=mask, other=1)
-    nz = tl.where(mask, val != 0, True)
+    # masked-out lanes load 1 -> `val != 0` is True (identity for AND).
+    nz = val != 0
     result = tl.reduce(nz, axis=0, combine_fn=reduce_all)
     tl.store(out, result)
 

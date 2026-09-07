@@ -36,6 +36,20 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
+_W_BLOCK = 128
+_BLOCK_DIM = 128
+
+
+@libentry()
+@triton.jit
+def _cdist_backward_w_kernel(grad_ptr, cdist_ptr, w_ptr, numel, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    off = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = off < numel
+    g = tl.load(grad_ptr + off, mask=mask, other=0.0).to(tl.float32)
+    c = tl.load(cdist_ptr + off, mask=mask, other=1.0).to(tl.float32)
+    tl.store(w_ptr + off, g / (c + 1e-12), mask=mask)
+
 
 @libentry()
 @triton.jit

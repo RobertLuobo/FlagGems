@@ -167,6 +167,148 @@ def _bce_weight_pos_weight_reduce_kernel(
     tl.store(mid + pid, tl.sum(acc))
 
 
+# ------------- single-launch scalar kernels (N<=16384, mean/sum) ------------
+# One CTA covers the whole input; the result (with *1/N and dtype cast) is
+# written straight to the output tensor so mean/sum costs exactly one launch.
+
+
+@triton.jit
+def _bce_scalar_kernel(x, y, out, N, inv_n, BLOCK: tl.constexpr, U: tl.constexpr):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_loss(xv, yv), 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
+
+
+@triton.jit
+def _bce_weight_scalar_kernel(
+    x, y, w, out, N, inv_n, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        wv = tl.load(w + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_loss(xv, yv) * wv, 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
+
+
+@triton.jit
+def _bce_pos_weight_scalar_kernel(
+    x, y, pw, out, N, inv_n, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        pv = tl.load(pw + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_pos_weight_loss(xv, yv, pv), 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
+
+
+@triton.jit
+def _bce_weight_pos_weight_scalar_kernel(
+    x, y, w, pw, out, N, inv_n, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        wv = tl.load(w + idx, mask=m).to(tl.float32)
+        pv = tl.load(pw + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_pos_weight_loss(xv, yv, pv) * wv, 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
+
+
+# ------------- stage-1b tail kernels (grid=1, masked) -----------------------
+# Covers the partial tail [Nbase, N) (N - Nbase < BLOCK) of an N>16384 input.
+# Kept as a *separate* single-CTA launch: an earlier merged fold+tail kernel
+# (two masked sections in one kernel) miscompiled on this backend even when
+# the tail section was entirely masked off.
+
+
+@triton.jit
+def _bce_tail_kernel(x, y, mid, Nbase, N, BLOCK: tl.constexpr, U: tl.constexpr):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = Nbase + i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_loss(xv, yv), 0.0)
+    tl.store(mid, tl.sum(acc))
+
+
+@triton.jit
+def _bce_weight_tail_kernel(
+    x, y, w, mid, Nbase, N, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = Nbase + i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        wv = tl.load(w + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_loss(xv, yv) * wv, 0.0)
+    tl.store(mid, tl.sum(acc))
+
+
+@triton.jit
+def _bce_pos_weight_tail_kernel(
+    x, y, pw, mid, Nbase, N, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = Nbase + i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        pv = tl.load(pw + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_pos_weight_loss(xv, yv, pv), 0.0)
+    tl.store(mid, tl.sum(acc))
+
+
+@triton.jit
+def _bce_weight_pos_weight_tail_kernel(
+    x, y, w, pw, mid, Nbase, N, BLOCK: tl.constexpr, U: tl.constexpr
+):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = Nbase + i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < N
+        xv = tl.load(x + idx, mask=m).to(tl.float32)
+        yv = tl.load(y + idx, mask=m).to(tl.float32)
+        wv = tl.load(w + idx, mask=m).to(tl.float32)
+        pv = tl.load(pw + idx, mask=m).to(tl.float32)
+        acc += tl.where(m, _bce_pos_weight_loss(xv, yv, pv) * wv, 0.0)
+    tl.store(mid, tl.sum(acc))
+
+
+# ------------- stage-2 fold kernel (grid=1, fp32 partials) ------------------
+
+
+@triton.jit
+def _bce_finalize_kernel(mid, out, G, inv_n, BLOCK: tl.constexpr, U: tl.constexpr):
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for i in tl.static_range(U):
+        idx = i * BLOCK + tl.arange(0, BLOCK)
+        m = idx < G
+        v = tl.load(mid + idx, mask=m, other=0.0)
+        acc += tl.where(m, v, 0.0)
+    tl.store(out, (tl.sum(acc) * inv_n).to(out.dtype.element_ty))
+
+
 # -------------------- flat pointwise kernels (reduction=0) -------------------
 @triton.jit
 def _bce_flat_kernel(
