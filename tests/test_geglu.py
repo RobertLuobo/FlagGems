@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import pytest
 import torch
 
@@ -26,6 +28,24 @@ try:
 except ImportError:
     TE_OP = None
 
+# TransformerEngine changed the geglu signature across releases. Newer builds
+# take (inp, quantizer=...), while older ones take the FP8-era signature
+# (inp, fp8_meta_tensor, fp8_tensor=None, otype=None, ...) and forward `otype`
+# straight into the pybind11 `tex.gelu` binding, which rejects `None`. Probe the
+# installed signature so the reference side keeps working on both.
+_TE_PARAMS = list(inspect.signature(TE_OP).parameters) if TE_OP is not None else []
+
+if "otype" in _TE_PARAMS:
+    from transformer_engine.pytorch.constants import TE_DType
+
+
+def te_geglu(input_tensor: torch.Tensor) -> torch.Tensor:
+    if "otype" in _TE_PARAMS:
+        return TE_OP(input_tensor, None, None, TE_DType[input_tensor.dtype])
+    if "quantizer" in _TE_PARAMS:
+        return TE_OP(input_tensor, quantizer=None)
+    return TE_OP(input_tensor, None)
+
 
 @pytest.mark.geglu
 @pytest.mark.parametrize("shape", utils.GLU_SHAPES)
@@ -34,7 +54,7 @@ except ImportError:
 def test_geglu(shape, dtype):
     input_tensor = torch.randn(shape, dtype=dtype, device=flag_gems.device)
 
-    ref_out = TE_OP(input_tensor, None)
+    ref_out = te_geglu(input_tensor)
     ref_out = utils.to_reference(ref_out)
 
     with flag_gems.use_gems():
