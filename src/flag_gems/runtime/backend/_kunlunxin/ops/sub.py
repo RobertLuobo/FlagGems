@@ -120,6 +120,18 @@ def sub_(A, B, *, alpha=1):
         return sub_func_tensor_scalar(A, B, alpha, out0=A)
 
 
+def subtract(A, B, *, alpha=1):
+    """Functional subtraction: torch.subtract(A, B, alpha) == A - B * alpha.
+
+    aten::subtract.Tensor aliases sub.Tensor semantically; the vendor
+    implementation reuses the tunable sub kernel so that torch.subtract
+    inside use_gems() does not fall back to the generic (un-tuned) pointwise
+    engine on XPU.
+    """
+    logger.debug("GEMS_KUNLUNXIN SUBTRACT")
+    return sub(A, B, alpha=alpha)
+
+
 def subtract_(A, B, *, alpha=1):
     """In-place subtraction: A.subtract_(B, alpha) == A -= B * alpha."""
     logger.debug("GEMS_KUNLUNXIN SUBTRACT_")

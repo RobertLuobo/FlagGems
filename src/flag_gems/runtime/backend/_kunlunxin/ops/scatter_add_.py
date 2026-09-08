@@ -588,3 +588,21 @@ def scatter_add_(x, dim, index, src):
         return scatter_add_1(x, dim, index, src)
     else:
         return scatter_add_0(x, dim, index, src)
+
+
+def scatter_add(inp, dim, index, src):
+    logger.debug("GEMS_KUNLUNXIN SCATTER_ADD")
+    # Functional (non-inplace) variant.  The generic implementation routes
+    # through the unaligned generic kernels, which drop updates whenever two
+    # programs contend for one output address (duplicate index values); the
+    # vendor scatter_add_ below carries the per-program span alignment that
+    # keeps every update exact on this backend.  The initial copy uses
+    # aten::_copy_from (not overridden by flag_gems) so the functional
+    # contract "do not modify inp" holds without paying for clone()/copy_
+    # through the flag_gems pointwise override.
+    if not inp.is_contiguous():
+        out = inp.clone()
+        return scatter_add_(out, dim, index, src)
+    out = torch.empty_like(inp)
+    torch.ops.aten._copy_from(inp, out, False)
+    return scatter_add_(out, dim, index, src)
