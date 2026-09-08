@@ -1210,8 +1210,6 @@ __all__ = [
     "ne_",
     "ne_scalar_",
     "negative_",
-    "nextafter",
-    "nextafter_",
     "nll_loss2d",
     "nll_loss_nd_backward",
     "nll_loss_nd_forward",
