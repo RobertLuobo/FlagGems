@@ -18,6 +18,8 @@ import torch
 import triton
 import triton.language as tl
 
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+
 from flag_gems.utils import pointwise_dynamic
 from flag_gems.utils import triton_lang_extension as ext
 
@@ -91,7 +93,7 @@ config_ = CodeGenConfig(
 )
 
 
-@xpu_pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=config_)
+@pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, 1, "DEFAULT")], config=config_)
 @triton.jit
 def log_sigmoid_backward_func(grad_output, self):
     # 1 - sigmoid(self) == sigmoid(-self) == 1 / (1 + exp(self))
