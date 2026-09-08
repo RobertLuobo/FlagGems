@@ -79,6 +79,51 @@ def bitwise_and_scalar(A, B):
 
 def bitwise_and_scalar_(A, B):
     logger.debug("GEMS_KUNLUNXIN BITWISE_AND_SCALAR_")
+    # int32-word packing fast path for bool/int16 in-place, mirroring the
+    # (verified) bitwise_and_scalar_tensor recipe of this file and the
+    # bitwise_or_scalar_ in-place variant: a byte / 16-bit load-store pays a
+    # heavy per-byte penalty on XPU, while 4 bools (or 2 int16s) fit one
+    # int32 word whose bytes / 16-bit lanes are uniformly AND-ed with the
+    # replicated scalar (bool takes the low bit of the two's-complement
+    # scalar, int16 the low 16 bits -- both match torch).
+    # In-place: the AND-ed int32 words are written directly back into A's own
+    # storage (out0=in_view), preserving alias / mutation semantics.
+    # Gating: the bool lane only packs for a Python *bool* scalar; a Python
+    # int with a bool tensor type-promotes to Long in torch and the in-place
+    # op even raises (result type Long can't be cast to Bool), so such inputs
+    # keep the generic scalar kernel (long-faithful, unchanged behavior).
+    # int16 packs for int/bool scalars that fit the 16-bit signed range
+    # (torch's in-place .Scalar converts the scalar to the tensor dtype first
+    # and raises on overflow, e.g. 0x1FFFF / 0x10000); out-of-range scalars
+    # keep the generic kernel (unchanged behavior).
+    # Restricted to contiguous inputs with a full int32-aligned byte count;
+    # anything else (non-contiguous, tail bytes, 0-dim/empty, int32/int64)
+    # falls back to the generic scalar kernel.
+    if (
+        A.dtype in (torch.bool, torch.int16)
+        and A.is_contiguous()
+        and isinstance(B, (int, bool))
+    ):
+        nbytes = A.numel() * A.element_size()
+        if nbytes > 0 and nbytes % 4 == 0:
+            scalar = int(B)
+            if A.dtype == torch.bool:
+                if type(B) is not bool:
+                    return bitwise_and_func_scalar(A, B, out0=A)
+                # torch bool conversion of a scalar = low bit (verified:
+                # 2->False, 3->True, 5->True, -2->False on reference).
+                mask = 0x01010101 if (scalar & 1) else 0
+            else:
+                if not -0x8000 <= scalar <= 0x7FFF:
+                    return bitwise_and_func_scalar(A, B, out0=A)
+                s = scalar & 0xFFFF
+                mask = s | (s << 16)
+            try:
+                in_view = A.reshape(-1).view(torch.int32)
+            except RuntimeError:  # e.g. unaligned storage offset
+                return bitwise_and_func_scalar(A, B, out0=A)
+            bitwise_and_func_scalar(in_view, mask, out0=in_view)
+            return A
     return bitwise_and_func_scalar(A, B, out0=A)
 
 

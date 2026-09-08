@@ -125,19 +125,21 @@ def expand_copy(x: torch.Tensor, size) -> torch.Tensor:
     # Ensure input is on the correct device
     device = x.device
 
-    # Create output tensor with target shape on the same device
-    out = torch.empty(size_tuple, dtype=x.dtype, device=device)
-
-    # Handle empty tensors
-    if out.numel() == 0:
-        return out
-
-    # Use torch.expand to get a broadcasted view with correct strides
+    # Resolve -1 / leading-dim broadcasting through the expand view first so
+    # the concrete output shape is known (torch.empty would reject -1).  This
+    # mirrors ATen: expand_copy = expand view + contiguous materialization.
     view = x.expand(size_tuple)
 
     # Ensure view is on the right device (expand preserves device)
     if view.device != device:
         view = view.to(device)
+
+    # Create output tensor with the concrete (resolved) shape on the same device
+    out = torch.empty(view.shape, dtype=x.dtype, device=device)
+
+    # Handle empty tensors
+    if out.numel() == 0:
+        return out
 
     if view.is_contiguous():
         # Same-shape (or full) copy: flat bounded-tile block DMA.
