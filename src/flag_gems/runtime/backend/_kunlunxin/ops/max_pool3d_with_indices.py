@@ -314,6 +314,8 @@ def max_pool3d_backward(
     grad_output = grad_output.to(torch.float32).contiguous()
     indices = indices.to(torch.int32).contiguous()
 
+    params = _parse_pool3d_params(kernel_size, stride, padding, dilation)
+
     in_n, in_c, in_d, in_h, in_w = input.shape
     out_d, out_h, out_w = (
         grad_output.shape[2],

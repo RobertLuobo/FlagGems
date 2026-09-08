@@ -44,6 +44,26 @@ logger = logging.getLogger(__name__)
 #   flat clamp kernel (int32 / int64 variants); the native XPU engine asserts
 #   pad >= 0 on crops, so crop cases are only reachable through the clamp
 #   kernels.
+#
+# Performance reconstruction round 2 (2026-09-04, device XPU 3, official
+# triton.testing.do_bench, benchmark matrix + large shapes):
+# - The flat clamp kernel's `o // W_out` + per-lane clamp gather still costs
+#   42-66us at (8,32,256) (fp16/bf16 ~2.5x the fp32 time), while a plain
+#   contiguous flat copy of the same size takes 8.8us and the vendor
+#   `_copy_from` interior block 6.3us (torch reference 6.65us).
+# - The old 3-segment `_copy_from` path was dominated by the two edge
+#   segments' `expand` (stride-0) source views (~80us each on XPU): the edge
+#   columns are now written by one flat Triton kernel
+#   (`_replication_pad1d_edge_kernel`, total_nc*(pad_l+pad_r) lanes, all
+#   contiguous 1..pad-wide runs). New fast path =
+#     interior `_copy_from` (vendor engine, ~6.3us) + edge kernel (~2us work +
+#     one ~6us launch): (8,32,256) 42.1-65.0 -> 15.2-15.6us,
+#     (16,64,256) 57.5 -> 20.9us, (32,64,256) 62.3 -> 29.8us,
+#     (2,1000,100) 50.6 -> 35.2us.
+# - Crossover (fp32): <=10K elems flat clamp (256/512/1024 buckets) wins,
+#   >10K the new pair wins. fp16/bf16 at (32,256) 8320 elems marginally
+#   prefer the pair (13.9 vs 15-16.3us) but flat is <1us cheaper at
+#   (4,8,256) 8288, so a single 10K threshold is used.
 
 
 @triton.jit
@@ -102,6 +122,38 @@ def _replication_pad1d_kernel_clamp_i32(
     in_offs = nc * W_in + iw
     vals = tl.load(x_ptr + in_offs, mask=mask)
     tl.store(out_ptr + o, vals, mask=mask)
+
+
+@triton.jit
+def _replication_pad1d_edge_kernel(
+    x_ptr,
+    out_ptr,
+    W_in,
+    W_out,
+    pad_l,
+    pad_r,
+    total_nc,
+    BLOCK: tl.constexpr,
+):
+    # One flat pass over all edge (replicated) columns of every row.
+    # Edge index n = nc * (pad_l + pad_r) + e; e < pad_l is the left-edge
+    # element (source column 0), e >= pad_l the right-edge element (source
+    # column W_in - 1). Both the interior block copy and this edge kernel
+    # therefore use only contiguous source/destination runs (the interior
+    # runs of a row are contiguous; the edge runs are 1..pad columns wide),
+    # unlike the flat clamp kernel whose per-lane `o // W_out` decode +
+    # clamp makes every load a discrete gather on XPU (measured ~1.5-2 GB/s
+    # big-shape penalty, ~2.5-3x on fp16/bf16).
+    n = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    per = pad_l + pad_r
+    total_e = total_nc * per
+    mask = n < total_e
+    nc = n // per
+    e = n - nc * per
+    is_l = e < pad_l
+    dst = nc * W_out + tl.where(is_l, e, pad_l + W_in + (e - pad_l))
+    v = tl.load(x_ptr + nc * W_in + tl.where(is_l, 0, W_in - 1), mask=mask)
+    tl.store(out_ptr + dst, v, mask=mask)
 
 
 def _pad2(padding):

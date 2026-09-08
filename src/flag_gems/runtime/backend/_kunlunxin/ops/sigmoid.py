@@ -77,6 +77,31 @@ _TINY_BLOCK = 2048
 _TINY_WARPS = 4
 
 
+def _flat_block(dtype, numel):
+    """Flat-kernel BLOCK for (dtype, numel); 0 means use generated pointwise."""
+    if dtype == torch.bfloat16:
+        if numel <= 8192:
+            return triton.next_power_of_2(numel)
+        if numel <= 131072:
+            return 8192  # flat B=8192 ties the generated pointwise here, and
+            # only the flat path is measurable through the op without a
+            # second output allocation (routed-PW is ~5us slower)
+        if numel <= 262144:
+            return 8192  # flat B=8192 beats pointwise at 256K (0.72 vs 0.69)
+        return 0  # >=512K: generated pointwise wins (0.82-0.87 spd)
+    # float16 / float32: flat beats the generated pointwise on every band.
+    if numel <= 8192:
+        return triton.next_power_of_2(numel)
+    if numel < 16384:
+        # odd sizes in (8K, 16K): single masked CTA, no bsl (see launcher)
+        return 16384
+    if numel <= 65536:
+        return 8192
+    if numel <= 2097152:
+        return 32768
+    return 131072
+
+
 @triton.jit
 def sigmoid_backward_fast_kernel(dy_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):
     pid = ext.program_id(0)
@@ -102,6 +127,12 @@ def sigmoid_backward_masked_kernel(dy_ptr, y_ptr, out_ptr, numel, BLOCK: tl.cons
 
 def _sigmoid_backward_fast(grad_output, output):
     numel = output.numel()
+    block = _flat_block(output.dtype, numel)
+    if block == 0:
+        # bf16 sizes where the generated cluster12 kernel wins outright.
+        # Allocate nothing here: the wrapper allocates its own output, and a
+        # second empty_strided costs ~3.5us on this device.
+        return sigmoid_backward_kernel(grad_output, output)
     # Allocate via empty_strided (unregistered by gems) to dodge the
     # registered-empty dispatch tax inside use_gems contexts.
     out = torch.empty_strided(

@@ -267,6 +267,31 @@ def min_norm_kernel_2(
 
 
 @libentry()
+@triton.jit
+def min_norm_rows_kernel(X, Out, M, N, buffer_size_limit: tl.constexpr):
+    """Partial-dim -inf norm: one program per row of the (M, N) row-major
+    compressed input.  The generic 2D min_norm_kernel (tl.min over a
+    [BLOCK_M, BLOCK_N] tile, axis=1) is silently mis-lowered by TritonXPU on
+    this backend: on (600, 40999) every one of the 1025 probed rows was wrong
+    and (3, 8199800) returned 0, while tl.sum/tl.max on the identical tile were
+    exact.  So the row is reduced with 1024-wide UNMASKED 1D loads (chunks are
+    exact multiples; every lane is in-bounds), an axis-free tl.min -- the same
+    1D min that the flat min_norm_kernel_1 path uses -- and a dynamic scalar
+    tail for the remainder.  All loads are exact multiples of the row so the
+    pointer stays affine (X + row * N + off + arange)."""
+    row = ext.program_id(0).to(tl.int64)
+    rmin = tl.full((), value=float("inf"), dtype=tl.float32)
+    full = (N // 1024) * 1024
+    for off in tl.range(0, full, 1024):
+        v = tl.load(X + row * N + off + tl.arange(0, 1024)).to(tl.float32)
+        rmin = tl.minimum(rmin, tl.min(tl.abs(v)))
+    for off in tl.range(0, N - full):
+        v = tl.load(X + row * N + full + off).to(tl.float32)
+        rmin = tl.minimum(rmin, tl.abs(v))
+    tl.store(Out + row, rmin, mask=row < M)
+
+
+@libentry()
 # @triton.autotune(configs=runtime.get_tuned_config("vector_norm"), key=["M", "N"])
 @triton.heuristics(
     {
@@ -1170,7 +1195,11 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
             elif ord == float("inf"):
                 max_norm_kernel[grid](x, out, M, N)
             elif ord == -float("inf"):
-                min_norm_kernel[grid](x, out, M, N)
+                # min_norm_kernel's 2D tile (tl.min over axis=1) is silently
+                # mis-lowered by TritonXPU for partial reductions; the
+                # one-row-per-program min_norm_rows_kernel is exact on every
+                # measured shape.
+                min_norm_rows_kernel[(M,)](x, out, M, N, buffer_size_limit=2048)
             elif ord == 0:
                 l0_norm_kernel[grid](x, out, M, N)
             elif ord == 1 and N > 1024:

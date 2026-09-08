@@ -9,6 +9,8 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
+_BLOCK_SIZE = 64
+
 
 @libentry()
 @triton.jit

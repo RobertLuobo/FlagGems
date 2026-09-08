@@ -1,5 +1,6 @@
 import logging
 
+import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
@@ -38,4 +39,9 @@ def arcsinh_(A):
 
 
 def arcsinh_out(A, out):
+    # ATen arcsinh on integer inputs produces a float32 result; the kernel
+    # casts back to x.dtype, so promote an integer input to float32 here to
+    # avoid a silently truncated (wrong) value being written into a float out.
+    if not A.is_floating_point():
+        A = A.to(torch.float32)
     return arcsinh_func(A, out0=out)

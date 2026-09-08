@@ -215,6 +215,79 @@ def _pd_small_kernel(
     tl.store(out_ptr + pid, _pd_finalize(acc, p_scalar, MODE))
 
 
+# Multi-row variant of _pd_small_kernel: ROWS independent rows per program to
+# cut the program count (and therefore the launch overhead) when N is large
+# but D is small (launch-bound regime, e.g. (10000, 1) / (10000, 256)). Each
+# row is processed exactly as in _pd_small_kernel; rows are independent so the
+# loads pipeline across the ROWS iterations.
+_ROWS = 8
+# Route to _pd_small_multi_kernel only in the launch-bound regime: many
+# independent small-D rows (e.g. (10000, 1) / (10000, 256)).
+_MULTI_MIN_N = 1024
+# Flat elementwise block for the D == 1 path (_pd_d1_kernel).
+_D1_BLOCK = 1024
+
+
+@libentry()
+@triton.jit
+def _pd_small_multi_kernel(
+    x1_ptr,
+    x2_ptr,
+    out_ptr,
+    N,
+    D,
+    eps,
+    p_scalar,
+    MODE: tl.constexpr,
+    S: tl.constexpr,
+    NP: tl.constexpr,
+    NSCALAR: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    for r in tl.static_range(ROWS):
+        row = pid * ROWS + r
+        if row < N:
+            base = row * D
+            acc = _pd_piece_sum(
+                x1_ptr, x2_ptr, base, eps, p_scalar, MODE, S, NP, NSCALAR,
+            )
+            tl.store(out_ptr + row, _pd_finalize(acc, p_scalar, MODE))
+
+
+# D == 1: every row is a single element, so all p-norms collapse to
+# |x1 - x2 + eps| (p == 0 counts non-zeros: 1.0 for every lane since
+# eps > 0 makes |x1 - x2 + eps| > 0 except a measure-zero set handled by the
+# comparison). A single flat elementwise pass over the N rows replaces the
+# per-row reduction kernel, which measured ~90x slower (row-serial latency).
+# Loads use a clamped index so no masked (possibly OOB) load is ever emitted;
+# the store mask only discards valid load results.
+@libentry()
+@triton.jit
+def _pd_d1_kernel(
+    x1_ptr,
+    x2_ptr,
+    out_ptr,
+    N,
+    eps,
+    MODE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    off = pid * BLOCK + tl.arange(0, BLOCK)
+    safe = tl.minimum(off, N - 1)
+    a = tl.load(x1_ptr + safe).to(tl.float32)
+    b = tl.load(x2_ptr + safe).to(tl.float32)
+    d = tl.abs(a - b + eps)
+    if MODE == 2:  # p == 0: nonzero count of a 1-element row.  Count the
+        # reference condition |a - b + eps| != 0 exactly (a - b != -eps, which
+        # also covers the a == b tie case: |eps| != 0).  d is computed in fp32
+        # after an exact fp16/bf16 -> fp32 conversion, so the comparison is
+        # exact for those dtypes.
+        d = (d != 0).to(tl.float32)
+    tl.store(out_ptr + off, d, mask=off < N)
+
+
 @libentry()
 @triton.jit
 def _pd_chunk_kernel(

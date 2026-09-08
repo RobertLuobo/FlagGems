@@ -441,6 +441,10 @@ def _weight_norm_bwd_multi_row(
     else:
         # 1-row program: correct for tile==1 and non-pow2 N (avoids the XPU
         # 2D-tile non-pow2 layout bug and the 1-row 2D-tile lowering bug).
+        # R = next_pow2(N) with an explicit mask + tl.where reduction: the
+        # unmasked 1D tl.sum codegen path is broken on XPU for small N
+        # (measured wrong for M>=3 programs, e.g. (5,4,3) dim=0 v_grad off by
+        # ~100%), while the masked/where path is exact for every M x N probed.
         grid = (M,)
         with torch_device_fn.device(saved_v.device):
             _wn_bwd_row1d_kernel[grid](
@@ -451,6 +455,7 @@ def _weight_norm_bwd_multi_row(
                 saved_g,
                 saved_norms,
                 N,
+                triton.next_power_of_2(N),
                 eps,
                 num_warps=2,
             )

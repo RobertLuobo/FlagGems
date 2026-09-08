@@ -113,6 +113,7 @@ def softplus_backward(grad_output, self, beta=1.0, threshold=20.0):
         return out
     block_size = _pick_backward_block(n_elements)
     grid = (triton.cdiv(n_elements, block_size),)
+    need_mask = (n_elements % block_size) != 0
     with torch_device_fn.device(grad.device):
         softplus_backward_kernel[grid](
             grad,
@@ -122,5 +123,6 @@ def softplus_backward(grad_output, self, beta=1.0, threshold=20.0):
             beta,
             threshold,
             BLOCK_SIZE=block_size,
+            NEED_MASK=need_mask,
         )
     return out

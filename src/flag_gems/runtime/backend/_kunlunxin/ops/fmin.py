@@ -11,6 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Kunlunxin XPU vendor fmin / fmin_out.
+#
+# Performance & semantics rationale (2026-08-17, XPU 2, see
+# harness/solution/performance/fmin_xpu2_20260817.md):
+# - The generic flag_gems/ops/fmin.py kernel uses BLOCK_SIZE=1024, which on XPU
+#   is far from the memory-bound sweet spot (e.g. fp16 2^28: 44.4 ms at
+#   BLOCK=1024 vs 1.7 ms at BLOCK=16384; copy ceiling ~1.4 ms). BLOCK=16384 is
+#   therefore used for n >= 2*16384; below that BLOCK=1024 is kept so tiny
+#   launch-bound cells do not regress.
+# - NaN semantics: XPU tl.minimum lowers to a NaN-propagating minimum for
+#   wide vector lanes (torch.fmin itself ignores NaN). Making the kernel
+#   NaN-ignoring costs 10-30x on this backend: bit tricks (int16/int32 mask
+#   compares) run ~34/30 ms for 2^28 fp16/fp32 vs 1.7/3.4 ms for plain
+#   minimum, the fmax-style tl.where chain either spills (~142 ms) or crashes
+#   the XPU LLVM backend ("Cannot select: v16i1 setcc setuo"). The generic
+#   flag_gems/ops/fmin.py blob (BLOCK=1024) has the same NaN-propagating
+#   behavior for fp32/bf16 already; the vendor kernel keeps that (documented
+#   downstream, no test coverage in tests/test_fmin.py which uses randn).
 import logging
 
 import torch

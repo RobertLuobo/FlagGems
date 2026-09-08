@@ -579,6 +579,7 @@ def median_count_le_kernel(
 ):
     pid = ext.program_id(0)
     cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
     keys_v = tl.load(keys + pid * BLOCK_N + cols)
     lo_v = tl.load(lo + pid)
     hi_v = tl.load(hi + pid)

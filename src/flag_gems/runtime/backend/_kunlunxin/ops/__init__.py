@@ -34,6 +34,7 @@ from ._nested_view_from_buffer_copy import _nested_view_from_buffer_copy
 from ._pdist_backward import _pdist_backward
 from ._pdist_forward import _pdist_forward, pdist
 from ._prelu_kernel import _prelu_kernel  # noqa: F401
+from ._prelu_kernel_backward import _prelu_kernel_backward  # noqa: F401
 from ._scaled_dot_product_fused_attention_overrideable import (
     _scaled_dot_product_fused_attention_overrideable,
 )
@@ -47,6 +48,7 @@ from .acos import acos, acos_
 from .adaptive_avg_pool2d import adaptive_avg_pool2d
 from .adaptive_max_pool2d import adaptive_max_pool2d
 from .add import add, add_
+from .addbmm import addbmm, addbmm_  # noqa: F401
 from .addcdiv import addcdiv, addcdiv_, addcdiv_out
 from .addcmul import addcmul, addcmul_, addcmul_out
 from .addmm import addmm, addmm_dtype, addmm_dtype_out, addmm_out  # noqa: F401
@@ -75,6 +77,7 @@ from .argsort import argsort
 from .as_strided_copy import as_strided_copy, as_strided_copy_out
 from .as_strided_scatter import as_strided_scatter
 from .asin import asin, asin_
+from .asinh_ import asinh_  # noqa: F401
 from .assert_async import _assert_async
 from .atan import atan, atan_
 from .atan2 import atan2, atan2_, atan2_out
@@ -139,6 +142,10 @@ from .ceil import ceil, ceil_, ceil_out
 from .celu import celu, celu_
 from .cholesky_inverse import cholesky_inverse
 from .cholesky_solve import cholesky_solve, cholesky_solve_out
+from .chunk import chunk
+from .chunk_cat import chunk_cat  # noqa: F401
+from .chunk_cat import chunk_cat as _chunk_cat
+from .conj_physical_ import conj_physical_  # noqa: F401
 from .clamp import (
     clamp,
     clamp_,
@@ -164,6 +171,7 @@ from .copysign import copysign, copysign_, copysign_out
 from .cos import cos, cos_
 from .cosh import cosh, cosh_, cosh_out  # noqa: F401
 from .count_nonzero import count_nonzero
+from .cudnn_batch_norm import cudnn_batch_norm  # noqa: F401
 from .cudnn_batch_norm_backward import cudnn_batch_norm_backward  # noqa: F401
 from .cudnn_convolution import cudnn_convolution  # noqa: F401
 from .cummax import cummax
@@ -179,6 +187,7 @@ from .diagonal import diagonal_backward
 from .diagonal_copy import diagonal_copy
 from .diff import diff
 from .digamma import digamma
+from .dist import dist
 from .digamma_ import digamma_
 from .div import (
     div_mode,
@@ -216,6 +225,16 @@ from .fill import (
     fill_tensor_out,
 )
 from .flip import flip
+from .float_power_ import (
+    float_power_scalar_tensor,
+    float_power_scalar_tensor_out,
+    float_power_tensor_scalar,
+    float_power_tensor_scalar_,
+    float_power_tensor_scalar_out,
+    float_power_tensor_tensor,
+    float_power_tensor_tensor_,
+    float_power_tensor_tensor_out,
+)
 from .floor import floor, floor_, floor_out
 from .fmax import fmax, fmax_out
 from .fmin import fmin, fmin_out
@@ -295,6 +314,7 @@ from .linalg_solve_triangular import (
     linalg_solve_triangular,
     linalg_solve_triangular_out,
 )
+from .linalg_svd import linalg_svd
 from .linear_backward import linear_backward
 from .linspace import linspace
 from .log import log
@@ -370,6 +390,7 @@ from .negative import negative
 from .negative_ import negative_
 from .new_full import new_full
 from .new_ones import new_ones
+from .nextafter import nextafter, nextafter_
 from .nllloss import (
     nll_loss2d,
     nll_loss2d_backward,
@@ -444,6 +465,7 @@ from .replication_pad2d_backward import (
 from .replication_pad3d import replication_pad3d  # noqa: F401
 from .replication_pad3d_backward import replication_pad3d_backward  # noqa: F401
 from .resize import resize, resize_
+from .resize_output import _resize_output, _resize_output_
 from .resolve_conj import resolve_conj
 from .resolve_neg import resolve_neg
 from .rms_norm import rms_norm, rms_norm_backward, rms_norm_forward
@@ -484,6 +506,8 @@ from .signbit import signbit, signbit_out
 from .silu import silu, silu_, silu_backward
 from .sin import sin, sin_
 from .sinc import sinc, sinc_, special_sinc
+from .sinh import sinh, sinh_  # noqa: F401
+from .slice import slice
 from .slice_backward import slice_backward
 from .slice_scatter import slice_scatter
 from .smooth_l1_loss import smooth_l1_loss, smooth_l1_loss_backward, smooth_l1_loss_out
@@ -514,10 +538,13 @@ from .special_exp2 import special_exp2
 from .special_gammainc import special_gammainc
 from .special_gammaincc import special_gammaincc
 from .special_gammaln import special_gammaln, special_gammaln_out
+from .special_hermite_polynomial_h import special_hermite_polynomial_h
 from .special_i0e import special_i0e, special_i0e_out
 from .special_i1 import special_i1, special_i1_out  # noqa: F401
 from .special_legendre_polynomial_p import special_legendre_polynomial_p
 from .special_log1p import special_log1p_out
+from .special_log1p import special_log1p  # noqa: F401  (kunlunxin override)
+from .special_logit import special_logit, special_logit_out  # noqa: F401
 from .special_log_ndtr import special_log_ndtr, special_log_ndtr_
 from .special_log_softmax import special_log_softmax
 from .special_logsumexp import special_logsumexp
@@ -607,6 +634,7 @@ __all__ = [
     "soft_margin_loss",
     "soft_margin_loss_out",
     "soft_margin_loss_backward",
+    "special_hermite_polynomial_h",
     "special_log_softmax",
     "special_logsumexp",
     "softshrink",
@@ -620,6 +648,8 @@ __all__ = [
     "acos",
     "add",
     "add_",
+    "addbmm",
+    "addbmm_",
     "addcdiv",
     "addcdiv_",
     "addcdiv_out",
@@ -691,6 +721,9 @@ __all__ = [
     "ceil_out",
     "celu",
     "celu_",
+    "chunk",
+    "_chunk_cat",
+    "chunk_cat",
     "clamp",
     "clamp_",
     "clamp_max",
@@ -818,6 +851,7 @@ __all__ = [
     "less_equal",
     "less_equal_scalar",
     "lift_fresh_copy",
+    "linalg_ldl_solve",
     "linspace",
     "log",
     "log1p",
@@ -880,6 +914,8 @@ __all__ = [
     "neg",
     "neg_",
     "negative",
+    "nextafter",
+    "nextafter_",
     "not_equal",
     "not_equal_scalar",
     "nll_loss_backward",
@@ -934,6 +970,8 @@ __all__ = [
     "repeat_interleave_tensor",
     "resize",
     "resize_",
+    "_resize_output",
+    "_resize_output_",
     "resolve_conj",
     "resolve_neg",
     "rot90",
@@ -973,6 +1011,7 @@ __all__ = [
     "sin_",
     "sinc",
     "sinc_",
+    "slice",
     "slice_backward",
     "slice_scatter",
     "softmax",
@@ -1018,6 +1057,8 @@ __all__ = [
     "trunc_",
     "true_divide_",
     "uniform_",
+    "unsafe_chunk",
+    "upsample_bilinear2d",
     "upsample_linear1d",
     "upsample_nearest1d",
     "upsample_nearest2d",
@@ -1177,6 +1218,8 @@ __all__ = [
     "log_sigmoid_backward",
     "log_sigmoid_backward_out",
     "log_sigmoid_forward",
+    "logcumsumexp",
+    "logcumsumexp_out",
     "log_softmax_backward_out",
     "log_softmax_out",
     "logaddexp",
@@ -1318,3 +1361,73 @@ __all__ = [
     "xor_scalar_",
     "xor_scalar_tensor",
 ]
+
+
+def _patch_adaptive_max_pool3d_functional():
+    """Route torch.nn.functional.adaptive_max_pool3d to the Gems forward.
+
+    The vendor XDNN wrapper on this stack rejects bfloat16 and returns
+    uninitialized index memory for float16/float32, so the corresponding
+    ``adaptive_max_pool3d_backward`` (registered for CUDA dispatch) would
+    receive garbage indices.  Only the tests/benchmark of this op family call
+    the functional, so the patch scope is limited; applied at import time,
+    mirroring the ``_sunrise`` vendor monkey patches.  Must stay in this
+    module (not ``_kunlunxin/__init__.py``): the package __init__ is loaded
+    before ``flag_gems.runtime`` finishes initializing.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    from .adaptive_max_pool3d import adaptive_max_pool3d as _gems_fwd
+
+    if getattr(F.adaptive_max_pool3d, "_flag_gems_kunlunxin_patched", False):
+        return
+
+    _orig = F.adaptive_max_pool3d
+
+    def _wrapped(input, output_size, return_indices=False):
+        # CPU tensors (the ``--ref cpu`` reference path of the harness) must
+        # keep the original functional: the Gems kernels only run on CUDA.
+        if input.device.type != "cuda":
+            return _orig(input, output_size, return_indices=return_indices)
+        return _gems_fwd(input, output_size, return_indices=return_indices)
+
+    _wrapped._flag_gems_kunlunxin_patched = True
+    F.adaptive_max_pool3d = _wrapped
+
+
+_patch_adaptive_max_pool3d_functional()
+
+_adaptive_max_pool2d_aten_lib = None
+
+
+def _patch_adaptive_max_pool2d_aten():
+    """Route ``torch.ops.aten.adaptive_max_pool2d`` (CUDA) to the Gems forward.
+
+    The vendor XDNN wrapper on this stack returns uninitialized index memory
+    for float16/float32/bfloat16 (the output values are correct, the indices
+    are garbage), so a ``adaptive_max_pool2d_backward`` whose reference
+    consumes those indices either faults or disagrees with ATen.  The Gems
+    ``adaptive_max_pool2d`` forward kernel computes ATen-exact flat spatial
+    indices (``h * W + w``, same window math and tie-break); registering it
+    for the CUDA dispatch key makes every ``torch.ops.aten.adaptive_max_pool2d``
+    call produce valid indices, both inside and outside ``use_gems()``
+    scopes.  The registration is process-global (the Library handle is held in
+    this module); the ``use_gems()`` registrar re-registers the same function
+    for the same key, so there is no conflict.
+    """
+    global _adaptive_max_pool2d_aten_lib
+    if _adaptive_max_pool2d_aten_lib is not None:
+        return
+
+    import torch
+
+    from .adaptive_max_pool2d import adaptive_max_pool2d as _gems_fwd
+
+    _adaptive_max_pool2d_aten_lib = torch.library.Library("aten", "IMPL")
+    _adaptive_max_pool2d_aten_lib.impl(
+        "adaptive_max_pool2d", _gems_fwd, "CUDA", allow_override=True
+    )
+
+
+_patch_adaptive_max_pool2d_aten()

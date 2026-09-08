@@ -150,6 +150,26 @@ def swiglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch
 __all__ = ["swiglu", "dswiglu"]
 
 
+@triton.jit
+def _rne_f16(x):
+    """RNE-round an f32 value to fp16 precision, returned as f32.
+
+    The value is exactly representable in fp16 (13 dropped mantissa bits), so
+    any subsequent f32->f16 conversion is exact regardless of rounding mode.
+    """
+    bits = x.to(tl.uint32, bitcast=True)
+    r = bits + 0x0FFF + ((bits >> 13) & 1)
+    return (r & 0xFFFFE000).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _rne_bf16(x):
+    """RNE-round an f32 value to bf16 precision, returned as f32."""
+    bits = x.to(tl.uint32, bitcast=True)
+    r = bits + 0x7FFF + ((bits >> 16) & 1)
+    return (r & 0xFFFF0000).to(tl.float32, bitcast=True)
+
+
 @libentry()
 @triton.jit
 def dswiglu_kernel(

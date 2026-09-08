@@ -153,6 +153,7 @@ def _lc_inv_kernel(L_ptr, X_ptr, N, r: tl.constexpr):
     l0 = b * N * N + r * 32 * N + r * 32
     x0 = b * 32768 + r * 1024
     J = tl.arange(0, 32)
+    dtype = L_ptr.dtype.element_ty
     for i in range(32):
         acc = tl.where(J == i, 1.0, 0.0)
         for k in range(i):

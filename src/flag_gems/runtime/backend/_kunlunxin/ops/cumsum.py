@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import logging
-import math
-import os
 
 import torch
 import triton
@@ -29,99 +27,151 @@ logger = logging.getLogger(__name__)
 device = device.name
 
 
-@libentry()
-@triton.jit(do_not_specialize=["n_elements", "part_num"])
-def scan_part_sum_kernel(
-    inp,
-    out,
-    partial_sum,
-    n_elements,
-    part_num,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = ext.program_id(0)
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset < n_elements
+# K == 1 (row scan over the last, stride-1 dim) tiers:
+#  - N <= _ROW_MAX_N: one row per program, whole row as a single 1D tile whose
+#    scan is a 1D tl.cumsum -- the only scan path this XPU backend lowers
+#    correctly (2D axis=1 tl.cumsum silently mis-computes).
+#  - N >  _ROW_MAX_N: per-row chunked online scan, BN-wide chunks chained in
+#    one program by a scalar carry (no host round trips / extra passes).
+_ROW_MAX_N = 4096
 
-    inp_ptrs = inp + offset
-    inp_vals = tl.load(inp_ptrs, mask=mask)
-    if (
-        tl.constexpr(inp_vals.dtype.is_int64())
-        or tl.constexpr(inp_vals.dtype.is_uint64())
-    ) or tl.constexpr(inp_vals.dtype.is_fp64()):
-        inp_vals = inp_vals
-    elif tl.constexpr(inp_vals.dtype.is_int()):
-        inp_vals = inp_vals.to(tl.int32)
+_TL_DTYPES = {
+    torch.float16: tl.float32,
+    torch.bfloat16: tl.float32,
+    torch.float32: tl.float32,
+    torch.float64: tl.float64,
+    torch.bool: tl.int32,
+    torch.uint8: tl.int32,
+    torch.int8: tl.int32,
+    torch.int16: tl.int32,
+    torch.int32: tl.int32,
+    torch.int64: tl.int64,
+    torch.uint64: tl.uint64,
+}
+
+
+@libentry()
+@triton.jit
+def cumsum_row_kernel(
+    inp_ptr,
+    out_ptr,
+    N: tl.constexpr,
+    TILE_N: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    """One row per program; single 1D tile inclusive scan. (2D axis=1
+    tl.cumsum silently mis-computes on this backend, so per-row 1D tiles.)"""
+    pid = ext.program_id(0)
+    row_offset = pid * N
+    n_offsets = tl.arange(0, TILE_N)
+    if NEED_MASK:
+        mask = n_offsets < N
+        x = tl.load(inp_ptr + row_offset + n_offsets, mask=mask, other=0.0)
     else:
-        inp_vals = inp_vals.to(tl.float32)
-    result = tl.cumsum(inp_vals, axis=0)
-
-    part_sum_via_sum = tl.sum(inp_vals)
-
-    out_ptrs = out + offset
-    tl.store(out_ptrs, result, mask=mask)
-
-    partial_sum_ptrs = partial_sum + pid
-    tl.store(partial_sum_ptrs, part_sum_via_sum)
+        x = tl.load(inp_ptr + row_offset + n_offsets)
+    if tl.constexpr(x.dtype.is_bf16()) or tl.constexpr(x.dtype.is_fp16()):
+        x = x.to(tl.float32)
+    elif (
+        tl.constexpr(x.dtype.is_int64()) or tl.constexpr(x.dtype.is_uint64())
+    ) or tl.constexpr(x.dtype.is_fp64()):
+        x = x
+    elif tl.constexpr(x.dtype.is_int()):
+        x = x.to(tl.int32)
+    else:
+        x = x.to(tl.float32)
+    r = tl.cumsum(x, axis=0)
+    if NEED_MASK:
+        tl.store(out_ptr + row_offset + n_offsets, r, mask=mask)
+    else:
+        tl.store(out_ptr + row_offset + n_offsets, r)
 
 
 @libentry()
-@triton.jit(do_not_specialize=["n_elements", "part_num"])
-def add_base_sum_kernel(
-    out,
-    partial_sum,
-    n_elements,
-    part_num,
-    BLOCK_SIZE: tl.constexpr,
+@triton.jit
+def cumsum_chunk_kernel(
+    inp_ptr,
+    out_ptr,
+    N,
+    ACC_DTYPE: tl.constexpr,
+    BN: tl.constexpr,
+    NEED_TAIL: tl.constexpr,
 ):
+    """Per-row chunked online scan for N > _ROW_MAX_N. A scalar
+    carry sum chains BN-wide chunks inside one program; the masked tail
+    chunk (masked load with other=0 + masked store) is proven exact."""
     pid = ext.program_id(0)
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset < n_elements
-
-    out_ptrs = out + offset
-    out_vals = tl.load(out_ptrs, mask=mask)
-
-    if pid > 0:
-        partial_sum_ptrs = partial_sum + pid - 1
-        last_part_sum_via_sum = tl.load(partial_sum_ptrs)
-
-        final_vals = out_vals + last_part_sum_via_sum
-        tl.store(out_ptrs, final_vals.to(out_vals.dtype), mask=mask)
+    row_offset = pid * N
+    carry = tl.zeros([BN], ACC_DTYPE)
+    for start in range(0, N, BN):
+        n_offsets = start + tl.arange(0, BN)
+        if NEED_TAIL:
+            mask = n_offsets < N
+            x = tl.load(inp_ptr + row_offset + n_offsets, mask=mask, other=0.0).to(
+                ACC_DTYPE
+            )
+        else:
+            x = tl.load(inp_ptr + row_offset + n_offsets).to(ACC_DTYPE)
+        r = tl.cumsum(x, axis=0) + carry
+        if NEED_TAIL:
+            tl.store(out_ptr + row_offset + n_offsets, r, mask=mask)
+        else:
+            tl.store(out_ptr + row_offset + n_offsets, r)
+        carry += tl.sum(x, axis=0)
 
 
 @libentry()
-@triton.jit(do_not_specialize=["part_num"])
-def scan_part_sum_abc_kernel(
-    inp,
-    out,
-    partial_sum,
-    B,
-    C,
-    part_num,
-    BLOCK_SIZE: tl.constexpr,
+@triton.jit
+def cumsum_identity_kernel(
+    inp_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK: tl.constexpr,
 ):
-    pid_a = ext.program_id(0)
-    pid_b = ext.program_id(1)
-    pid_c = ext.program_id(2)
+    """N == 1: cumsum along a length-1 row is the elementwise identity
+    (out dtype may differ, e.g. int -> int64, so a plain kernel is used)."""
+    pid = ext.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    x = tl.load(inp_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, x, mask=mask)
 
-    a_idx = pid_a
-    b_idx = pid_b * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    c_idx = pid_c
 
-    offset = a_idx * B * C + b_idx * C + c_idx
-    base_part_offset = a_idx * part_num * C + c_idx
-    part_offset = base_part_offset + pid_b * C
-
-    mask = b_idx < B
-    inp_ptrs = inp + offset
-    inp_vals = tl.load(inp_ptrs, mask=mask)
-    if (
-        tl.constexpr(inp_vals.dtype.is_int64())
-        or tl.constexpr(inp_vals.dtype.is_uint64())
-    ) or tl.constexpr(inp_vals.dtype.is_fp64()):
-        inp_vals = inp_vals
-    elif tl.constexpr(inp_vals.dtype.is_int()):
-        inp_vals = inp_vals.to(tl.int32)
+def _scan_rows_into(inp, out, M, N):
+    """K == 1 (row scan) fast paths: identity for N == 1, single-shot row
+    kernel for N <= 4096, chunked online scan for N > 4096."""
+    if N == 1:
+        n_elements = inp.numel()
+        BLOCK = 1024
+        grid = (triton.cdiv(n_elements, BLOCK), 1, 1)
+        cumsum_identity_kernel[grid](
+            inp,
+            out,
+            n_elements,
+            BLOCK=BLOCK,
+            num_warps=4,
+            buffer_size_limit=2048,
+        )
+    elif N <= _ROW_MAX_N:
+        # A tile of <= 32 lanes is mis-lowered on this backend: the scan runs
+        # over the full 32-wide vector and keeps carrying across the row
+        # boundary, so rows after the first come out with a stale prefix added
+        # (silently, e.g. M=64/N=4 reproduces the flat-cumsum pattern). Keep
+        # the tile at >= 64 lanes and mask the padding; masked padding lanes
+        # cannot corrupt a prefix scan because lane i only depends on lanes
+        # <= i and the store is masked as well.
+        TILE_N = max(64, triton.next_power_of_2(N))
+        need_mask = 1 if TILE_N != N else 0
+        num_warps = 8 if TILE_N > 2048 else 4
+        grid = (M, 1, 1)
+        cumsum_row_kernel[grid](
+            inp,
+            out,
+            N=N,
+            TILE_N=TILE_N,
+            NEED_MASK=need_mask,
+            num_warps=num_warps,
+            buffer_size_limit=2048,
+        )
     else:
         inp_vals = inp_vals.to(tl.float32)
     result = tl.cumsum(inp_vals, axis=0)
@@ -372,21 +422,102 @@ def scan_then_fan(inp, out, A, B, C, dtype):
             inp, out, partial_sum, B, C, part_num, BLOCK_SIZE
         )
 
-        if "TRITONXPU_OTHER_SIM" in os.environ:
-            del os.environ["TRITONXPU_OTHER_SIM"]
-        if "TRITONXPU_STORE_MASK_SIM" in os.environ:
-            del os.environ["TRITONXPU_STORE_MASK_SIM"]
 
+# K > 1 (mid-dim scan) tier: the previous scan_then_fan / scan_part_sum_*
+# kernels are unusable on this backend -- their 1024-lane tl.cumsum is
+# data-dependently mis-computed, their masked tail block performs OOB reads
+# into adjacent memory (polluted partial sums and even a hard fault for some
+# shapes), and the chunked row scans (N > _ROW_MAX_N, multiple iterations)
+# silently corrupt every row past the 12th for a masked tail.  The only
+# reliably-correct scan primitive on this backend is a SINGLE-SHOT <= 4096-lane
+# 1D tl.cumsum over unmasked, in-bounds data (see cumsum_row_kernel).  So the
+# mid-dim scan is decomposed into three passes over groups of _GROUP lanes on
+# a zero-padded (M*K, N) copy, with the group-prefix scan itself reusing
+# _scan_rows_into (which is proven).  cumsum commutes with the
+# (M, N, K) -> (M, K, N) transpose, so the result is identical to torch's.
+# See harness/solution/performance/cumsum__recheck_20260906.md.
+_GROUP = 4096
+
+
+@libentry()
+@triton.jit
+def scan_group_sum_kernel(inp, sums, N: tl.constexpr, NG: tl.constexpr, GROUP: tl.constexpr):
+    """(R, NG) grid: sum one GROUP-wide group.  The input is zero-padded to
+    exactly NG * GROUP columns, so the load is always fully in-bounds and
+    needs no mask (masked loads that can read adjacent memory are the one
+    construct this backend mis-compiles)."""
+    pid_r = ext.program_id(0)
+    pid_g = ext.program_id(1)
+    offs = pid_g * GROUP + tl.arange(0, GROUP)
+    x = tl.load(inp + pid_r * N + offs)
+    if tl.constexpr(x.dtype.is_bf16()) or tl.constexpr(x.dtype.is_fp16()):
+        x = x.to(tl.float32)
+    elif (
+        tl.constexpr(x.dtype.is_int64()) or tl.constexpr(x.dtype.is_uint64())
+    ) or tl.constexpr(x.dtype.is_fp64()):
+        x = x
+    elif tl.constexpr(x.dtype.is_int()):
+        x = x.to(tl.int32)
     else:
-        with torch_device_fn.device(inp.device):
-            scan_part_sum_abc_kernel[grid](
-                inp, out, partial_sum, B, C, part_num, BLOCK_SIZE
-            )
+        x = x.to(tl.float32)
+    tl.store(sums + pid_r * NG + pid_g, tl.sum(x, axis=0))
 
-    if part_num >= 2:
-        scan_then_fan(partial_sum, partial_sum, A, part_num, C, dtype)
-        with torch_device_fn.device(inp.device):
-            add_base_sum_abc_kernel[grid](out, partial_sum, B, C, part_num, BLOCK_SIZE)
+
+@libentry()
+@triton.jit
+def scan_group_add_kernel(inp, out, sums, N: tl.constexpr, NG: tl.constexpr, GROUP: tl.constexpr):
+    """(R, NG) grid: single-shot 1D scan of one group plus the prefix of all
+    groups before it (read directly from the pre-scanned `sums`)."""
+    pid_r = ext.program_id(0)
+    pid_g = ext.program_id(1)
+    offs = pid_g * GROUP + tl.arange(0, GROUP)
+    x = tl.load(inp + pid_r * N + offs)
+    if tl.constexpr(x.dtype.is_bf16()) or tl.constexpr(x.dtype.is_fp16()):
+        x = x.to(tl.float32)
+    elif (
+        tl.constexpr(x.dtype.is_int64()) or tl.constexpr(x.dtype.is_uint64())
+    ) or tl.constexpr(x.dtype.is_fp64()):
+        x = x
+    elif tl.constexpr(x.dtype.is_int()):
+        x = x.to(tl.int32)
+    else:
+        x = x.to(tl.float32)
+    base = tl.load(sums + pid_r * NG + tl.maximum(pid_g - 1, 0))
+    base = base * (pid_g > 0).to(base.dtype)
+    r = tl.cumsum(x, axis=0) + base
+    tl.store(out + pid_r * N + offs, r)
+
+
+def _scan_mid_into(inp, out, M, N, K):
+    """"(M, N, K) -> (M, K, N) -> padded group scan -> transpose back."""
+    R = M * K
+    n_groups = (N + _GROUP - 1) // _GROUP
+    Np = n_groups * _GROUP
+    with torch_device_fn.device(inp.device):
+        inp_t = inp.view(M, N, K).permute(0, 2, 1).contiguous()  # (M, K, N)
+        xp = torch.zeros(R, Np, dtype=inp.dtype, device=inp.device)
+        xp[:, :N] = inp_t.reshape(R, N)
+        # group sums are accumulated in fp32 (floats) / int64 (ints); the final
+        # store below casts back to `out`'s dtype (two's-complement for ints).
+        sums = torch.empty(
+            R,
+            n_groups,
+            dtype=torch.float32 if inp.dtype.is_floating_point else torch.int64,
+            device=inp.device,
+        )
+        out_t = torch.empty(R, Np, dtype=out.dtype, device=out.device)
+        scan_group_sum_kernel[(R, n_groups)](
+            xp, sums, Np, n_groups, _GROUP, num_warps=8, buffer_size_limit=2048
+        )
+        # group-prefix scan (row-scan tiers, proven; in-place is safe because
+        # each program only stores back the addresses it just loaded).
+        _scan_rows_into(sums, sums, R, n_groups)
+        scan_group_add_kernel[(R, n_groups)](
+            xp, out_t, sums, Np, n_groups, _GROUP, num_warps=8, buffer_size_limit=2048
+        )
+    torch.ops.aten._copy_from(
+        out_t[:, :N].reshape(M, K, N).permute(0, 2, 1), out.view(M, N, K), False
+    )
 
 
 def cumsum_wrapper(inp, dim=1, dtype=None, out=None):

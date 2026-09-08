@@ -123,6 +123,30 @@ def _ebdb_tile_scan_kernel(
 
 @libentry()
 @triton.jit
+def _ebdb_tile_prefix_kernel(
+    tile_count_ptr,
+    prefix_ptr,
+    n_tiles_ptr,
+    NWP: tl.constexpr,
+    BW: tl.constexpr,
+):
+    # One program per (sample-tile, row-block): exclusive-scan (along the tile
+    # axis) of the per-sample-tile counts.  Load-only dynamic loop (same
+    # tl.max-derived bound as _ebdb_tile_total_kernel) with a guard plus a
+    # single store, matching the gather kernels that lower cleanly here.
+    tid = tl.program_id(0)
+    rid = tl.program_id(1)
+    rows = rid * BW + tl.arange(0, BW)
+    n_tiles = tl.max(tl.load(n_tiles_ptr + rows))
+    acc = tl.zeros([BW], dtype=tl.int32)
+    for u in range(n_tiles):
+        if u < tid:
+            acc += tl.load(tile_count_ptr + u * NWP + rows)
+    tl.store(prefix_ptr + tid * NWP + rows, acc)
+
+
+@libentry()
+@triton.jit
 def _ebdb_scan_kernel(counts_ptr, start_ptr, TILE: tl.constexpr):
     off = tl.arange(0, TILE)
     c = tl.load(counts_ptr + off).to(tl.float32)
@@ -198,6 +222,10 @@ def _ebdb_gather_row_kernel(
     cols = blk * BD + tl.arange(0, BD)
     start = tl.load(start_ptr + row)
     cnt = tl.load(counts_ptr + row)
+    # The loop bound is derived through tl.max of a tile: a scalar-loaded bound
+    # with a 128-lane body fails TritonXPUUnrollControl on this backend (see
+    # _ebdb_tile_total_kernel), so mirror the flat kernel's loop structure.
+    k_max = tl.max(tl.full([BD], cnt, tl.int32))
     freq = 1.0
     if SGBF:
         if cnt > 1:

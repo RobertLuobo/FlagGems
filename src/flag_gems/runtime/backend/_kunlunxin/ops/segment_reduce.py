@@ -1101,11 +1101,23 @@ def segment_reduce(
     segment_count = output_shape[axis]
     inner_size = _prod(data_contig.shape[axis + 1 :])
     data_size_axis = data_contig.shape[axis]
+    segment_lengths = offsets_contig[..., 1:] - offsets_contig[..., :-1]
+    if segment_lengths.numel() > 0:
+        max_segment_length = int(segment_lengths.max().item())
+    else:
+        max_segment_length = 0
     block_size = min(
         _get_block_size(data.device), triton.next_power_of_2(max(data_size_axis, 32))
     )
     has_initial, initial_value = _make_initial(reduce, initial)
     grid = (output.numel(),)
+    # Bound the unroll by the largest *segment* instead of the whole axis:
+    # the kernel body is statically unrolled and TritonXPU (arch=3) faults
+    # with an illegal memory access on roughly 56+ unrolled 1024-wide
+    # blocks.  Every block beyond cdiv(segment_length, BLOCK_SIZE) is
+    # masked off by `block_active` anyway, so this is exactly correct and
+    # also much faster for the common short-segment case.
+    max_blocks = triton.cdiv(max(max_segment_length, 1), block_size)
 
     with torch_device_fn.device(data.device):
         _segment_reduce_forward_kernel[grid](
