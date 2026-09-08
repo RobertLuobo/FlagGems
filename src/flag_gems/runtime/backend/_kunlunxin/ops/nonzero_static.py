@@ -299,6 +299,10 @@ def _multiblock_nonzero_static(input, size, fill_value, out):
     prefixes = torch.empty_like(counts)
     total = torch.empty((), device=input.device, dtype=torch.int64)
     shape = tuple(input.shape) + (1,) * (6 - ndim)
+    # Single-program scan; keep the scan width tied to the actual block count
+    # so small-multiblock inputs do not pay a fixed 1024-lane scan (measured
+    # +0.43ms on the 1D 1M/256K cells with a fixed 1024).
+    scan_size = 1 << (num_blocks - 1).bit_length()
     with torch_device_fn.device(input.device):
         _nonzero_static_multiblock_count_kernel[(num_blocks,)](
             x,

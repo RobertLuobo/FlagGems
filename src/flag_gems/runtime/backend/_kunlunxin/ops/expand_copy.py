@@ -139,6 +139,13 @@ def expand_copy(x: torch.Tensor, size) -> torch.Tensor:
     if view.device != device:
         view = view.to(device)
 
+    # Create output tensor with the concrete (resolved) shape on the same device
+    out = torch.empty(view.shape, dtype=x.dtype, device=device)
+
+    # Handle empty tensors
+    if out.numel() == 0:
+        return out
+
     if view.is_contiguous():
         # Same-shape (or full) copy: flat bounded-tile block DMA.
         return copy_(out, view)

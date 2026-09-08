@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 # measures ~1.20 ms on the same shape, so arctan2 reuses exactly that poly
 # with the same block policy (3 unmasked sizes + 1 masked fallback).
 #
+# 2026-09-08 performance pass (mirror of the _kunlunxin/ops/atan2.py
+# 2026-09-04 tuning, which measured 0.5768x -> ~0.70x on the sibling atan2_):
+#  * fp16/bf16 run a deg-4 variant of the same LSQ fit (max abs err 1.16e-4,
+#    worst-case vs atol=1e-4 + rtol*|ref| is 0.77 for both fp16 (rtol 1e-3)
+#    and bf16 (rtol 16e-3), i.e. >=1.3x margin; the deg-7 fit (9.5e-7) is
+#    kept for fp32).  The (0,0)/(+-inf,1) special-value entries stay inside
+#    the 1e-4 atol (poly(0) = -7.7e-5).
+#  * Block policy swept by atan2 (event-time): >=2.1M -> 32768/8w (128
+#    elts/thread), 256K..1M -> 8192/8w (32 elts/thread), <=64K -> 2048/4w
+#    (16 elts/thread), the previous 131072/32w and 16384-wide policies
+#    measured 1.6x-2.6x slower at 1M/256K/64K/16K.
+#
 # arctan2-specific edge semantics on top of the atan2 poly:
 #  * NaN inputs must produce NaN (torch semantics, exercised by
 #    test_arctan2_special_values).  tl.minimum/tl.maximum are minnum/maxnum
@@ -111,6 +123,7 @@ def _arctan2_kernel_impl(
     out_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    LOW_DEG: tl.constexpr,
 ):
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -132,6 +145,7 @@ def _arctan2_kernel_impl_unmasked(
     x_ptr,
     out_ptr,
     BLOCK_SIZE: tl.constexpr,
+    LOW_DEG: tl.constexpr,
 ):
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -149,6 +163,7 @@ def _launch(y, x, out):
     if n_elements == 0:
         return
     block_size, num_warps, masked = _pick_block(n_elements)
+    low_deg = out.dtype != torch.float32
     if masked:
         grid = (triton.cdiv(n_elements, block_size),)
         _arctan2_kernel_impl[grid](
@@ -157,6 +172,7 @@ def _launch(y, x, out):
             out,
             n_elements,
             BLOCK_SIZE=block_size,
+            LOW_DEG=low_deg,
             num_warps=num_warps,
             unroll_num=_UNROLL_NUM,
             buffer_size_limit=_BUFFER_SIZE_LIMIT,
@@ -169,6 +185,7 @@ def _launch(y, x, out):
             x,
             out,
             BLOCK_SIZE=block_size,
+            LOW_DEG=low_deg,
             num_warps=num_warps,
             unroll_num=_UNROLL_NUM,
             buffer_size_limit=_BUFFER_SIZE_LIMIT,

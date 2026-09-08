@@ -674,6 +674,110 @@ def avg_pool2d_backward_flat_kernel(
     )
 
 
+@libentry()
+@triton.jit
+def avg_pool2d_backward_tap_kernel(
+    grad_output_ptr,
+    grad_input_ptr,
+    numel,
+    in_h: tl.constexpr,
+    in_w: tl.constexpr,
+    out_h: tl.constexpr,
+    out_w: tl.constexpr,
+    kernel_h: tl.constexpr,
+    kernel_w: tl.constexpr,
+    stride_h: tl.constexpr,
+    stride_w: tl.constexpr,
+    padding_h: tl.constexpr,
+    padding_w: tl.constexpr,
+    KH_TAPS: tl.constexpr,
+    KW_TAPS: tl.constexpr,
+    COUNT_INCLUDE_PAD: tl.constexpr,
+    divisor_override,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Folded-window variant of avg_pool2d_backward_flat_kernel. Instead of
+    # iterating the full (kernel_h x kernel_w) static window (9 taps for
+    # k3s2p1, most of which are masked out), iterate only the ceil(k/s) x
+    # ceil(k/w) taps that can ever be valid:
+    #   h_num = h_in + padding_h; h_base = h_num // stride_h
+    #   h_rem = h_num - h_base * stride_h; kh = h_rem + jh * stride_h
+    #   h_out = h_base - jh                      (jh in [0, ceil(k/stride)))
+    # This is a bijection over the (kh, h_out) pairs of the plain kernel, so
+    # the same effective tap set with the same divisor semantics; only the
+    # guaranteed-invalid taps are dropped (9 -> 4 for k3s2p1).
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    input_mask = offsets < numel
+
+    w_in = offsets % in_w
+    hw_tmp = offsets // in_w
+    h_in = hw_tmp % in_h
+    nc_idx = hw_tmp // in_h
+
+    grad_output_base_ptr = grad_output_ptr + nc_idx * (out_h * out_w)
+    grad_acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+
+    h_num = h_in + padding_h
+    h_base = h_num // stride_h
+    h_rem = h_num - h_base * stride_h
+    w_num = w_in + padding_w
+    w_base = w_num // stride_w
+    w_rem = w_num - w_base * stride_w
+
+    for jh in tl.static_range(0, KH_TAPS):
+        kh = h_rem + jh * stride_h
+        h_out = h_base - jh
+        h_ok = (kh < kernel_h) & (h_out >= 0) & (h_out < out_h)
+        h_start = h_out * stride_h - padding_h
+        if COUNT_INCLUDE_PAD:
+            h_lower, h_upper = -padding_h, in_h + padding_h
+        else:
+            h_lower, h_upper = 0, in_h
+        h_first = tl.maximum(h_lower - h_start, 0)
+        h_last = tl.minimum(h_upper - h_start, kernel_h)
+        h_count = tl.maximum(h_last - h_first, 0)
+        for jw in tl.static_range(0, KW_TAPS):
+            kw = w_rem + jw * stride_w
+            w_out = w_base - jw
+            out_mask = (
+                input_mask
+                & h_ok
+                & (kw < kernel_w)
+                & (w_out >= 0)
+                & (w_out < out_w)
+            )
+            w_start = w_out * stride_w - padding_w
+            if COUNT_INCLUDE_PAD:
+                w_lower, w_upper = -padding_w, in_w + padding_w
+            else:
+                w_lower, w_upper = 0, in_w
+            w_first = tl.maximum(w_lower - w_start, 0)
+            w_last = tl.minimum(w_upper - w_start, kernel_w)
+            w_count = tl.maximum(w_last - w_first, 0)
+            default_divisor = (h_count * w_count).to(tl.float32)
+            divisor = tl.where(
+                divisor_override != 0,
+                divisor_override + default_divisor * 0,
+                default_divisor,
+            )
+            divisor = tl.where(divisor == 0, 1.0, divisor)
+
+            # Unconditional in-bounds load (clamped index) + value-level
+            # select; masked loads with compound i1 conditions are a slow
+            # path on XPU.
+            c_h_out = tl.minimum(tl.maximum(h_out, 0), out_h - 1)
+            c_w_out = tl.minimum(tl.maximum(w_out, 0), out_w - 1)
+            grad_out_ptr = grad_output_base_ptr + c_h_out * out_w + c_w_out
+            grad_out = tl.load(grad_out_ptr, mask=input_mask, other=0.0)
+            grad_acc += tl.where(out_mask, grad_out / divisor, 0.0)
+
+    tl.store(
+        grad_input_ptr + offsets,
+        grad_acc.to(grad_input_ptr.type.element_ty),
+        mask=input_mask,
+    )
+
+
 def avg_pool2d_backward(
     grad_output: torch.Tensor,
     input: torch.Tensor,
@@ -721,6 +825,8 @@ def avg_pool2d_backward(
         stride_w,
         padding_h,
         padding_w,
+        KH_TAPS=kh_taps,
+        KW_TAPS=kw_taps,
         COUNT_INCLUDE_PAD=count_include_pad,
         divisor_override=divisor_override if divisor_override is not None else 0.0,
         BLOCK_SIZE=1024,

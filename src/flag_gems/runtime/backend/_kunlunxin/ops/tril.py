@@ -1020,6 +1020,13 @@ def _launch_exact_diag0_tile(
 
 
 _INPLACE_FLAT_BLOCK = 8192
+# Pow2 shift/mask only pays off once the band is large enough to amortize the
+# bigger blocks / different warp count of the shared `_launch_v2_pow2` path.
+# Below this (measured [10000,256] 65K elements, [64,64] 4K) the div kernel is
+# equal or better and the swap is within the launch-floor noise band; at/above
+# it every shape measured faster ([64,512,512] 262K: 1.6-1.9x, [4096,4096]
+# 16.7M: 1.6-1.8x). Must stay < 261632 (active of [64,512,512] at diag=0).
+_INPLACE_POW2_MIN_TOTAL = 1 << 17
 
 
 def _launch_tril_inplace_contiguous(
@@ -1039,6 +1046,19 @@ def _launch_tril_inplace_contiguous(
     active_rows = min(M, max(0, N - 1 - diagonal))
     if active_rows == 0:
         return input
+
+    if _is_power_of_2(N) and active_rows * N >= _INPLACE_POW2_MIN_TOTAL:
+        # Power-of-two N: share the proven `_tril_flat_pow2_kernel` (shift/mask
+        # row/col recovery) used by the out variants -- the XPU triton backend
+        # emits a real division for `offsets // N` even when N is a pow2
+        # constexpr, and that division dominates this memory-bound kernel
+        # (isolated [4096,4096] fp32: ~0.46ms -> ~0.29ms, [10000,65536] fp16:
+        # ~21.6ms -> ~12.8ms). In-place aliasing (in_ptr == out_ptr) is fine:
+        # kept cells are rewritten with their loaded values and strict-upper
+        # cells become 0; `active_rows` restricts the pass to the band.
+        return _launch_v2_pow2(
+            input, input, int(diagonal), active_rows=active_rows
+        )
 
     MN = M * N
     active_total = active_rows * N

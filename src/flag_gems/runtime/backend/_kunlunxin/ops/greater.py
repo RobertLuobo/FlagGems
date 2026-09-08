@@ -13,6 +13,7 @@
 # TRITONXPU_COMPARE_FUSION / TRITONXPU_FP16_FAST launch env vars for the tensor
 # path. Kernel body / algorithm unchanged (zero correctness risk).
 import logging
+import math
 import os
 
 import torch
@@ -195,6 +196,39 @@ def _greater_scalar_fast(A, scalar):
     return out
 
 
+@triton.jit
+def greater_scalar_fast_masked_kernel(
+    out_ptr, x_ptr, scalar, numel, TILE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    mask = tid < numel
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    t = (x - scalar) * 1.0e30
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(out_ptr + tid, t, mask=mask)
+
+
+def _greater_scalar_fast_masked(A, scalar, numel):
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (math.ceil(numel / _GREATER_SCALAR_FAST_TILE),)
+    greater_scalar_fast_masked_kernel[grid](
+        out32,
+        A,
+        scalar,
+        numel,
+        TILE=_GREATER_SCALAR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
 def _greater_scalar_out_fast(A, scalar, out):
     # Two-stage recipe identical to _greater_scalar_fast, but stage 2 converts
     # into the caller-provided bool `out` instead of an internal buffer. Stage 1
@@ -210,6 +244,28 @@ def _greater_scalar_out_fast(A, scalar, out):
         out32,
         A,
         scalar,
+        TILE=_GREATER_SCALAR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
+def _greater_scalar_out_fast_masked(A, scalar, out, numel):
+    # Out-variant of the masked two-stage path (real tail mask in the last
+    # block, every in-buffer element still written). Same recipe as
+    # _greater_scalar_fast_masked but stage 2 converts into the caller-provided
+    # contiguous bool `out`.
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (math.ceil(numel / _GREATER_SCALAR_FAST_TILE),)
+    greater_scalar_fast_masked_kernel[grid](
+        out32,
+        A,
+        scalar,
+        numel,
         TILE=_GREATER_SCALAR_FAST_TILE,
         num_warps=4,
         buffer_size_limit=8192,

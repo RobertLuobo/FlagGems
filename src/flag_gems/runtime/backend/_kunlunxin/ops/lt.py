@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 
 import torch
@@ -124,6 +125,39 @@ def _lt_scalar_fast(A, scalar):
         unroll_num=16,
         isCloseMemoryAsync=False,
     )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
+@triton.jit
+def lt_scalar_fast_masked_kernel(out_ptr, x_ptr, scalar, numel, TILE: tl.constexpr):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    mask = tid < numel
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    t = (scalar - x) * 1.0e30
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(out_ptr + tid, t, mask=mask)
+
+
+def _lt_scalar_fast_masked(A, scalar, numel):
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (math.ceil(numel / _LT_SCALAR_FAST_TILE),)
+    lt_scalar_fast_masked_kernel[grid](
+        out32,
+        A,
+        scalar,
+        numel,
+        TILE=_LT_SCALAR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
     return out
 
 

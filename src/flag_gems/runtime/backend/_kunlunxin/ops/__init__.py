@@ -27,6 +27,9 @@ from ._functional_sym_constrain_range_for_size import (
 from ._fused_adam import _fused_adam, _fused_adam_
 from ._fused_rms_norm import _fused_rms_norm  # noqa: F401
 from ._is_all_true import _is_all_true
+from ._jagged_to_padded_dense_forward import (
+    _jagged_to_padded_dense_forward,
+)
 from ._linalg_eigvals import _linalg_eigvals
 from ._native_batch_norm_legit_functional import _native_batch_norm_legit_functional
 from ._native_batch_norm_legit_no_training import _native_batch_norm_legit_no_training
@@ -192,6 +195,7 @@ from .digamma_ import digamma_
 from .div import (
     div_mode,
     div_mode_,
+    divide,
     floor_divide,
     floor_divide_,
     remainder,
@@ -200,6 +204,7 @@ from .div import (
     true_divide_,
     true_divide_out,
     true_divide_tensor,
+    true_divide_tensor_,
 )
 from .dot import dot
 from .dropout import dropout, dropout_backward
@@ -207,11 +212,13 @@ from .elu import elu, elu_, elu_backward
 from .embedding import embedding, embedding_backward, embedding_dense_backward
 from .eq import eq, eq_, eq_scalar, eq_scalar_
 from .erf import erf, erf_, special_erf
+from .erfc import erfc, erfc_, special_erfc  # noqa: F401
 from .erfinv import erfinv
 from .erfinv_ import erfinv_  # noqa: F401
 from .exp import exp, exp_, exp_out
 from .exp2 import exp2, exp2_
 from .expm1 import expm1, expm1_, expm1_out
+from .exponential import exponential  # noqa: F401
 from .exponential_ import exponential_
 from .eye import eye
 from .eye_m import eye_m
@@ -382,6 +389,7 @@ from .nanmedian import nanmedian, nanmedian_dim, nanmedian_dim_values, nanmedian
 from .nansum import nansum, nansum_out
 from .narrow_copy import narrow_copy
 from .native_batch_norm import native_batch_norm
+from .native_dropout_backward import native_dropout_backward
 from .native_group_norm import native_group_norm
 from .native_layer_norm import native_layer_norm
 from .ne import ne, ne_, ne_scalar, ne_scalar_
@@ -473,6 +481,7 @@ from .rnn_relu import rnn_relu
 from .roll import roll
 from .rot90 import rot90
 from .round import round, round_, round_out
+from .special_round import special_round, special_round_out
 from .rrelu_with_noise_backward import rrelu_with_noise_backward
 from .rsqrt import rsqrt, rsqrt_
 from .rsub import rsub, rsub_scalar, rsub_tensor
@@ -573,7 +582,7 @@ from .square import square, square_, square_out
 from .squeeze_copy import squeeze_copy  # noqa: F401
 from .stack import stack
 from .std import std
-from .sub import sub, sub_, subtract_
+from .sub import sub, sub_, subtract, subtract_
 from .sum import sum, sum_dim, sum_dim_out, sum_out
 from .t_copy import t_copy, t_copy_out
 from .tan import tan, tan_
@@ -612,10 +621,12 @@ from .weightnorm import weight_norm_interface, weight_norm_interface_backward
 from .where import where_scalar_other, where_scalar_self, where_self, where_self_out
 from .xlogy import (
     xlogy,
+    xlogy_,
     xlogy_out,
     xlogy_scalar_tensor,
     xlogy_scalar_tensor_out,
     xlogy_tensor_scalar,
+    xlogy_tensor_scalar_,
     xlogy_tensor_scalar_out,
 )
 from .zero import zero, zero_, zero_out
@@ -637,6 +648,8 @@ __all__ = [
     "special_hermite_polynomial_h",
     "special_log_softmax",
     "special_logsumexp",
+    "special_round",
+    "special_round_out",
     "softshrink",
     "softshrink_out",
     "_unique2",
@@ -658,6 +671,7 @@ __all__ = [
     "addmm",
     "addmm_out",
     "addmv",
+    "addmv_",
     "addmv_out",
     "addr",
     "alias_copy",
@@ -761,6 +775,7 @@ __all__ = [
     "diagonal_backward",
     "div_mode",
     "div_mode_",
+    "divide",
     "dot",
     "dropout",
     "dropout_backward",
@@ -773,14 +788,18 @@ __all__ = [
     "eq_scalar",
     "erf",
     "erf_",
+    "erfc",
+    "erfc_",
     "exp",
     "exp_",
     "exp_out",
     "exp2",
     "exp2_",
+    "expand_copy",
     "expm1",
     "expm1_",
     "expm1_out",
+    "exponential",
     "exponential_",
     "eye",
     "eye_m",
@@ -825,6 +844,8 @@ __all__ = [
     "hadamard_transform",
     "hardsigmoid",
     "hardsigmoid_out",
+    "hardshrink",
+    "hardshrink_out",
     "index",
     "index_add",
     "index_add_",
@@ -849,7 +870,11 @@ __all__ = [
     "lerp_tensor",
     "lerp_tensor_",
     "less_equal",
+    "less_equal_",
     "less_equal_scalar",
+    "less_equal_scalar_",
+    "less_",
+    "less_scalar_",
     "lift_fresh_copy",
     "linalg_ldl_solve",
     "linspace",
@@ -902,7 +927,9 @@ __all__ = [
     "mv",
     "mv_cluster",
     "nan_to_num",
+    "nan_to_num_",
     "narrow_copy",
+    "native_dropout_backward",
     "nanmedian",
     "nanmedian_dim",
     "nanmedian_dim_values",
@@ -994,6 +1021,7 @@ __all__ = [
     "scaled_softmax_forward",
     "scatter",
     "scatter_",
+    "scatter_add",
     "scatter_add_",
     "select_scatter",
     "selu",
@@ -1025,6 +1053,7 @@ __all__ = [
     "std",
     "sub",
     "sub_",
+    "subtract",
     "subtract_",
     "sum",
     "sum_dim",
@@ -1075,10 +1104,12 @@ __all__ = [
     "where_self",
     "where_self_out",
     "xlogy",
+    "xlogy_",
     "xlogy_out",
     "xlogy_scalar_tensor",
     "xlogy_scalar_tensor_out",
     "xlogy_tensor_scalar",
+    "xlogy_tensor_scalar_",
     "xlogy_tensor_scalar_out",
     "zero",
     "zero_",
@@ -1431,3 +1462,5 @@ def _patch_adaptive_max_pool2d_aten():
 
 
 _patch_adaptive_max_pool2d_aten()
+
+from .expand_copy import expand_copy

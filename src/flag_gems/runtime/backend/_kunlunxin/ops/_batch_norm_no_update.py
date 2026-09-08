@@ -151,6 +151,34 @@ def _batch_norm_no_update(
                     isCloseVectorization=True,
                     buffer_size_limit=2048,
                 )
+            else:
+                # n_groups x channels programs, each handling NB consecutive
+                # n-slices; chunk the program space when it exceeds the
+                # per-launch cap.
+                programs = n_groups * channels
+                for program_base in range(0, programs, BNNU_MAX_PROGRAMS):
+                    program_count = min(BNNU_MAX_PROGRAMS, programs - program_base)
+                    _batch_norm_no_update_fused_kernel[(program_count,)](
+                        input_flat,
+                        weight_pointer,
+                        bias_pointer,
+                        running_mean,
+                        running_var,
+                        output_flat,
+                        batch_dim,
+                        channels,
+                        inner,
+                        eps,
+                        program_base,
+                        NB=nb,
+                        HAS_WEIGHT=weight is not None,
+                        HAS_BIAS=bias is not None,
+                        TILE_S=tile_s,
+                        NEED_MASK=need_mask,
+                        num_warps=4,
+                        isCloseVectorization=True,
+                        buffer_size_limit=2048,
+                    )
 
     save_mean = torch.empty((0,), dtype=input.dtype, device=input.device)
     save_var = torch.empty((0,), dtype=input.dtype, device=input.device)

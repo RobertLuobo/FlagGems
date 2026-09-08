@@ -32,6 +32,27 @@ def _cubic_convolution2(x):
 
 
 @triton.jit
+def _gs_load(ptr, mask, NEED_MASK: tl.constexpr):
+    # When the total element count is a multiple of BLOCK there is no tail
+    # block, so `mask` is provably all-true; the unmasked load path avoids
+    # the slower masked-memory codegen on XPU (HARNESS_SUMMARY 2.4). All
+    # indices fed to the unmasked load are already clamped into the input
+    # tensor while `mask` is all-true, so the addresses are always in-bounds.
+    if NEED_MASK:
+        return tl.load(ptr, mask=mask, other=0.0)
+    else:
+        return tl.load(ptr)
+
+
+@triton.jit
+def _gs_store(ptr, value, mask, NEED_MASK: tl.constexpr):
+    if NEED_MASK:
+        tl.store(ptr, value, mask=mask)
+    else:
+        tl.store(ptr, value)
+
+
+@triton.jit
 def _grid_sample_2d_kunlunxin_kernel(
     output_ptr,
     input_ptr,
@@ -54,6 +75,7 @@ def _grid_sample_2d_kunlunxin_kernel(
     PADDING: tl.constexpr,
     ALIGN_CORNERS: tl.constexpr,
     BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < total
@@ -351,6 +373,7 @@ def _grid_sample_3d_kunlunxin_kernel(
     PADDING: tl.constexpr,
     ALIGN: tl.constexpr,
     BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < total
@@ -536,6 +559,7 @@ def grid_sample(
             PADDING={"zeros": 0, "border": 1, "reflection": 2}[padding_mode],
             ALIGN=align_corners,
             BLOCK=block,
+            NEED_MASK=(total % block != 0),
             num_warps=4,
             num_stages=1,
             isCloseVectorization=True,
@@ -582,6 +606,7 @@ def grid_sample(
         PADDING=padding_id,
         ALIGN_CORNERS=align_corners,
         BLOCK=block,
+        NEED_MASK=(total % block != 0),
         num_warps=4,
         num_stages=1,
         isCloseVectorization=True,
