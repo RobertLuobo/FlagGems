@@ -91,6 +91,50 @@ def copy_tensor_kernel(in_ptr, out_ptr, total, BLOCK: tl.constexpr):
     tl.store(out_ptr + o, vals, mask=mask)
 
 
+# One side (left: SIDE=0 / right: SIDE=1) of the reflection pads, for ALL rows
+# at once, as a flat (B * pad_side) range. The interior is copied by the native
+# `_copy_from` engine (see _launch_reflection_pad1d big-shape path); only these
+# 2 * B * pad_side elements use a Triton gather (reversed source order).
+#
+# IMPORTANT: every lane's load/store address is clamped in-bounds
+# (`idx_c = min(idx, total_side-1)`). The earlier variant computed the address
+# from the raw (unclamped) index: masked-off lanes produced out-of-bounds
+# addresses and the XPU backend corrupted neighboring memory (documented
+# "masked tail" hazard of this backend), showing up as garbage in the pad
+# slots. Clamping keeps all addresses inside the buffer; the `m` mask makes the
+# extra duplicate writes semantically harmless.
+@triton.jit
+def pad1d_side_kernel(
+    in_ptr,
+    out_ptr,
+    W_in,
+    pad_left,
+    W_out,
+    total_side,
+    PAD: tl.constexpr,
+    SIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    idx_c = tl.minimum(idx, total_side - 1)
+    m = idx < total_side
+    b = idx_c // PAD
+    j = idx_c - b * PAD
+    if SIDE == 0:
+        # output w = j in [0, pad_left) <- src = pad_left - j (reversed)
+        src = pad_left - j
+        dst = b * W_out + j
+    else:
+        # output w = W_in + pad_left + j in [W_in+pad_left, W_out)
+        # <- src = W_in - 2 - j (reversed; exact when pad_right < W_in, which
+        # is host-validated)
+        src = W_in - 2 - j
+        dst = b * W_out + W_in + pad_left + j
+    v = tl.load(in_ptr + b * W_in + src)
+    tl.store(out_ptr + dst, v, mask=m)
+
+
 def _launch_reflection_pad1d(input: torch.Tensor, padding, out: torch.Tensor = None):
     if not isinstance(padding, (list, tuple)) or len(padding) != 2:
         raise ValueError(
@@ -151,6 +195,48 @@ def _launch_reflection_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
         )
 
     total_out = B * W_out
+    # Big-output split path: copy the (contiguous) interior with the native
+    # `_copy_from` engine (gems never overrides `_copy_from` -> reaches the
+    # vendor strided-copy engine; same trick as slice_backward/constant_pad_nd)
+    # and handle only the 2*B*(pad_left+pad_right) pad elements in Triton.
+    # The flat kernel below is gather-bound for the interior (measured ~2.2ms
+    # vs native ~0.023ms on [32,64,2048] pad(3,5)); the split is ~30x faster
+    # there (measured ~60-75us). For smaller outputs the extra launches lose
+    # to the single flat kernel, so keep them on the flat path (measured
+    # crossover: split wins from ~33k output elements up; the benchmark
+    # middle shape (8,16,256) stays on flat).
+    if total_out >= 262144:
+        with torch_device_fn.device(x.device):
+            mid = torch.ops.aten.slice(out, -1, pad_left, pad_left + W_in)
+            torch.ops.aten._copy_from(x, mid, False)
+            if pad_left > 0:
+                tot = B * pad_left
+                pad1d_side_kernel[(triton.cdiv(tot, 256),)](
+                    x,
+                    out,
+                    W_in,
+                    pad_left,
+                    W_out,
+                    tot,
+                    PAD=pad_left,
+                    SIDE=0,
+                    BLOCK=256,
+                )
+            if pad_right > 0:
+                tot = B * pad_right
+                pad1d_side_kernel[(triton.cdiv(tot, 256),)](
+                    x,
+                    out,
+                    W_in,
+                    pad_left,
+                    W_out,
+                    tot,
+                    PAD=pad_right,
+                    SIDE=1,
+                    BLOCK=256,
+                )
+        return out
+
     # Adaptive BLOCK: tiny outputs fit with far less launch overhead in a
     # 256-lane program than in one 1024-lane program (measured 1.2-1.7x on
     # (3,33)/(2,4,64)); medium/large shapes keep BLOCK=1024 (sweep optimum).

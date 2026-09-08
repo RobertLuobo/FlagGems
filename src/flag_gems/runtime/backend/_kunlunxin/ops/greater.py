@@ -13,6 +13,7 @@
 # TRITONXPU_COMPARE_FUSION / TRITONXPU_FP16_FAST launch env vars for the tensor
 # path. Kernel body / algorithm unchanged (zero correctness risk).
 import logging
+import math
 import os
 
 import torch
@@ -112,15 +113,27 @@ def greater_scalar(A, B):
     # trips `arith.cmpf requires all operands to have the same type` and blows the
     # uni_sram budget -> `out of resource: uni_sram` compile failure (fp16). The
     # sibling gt_scalar deliberately omits them for the same reason.
+    numel = A.numel()
+    dtype = A.dtype
     if (
         A.is_contiguous()
-        and A.dtype in (torch.float16, torch.float32, torch.bfloat16)
-        and (numel := A.numel()) >= _GREATER_SCALAR_FAST_TILE
-        and numel % _GREATER_SCALAR_FAST_TILE == 0
-        and numel // _GREATER_SCALAR_FAST_TILE >= _GREATER_SCALAR_MIN_GRID
-        and float(B) == float(torch.tensor(float(B), dtype=A.dtype).item())
+        and dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and float(B) == float(torch.tensor(float(B), dtype=dtype).item())
     ):
-        return _greater_scalar_fast(A, float(B))
+        if (
+            numel >= _GREATER_SCALAR_FAST_TILE * _GREATER_SCALAR_MIN_GRID
+            and numel % _GREATER_SCALAR_FAST_TILE == 0
+        ):
+            # exact-multiple flat tiles (grid = numel / TILE >= MIN_GRID): no
+            # mask, no i1 -- a saturating fp32 store + vendor bool conversion.
+            return _greater_scalar_fast(A, float(B))
+        if numel >= _GREATER_SCALAR_MASKED_MIN and numel % _GREATER_SCALAR_FAST_TILE != 0:
+            # non-multiple mid sizes (e.g. 2.56M): flat tiles with a real tail
+            # mask. The mask is genuine (only the OOB tail of the last block is
+            # masked -- every in-buffer element is still written), so the
+            # masked-memory path is the only penalty and the i1/bool-store
+            # catastrophe is still avoided.
+            return _greater_scalar_fast_masked(A, float(B), numel)
     res = greater_func_scalar(A, B)
     return res
 
@@ -163,7 +176,8 @@ def greater_scalar(A, B):
 # behavior verified against torch on device for all three dtypes
 # (iso_midf32.py; also consistent with the ge_/lt_ family closures).
 _GREATER_SCALAR_FAST_TILE = 131072
-_GREATER_SCALAR_MIN_GRID = 512
+_GREATER_SCALAR_MIN_GRID = 128
+_GREATER_SCALAR_MASKED_MIN = 1 << 20
 
 
 @triton.jit
@@ -184,6 +198,39 @@ def _greater_scalar_fast(A, scalar):
         out32,
         A,
         scalar,
+        TILE=_GREATER_SCALAR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
+@triton.jit
+def greater_scalar_fast_masked_kernel(
+    out_ptr, x_ptr, scalar, numel, TILE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    mask = tid < numel
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    t = (x - scalar) * 1.0e30
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(out_ptr + tid, t, mask=mask)
+
+
+def _greater_scalar_fast_masked(A, scalar, numel):
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (math.ceil(numel / _GREATER_SCALAR_FAST_TILE),)
+    greater_scalar_fast_masked_kernel[grid](
+        out32,
+        A,
+        scalar,
+        numel,
         TILE=_GREATER_SCALAR_FAST_TILE,
         num_warps=4,
         buffer_size_limit=8192,
@@ -220,6 +267,28 @@ def _greater_scalar_out_fast(A, scalar, out):
     return out
 
 
+def _greater_scalar_out_fast_masked(A, scalar, out, numel):
+    # Out-variant of the masked two-stage path (real tail mask in the last
+    # block, every in-buffer element still written). Same recipe as
+    # _greater_scalar_fast_masked but stage 2 converts into the caller-provided
+    # contiguous bool `out`.
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (math.ceil(numel / _GREATER_SCALAR_FAST_TILE),)
+    greater_scalar_fast_masked_kernel[grid](
+        out32,
+        A,
+        scalar,
+        numel,
+        TILE=_GREATER_SCALAR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
 def greater_scalar_out(A, B, *, out=None):
     logger.debug("GEMS_KUNLUNXIN GREATER_SCALAR_OUT")
     # See greater_scalar: no fusion env vars on the scalar path (fp16 compile).
@@ -234,12 +303,16 @@ def greater_scalar_out(A, B, *, out=None):
         and A.is_contiguous()
         and out.is_contiguous()
         and A.dtype in (torch.float16, torch.float32, torch.bfloat16)
-        and (numel := A.numel()) >= _GREATER_SCALAR_FAST_TILE
-        and numel % _GREATER_SCALAR_FAST_TILE == 0
-        and numel // _GREATER_SCALAR_FAST_TILE >= _GREATER_SCALAR_MIN_GRID
         and float(B) == float(torch.tensor(float(B), dtype=A.dtype).item())
     ):
-        return _greater_scalar_out_fast(A, float(B), out)
+        numel = A.numel()
+        if (
+            numel >= _GREATER_SCALAR_FAST_TILE * _GREATER_SCALAR_MIN_GRID
+            and numel % _GREATER_SCALAR_FAST_TILE == 0
+        ):
+            return _greater_scalar_out_fast(A, float(B), out)
+        if numel >= _GREATER_SCALAR_MASKED_MIN and numel % _GREATER_SCALAR_FAST_TILE != 0:
+            return _greater_scalar_out_fast_masked(A, float(B), out, numel)
     if out is None:
         res = greater_func_scalar(A, B)
     else:

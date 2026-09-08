@@ -1068,14 +1068,27 @@ def _backward_launch(output, grad_output, in_grad, M, N):
             num_warps=8,
         )
         if tail:
-            log_softmax_backward_kernel_multirow_tail[(1, 1, 1)](
-                output,
-                grad_output,
-                in_grad,
-                M,
-                nfull * tile_m,
+            # Tail rows (M % TILE_M != 0) go through the per-row 1D masked
+            # kernel instead of log_softmax_backward_kernel_multirow_tail:
+            # the 2D row-masked tile miscompiles on XPU (measured maxdiff
+            # 15-44 on (8|40|100, 64) vs fp64 ref; same family as the
+            # log_softmax 2026-09-02 forward tail fix). TILE_N is padded to
+            # >= 64 lanes: the 1D per-row kernel drops lanes below 64 (e.g.
+            # N=2/4 unmasked -> maxdiff 5.8/15.3), while a 64-lane masked
+            # tile is exact. This branch only runs for pow2 N, so padding
+            # only affects N < 64. Slicing the row range keeps the kernel's
+            # `pid_m * N` row stride contiguous. Benchmark shapes all have
+            # tail == 0, so this changes no hot path.
+            row_start = nfull * tile_m
+            tile_n = max(triton.next_power_of_2(N), 64)
+            log_softmax_backward_kernel_perrow[(tail, 1, 1)](
+                output[row_start:],
+                grad_output[row_start:],
+                in_grad[row_start:],
+                tail,
                 N,
-                TILE_M=tile_m,
+                TILE_N=tile_n,
+                NEED_MASK=(N % tile_n) != 0,
                 buffer_size_limit=2048,
                 num_warps=8,
             )
@@ -1275,9 +1288,77 @@ def log_softmax_out(self, dim, half_to_float=False, *, out):
 
 
 def log_softmax_backward_out(grad_output, output, dim, input_dtype, *, out):
+    # Out-variant: compute directly into `out` instead of the previous
+    # `res = log_softmax_backward(...); out.copy_(res)` shape. `copy_` is a
+    # gems-registered op, so inside `flag_gems.use_gems()` the write-back was
+    # a gems strided pointwise copy over the whole tensor (the same trap as
+    # softmax_out 2026-08-29); a direct launch removes one full-tensor
+    # read+write. Layout handling mirrors log_softmax_out: K>1 transposes and
+    # non-contiguous out both go through the native strided copy
+    # `aten::_copy_from` (gems never overrides it).
     logger.debug("GEMS_KUNLUNXIN LOG_SOFTMAX_BACKWARD_OUT")
-    res = log_softmax_backward(grad_output, output, dim, input_dtype)
-    if tuple(out.shape) != tuple(res.shape):
-        out.resize_(res.shape)
-    out.copy_(res)
+
+    assert dim >= -output.ndim and dim < output.ndim, "Invalid dim"
+    dim = dim % output.ndim
+    if tuple(out.shape) != tuple(output.shape):
+        out.resize_(output.shape)
+    if out.dtype != input_dtype:
+        raise RuntimeError(
+            f"_log_softmax_backward_data.out: expected out dtype {input_dtype}, got {out.dtype}"
+        )
+    if output.numel() == 0:
+        # Empty input (any dim-size == 0): ATen semantics only resize the
+        # output and return; no kernel may run with N == 0.
+        return out
+
+    M = 1
+    N = output.shape[dim]
+    for i in range(dim):
+        M *= output.shape[i]
+
+    grad_output = grad_output.contiguous()
+    output = output.contiguous()
+    K = output.numel() // M // N
+
+    with torch_device_fn.device(out.device):
+        if K > 1:
+            # Reduction over an interior dim: transpose so the reduced axis is
+            # contiguous, then run the fast K == 1 launch family into a
+            # contiguous scratch and mirror it back through a transposed view
+            # of out (see log_softmax_out 2026-08-29: Tensor.contiguous() is a
+            # gems-registered op inside use_gems() and would be a slow
+            # strided pointwise copy).
+            out_grad_t = torch.empty(
+                (M * K, N), dtype=grad_output.dtype, device=out.device
+            )
+            torch.ops.aten._copy_from(
+                grad_output.view(M, N, K).transpose(1, 2),
+                out_grad_t.view(M, K, N),
+                False,
+            )
+            out_t = torch.empty((M * K, N), dtype=output.dtype, device=out.device)
+            torch.ops.aten._copy_from(
+                output.view(M, N, K).transpose(1, 2), out_t.view(M, K, N), False
+            )
+            in_grad_t = torch.empty((M * K, N), dtype=input_dtype, device=out.device)
+            _backward_launch(out_t, out_grad_t, in_grad_t, M * K, N)
+            src = in_grad_t.view(M, K, N).transpose(1, 2)
+            if out.is_contiguous():
+                torch.ops.aten._copy_from(src, out.view(M, N, K), False)
+            else:
+                scratch = torch.empty((M, N, K), dtype=input_dtype, device=out.device)
+                torch.ops.aten._copy_from(src, scratch, False)
+                torch.ops.aten._copy_from(scratch, out, False)
+            return out
+        if out.is_contiguous():
+            # Fast path: the launch kernels write flat (M, N)-contiguous
+            # offsets, so a contiguous out can be written in place.
+            _backward_launch(output, grad_output, out.view(M, N), M, N)
+        else:
+            # Strided out (e.g. a slice view): compute into a contiguous
+            # scratch, then mirror with the native strided copy (gems never
+            # overrides _copy_from, unlike the registered copy_).
+            tmp = torch.empty(output.shape, dtype=input_dtype, device=out.device)
+            _backward_launch(output, grad_output, tmp.view(M, N), M, N)
+            torch.ops.aten._copy_from(tmp, out, False)
     return out

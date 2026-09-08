@@ -303,6 +303,27 @@ def true_divide_(A, B):
         return true_div_func_tensor_scalar(A, B, out0=A)
 
 
+def true_divide_tensor_(A, B):
+    """Canonical Tensor overload of in-place true division
+    (explicit aten true_divide_.Tensor).
+
+    The generic flag_gems.ops.true_divide_.true_divide_tensor_ routes through
+    the generic flag_gems.ops.div.true_divide_, whose pointwise kernel lacks
+    the Kunlunxin tuned CodeGenConfig (same issue as true_divide_tensor,
+    measured ~330x slower on XPU for (4096,4096) fp32: 69ms vs 205us; for the
+    in-place tensor/tensor path the baseline is even worse, ~71ms vs 0.24ms).
+    Exporting this vendor implementation lets SpecOpRegistrar swap it in so
+    aten::true_divide_.Tensor uses the same fast tuned kernel as div_ and
+    true_divide_.
+    """
+    logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_TENSOR_")
+    # keep the dispatch-contract log line expected by tests/test_true_divide.py
+    # (caplog on logger "flag_gems.ops.true_divide_", same pattern as
+    # true_divide_tensor / special_erf)
+    logging.getLogger("flag_gems.ops.true_divide_").debug("GEMS TRUE_DIVIDE_")
+    return true_divide_(A, B)
+
+
 def divide(A, B):
     """Vendor override for aten::divide (alias of true division).
 

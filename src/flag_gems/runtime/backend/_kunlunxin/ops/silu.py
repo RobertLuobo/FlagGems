@@ -52,12 +52,24 @@ def silu_forward(x):
 # a swept comparison showed all unroll8 variants land at ~0.55ms for
 # [4096,4096] fp16 (vs 0.80ms config-less, ~1.45x) with bit-identical output;
 # vec OPEN spiked to 28.9ms on fp32 [1024,65536] so keep isCloseVectorization.
+# The sigmoid division in silu_backward_kernel uses tl.fdiv (not libdevice
+# div_rn): on XPU an interleaved A/B probe (2026-09-08, XPU 6) showed fdiv
+# output bit-identical to div_rn (maxabs=0.0 on 100M+ randn/zero/ones/
+# subnormal samples, incl. masked-tail shapes) and 4-6% faster on the
+# pointwise path (e.g. [4096,4096] fp16 513->486us, fp32 467->439us;
+# [1024,65536] bf16 2006->1884us) -- div_rn is a slower (round-to-nearest
+# emulated) division on this backend; inf/NaN semantics identical to torch
+# reference (both produce NaN at the same positions).
+# NOTE: the tiny flat kernel below MUST keep div_rn -- on XPU, fdiv in a
+# hand-written flat 1D kernel with other=0.0 masked loads miscompiles for
+# float16 (loaded x becomes 0.0 -> output = dy*sigmoid(0)*1.0, e.g.
+# [0.5786]/[-0.896] gives -0.448 instead of -0.693); div_rn is unaffected.
 @pointwise_dynamic(promotion_methods=[(0, "DEFAULT")], config=config_)
 @triton.jit
 def silu_backward_kernel(x, dy):
     dy_fp32 = dy.to(tl.float32)
     x_fp32 = x.to(tl.float32)
-    sigma = div_rn(1.0, 1.0 + tl.exp(-x_fp32))
+    sigma = tl.fdiv(1.0, 1.0 + tl.exp(-x_fp32))
     dx = dy_fp32 * sigma * (1.0 + x_fp32 * (1.0 - sigma))
     return dx
 
@@ -71,7 +83,9 @@ def silu_backward_kernel(x, dy):
 # flat/NEED_MASK tier (B2048..B32768 x w4..16) and every CodeGenConfig variant
 # (unroll 8/16/32 x buffer 4096/8192/16384 x tile 256/512/1024 x autogrid),
 # so only the tiny window uses the flat kernel. Math bit-identical to
-# silu_backward_kernel (fp32 staging, div_rn, downcast at store).
+# silu_backward_kernel (fp32 staging, downcast at store; div_rn == fdiv
+# bitwise on this backend, see probe note above) even though it keeps
+# div_rn for the fp16 masked-load miscompile documented above.
 _TINY_MAX_NUMEL = 2048
 _TINY_BLOCK = 2048
 _TINY_WARPS = 4

@@ -21,7 +21,7 @@ import triton.language as tl
 # from flag_gems import runtime
 from flag_gems.ops.zeros import zero_
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import dim_compress, libentry
+from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,31 @@ _SMALL_M = 4096
 _HUGE_N = 32768
 _SMALL_BLOCK_M = 8
 _TAIL_BLOCK_M = 64
+# Register/lane budget (BM * BN) for the exact single-tile row reduce.
+_EXACT_TILE_LANES = 65536
+
+
+def _compress(inp, dims):
+    """Equivalent of `dim_compress` (permute + compactify) whose transposed
+    copy goes through `torch.ops.aten._copy_from` (gems never registers
+    `_copy_from` -> the vendor native strided-copy engine).  `.contiguous()`
+    inside `use_gems()` would otherwise dispatch to the gems `copy_` strided
+    pointwise path (~5GB/s discrete-gather wall, tens of ms for the 3-D
+    middle-dim shapes).  Zero-copy when the permuted view is already
+    contiguous.  Same pattern as slice_backward / resize / constant_pad_nd."""
+    if isinstance(dims, int):
+        dims = [dims]
+    nd = inp.ndim
+    stride = inp.stride()
+    batch_dim = [i for i in range(nd) if i not in dims]
+    sorted_reduction_dim = sorted(dims, key=lambda x: stride[x], reverse=True)
+    order = batch_dim + sorted_reduction_dim
+    perm = inp.permute(order)
+    if perm.is_contiguous():
+        return perm
+    dst = torch.empty(perm.shape, dtype=perm.dtype, device=perm.device)
+    torch.ops.aten._copy_from(perm, dst, False)
+    return dst
 
 
 def _resolve_acc_dtype(inp_dtype):
@@ -285,7 +310,22 @@ def _launch_sum_dim(inp, out, M, N):
         # exact flat machinery (parallel over N).
         _launch_sum_flat(inp.view(-1), out, _resolve_acc_dtype(inp.dtype))
         return
-
+    if N == 1:
+        # Sum over size-1 dims == exact copy of the input (no reduction).
+        # Native strided-copy engine (gems never registers _copy_from).
+        torch.ops.aten._copy_from(inp.reshape(-1), out.reshape(-1), False)
+        return
+    if (N & (N - 1)) == 0 and N < _ROW_BN:
+        # Exact unmasked single-tile row reduce (N a power of two, < 8192;
+        # 8192 is the documented exact tl.sum point).  Avoids the
+        # all-true-mask slow path of the two-stage tail kernel (which also
+        # wastes a zero-fill launch for the n0 == 0 case).
+        block_m = min(_BLOCK_M, max(8, _EXACT_TILE_LANES // N))
+        with torch_device_fn.device(inp.device):
+            _sum_row_full_kernel[(triton.cdiv(M, block_m), 1, 1)](
+                inp, out, M, N, N, block_m, N, buffer_size_limit=2048
+            )
+        return
     block_m = _BLOCK_M
     if M <= _SMALL_M and N >= _HUGE_N:
         block_m = _SMALL_BLOCK_M
@@ -367,7 +407,7 @@ def sum_dim(inp, dim=None, keepdim=False, *, dtype=None):
 
     shape = list(inp.shape)
     dim = [d % inp.ndim for d in dim]
-    inp = dim_compress(inp, dim)
+    inp = _compress(inp, dim)
     N = 1
     for i in dim:
         N *= shape[i]
@@ -407,7 +447,7 @@ def sum_dim_out(inp, dim=None, keepdim=False, *, dtype=None, out):
 
     shape = list(inp.shape)
     dim = [d % inp.ndim for d in dim]
-    inp = dim_compress(inp, dim)
+    inp = _compress(inp, dim)
     N = 1
     for i in dim:
         N *= shape[i]

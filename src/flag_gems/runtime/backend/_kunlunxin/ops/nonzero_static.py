@@ -24,7 +24,7 @@ from flag_gems.utils import libentry
 
 _SMALL_INPUT_MAX_NUMEL = 8192
 _MULTI_BLOCK_TILE_SIZE = 8192
-_MULTI_BLOCK_COUNT_SIZE = 256
+_MULTI_BLOCK_COUNT_SIZE = 1024
 _MULTI_BLOCK_MAX_NUMEL = _MULTI_BLOCK_TILE_SIZE * _MULTI_BLOCK_COUNT_SIZE
 
 
@@ -176,7 +176,7 @@ def _nonzero_static_multiblock_scan_kernel(
 @triton.jit
 def _nonzero_static_multiblock_write_kernel(
     x_ptr,
-    counts_ptr,
+    prefixes_ptr,
     workspace_ptr,
     size: tl.constexpr,
     numel: tl.constexpr,
@@ -189,7 +189,6 @@ def _nonzero_static_multiblock_write_kernel(
     D5: tl.constexpr,
     IS_COMPLEX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    COUNT_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_SIZE)
@@ -202,12 +201,11 @@ def _nonzero_static_multiblock_write_kernel(
         flags = tl.load(x_ptr + linear) != 0
     valid = (linear < numel) & flags
     local_rank = tl.cumsum(valid.to(tl.int32), axis=0) - 1
-    prior_counts = tl.load(counts_ptr + tl.arange(0, COUNT_SIZE))
-    prefix = tl.sum(tl.where(tl.arange(0, COUNT_SIZE) < pid, prior_counts, 0), axis=0)
-    selected = valid & (prefix + local_rank < size)
+    prior = tl.load(prefixes_ptr + pid)
+    selected = valid & (prior + local_rank < size)
     destination = tl.where(
         selected,
-        prefix + local_rank,
+        prior + local_rank,
         size + pid * BLOCK_SIZE + offsets,
     ).to(tl.int64)
 
@@ -299,6 +297,10 @@ def _multiblock_nonzero_static(input, size, fill_value, out):
     prefixes = torch.empty_like(counts)
     total = torch.empty((), device=input.device, dtype=torch.int64)
     shape = tuple(input.shape) + (1,) * (6 - ndim)
+    # Single-program scan; keep the scan width tied to the actual block count
+    # so small-multiblock inputs do not pay a fixed 1024-lane scan (measured
+    # +0.43ms on the 1D 1M/256K cells with a fixed 1024).
+    scan_size = 1 << (num_blocks - 1).bit_length()
     with torch_device_fn.device(input.device):
         _nonzero_static_multiblock_count_kernel[(num_blocks,)](
             x,
@@ -307,13 +309,13 @@ def _multiblock_nonzero_static(input, size, fill_value, out):
             IS_COMPLEX=source.is_complex(),
             BLOCK_SIZE=_MULTI_BLOCK_TILE_SIZE,
         )
-        counts[num_blocks:].zero_()
+        counts[num_blocks:scan_size].zero_()
         _nonzero_static_multiblock_scan_kernel[(1,)](
-            counts, prefixes, total, COUNT_SIZE=_MULTI_BLOCK_COUNT_SIZE
+            counts, prefixes, total, COUNT_SIZE=scan_size
         )
         _nonzero_static_multiblock_write_kernel[(num_blocks,)](
             x,
-            counts,
+            prefixes,
             workspace,
             size,
             numel,
@@ -321,7 +323,6 @@ def _multiblock_nonzero_static(input, size, fill_value, out):
             *shape,
             IS_COMPLEX=source.is_complex(),
             BLOCK_SIZE=_MULTI_BLOCK_TILE_SIZE,
-            COUNT_SIZE=_MULTI_BLOCK_COUNT_SIZE,
         )
         if size:
             _nonzero_static_multiblock_fill_tail_kernel[(size,)](

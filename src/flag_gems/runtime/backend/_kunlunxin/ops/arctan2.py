@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 # measures ~1.20 ms on the same shape, so arctan2 reuses exactly that poly
 # with the same block policy (3 unmasked sizes + 1 masked fallback).
 #
+# 2026-09-08 performance pass (mirror of the _kunlunxin/ops/atan2.py
+# 2026-09-04 tuning, which measured 0.5768x -> ~0.70x on the sibling atan2_):
+#  * fp16/bf16 run a deg-4 variant of the same LSQ fit (max abs err 1.16e-4,
+#    worst-case vs atol=1e-4 + rtol*|ref| is 0.77 for both fp16 (rtol 1e-3)
+#    and bf16 (rtol 16e-3), i.e. >=1.3x margin; the deg-7 fit (9.5e-7) is
+#    kept for fp32).  The (0,0)/(+-inf,1) special-value entries stay inside
+#    the 1e-4 atol (poly(0) = -7.7e-5).
+#  * Block policy swept by atan2 (event-time): >=2.1M -> 32768/8w (128
+#    elts/thread), 256K..1M -> 8192/8w (32 elts/thread), <=64K -> 2048/4w
+#    (16 elts/thread), the previous 131072/32w and 16384-wide policies
+#    measured 1.6x-2.6x slower at 1M/256K/64K/16K.
+#
 # arctan2-specific edge semantics on top of the atan2 poly:
 #  * NaN inputs must produce NaN (torch semantics, exercised by
 #    test_arctan2_special_values).  tl.minimum/tl.maximum are minnum/maxnum
@@ -59,8 +71,6 @@ config_ = CodeGenConfig(
     unroll_num=8,
 )
 
-_MIN_BLOCK = 2048
-_MAX_BLOCK = 131072
 _UNROLL_NUM = 16
 _BUFFER_SIZE_LIMIT = 8192
 _IS_CLOSE_MEMORY_ASYNC = False
@@ -68,37 +78,49 @@ _IS_CLOSE_MEMORY_ASYNC = False
 
 def _pick_block(n_elements):
     # Same bucketing as atan2: unmasked when the shape divides the tile
-    # exactly (masked memory path on XPU costs ~2x).
-    if n_elements >= 1_048_576 and n_elements % _MAX_BLOCK == 0:
-        return _MAX_BLOCK, 32, False
-    if n_elements >= 262_144 and n_elements % 32768 == 0:
-        return 32768, 8, False
-    if n_elements >= 16384 and n_elements % 16384 == 0:
-        return 16384, 8, False
-    if n_elements <= 65536:
-        return _MIN_BLOCK, 4, True
-    return 16384, 8, True
+    # exactly (masked memory path on XPU costs ~2x).  Swept by the 2026-09-04
+    # atan2 pass with triton do_bench (event-time, all matrix shapes):
+    #   >=2.1M:   32768/8w  (128 elts/thread)
+    #   256K..1M: 8192/8w   (32 elts/thread)  -- 1.1x-1.3x faster than 16384/8w
+    #   <=64K:    2048/4w   (16 elts/thread)  -- 1.1x-2.6x faster than 16384/8w
+    # The former 131072/32w (>=1M) was 1.6x-2.6x slower at 1M/256K/64K/16K.
+    if n_elements >= 2_097_152:
+        return 32768, 8, n_elements % 32768 != 0
+    if n_elements >= 262_144 and n_elements % 8192 == 0:
+        return 8192, 8, False
+    if n_elements <= 65536 and n_elements % 2048 == 0:
+        return 2048, 4, False
+    if n_elements >= 16384:
+        return 16384, 8, True
+    return 2048, 4, True
 
 
 @triton.jit
-def _arctan2_poly(yc, xc):
-    # Same LSQ-fitted deg-7 atan polynomial as atan2.py (kept a local copy so
-    # this file stays self-contained): atan2(y, x) is assembled from
-    # atan(u), u = min(|y|,|x|) / max(|y|,|x|) in [0,1], plus the pi/2 - p
-    # (|y| > |x|) and pi - t (x < 0) quadrant swaps and the sign of y.
+def _arctan2_poly(yc, xc, LOW_DEG: tl.constexpr):
+    # yc: y-coordinate (first arg), xc: x-coordinate (second arg).
+    # LOW_DEG = True for fp16/bf16: deg-4 fit (max abs err 1.16e-4, >=1.3x
+    # margin vs atol 1e-4 + rtol*|ref|); False for fp32: deg-7 fit (9.5e-7).
+    # Same LSQ fits as atan2.py.
     ay = tl.abs(yc)
     ax = tl.abs(xc)
     m = tl.maximum(ay, ax)
     mn = tl.minimum(ay, ax)
     u = mn / tl.where(m > 0.0, m, 1.0)  # (0,0) -> u = 0, not 0/0
-    p = 5.21594798e-02
-    p = p * u + -2.22082111e-01
-    p = p * u + 3.16956596e-01
-    p = p * u + -3.27826582e-02
-    p = p * u + -3.28529690e-01
-    p = p * u + -3.31425699e-04
-    p = p * u + 1.00000797e00
-    p = p * u + 4.05427219e-17
+    if LOW_DEG:
+        p = 1.4017184409e-01
+        p = p * u + -3.4245381452e-01
+        p = p * u + -1.5262712340e-02
+        p = p * u + 1.0031357076e00
+        p = p * u + -7.7171867993e-05
+    else:
+        p = 5.21594798e-02
+        p = p * u + -2.22082111e-01
+        p = p * u + 3.16956596e-01
+        p = p * u + -3.27826582e-02
+        p = p * u + -3.28529690e-01
+        p = p * u + -3.31425699e-04
+        p = p * u + 1.00000797e00
+        p = p * u + 4.05427219e-17
     t = tl.where(ay > ax, 1.5707963267948966 - p, p)
     t = tl.where(xc < 0.0, 3.141592653589793 - t, t)
     return tl.where(yc < 0.0, -t, t)
@@ -111,13 +133,14 @@ def _arctan2_kernel_impl(
     out_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
+    LOW_DEG: tl.constexpr,
 ):
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offset < n_elements
     yc = tl.load(y_ptr + offset, mask=mask, other=0).to(tl.float32)
     xc = tl.load(x_ptr + offset, mask=mask, other=0).to(tl.float32)
-    res = _arctan2_poly(yc, xc)
+    res = _arctan2_poly(yc, xc, LOW_DEG)
     # NaN propagation (torch semantics): minnum/maxnum drop NaN, so replace
     # res with a NaN arm when either input is NaN.  Ordered >=/< only.
     nanc = (yc + xc) * 0.0
@@ -132,12 +155,13 @@ def _arctan2_kernel_impl_unmasked(
     x_ptr,
     out_ptr,
     BLOCK_SIZE: tl.constexpr,
+    LOW_DEG: tl.constexpr,
 ):
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     yc = tl.load(y_ptr + offset).to(tl.float32)
     xc = tl.load(x_ptr + offset).to(tl.float32)
-    res = _arctan2_poly(yc, xc)
+    res = _arctan2_poly(yc, xc, LOW_DEG)
     nanc = (yc + xc) * 0.0
     res = tl.where(yc >= 0.0, res, tl.where(yc < 0.0, res, nanc))
     res = tl.where(xc >= 0.0, res, tl.where(xc < 0.0, res, nanc))
@@ -149,6 +173,7 @@ def _launch(y, x, out):
     if n_elements == 0:
         return
     block_size, num_warps, masked = _pick_block(n_elements)
+    low_deg = out.dtype != torch.float32
     if masked:
         grid = (triton.cdiv(n_elements, block_size),)
         _arctan2_kernel_impl[grid](
@@ -157,6 +182,7 @@ def _launch(y, x, out):
             out,
             n_elements,
             BLOCK_SIZE=block_size,
+            LOW_DEG=low_deg,
             num_warps=num_warps,
             unroll_num=_UNROLL_NUM,
             buffer_size_limit=_BUFFER_SIZE_LIMIT,
@@ -169,6 +195,7 @@ def _launch(y, x, out):
             x,
             out,
             BLOCK_SIZE=block_size,
+            LOW_DEG=low_deg,
             num_warps=num_warps,
             unroll_num=_UNROLL_NUM,
             buffer_size_limit=_BUFFER_SIZE_LIMIT,

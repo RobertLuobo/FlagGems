@@ -177,9 +177,7 @@ def _batch_norm_no_update_kernel(
             else:
                 x = tl.load(input_pointer + base + idx).to(tl.float32)
                 y = weight * (x - mean) * inv_std + bias
-                tl.store(
-                    output_pointer + base + idx, y.to(output_pointer.dtype.element_ty)
-                )
+                tl.store(output_pointer + base + idx, y.to(output_pointer.dtype.element_ty))
 
 
 @libentry()
@@ -236,9 +234,7 @@ def _batch_norm_no_update_fused_kernel(
             else:
                 x = tl.load(input_pointer + base + idx).to(tl.float32)
                 y = weight * (x - mean) * inv_std + bias
-                tl.store(
-                    output_pointer + base + idx, y.to(output_pointer.dtype.element_ty)
-                )
+                tl.store(output_pointer + base + idx, y.to(output_pointer.dtype.element_ty))
 
 
 def _batch_norm_no_update(
@@ -278,24 +274,23 @@ def _batch_norm_no_update(
         weight_pointer = input_flat if weight is None else weight
         bias_pointer = input_flat if bias is None else bias
         with torch_device_fn.device(input.device):
-            # n_groups x channels programs, each handling NB consecutive n-slices;
-            # chunk the program space when it exceeds the per-launch cap.
-            programs = n_groups * channels
-            for program_base in range(0, programs, BNNU_MAX_PROGRAMS):
-                program_count = min(BNNU_MAX_PROGRAMS, programs - program_base)
-                _batch_norm_no_update_fused_kernel[(program_count,)](
+            if nb == 1:
+                # NB == 1: one n-slice per program (spatial_dim > BNNU_BIG_S
+                # bandwidth-bound shapes, or N == 1). The fused kernel's
+                # runtime 1-iteration n-loop measures ~25-30% SLOWER than the
+                # plain per-slice kernel on S=16384 (interleaved A/B 2026-09-08:
+                # (16,8,128,128) 87.5us -> 116-120us across all 3 dtypes and
+                # both rounds), so keep the per-slice launch in this regime.
+                _batch_norm_no_update_kernel[(n_slices,)](
                     input_flat,
                     weight_pointer,
                     bias_pointer,
                     running_mean,
                     running_var,
                     output_flat,
-                    batch_dim,
                     channels,
                     inner,
                     eps,
-                    program_base,
-                    NB=nb,
                     HAS_WEIGHT=weight is not None,
                     HAS_BIAS=bias is not None,
                     TILE_S=tile_s,
@@ -304,6 +299,34 @@ def _batch_norm_no_update(
                     isCloseVectorization=True,
                     buffer_size_limit=2048,
                 )
+            else:
+                # n_groups x channels programs, each handling NB consecutive
+                # n-slices; chunk the program space when it exceeds the
+                # per-launch cap.
+                programs = n_groups * channels
+                for program_base in range(0, programs, BNNU_MAX_PROGRAMS):
+                    program_count = min(BNNU_MAX_PROGRAMS, programs - program_base)
+                    _batch_norm_no_update_fused_kernel[(program_count,)](
+                        input_flat,
+                        weight_pointer,
+                        bias_pointer,
+                        running_mean,
+                        running_var,
+                        output_flat,
+                        batch_dim,
+                        channels,
+                        inner,
+                        eps,
+                        program_base,
+                        NB=nb,
+                        HAS_WEIGHT=weight is not None,
+                        HAS_BIAS=bias is not None,
+                        TILE_S=tile_s,
+                        NEED_MASK=need_mask,
+                        num_warps=4,
+                        isCloseVectorization=True,
+                        buffer_size_limit=2048,
+                    )
 
     save_mean = torch.empty((0,), dtype=input.dtype, device=input.device)
     save_var = torch.empty((0,), dtype=input.dtype, device=input.device)

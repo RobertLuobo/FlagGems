@@ -1315,8 +1315,14 @@ def softmax_backward(grad_output, output, dim, input_dtype, grad_input=None):
     for i in range(dim):
         M *= output.shape[i]
 
-    grad_output = grad_output.contiguous()
-    output = output.contiguous()
+    # `.contiguous()` inside `flag_gems.use_gems()` dispatches through the
+    # registered gems `copy_` (Triton strided copy, ~1 GB/s on XPU; measured
+    # 62.7 ms for the (64, 4096, 64) fp16 transposed forward view of the
+    # K > 1 softmax vs 0.05 ms natively) -- use the native _copy_from path.
+    grad_output = (
+        grad_output if grad_output.is_contiguous() else _native_contiguous(grad_output)
+    )
+    output = output if output.is_contiguous() else _native_contiguous(output)
     K = output.numel() // M // N
     # The kernel computes in fp32 before storing, so an output buffer with the
     # requested dtype has the same values as the previous final `.to(...)`.
@@ -1362,17 +1368,16 @@ def softmax_backward(grad_output, output, dim, input_dtype, grad_input=None):
             _softmax_backward_launch_k1(
                 out_reshaped, out_grad_reshaped, in_grad_reshaped, M * K, N, input_dtype
             )
-            origin_dim = output.ndim
-            if output.ndim == 3:
-                m, n, k = output.shape
-            elif output.ndim == 2:
-                m, n = output.shape
-            if M == 1 and origin_dim == 2:
-                in_grad = in_grad_reshaped.view(K, N).transpose(0, 1)
-            elif M == 1 and origin_dim == 3:
-                in_grad = in_grad_reshaped.transpose(0, 1).view(m, n, k)
-            else:
-                in_grad = in_grad_reshaped.view(m, k, n).transpose(1, 2)
+            # Reconstruct the original layout [shape[:dim], N, shape[dim+1:]]
+            # from the [M, K, N]-transposed kernel result: the intermediate
+            # [M, K, N] view transposed to [M, N, K] is re-viewed with the
+            # original rank.  The final .view() only splits the (contiguous)
+            # M and K axes, so it never copies and never needs .contiguous()
+            # (the old rank-2/3 branches raised UnboundLocalError for
+            # ndim >= 4, e.g. (2, 3, 4, 5) with dim = 1).
+            in_grad = (
+                in_grad_reshaped.view(M, K, N).transpose(1, 2).view(output.shape)
+            )
         else:
             _softmax_backward_launch_k1(output, grad_output, in_grad, M, N, input_dtype)
     return in_grad
