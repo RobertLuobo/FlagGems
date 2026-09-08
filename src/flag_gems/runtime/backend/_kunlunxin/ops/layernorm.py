@@ -534,6 +534,122 @@ def weight_bias_backward_kernel_heur_block_row_size(args):
     return 1
 
 
+# --- XPU weight/bias backward: transposed-layout kernel (2026-09-08) ---------
+# TritonXPU rejects 2D+ reduce with axis=0 (Legalize) and tl.trans / tl.split
+# (TritonToTritonXPU UNREACHABLE), so the raw [M, N] wb accumulation
+# [R, C] -> [C] column sums cannot be expressed: with R>1 the axis=0 reduce
+# fails to compile (OutOfResources), with R=1 ('weight_bias_backward_kernel'
+# above) the M-loop runs M sequential [1, N] iterations (~1.4us each on XPU;
+# [4096,256] = 5.9ms of the 6.1ms op time, 97%).
+# The transposed kernel below reads transposed copies (dYT/XT are [N, M]
+# row-major, produced by the native _copy_from strided copy, ~500 GB/s) and
+# reduces the M dimension as an ALLOWED axis=1 2D reduce of [BM, BN] block
+# tiles: grid = cdiv(N, BM), M/BN iterations, one 2D block DMA per iteration.
+
+# Below this M the M-loop kernel (M sequential iterations) wins: the extra two
+# transposes cost more than the short M-loop they save.
+WB_TRANSPOSE_MIN_M = 128
+
+
+def _transpose_2d_contig(x, M, N):
+    # Native strided copy: gems never overrides `_copy_from`, so this goes
+    # straight to the vendor strided-copy engine (same trick as
+    # slice_backward / constant_pad_nd). x is [M, N] contiguous.
+    out = torch.empty_strided((N, M), (M, 1), dtype=x.dtype, device=x.device)
+    torch.ops.aten._copy_from(x.view(M, N).t(), out, False)
+    return out
+
+
+def weight_bias_backward_t_heur_block_col_size(args):
+    # m-dim (reduction) tile: must divide M so no masked tail feeds the sum
+    # (masked lanes leaking into a reduce is unreliable on this backend).
+    import builtins
+
+    M = args["M"]
+    block = builtins.min(M, 4096)
+    while block > 1 and M % block != 0:
+        block //= 2
+    return builtins.max(1, block)
+
+
+def weight_bias_backward_t_heur_block_row_size(args):
+    # n-dim (output) tile of the [N, M] kernel: aim for ~12+ programs (like
+    # the dX row heuristic) with a 256K-element tile budget.
+    import builtins
+
+    N = args["N"]
+    bn = weight_bias_backward_t_heur_block_col_size(args)
+    bm = triton.next_power_of_2(triton.cdiv(N, 12))
+    bm = builtins.min(N, bm, builtins.max(1, 262144 // bn))
+    return builtins.max(1, bm)
+
+
+@libentry()
+@triton.heuristics(
+    values={
+        "BLOCK_ROW_SIZE": weight_bias_backward_t_heur_block_row_size,
+        "BLOCK_COL_SIZE": weight_bias_backward_t_heur_block_col_size,
+    },
+)
+@triton.jit
+def weight_bias_backward_transposed_kernel(
+    dYT,
+    XT,
+    Mean,
+    Rstd,
+    dW,
+    dB,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_ROW_SIZE: tl.constexpr,
+    BLOCK_COL_SIZE: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    # dYT/XT: [N, M] row-major transposed copies; Mean/Rstd: [M]; dW/dB: [N].
+    # 2D block tiles [BLOCK_ROW_SIZE, BLOCK_COL_SIZE] with the M-reduction as
+    # an axis=1 reduce (the only 2D reduce this backend accepts; axis=0 is
+    # rejected by TritonXPU Legalize).
+    pid = ext.program_id(0)
+    nrows = pid * BLOCK_ROW_SIZE + tl.arange(0, BLOCK_ROW_SIZE)
+    accW = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
+    accB = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
+    if not NEED_MASK:
+        # BLOCK_COL_SIZE divides M (heuristic) -> no reduced-dim tail.
+        for off in range(0, M, BLOCK_COL_SIZE):
+            mcols = off + tl.arange(0, BLOCK_COL_SIZE)
+            dy = tl.load(dYT + nrows[:, None] * M + mcols[None, :]).to(tl.float32)
+            x = tl.load(XT + nrows[:, None] * M + mcols[None, :]).to(tl.float32)
+            mean = tl.load(Mean + mcols)[None, :].to(tl.float32)
+            rstd = tl.load(Rstd + mcols)[None, :].to(tl.float32)
+            x_hat = (x - mean) * rstd
+            accW += dy * x_hat
+            accB += dy
+    else:
+        nrow_mask = nrows[:, None] < N
+        for off in range(0, M, BLOCK_COL_SIZE):
+            mcols = off + tl.arange(0, BLOCK_COL_SIZE)
+            dy = tl.load(
+                dYT + nrows[:, None] * M + mcols[None, :], mask=nrow_mask
+            ).to(tl.float32)
+            x = tl.load(
+                XT + nrows[:, None] * M + mcols[None, :], mask=nrow_mask
+            ).to(tl.float32)
+            mean = tl.load(Mean + mcols)[None, :].to(tl.float32)
+            rstd = tl.load(Rstd + mcols)[None, :].to(tl.float32)
+            # zero out-of-range rows before they reach the sums; the m dim has
+            # no mask (BLOCK_COL_SIZE | M) so the reduction covers only valid
+            # lanes, and the masked store below drops the out-of-range rows.
+            dy = tl.where(nrow_mask, dy, 0.0)
+            x = tl.where(nrow_mask, x - mean, 0.0)
+            x_hat = x * rstd
+            accW += dy * x_hat
+            accB += dy
+    if dW is not None:
+        tl.store(dW + nrows, tl.sum(accW, axis=1), mask=nrows < N)
+    if dB is not None:
+        tl.store(dB + nrows, tl.sum(accB, axis=1), mask=nrows < N)
+
+
 def weight_bias_backward_kernel_heur_block_col_size(args):
     import builtins
 
@@ -835,21 +951,46 @@ def layer_norm_backward(
         )
     else:
         bias_grad = None
-    bc_wb = weight_bias_backward_kernel_heur_block_col_size({"N": N})
-    need_mask_wb = N % bc_wb != 0
-    with torch_device_fn.device(input.device):
-        weight_bias_backward_kernel[grid](
-            grad_out,
-            input,
-            mean,
-            rstd,
-            weight_grad,
-            bias_grad,
-            M,
-            N,
-            NEED_MASK=need_mask_wb,
-            isCloseCoreTiling=True,
-            isCloseUnrollControl=True,
-            isCloseVectorization=True,
-        )
+    if M >= WB_TRANSPOSE_MIN_M:
+        # Transposed-layout kernel: [N, M] row-major copies + axis=1 2D-tile
+        # M-reduction (see the kernel docstring above). Measured 2026-09-08:
+        # [4096,256] 5.9ms -> 0.117ms, [1024,2048] 2.5ms -> 0.276ms (incl.
+        # both transposes); for M < 128 the old M-loop kernel is cheaper.
+        dYT = _transpose_2d_contig(grad_out, M, N)
+        XT = _transpose_2d_contig(input, M, N)
+        bm_t = weight_bias_backward_t_heur_block_row_size({"M": M, "N": N})
+        with torch_device_fn.device(input.device):
+            grid_t = lambda meta: (triton.cdiv(N, meta["BLOCK_ROW_SIZE"]), 1, 1)
+            weight_bias_backward_transposed_kernel[grid_t](
+                dYT,
+                XT,
+                mean,
+                rstd,
+                weight_grad,
+                bias_grad,
+                M,
+                N,
+                NEED_MASK=N % bm_t != 0,
+                isCloseUnrollControl=True,
+                isCloseCoreTiling=True,
+                isCloseVectorization=True,
+            )
+    else:
+        bc_wb = weight_bias_backward_kernel_heur_block_col_size({"N": N})
+        need_mask_wb = N % bc_wb != 0
+        with torch_device_fn.device(input.device):
+            weight_bias_backward_kernel[grid](
+                grad_out,
+                input,
+                mean,
+                rstd,
+                weight_grad,
+                bias_grad,
+                M,
+                N,
+                NEED_MASK=need_mask_wb,
+                isCloseCoreTiling=True,
+                isCloseUnrollControl=True,
+                isCloseVectorization=True,
+            )
     return in_grad, weight_grad, bias_grad

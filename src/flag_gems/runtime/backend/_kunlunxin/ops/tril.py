@@ -787,13 +787,25 @@ def _launch_v2_band(
     batch = input.numel() // (M * N)
     total = band_lo * N
     if _is_power_of_2(N):
+        if batch == 1:
+            if total > 0:
+                _launch_v2_pow2(input, out, diagonal, active_rows=band_lo)
+            if band_lo < M and input.data_ptr() != out.data_ptr():
+                _vendor_copy_from(input[band_lo:], out[band_lo:])
+            return out
+        # Batched (>1): the kept bottom rows of every matrix form a gap-bearing
+        # view (`input[..., band_lo:, :]` keeps a band_lo-row hole per matrix
+        # -> not contiguous) and the vendor strided copy of it is ~3.4x slower
+        # than a full contiguous-src copy (isolated, [100,65536,100] fp16:
+        # 4.74ms vs 1.40ms). Copy the full matrix first (no-op when out aliases
+        # input), then let the band kernel rewrite the [0, band_lo) prefix as
+        # the last writer: kept cells keep the copied input values, strict
+        # upper cells become 0. Correct because the band kernel runs after the
+        # copy, so it can never be overwritten.
+        if band_lo < M and input.data_ptr() != out.data_ptr():
+            _vendor_copy_from(input, out)
         if total > 0:
             _launch_v2_pow2(input, out, diagonal, active_rows=band_lo)
-        if band_lo < M:
-            if batch == 1:
-                _vendor_copy_from(input[band_lo:], out[band_lo:])
-            else:
-                _vendor_copy_from(input[..., band_lo:, :], out[..., band_lo:, :])
         return out
     if batch == 1:
         if total > 0:
@@ -801,16 +813,18 @@ def _launch_v2_band(
                 _launch_v2_rows(input, out, diagonal, num_rows=band_lo)
             else:
                 _launch_v2_flat(input, out, diagonal, total)
-        if band_lo < M:
+        if band_lo < M and input.data_ptr() != out.data_ptr():
             _vendor_copy_from(input[band_lo:], out[band_lo:])
         return out
-    # Batched: the kept bottom rows of every matrix form one regular strided
-    # view, so a single native `_copy_from` moves them all; only the (usually
-    # tiny) band prefix of each matrix goes through the tril kernel.
+    # Batched (>1): same as the power-of-two case above -- full vendor copy
+    # first (contiguous src, ~3.4x faster than the gap-bearing kept-rows view),
+    # then the band kernel rewrites the [0, band_lo) prefix of every matrix.
+    # The old gap-view `_copy_from(input[..., band_lo:, :], out[..., band_lo:, :])`
+    # measured 3.3-4.0x slower on [100,65536,100]/[1000,8192,100].
+    if band_lo < M and input.data_ptr() != out.data_ptr():
+        _vendor_copy_from(input, out)
     if total > 0:
         _launch_v2_band_batchgrid(input, out, diagonal, band_lo)
-    if band_lo < M:
-        _vendor_copy_from(input[..., band_lo:, :], out[..., band_lo:, :])
     return out
 
 
@@ -1020,6 +1034,13 @@ def _launch_exact_diag0_tile(
 
 
 _INPLACE_FLAT_BLOCK = 8192
+# Pow2 shift/mask only pays off once the band is large enough to amortize the
+# bigger blocks / different warp count of the shared `_launch_v2_pow2` path.
+# Below this (measured [10000,256] 65K elements, [64,64] 4K) the div kernel is
+# equal or better and the swap is within the launch-floor noise band; at/above
+# it every shape measured faster ([64,512,512] 262K: 1.6-1.9x, [4096,4096]
+# 16.7M: 1.6-1.8x). Must stay < 261632 (active of [64,512,512] at diag=0).
+_INPLACE_POW2_MIN_TOTAL = 1 << 17
 
 
 def _launch_tril_inplace_contiguous(
@@ -1039,6 +1060,19 @@ def _launch_tril_inplace_contiguous(
     active_rows = min(M, max(0, N - 1 - diagonal))
     if active_rows == 0:
         return input
+
+    if _is_power_of_2(N) and active_rows * N >= _INPLACE_POW2_MIN_TOTAL:
+        # Power-of-two N: share the proven `_tril_flat_pow2_kernel` (shift/mask
+        # row/col recovery) used by the out variants -- the XPU triton backend
+        # emits a real division for `offsets // N` even when N is a pow2
+        # constexpr, and that division dominates this memory-bound kernel
+        # (isolated [4096,4096] fp32: ~0.46ms -> ~0.29ms, [10000,65536] fp16:
+        # ~21.6ms -> ~12.8ms). In-place aliasing (in_ptr == out_ptr) is fine:
+        # kept cells are rewritten with their loaded values and strict-upper
+        # cells become 0; `active_rows` restricts the pass to the band.
+        return _launch_v2_pow2(
+            input, input, int(diagonal), active_rows=active_rows
+        )
 
     MN = M * N
     active_total = active_rows * N

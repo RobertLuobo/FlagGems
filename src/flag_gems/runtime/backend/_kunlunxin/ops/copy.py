@@ -75,19 +75,37 @@ def _copy_e8m0_to_fp32_kernel(src, dst, n_elements, BLOCK_SIZE: tl.constexpr):
 
 
 @triton.jit
-def _copy_flat_kernel(src_ptr, dst_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+def _copy_flat_kernel(
+    src_ptr, dst_ptr, n_elements, BLOCK_SIZE: tl.constexpr, NEED_MASK: tl.constexpr
+):
     """Bounded-tile flat block-DMA copy for contiguous same-dtype tensors.
 
     The pointwise codegen widens the 1d tile to next_pow2(numel/12) (12-CTAs
     "XPU BLOCK_NUM" partition), which measures 0.073-0.16ms on a 16M-element
     copy but 1.08ms on bool (i1 bytes cannot reuse the wide-tile path).  A
-    fixed 65536-lane tile with a full grid keeps every access a contiguous
-    block DMA and measures 0.061ms fp16 / 0.19ms bool on the same shape.
+    fixed bounded tile with a full grid keeps every access a contiguous
+    block DMA.  NEED_MASK constexpr splits the always-true-mask case (the
+    slow masked-memory path on XPU) from the true-tail case.
     """
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-    tl.store(dst_ptr + offsets, tl.load(src_ptr + offsets, mask=mask), mask=mask)
+    if NEED_MASK:
+        mask = offsets < n_elements
+        tl.store(dst_ptr + offsets, tl.load(src_ptr + offsets, mask=mask), mask=mask)
+    else:
+        tl.store(dst_ptr + offsets, tl.load(src_ptr + offsets))
+
+
+def _pick_flat_block(n_elements: int) -> int:
+    if n_elements >= 2**19:
+        return 65536
+    if n_elements >= 2**16:
+        return 32768
+    if n_elements >= 2**13:
+        return 8192
+    if n_elements >= 2**10:
+        return 4096
+    return 1024
 
 
 def _is_e8m0(tensor: torch.Tensor) -> bool:
@@ -198,25 +216,45 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
         and dst.is_contiguous()
         and expanded_src.dtype == dst.dtype
     ):
-        block_size = 65536
-        if expanded_src.dtype is torch.bool:
-            # bool is stored as one byte; the XPU i1 load/store lowering is
-            # byte-serial (~0.19ms for 16M elements) while a u8 view hits the
-            # vectorized block-DMA path (~0.032ms, 6x).  Bit-exact by
-            # construction (1 byte per element, no value reinterpretation).
-            _copy_flat_kernel[(triton.cdiv(expanded_src.numel(), block_size),)](
-                expanded_src.view(torch.uint8),
-                dst.view(torch.uint8),
-                expanded_src.numel(),
+        n_elements = expanded_src.numel()
+        item_size = expanded_src.element_size()
+        # Unify 1B/2B/4B element dtypes onto an int32(4B) view: 4B load/store
+        # measures ~830-860 GB/s vs ~505-530 GB/s for raw element loads (the
+        # byte-wide path), and is bit-exact (no value reinterpretation).
+        # Requires 4B-aligned storage and a byte-total divisible by 4;
+        # otherwise fall back to the raw element-wise kernel below.  The
+        # reshape+view host-side work (~3.4us) only pays off on large copies,
+        # so small tensors keep the raw path.
+        if (
+            item_size <= 4
+            and (n_elements * item_size) % 4 == 0
+            and n_elements * item_size >= 2**20
+            and expanded_src.data_ptr() % 4 == 0
+            and dst.data_ptr() % 4 == 0
+        ):
+            # reshape(-1) first: Tensor.view(dtype) requires the last dim's
+            # byte-size to divide 4, which non-flat shapes (e.g. (20,320,15)
+            # fp16) would violate; flattening a contiguous tensor is free.
+            src_view = expanded_src.reshape(-1).view(torch.int32)
+            dst_view = dst.reshape(-1).view(torch.int32)
+            n32 = src_view.numel()
+            block_size = _pick_flat_block(n32)
+            _copy_flat_kernel[(triton.cdiv(n32, block_size),)](
+                src_view,
+                dst_view,
+                n32,
                 BLOCK_SIZE=block_size,
+                NEED_MASK=(n32 % block_size != 0),
                 num_warps=32,
             )
         else:
-            _copy_flat_kernel[(triton.cdiv(expanded_src.numel(), block_size),)](
+            block_size = _pick_flat_block(n_elements)
+            _copy_flat_kernel[(triton.cdiv(n_elements, block_size),)](
                 expanded_src,
                 dst,
-                expanded_src.numel(),
+                n_elements,
                 BLOCK_SIZE=block_size,
+                NEED_MASK=(n_elements % block_size != 0),
                 num_warps=32,
             )
         return dst

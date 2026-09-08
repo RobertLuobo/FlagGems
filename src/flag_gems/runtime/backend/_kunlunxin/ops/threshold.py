@@ -83,11 +83,13 @@ def threshold_backward_kernel(grad_output, self, threshold):
 # (x * (y > t), tl.where, sub-then-compare) lands at ~0.70-0.76ms — the XPU
 # backend lowers `arith.cmpf` to a slow scalar path. An equivalent UINT32
 # bit-pattern test (`arith.cmpi`) plus a magnitude bound (`0x7F800000` clears
-# negatives/inf/NaN) keeps the vectorized int fast path. This candidate is
-# strictly better than the pointwise kernel on every case of the
-# comprehensive benchmark (do_bench, dtype-equal gems speed ~0.29x -> ~0.36x,
-# still < 1.0x gate). Restricted to non-negative fp32 thresholds (host check);
-# everything else falls back to the pointwise kernel above.
+# negatives/-0.0/-inf/NaN; `+inf` (== 0x7F800000) is kept because it is
+# greater than any non-negative threshold) keeps the vectorized int fast
+# path. This candidate is strictly better than the pointwise kernel on every
+# case of the comprehensive benchmark (do_bench, dtype-equal gems speed
+# ~0.29x -> ~0.36x, still < 1.0x gate). Restricted to non-negative fp32
+# thresholds (host check); everything else falls back to the pointwise
+# kernel above.
 _THRESHOLD_BWD_BLOCK = 16384
 _THRESHOLD_BWD_BLOCK_SMALL = 8192
 _THRESHOLD_BWD_WARPS = 1
@@ -110,13 +112,17 @@ def _threshold_backward_bits_kernel(
         x = tl.load(grad + offs, mask=m)
         y = tl.load(self + offs, mask=m)
         yb = y.to(tl.float32).to(tl.uint32, bitcast=True)
-        keep = (yb > threshold_bits) & (yb < 0x7F800000)
+        # `yb <= 0x7F800000` (not `<`) keeps +inf (bits 0x7F800000), which is
+        # > any non-negative threshold and must retain the grad; it still
+        # excludes negatives/-0.0 (>= 0x80000000), -inf and NaN (> 0x7F800000),
+        # all of which compare False against a non-negative threshold.
+        keep = (yb > threshold_bits) & (yb <= 0x7F800000)
         tl.store(out + offs, x * keep.to(x.dtype), mask=m)
     else:
         x = tl.load(grad + offs)
         y = tl.load(self + offs)
         yb = y.to(tl.float32).to(tl.uint32, bitcast=True)
-        keep = (yb > threshold_bits) & (yb < 0x7F800000)
+        keep = (yb > threshold_bits) & (yb <= 0x7F800000)
         tl.store(out + offs, x * keep.to(x.dtype))
 
 

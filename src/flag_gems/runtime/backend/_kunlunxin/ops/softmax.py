@@ -1009,11 +1009,14 @@ def softmax_backward_kernel_tail_pass(
 
 
 # ---------------------------------------------------------------------------
-# K > 1 (reduced dim is not innermost): the tensor is viewed as [M, N, K]
-# (n = reduced dim, k = innermost) and transposed into [M*K, N] with
-# aten._copy_from, then reduced by softmax_backward_kernel_inner (one program
-# per row).  There is no [BN, K] partial/combine/pass trio in this file; the
-# column-reduce design that this comment used to describe was never landed.
+# K > 1 (reduced dim is not the innermost axis): the tensor is viewed as
+# [M, N, K] (n = reduced dim, k = innermost), transposed into [M, K, N] with
+# aten._copy_from, then reduced by the K == 1 launch family over the [M*K, N]
+# view (one row per (m, k)).  There is no [BN, K] partial/combine/pass trio in
+# this file; the column-reduce design that this comment used to describe was
+# never landed.  (softmax_backward_kernel_inner below is the retired
+# transpose-based single-row kernel; kept only as reference, no longer
+# dispatched.)
 
 
 def _softmax_backward_launch_k1(output, grad_output, in_grad, M, N, input_dtype):
@@ -1312,8 +1315,14 @@ def softmax_backward(grad_output, output, dim, input_dtype, grad_input=None):
     for i in range(dim):
         M *= output.shape[i]
 
-    grad_output = grad_output.contiguous()
-    output = output.contiguous()
+    # `.contiguous()` inside `flag_gems.use_gems()` dispatches through the
+    # registered gems `copy_` (Triton strided copy, ~1 GB/s on XPU; measured
+    # 62.7 ms for the (64, 4096, 64) fp16 transposed forward view of the
+    # K > 1 softmax vs 0.05 ms natively) -- use the native _copy_from path.
+    grad_output = (
+        grad_output if grad_output.is_contiguous() else _native_contiguous(grad_output)
+    )
+    output = output if output.is_contiguous() else _native_contiguous(output)
     K = output.numel() // M // N
     # The kernel computes in fp32 before storing, so an output buffer with the
     # requested dtype has the same values as the previous final `.to(...)`.
@@ -1326,12 +1335,13 @@ def softmax_backward(grad_output, output, dim, input_dtype, grad_input=None):
 
     with torch_device_fn.device(in_grad.device):
         if K > 1:
-            # Fallback (K > 8192 or unusual shapes): old transpose-based path
-            # (correct but slow through gems copy_).
-            # Transpose copies via aten._copy_from: flag_gems NEVER overrides
-            # _copy_from, so these strided copies run at native speed (the
-            # .contiguous() path dispatched to the gems copy_ override and was
-            # ~300x slower; measured 308ms for [64,4096,64] fp16).
+            # Reduced dim N is an interior axis (stride K in the [M, N, K]
+            # layout), so the tensor is transposed to [M, K, N] -- reduced
+            # dim N innermost -- and the K == 1 launch family runs on the
+            # [M*K, N] view.  Transpose copies use aten._copy_from:
+            # flag_gems NEVER overrides _copy_from, so these strided copies
+            # run at native speed (the .contiguous() path would dispatch to
+            # the gems copy_ override, ~300x slower).
             out_grad_view = grad_output.view(M, N, K).transpose(1, 2)
             out_view = output.view(M, N, K).transpose(1, 2)
             out_grad_reshaped = torch.empty(
@@ -1342,31 +1352,32 @@ def softmax_backward(grad_output, output, dim, input_dtype, grad_input=None):
             )
             torch.ops.aten._copy_from(out_grad_view, out_grad_reshaped, False)
             torch.ops.aten._copy_from(out_view, out_reshaped, False)
-            in_grad_view = in_grad.view(M, N, K).transpose(1, 2)
+            # `in_grad` is a fresh (uninitialized) buffer and the kernels
+            # below overwrite every lane of in_grad_reshaped, so no copy of
+            # the uninitialized data is needed (the previous code paid one
+            # full [M*K, N] copy for it).
             in_grad_reshaped = torch.empty(
                 (M * K, N), dtype=in_grad.dtype, device=in_grad.device
             )
-            torch.ops.aten._copy_from(in_grad_view, in_grad_reshaped, False)
-            grid = lambda meta: (M * K, 1, 1)  # noqa: E731
-            softmax_backward_kernel_inner[grid](
-                out_reshaped,
-                out_grad_reshaped,
-                in_grad_reshaped,
-                M * K,
-                N,
-                buffer_size_limit=2048,
+            # The tuned K == 1 launch family (2-D affine multirow tiles for
+            # N <= 4096, per-row two-pass wide tiles above).  The previous
+            # softmax_backward_kernel_inner was ~100x slower on small-N
+            # shapes (masked `other=0.0` single-row tiles, one program per
+            # row: (100, 256, 100) fp16 6.1 ms vs the multirow
+            # [16, 256] tile at ~0.06 ms).
+            _softmax_backward_launch_k1(
+                out_reshaped, out_grad_reshaped, in_grad_reshaped, M * K, N, input_dtype
             )
-            origin_dim = output.ndim
-            if output.ndim == 3:
-                m, n, k = output.shape
-            elif output.ndim == 2:
-                m, n = output.shape
-            if M == 1 and origin_dim == 2:
-                in_grad = in_grad_reshaped.view(K, N).transpose(0, 1)
-            elif M == 1 and origin_dim == 3:
-                in_grad = in_grad_reshaped.transpose(0, 1).view(m, n, k)
-            else:
-                in_grad = in_grad_reshaped.view(m, k, n).transpose(1, 2)
+            # Reconstruct the original layout [shape[:dim], N, shape[dim+1:]]
+            # from the [M, K, N]-transposed kernel result: the intermediate
+            # [M, K, N] view transposed to [M, N, K] is re-viewed with the
+            # original rank.  The final .view() only splits the (contiguous)
+            # M and K axes, so it never copies and never needs .contiguous()
+            # (the old rank-2/3 branches raised UnboundLocalError for
+            # ndim >= 4, e.g. (2, 3, 4, 5) with dim = 1).
+            in_grad = (
+                in_grad_reshaped.view(M, K, N).transpose(1, 2).view(output.shape)
+            )
         else:
             _softmax_backward_launch_k1(output, grad_output, in_grad, M, N, input_dtype)
     return in_grad
@@ -1389,5 +1400,9 @@ def softmax_backward_out(grad_output, output, dim, input_dtype, *, grad_input):
         grad_input=grad_input if grad_input.is_contiguous() else None,
     )
     if result is not grad_input:
-        grad_input.copy_(result)
+        # `copy_` is a gems-registered op, so inside `flag_gems.use_gems()`
+        # this would run the Triton strided copy (~1.25 GB/s, 100-1000x slower
+        # than the native XPU copy for a transposed source).  `aten::_copy_from`
+        # is never overridden by gems: native strided copy.
+        torch.ops.aten._copy_from(result, grad_input, False)
     return grad_input

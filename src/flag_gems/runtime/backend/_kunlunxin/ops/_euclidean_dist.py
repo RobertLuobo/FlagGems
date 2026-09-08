@@ -10,16 +10,20 @@
 # [128,256]x[128,256] (=32768 programs) gems speedup ~0.02, [64,128] ~0.075
 # (harness/perf_ir_3/ir-euclidean_dist-dev6.log).
 #
-# Fix: keep the 1D-reduction structure (XPU handles 1D tiles well; a 2D
-# [BLOCK_M,BLOCK_D] tile + axis reduction hits `out of resource: uni_sram`, and a
-# gems-op composition -- matmul + norms + elementwise -- chains ~10 kernel launches
-# at ~0.15ms each and can wedge the device via async double-buffering), but:
-#   1) load the x1 row ONCE per program and reuse it across a CHUNK of x2 rows
-#      (kills the redundant x1 reloads), and
-#   2) have each program own a CHUNK of output columns so the launch count drops
-#      from N*M to N*cdiv(M,CHUNK).
-# CHUNK is picked to keep the grid around a few hundred programs (enough XPU
-# parallelism without over-serializing each program).
+# Fix (round 2): the previous kernel kept a 1-row x1 tile ([1,BLOCK_D]) and
+# batched only x2 columns (CHUNK), which made the D-reduction per output
+# element. Sweeping [BLOCK_M, BLOCK_D] 2D row-batched tiles on this device
+# (harness/solution/euclidean_dist/euclidean_dist_perf_fix.md) shows that
+# BLOCK_M=1 is the bottleneck, NOT uni_sram: [128,256]x[128,256] goes from
+# 1.52ms (BLOCK_M=1) to 0.144ms (BLOCK_M=32), [64,128] 0.112ms -> 0.043ms,
+# with 32x256 = 8192-elem tiles still inside the XPU reduction safe point
+# (HARNESS_SUMMARY 2.5: BLOCK <= 8192). Structure kept identical to round 1:
+#   1) load the x1 [BLOCK_M, BLOCK_D] tile ONCE per program and reuse it
+#      across a CHUNK of x2 rows (kills the redundant x1 reloads), and
+#   2) have each program own a CHUNK of output columns so the launch count
+#      drops from N*M to cdiv(M,CHUNK)*cdiv(N,BLOCK_M).
+# BLOCK_M = min(32, next_pow2(N)) and CHUNK = cdiv(M, min(64, M)) give exact
+# grid coverage for every shape in the test/bench matrix (no masked tails).
 import logging
 
 import torch
@@ -95,13 +99,13 @@ def _euclidean_dist(x1, x2):
     if N == 0 or M == 0:
         return output
 
-    # Larger reductions are resource-sensitive on XPU; keep the original
-    # one-row reduction there and batch only the smaller supported reductions.
-    BLOCK_M = 4 if D < 256 else 1
+    # Row-batched 2D tile: [BLOCK_M, BLOCK_D] with an axis=1 reduction.
+    # 32x256 = 8192-elem tiles stay inside the XPU reduction safe point
+    # (HARNESS_SUMMARY 2.5: BLOCK <= 8192 without buffer_size_limit).
+    BLOCK_M = min(32, triton.next_power_of_2(N))
     BLOCK_D = min(triton.next_power_of_2(D), 1024)
-    # Target ~512 programs total after grouping adjacent x1 rows.
-    n_col_blocks = max(1, triton.cdiv(512, triton.cdiv(N, BLOCK_M)))
-    CHUNK = triton.cdiv(M, n_col_blocks)
+    # ~64 column programs; keeps the grid small without over-serializing.
+    CHUNK = max(1, triton.cdiv(M, min(64, M)))
 
     with torch_device_fn.device(x1.device):
         grid = (triton.cdiv(M, CHUNK), triton.cdiv(N, BLOCK_M))

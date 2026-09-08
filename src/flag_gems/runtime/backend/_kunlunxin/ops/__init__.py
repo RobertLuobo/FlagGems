@@ -27,6 +27,9 @@ from ._functional_sym_constrain_range_for_size import (
 from ._fused_adam import _fused_adam, _fused_adam_
 from ._fused_rms_norm import _fused_rms_norm  # noqa: F401
 from ._is_all_true import _is_all_true
+from ._jagged_to_padded_dense_forward import (
+    _jagged_to_padded_dense_forward,
+)
 from ._linalg_eigvals import _linalg_eigvals
 from ._native_batch_norm_legit_functional import _native_batch_norm_legit_functional
 from ._native_batch_norm_legit_no_training import _native_batch_norm_legit_no_training
@@ -39,21 +42,28 @@ from ._scaled_dot_product_fused_attention_overrideable import (
     _scaled_dot_product_fused_attention_overrideable,
 )
 from ._thnn_fused_lstm_cell_backward_impl import _thnn_fused_lstm_cell_backward_impl
+from ._masked_scale import _masked_scale  # noqa: F401
 from ._unsafe_masked_index_put_accumulate import _unsafe_masked_index_put_accumulate
 from ._upsample_bilinear2d_aa import _upsample_bilinear2d_aa  # noqa: F401
 from ._upsample_nearest_exact2d_backward import _upsample_nearest_exact2d_backward
+from ._upsample_nearest_exact3d import _upsample_nearest_exact3d
 from .abs import abs, abs_
 from .absolute import absolute, absolute_
 from .acos import acos, acos_
+from .acosh import acosh, acosh_  # noqa: F401
 from .adaptive_avg_pool2d import adaptive_avg_pool2d
 from .adaptive_max_pool2d import adaptive_max_pool2d
+from .adaptive_max_pool2d_backward import adaptive_max_pool2d_backward
+from .adaptive_max_pool3d import adaptive_max_pool3d
+from .adaptive_max_pool3d_backward import adaptive_max_pool3d_backward
 from .add import add, add_
 from .addbmm import addbmm, addbmm_  # noqa: F401
 from .addcdiv import addcdiv, addcdiv_, addcdiv_out
 from .addcmul import addcmul, addcmul_, addcmul_out
+from .add_relu import _add_relu, _add_relu_  # noqa: F401
 from .addmm import addmm, addmm_dtype, addmm_dtype_out, addmm_out  # noqa: F401
 from .addmm_ import addmm_
-from .addmv import addmv, addmv_out
+from .addmv import addmv, addmv_, addmv_out  # noqa: F401
 from .addr import addr
 from .affine_grid_generator import affine_grid_generator  # noqa: F401
 from .alias_copy import alias_copy, alias_copy_out
@@ -167,11 +177,11 @@ from .conv_depthwise2d import _conv_depthwise2d
 from .conv_transpose1d import conv_transpose1d
 from .conv_transpose2d import conv_transpose2d
 from .copy import copy, copy_
-from .copysign import copysign, copysign_out
-from .copysign_ import copysign_
+from .copysign import copysign, copysign_, copysign_out
 from .cos import cos, cos_
 from .cosh import cosh, cosh_, cosh_out  # noqa: F401
 from .count_nonzero import count_nonzero
+from .cudnn_batch_norm import cudnn_batch_norm  # noqa: F401
 from .cudnn_batch_norm_backward import cudnn_batch_norm_backward  # noqa: F401
 from .cudnn_convolution import cudnn_convolution  # noqa: F401
 from .cummax import cummax
@@ -185,12 +195,14 @@ from .diag import diag
 from .diag_embed import diag_embed
 from .diagonal import diagonal_backward
 from .diagonal_copy import diagonal_copy
-from .digamma import digamma
-from .digamma_ import digamma_
 from .diff import diff
+from .digamma import digamma
+from .dist import dist
+from .digamma_ import digamma_
 from .div import (
     div_mode,
     div_mode_,
+    divide,
     floor_divide,
     floor_divide_,
     remainder,
@@ -199,6 +211,7 @@ from .div import (
     true_divide_,
     true_divide_out,
     true_divide_tensor,
+    true_divide_tensor_,
 )
 from .dot import dot
 from .dropout import dropout, dropout_backward
@@ -206,11 +219,13 @@ from .elu import elu, elu_, elu_backward
 from .embedding import embedding, embedding_backward, embedding_dense_backward
 from .eq import eq, eq_, eq_scalar, eq_scalar_
 from .erf import erf, erf_, special_erf
+from .erfc import erfc, erfc_, special_erfc  # noqa: F401
 from .erfinv import erfinv
 from .erfinv_ import erfinv_  # noqa: F401
 from .exp import exp, exp_, exp_out
 from .exp2 import exp2, exp2_
 from .expm1 import expm1, expm1_, expm1_out
+from .exponential import exponential  # noqa: F401
 from .exponential_ import exponential_
 from .eye import eye
 from .eye_m import eye_m
@@ -264,17 +279,22 @@ from .groupnorm import group_norm, group_norm_backward
 from .gt import gt, gt_scalar, gt_scalar_, gt_tensor_
 from .hadamard_transform import hadamard_transform
 from .hardsigmoid import hardsigmoid, hardsigmoid_out
+from .hardsigmoid_backward import hardsigmoid_backward  # noqa: F401
+from .hardshrink import hardshrink, hardshrink_out
+from .hardswish_ import hardswish_  # noqa: F401
+from .hardtanh_backward import hardtanh_backward  # noqa: F401
 from .heaviside_ import heaviside_  # noqa: F401
 from .histc import histc
 from .hstack import hstack
-from .hypot import hypot
+from .hypot import hypot, hypot_
 from .igamma_ import igamma_  # noqa: F401
 from .igammac import igammac, igammac_out
 from .igammac_ import igammac_
 from .im2col import im2col
 from .index import index
 from .index_add import index_add, index_add_
-from .index_copy_ import index_copy_
+from .index_copy_ import index_copy, index_copy_
+from .index_fill import index_fill, index_fill_  # noqa: F401
 from .index_put import index_put, index_put_
 from .index_put_impl import _index_put_impl_
 from .index_reduce import index_reduce_
@@ -294,17 +314,25 @@ from .lcm import lcm, lcm_
 from .le import le, le_, le_scalar
 from .leaky_relu import leaky_relu, leaky_relu_, leaky_relu_backward, leaky_relu_out
 from .lerp import lerp_scalar, lerp_scalar_, lerp_tensor, lerp_tensor_
-from .less_equal import less_equal, less_equal_scalar
+from .less_equal import (
+    less_equal,
+    less_equal_,
+    less_equal_scalar,
+    less_equal_scalar_,
+)
 from .lgamma import lgamma, lgamma_
 from .lift_fresh import lift_fresh  # noqa: F401
 from .lift_fresh_copy import lift_fresh_copy
+from .lift_out import lift_out  # noqa: F401
 from .linalg_cholesky import linalg_cholesky
 from .linalg_cross import linalg_cross, linalg_cross_out
 from .linalg_det import linalg_det, linalg_det_out
 from .linalg_householder_product import linalg_householder_product
 from .linalg_ldl_factor import ldl_factor
 from .linalg_ldl_factor_ex import ldl_factor_ex
+from .linalg_ldl_solve import linalg_ldl_solve
 from .linalg_lstsq import linalg_lstsq
+from .linalg_lu import linalg_lu, linalg_lu_out
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
 from .linalg_matrix_norm import linalg_matrix_norm
@@ -340,7 +368,7 @@ from .logical_or import logical_or, logical_or_
 from .logical_xor import logical_xor, logical_xor_
 from .logspace import logspace
 from .logsumexp import logsumexp
-from .lt import lt, lt_, lt_scalar, lt_scalar_
+from .lt import lt, lt_, lt_scalar, lt_scalar_, less_, less_scalar_
 from .lu_unpack import lu_unpack, lu_unpack_out
 from .margin_ranking_loss import margin_ranking_loss
 from .masked_fill import masked_fill, masked_fill_
@@ -364,7 +392,9 @@ from .median import median, median_dim, median_dim_values, median_out
 from .min import min, min_dim
 from .minimum import minimum
 from .miopen_batch_norm_backward import miopen_batch_norm_backward
+from .mish import mish, mish_
 from .mish_backward import mish_backward
+from .mkldnn_rnn_layer import mkldnn_rnn_layer
 from .mm import mm, mm_out
 from .mode import mode
 from .moe_sum import moe_sum
@@ -377,11 +407,12 @@ from .multiply_ import multiply_
 from .mv import mv, mv_cluster
 from .mvlgamma import mvlgamma
 from .mvlgamma_ import mvlgamma_
-from .nan_to_num import nan_to_num
+from .nan_to_num import nan_to_num, nan_to_num_
 from .nanmedian import nanmedian, nanmedian_dim, nanmedian_dim_values, nanmedian_out
 from .nansum import nansum, nansum_out
 from .narrow_copy import narrow_copy
 from .native_batch_norm import native_batch_norm
+from .native_dropout_backward import native_dropout_backward
 from .native_group_norm import native_group_norm
 from .native_layer_norm import native_layer_norm
 from .ne import ne, ne_, ne_scalar, ne_scalar_
@@ -473,6 +504,7 @@ from .rnn_relu import rnn_relu
 from .roll import roll
 from .rot90 import rot90
 from .round import round, round_, round_out
+from .special_round import special_round, special_round_out
 from .rrelu_with_noise_backward import rrelu_with_noise_backward
 from .rsqrt import rsqrt, rsqrt_
 from .rsub import rsub, rsub_scalar, rsub_tensor
@@ -481,7 +513,7 @@ from .scalar_tensor import scalar_tensor
 from .scaled_mm import scaled_mm, scaled_mm_out
 from .scaled_softmax import scaled_softmax_backward, scaled_softmax_forward
 from .scatter import scatter, scatter_
-from .scatter_add_ import scatter_add_
+from .scatter_add_ import scatter_add, scatter_add_
 from .scatter_reduce import scatter_reduce, scatter_reduce_, scatter_reduce_out
 from .searchsorted import (
     searchsorted,
@@ -553,7 +585,9 @@ from .special_modified_bessel_k0 import (
     special_modified_bessel_k0_out,
 )
 from .special_multigammaln import special_multigammaln
+from .special_ndtr import special_ndtr
 from .special_ndtri import special_ndtri
+from .special_expit import special_expit  # noqa: F401
 from .special_shifted_chebyshev_polynomial_t import (
     special_shifted_chebyshev_polynomial_t,
 )
@@ -569,11 +603,11 @@ from .special_shifted_chebyshev_polynomial_w import (
 )
 from .split_with_sizes_copy import split_with_sizes_copy  # noqa: F401
 from .sqrt import sqrt, sqrt_
-from .squeeze_copy import squeeze_copy  # noqa: F401
 from .square import square, square_, square_out
+from .squeeze_copy import squeeze_copy  # noqa: F401
 from .stack import stack
 from .std import std
-from .sub import sub, sub_, subtract_
+from .sub import sub, sub_, subtract, subtract_
 from .sum import sum, sum_dim, sum_dim_out, sum_out
 from .t_copy import t_copy, t_copy_out
 from .tan import tan, tan_
@@ -593,8 +627,11 @@ from .uniform import uniform_
 from .unique import _unique2
 from .unique_consecutive import unique_consecutive
 from .unique_dim import unique_dim
+from .unsafe_chunk import unsafe_chunk
+from .unsqueeze import unsqueeze_  # noqa: F401 (in-place dim insertion, XPU fast path)
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
 from .upsample_bicubic2d_aa_backward import _upsample_bicubic2d_aa_backward
+from .upsample_bilinear2d import upsample_bilinear2d  # noqa: F401
 from .upsample_linear1d import upsample_linear1d
 from .upsample_linear1d_backward import upsample_linear1d_backward
 from .upsample_nearest1d import upsample_nearest1d
@@ -612,10 +649,12 @@ from .weightnorm import weight_norm_interface, weight_norm_interface_backward
 from .where import where_scalar_other, where_scalar_self, where_self, where_self_out
 from .xlogy import (
     xlogy,
+    xlogy_,
     xlogy_out,
     xlogy_scalar_tensor,
     xlogy_scalar_tensor_out,
     xlogy_tensor_scalar,
+    xlogy_tensor_scalar_,
     xlogy_tensor_scalar_out,
 )
 from .zero import zero, zero_, zero_out
@@ -637,6 +676,8 @@ __all__ = [
     "special_hermite_polynomial_h",
     "special_log_softmax",
     "special_logsumexp",
+    "special_round",
+    "special_round_out",
     "softshrink",
     "softshrink_out",
     "_unique2",
@@ -658,6 +699,7 @@ __all__ = [
     "addmm",
     "addmm_out",
     "addmv",
+    "addmv_",
     "addmv_out",
     "addr",
     "alias_copy",
@@ -761,6 +803,7 @@ __all__ = [
     "diagonal_backward",
     "div_mode",
     "div_mode_",
+    "divide",
     "dot",
     "dropout",
     "dropout_backward",
@@ -773,14 +816,18 @@ __all__ = [
     "eq_scalar",
     "erf",
     "erf_",
+    "erfc",
+    "erfc_",
     "exp",
     "exp_",
     "exp_out",
     "exp2",
     "exp2_",
+    "expand_copy",
     "expm1",
     "expm1_",
     "expm1_out",
+    "exponential",
     "exponential_",
     "eye",
     "eye_m",
@@ -825,6 +872,8 @@ __all__ = [
     "hadamard_transform",
     "hardsigmoid",
     "hardsigmoid_out",
+    "hardshrink",
+    "hardshrink_out",
     "index",
     "index_add",
     "index_add_",
@@ -849,7 +898,11 @@ __all__ = [
     "lerp_tensor",
     "lerp_tensor_",
     "less_equal",
+    "less_equal_",
     "less_equal_scalar",
+    "less_equal_scalar_",
+    "less_",
+    "less_scalar_",
     "lift_fresh_copy",
     "linalg_ldl_solve",
     "linspace",
@@ -902,7 +955,9 @@ __all__ = [
     "mv",
     "mv_cluster",
     "nan_to_num",
+    "nan_to_num_",
     "narrow_copy",
+    "native_dropout_backward",
     "nanmedian",
     "nanmedian_dim",
     "nanmedian_dim_values",
@@ -994,6 +1049,7 @@ __all__ = [
     "scaled_softmax_forward",
     "scatter",
     "scatter_",
+    "scatter_add",
     "scatter_add_",
     "select_scatter",
     "selu",
@@ -1025,6 +1081,7 @@ __all__ = [
     "std",
     "sub",
     "sub_",
+    "subtract",
     "subtract_",
     "sum",
     "sum_dim",
@@ -1075,230 +1132,18 @@ __all__ = [
     "where_self",
     "where_self_out",
     "xlogy",
+    "xlogy_",
     "xlogy_out",
     "xlogy_scalar_tensor",
     "xlogy_scalar_tensor_out",
     "xlogy_tensor_scalar",
+    "xlogy_tensor_scalar_",
     "xlogy_tensor_scalar_out",
     "zero",
     "zero_",
     "zero_out",
     "zeros",
     "zeros_like",
-"_nested_view_from_buffer_copy",
-    "_scaled_dot_product_fused_attention_overrideable",
-    "_upsample_nearest_exact2d_backward",
-    "_upsample_bicubic2d_aa_backward",
-    "adaptive_avg_pool2d",
-    "adaptive_max_pool2d",
-    "avg_pool3d",
-    "avg_pool3d_backward",
-    "col2im",
-    "conv_transpose1d",
-    "conv_transpose2d",
-    "fractional_max_pool2d",
-    "fractional_max_pool2d_backward",
-    "grid_sample",
-    "grid_sampler_3d_backward",
-    "im2col",
-    "max_pool2d_with_indices_backward",
-    "max_pool3d_with_indices",
-    "max_pool3d_backward",
-    "max_pool3d_with_indices_backward",
-    "reflection_pad1d_backward",
-    "reflection_pad2d_backward",
-    "reflection_pad3d",
-    "reflection_pad3d_out",
-    "reflection_pad3d_backward",
-    "replication_pad1d",
-    "replication_pad1d_out",
-    "replication_pad2d",
-    "replication_pad2d_out",
-    "replication_pad2d_backward",
-    "replication_pad2d_backward_grad_input",
-    "upsample_linear1d_backward",
-    "upsample_nearest3d",
-    "digamma",
-    "special_gammainc",
-    "special_gammaincc",
-    "special_gammaln",
-    "special_gammaln_out",
-    "special_digamma",
-    "special_erfcx",
-    "special_log_ndtr",
-    "special_log_ndtr_",
-    "special_multigammaln",
-    "special_ndtri",
-    "erfinv",
-    "special_erf",
-    "special_erfinv",
-    "special_erfinv_",
-    "special_erfinv_out",
-    "special_exp2",
-    "lgamma",
-    "lgamma_",
-    "igammac",
-    "igammac_",
-    "igammac_out",
-    "special_modified_bessel_k0",
-    "special_modified_bessel_k0_out",
-    "special_bessel_j0",
-    "special_bessel_j1",
-    "special_bessel_y0",
-    "special_bessel_y1",
-    "special_i0e",
-    "special_i0e_out",
-    "special_legendre_polynomial_p",
-    "special_chebyshev_polynomial_u",
-    "special_chebyshev_polynomial_v",
-    "special_chebyshev_polynomial_w",
-    "special_chebyshev_polynomial_w_out",
-    "special_log1p_out",
-    "special_shifted_chebyshev_polynomial_t",
-    "special_shifted_chebyshev_polynomial_u",
-    "special_shifted_chebyshev_polynomial_u_",
-    "special_shifted_chebyshev_polynomial_v",
-    "special_shifted_chebyshev_polynomial_w",
-    "log2",
-    "log2_",
-    "log_sigmoid_backward",
-    "log_sigmoid_backward_out",
-    "log_sigmoid_forward",
-    "logcumsumexp",
-    "logcumsumexp_out",
-    "log_softmax_backward_out",
-    "log_softmax_out",
-    "logaddexp",
-    "logaddexp_out",
-    "polygamma",
-    "polygamma_",
-    "polygamma_out",
-    "addmm_",
-    "baddbmm_",
-    "baddbmm_out",
-    "cholesky_inverse",
-    "cholesky_solve",
-    "cholesky_solve_out",
-    "linalg_cholesky",
-    "linalg_cross",
-    "linalg_cross_out",
-    "mvlgamma",
-    "mvlgamma_",
-    "_linalg_eigvals",
-    "linalg_det",
-    "linalg_det_out",
-    "linalg_householder_product",
-    "ldl_factor",
-    "ldl_factor_ex",
-    "linalg_lstsq",
-    "linalg_lu_factor",
-    "linalg_lu_factor_out",
-    "linalg_lu_factor_ex",
-    "linalg_lu_factor_ex_out",
-    "linalg_matrix_norm",
-    "linalg_slogdet",
-    "linalg_solve_triangular",
-    "linalg_solve_triangular_out",
-    "linear_backward",
-    "lu_unpack",
-    "lu_unpack_out",
-    "ormqr",
-    "norm",
-    "norm_scalar",
-    "norm_scalaropt_dim",
-    "renorm",
-    "renorm_",
-    "_unsafe_masked_index_put_accumulate",
-    "unique_consecutive",
-    "unique_dim",
-    "argsort",
-    "as_strided_scatter",
-    "unfold_copy",
-    "bucketize",
-    "cumsum_",
-    "diagonal_copy",
-    "histc",
-    "index_copy_",
-    "_index_put_impl_",
-    "index_reduce_",
-    "index_select_backward",
-    "kthvalue",
-    "masked_scatter_backward",
-    "median",
-    "median_dim",
-    "median_dim_values",
-    "median_out",
-    "mode",
-    "roll",
-    "scatter_reduce",
-    "scatter_reduce_",
-    "scatter_reduce_out",
-    "searchsorted",
-    "searchsorted_out",
-    "searchsorted_scalar",
-    "searchsorted_scalar_out",
-    "_segment_reduce_backward",
-    "_segment_reduce_backward_out",
-    "segment_reduce",
-    "segment_reduce_out",
-    "select_backward",
-    "_amp_foreach_non_finite_check_and_unscale_",
-    "_assert_async",
-    "_batch_norm_impl_index",
-    "_batch_norm_no_update",
-    "_embedding_bag_dense_backward",
-    "_native_batch_norm_legit_functional",
-    "_native_batch_norm_legit_no_training",
-    "_fused_adam",
-    "_fused_adam_",
-    "_cdist_backward",
-    "_dyn_quant_pack_4bit_weight",
-    "smooth_l1_loss",
-    "smooth_l1_loss_backward",
-    "smooth_l1_loss_out",
-    "_pdist_backward",
-    "_pdist_forward",
-    "pdist",
-    "pairwise_distance",
-    "bernoulli",
-    "binary_cross_entropy",
-    "binary_cross_entropy_out",
-    "binary_cross_entropy_backward",
-    "binary_cross_entropy_with_logits",
-    "dequantize",
-    "embedding_dense_backward",
-    "fused_experts_impl",
-    "inplace_fused_experts",
-    "outplace_fused_experts",
-    "fused_recurrent_gated_delta_rule_fwd",
-    "get_paged_mqa_logits_metadata",
-    "group_mm",
-    "native_group_norm",
-    "native_batch_norm",
-    "native_layer_norm",
-    "leaky_relu_backward",
-    "margin_ranking_loss",
-    "mish_backward",
-    "miopen_batch_norm_backward",
-    "moe_sum",
-    "mse_loss_backward",
-    "multiply",
-    "nansum",
-    "nansum_out",
-    "nll_loss_nd_backward",
-    "nll_loss_nd_forward",
-    "nll_loss2d",
-    "quantized_lstm",
-    "te_rmsnorm_bwd",
-    "scaled_dot_product_efficient_attention_backward",
-    "scaled_mm",
-    "scaled_mm_out",
-    "scalar_tensor",
-    "special_sinc",
-    "softmax_backward_out",
-    "softmax_out",
-    "softplus_backward",
-    "_weight_norm",
     "_functional_assert_async",
     "absolute_",
     "acos_",
@@ -1355,6 +1200,7 @@ __all__ = [
     "square_",
     "square_out",
     "true_divide_tensor",
+    "true_divide_tensor_",
     "var",
     "var_correction",
     "var_dim",
@@ -1425,11 +1271,14 @@ __all__ = [
     "special_gammaln",
     "special_gammaln_out",
     "special_digamma",
+    "special_erfc",
     "special_erfcx",
     "special_log_ndtr",
     "special_log_ndtr_",
     "special_multigammaln",
+    "special_ndtr",
     "special_ndtri",
+    "special_expit",
     "erfinv",
     "special_erf",
     "special_erfinv",
@@ -1657,3 +1506,5 @@ def _patch_adaptive_max_pool2d_aten():
 
 
 _patch_adaptive_max_pool2d_aten()
+
+from .expand_copy import expand_copy

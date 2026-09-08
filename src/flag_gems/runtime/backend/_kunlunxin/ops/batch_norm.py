@@ -23,11 +23,7 @@ from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 
-from ._batch_norm_no_update import (
-    BNNU_MAX_PROGRAMS,
-    BNNU_TILE_S,
-    _batch_norm_no_update_kernel,
-)
+from ._batch_norm_no_update import _batch_norm_no_update
 
 logger = logging.getLogger(__name__)
 rsqrt = tl_extra_shim.rsqrt
@@ -838,11 +834,16 @@ def batch_norm(
 ):
     logger.debug("GEMS_KUNLUNXIN BATCH_NORM")
 
-    # Inference -> single per-(n,c)-slice kernel launch (see NOTE above): no transpose
-    # copies, no discrete channel gathers, no separate normalize launch. It replaces
-    # both the fused-transpose path (was ~6-12 ms on small benchmark shapes) and the
-    # 3-stage path's normalize launch for large shapes. Training keeps the 3-stage
-    # path below (unchanged).
+    # Inference -> vendor batch-fused `_batch_norm_no_update` (see NOTE above and the
+    # `_batch_norm_no_update.py` header, 2026-09-04/2026-09-08): the per-(n,c) slice
+    # launch pays the XPU per-program scheduling wall on the benchmark shapes
+    # (256 programs x 1 tile ~= 88-96us), while the fused kernel groups NB consecutive
+    # n-slices per program (grid = C*ceil(N/NB) + exact-fit tiles) and measured
+    # 2.7-3.1x on those shapes ((16,16,64) 88.7->29.7us, (16,16,1024) 87.0->31.5us,
+    # (16,16,8,48) 90.1->28.7us, (16,16,4098) 133.7->101.6us; (16,8,128,128) with
+    # S>BNNU_BIG_S stays on the per-slice path inside `_batch_norm_no_update`).
+    # The math is identical (y = w*(x-mean)*rsqrt(var+eps)+b in fp32, running stats
+    # NOT updated). Training keeps the 3-stage path below (unchanged).
     if not training:
         input_3d = make_3d_for_bn(input)  # [N, C, S]
         if not input_3d.is_contiguous():
@@ -850,32 +851,9 @@ def batch_norm(
         batch_dim, feat_dim, spatial_dim = input_3d.shape
         n_slices = batch_dim * feat_dim
         if n_slices > 0:
-            output = torch.empty_like(input_3d)
-            input_flat = input_3d.reshape(-1)
-            output_flat = output.reshape(-1)
-            has_weight = weight is not None
-            has_bias = bias is not None
-            with torch_device_fn.device(input.device):
-                for slice_offset in range(0, n_slices, BNNU_MAX_PROGRAMS):
-                    slice_count = min(BNNU_MAX_PROGRAMS, n_slices - slice_offset)
-                    _batch_norm_no_update_kernel[(slice_count,)](
-                        input_flat[slice_offset * spatial_dim :],
-                        weight if has_weight else input_flat,
-                        bias if has_bias else input_flat,
-                        running_mean,
-                        running_var,
-                        output_flat[slice_offset * spatial_dim :],
-                        feat_dim,
-                        spatial_dim,
-                        eps,
-                        HAS_WEIGHT=has_weight,
-                        HAS_BIAS=has_bias,
-                        TILE_S=BNNU_TILE_S,
-                        NEED_MASK=(spatial_dim % BNNU_TILE_S) != 0,
-                        num_warps=4,
-                        isCloseVectorization=True,
-                        buffer_size_limit=2048,
-                    )
+            output, _, _, _ = _batch_norm_no_update(
+                input, weight, bias, running_mean, running_var, momentum, eps
+            )
             # NOTE: return stats as UNINITIALIZED [C] tensors for inference, exactly
             # like the previous fused path did: the native batch_norm inference
             # caller never consumes them, and computing running_mean.to()/rsqrt()
