@@ -198,6 +198,7 @@ def special_erfinv(x: torch.Tensor):
         out = out.reshape(x.shape).as_strided(x.size(), x.stride())
     return out
 
+
 def special_erfinv_(x: torch.Tensor):
     """Special erfinv_ in-place function"""
     logger.debug("GEMS KUNLUNXIN special_erfinv_")

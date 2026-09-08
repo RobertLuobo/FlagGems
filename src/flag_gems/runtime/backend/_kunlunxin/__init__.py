@@ -26,7 +26,13 @@ CUSTOMIZED_UNUSED_OPS = (
     "atan2_out",
     "cummin",
     "cumsum",
+    "grid_sampler_3d_backward",
     "randperm",
+    "searchsorted",
+    "searchsorted_out",
+    "searchsorted_scalar",
+    "searchsorted_scalar_out",
+    "sort",
     "topk",
     "unique",
 )
