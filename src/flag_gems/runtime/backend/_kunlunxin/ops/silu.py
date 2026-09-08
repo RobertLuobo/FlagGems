@@ -14,6 +14,7 @@
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
@@ -51,14 +52,94 @@ def silu_forward(x):
 # a swept comparison showed all unroll8 variants land at ~0.55ms for
 # [4096,4096] fp16 (vs 0.80ms config-less, ~1.45x) with bit-identical output;
 # vec OPEN spiked to 28.9ms on fp32 [1024,65536] so keep isCloseVectorization.
+# The sigmoid division in silu_backward_kernel uses tl.fdiv (not libdevice
+# div_rn): on XPU an interleaved A/B probe (2026-09-08, XPU 6) showed fdiv
+# output bit-identical to div_rn (maxabs=0.0 on 100M+ randn/zero/ones/
+# subnormal samples, incl. masked-tail shapes) and 4-6% faster on the
+# pointwise path (e.g. [4096,4096] fp16 513->486us, fp32 467->439us;
+# [1024,65536] bf16 2006->1884us) -- div_rn is a slower (round-to-nearest
+# emulated) division on this backend; inf/NaN semantics identical to torch
+# reference (both produce NaN at the same positions).
+# NOTE: the tiny flat kernel below MUST keep div_rn -- on XPU, fdiv in a
+# hand-written flat 1D kernel with other=0.0 masked loads miscompiles for
+# float16 (loaded x becomes 0.0 -> output = dy*sigmoid(0)*1.0, e.g.
+# [0.5786]/[-0.896] gives -0.448 instead of -0.693); div_rn is unaffected.
 @pointwise_dynamic(promotion_methods=[(0, "DEFAULT")], config=config_)
 @triton.jit
 def silu_backward_kernel(x, dy):
     dy_fp32 = dy.to(tl.float32)
     x_fp32 = x.to(tl.float32)
-    sigma = div_rn(1.0, 1.0 + tl.exp(-x_fp32))
+    sigma = tl.fdiv(1.0, 1.0 + tl.exp(-x_fp32))
     dx = dy_fp32 * sigma * (1.0 + x_fp32 * (1.0 - sigma))
     return dx
+
+
+# silu_backward tiny fast path (contiguous fp16/fp32/bf16, numel <= 2048):
+# a flat 1D masked/unmasked kernel that skips the pointwise_dynamic wrapper.
+# Measurement on XPU 5 (2026-08-19, official 12-shape matrix, do_bench A/B):
+# at numel <= 2048 the pointwise codegen (kunlunAutoGrid=False) pays a fixed
+# ~8us wrapper/grid overhead per call (e.g. [1024,1] fp16 15.5us vs 7.1us flat);
+# at numel > 2048 the tuned pointwise config_ is strictly faster than every
+# flat/NEED_MASK tier (B2048..B32768 x w4..16) and every CodeGenConfig variant
+# (unroll 8/16/32 x buffer 4096/8192/16384 x tile 256/512/1024 x autogrid),
+# so only the tiny window uses the flat kernel. Math bit-identical to
+# silu_backward_kernel (fp32 staging, downcast at store; div_rn == fdiv
+# bitwise on this backend, see probe note above) even though it keeps
+# div_rn for the fp16 masked-load miscompile documented above.
+_TINY_MAX_NUMEL = 2048
+_TINY_BLOCK = 2048
+_TINY_WARPS = 4
+
+
+@triton.jit
+def silu_backward_tiny_kernel(
+    g_ptr, x_ptr, out_ptr, n_elements, BLOCK: tl.constexpr, NEED_MASK: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    if NEED_MASK:
+        mask = offs < n_elements
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+        dy = tl.load(g_ptr + offs, mask=mask, other=0.0)
+    else:
+        x = tl.load(x_ptr + offs)
+        dy = tl.load(g_ptr + offs)
+    x_fp32 = x.to(tl.float32)
+    dy_fp32 = dy.to(tl.float32)
+    sigma = div_rn(1.0, 1.0 + tl.exp(-x_fp32))
+    dx = dy_fp32 * sigma * (1.0 + x_fp32 * (1.0 - sigma))
+    if NEED_MASK:
+        tl.store(out_ptr + offs, dx.to(x.dtype), mask=mask)
+    else:
+        tl.store(out_ptr + offs, dx.to(x.dtype))
+
+
+def _silu_backward_tiny(grad_output, self):
+    numel = grad_output.numel()
+    out = torch.empty_like(self)
+    if numel == 0:
+        return out
+    if numel == _TINY_BLOCK:
+        silu_backward_tiny_kernel[(1,)](
+            grad_output,
+            self,
+            out,
+            numel,
+            BLOCK=_TINY_BLOCK,
+            NEED_MASK=False,
+            num_warps=_TINY_WARPS,
+        )
+    else:
+        silu_backward_tiny_kernel[(1,)](
+            grad_output,
+            self,
+            out,
+            numel,
+            BLOCK=_TINY_BLOCK,
+            NEED_MASK=True,
+            num_warps=_TINY_WARPS,
+        )
+    return out
 
 
 def silu(self):
@@ -69,6 +150,13 @@ def silu(self):
 
 def silu_backward(grad_output, self):
     logger.debug("GEMS_KUNLUNXIN SILU_BACKWARD")
+    if (
+        grad_output.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and grad_output.is_contiguous()
+        and self.is_contiguous()
+        and grad_output.numel() <= _TINY_MAX_NUMEL
+    ):
+        return _silu_backward_tiny(grad_output, self)
     grad_input = silu_backward_kernel(self, grad_output)
     return grad_input
 

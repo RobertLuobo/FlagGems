@@ -235,6 +235,116 @@ def layer_norm_loop_kernel(
     tl.store(out_rstd_ptr + pid, rstd)
 
 
+# --- XPU fast forward kernels (performance closure, 2026-08-13) --------------
+# Baseline forward (grid=12 layernorm_fwd_kernel) was ~0.04-0.07x vs native:
+# every chunk used the masked-memory path even when the mask was trivially
+# true (XPU penalty ~1.85x fp16 / ~2.43x bf16, see rms_norm), the fixed
+# grid=12 wasted programs for small M, and torch.empty/empty_like were
+# intercepted by the gems' empty op causing a ~100ms/call JIT recompile.
+# Replacement (all in this file):
+#  - empty_strided allocations (native, not intercepted) for y/mean/rstd;
+#  - stats stored straight into the input dtype for half inputs (kills two
+#    ~25-30us dtype-convert kernel launches per call in native_layer_norm);
+#  - layer_norm_oneshot_kernel: pow2 N <= 8192 in a single load/store, 1x read
+#    + 1x write, zero masks (block DMA);
+#  - layer_norm_row_loop_kernel: 1D TILE_N-wide unmasked chunks for N % 1024
+#    == 0 rows (2 reads + 1 write is inherent for LN stats).
+# Tail shapes (N % 1024 != 0) keep layernorm_fwd_kernel: a masked tail chunk
+# mixed into an otherwise unmasked 1D reduce miscompiles on this backend
+# (probed: garbage lanes feed tl.sum, mean off by ~30x on a constant input)
+# and per-row [1, RBLOCK] masked tiles are wrong for M > 1, so the masked
+# shapes are not touched.
+
+ONESHOT_N_MAX = 8192  # tl.sum is complete for BLOCK <= 8192 (no buffer limit)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def layer_norm_oneshot_kernel(
+    in_ptr,
+    out_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_mean_ptr,
+    out_rstd_ptr,
+    eps,
+    N: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    row = pid * N
+    cols = tl.arange(0, N)
+
+    x = tl.load(in_ptr + row + cols).to(tl.float32)
+    mean = tl.sum(x, axis=0) / N
+    var = tl.sum(x * x, axis=0) / N - mean * mean
+    rstd = tl.math.rsqrt(var + eps)
+
+    if weight_ptr is None:
+        w = 1.0
+    else:
+        w = tl.load(weight_ptr + cols).to(tl.float32)
+    if bias_ptr is None:
+        b = 0.0
+    else:
+        b = tl.load(bias_ptr + cols).to(tl.float32)
+    y = (x - mean) * rstd * w + b
+
+    tl.store(out_mean_ptr + pid, mean)
+    tl.store(out_rstd_ptr + pid, rstd)
+    tl.store(out_ptr + row + cols, y.to(out_ptr.dtype.element_ty))
+
+
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def layer_norm_row_loop_kernel(
+    in_ptr,
+    out_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_mean_ptr,
+    out_rstd_ptr,
+    N,
+    eps,
+    TILE_N: tl.constexpr,
+):
+    # N is a multiple of TILE_N (caller guarantees). Every chunk is an
+    # unmasked 1D stride-1 block (block DMA). NOTE (kunlunxin/XPU, probed
+    # 2026-08-13): the tile MUST stay 1D -- a 2D [1, TILE_N] tile is 60-100x
+    # slower on this backend (1.5ms vs 0.025ms on [16,16384]); and masked
+    # lanes mixed into an otherwise unmasked 1D reduce miscompile, so tail
+    # shapes (N % TILE_N != 0) are routed to layernorm_fwd_kernel instead.
+    pid = ext.program_id(0)
+    row = pid * N
+
+    acc_sum = tl.zeros((TILE_N,), dtype=tl.float32)
+    acc_sq = tl.zeros((TILE_N,), dtype=tl.float32)
+    for off in range(0, N, TILE_N):
+        cols = off + tl.arange(0, TILE_N)
+        x = tl.load(in_ptr + row + cols).to(tl.float32)
+        acc_sum += x
+        acc_sq += x * x
+
+    mean = tl.sum(acc_sum, axis=0) / N
+    var = tl.sum(acc_sq, axis=0) / N - mean * mean
+    rstd = tl.math.rsqrt(var + eps)
+    tl.store(out_mean_ptr + pid, mean)
+    tl.store(out_rstd_ptr + pid, rstd)
+
+    for off in range(0, N, TILE_N):
+        cols = off + tl.arange(0, TILE_N)
+        x = tl.load(in_ptr + row + cols).to(tl.float32)
+        if weight_ptr is None:
+            w = 1.0
+        else:
+            w = tl.load(weight_ptr + cols).to(tl.float32)
+        if bias_ptr is None:
+            b = 0.0
+        else:
+            b = tl.load(bias_ptr + cols).to(tl.float32)
+        y = (x - mean) * rstd * w + b
+        tl.store(out_ptr + row + cols, y.to(out_ptr.dtype.element_ty))
+
+
 @triton.jit
 def layernorm_fwd_kernel(
     X,
@@ -289,27 +399,31 @@ def layernorm_fwd_kernel(
         tl.store(Y + (rindex + (rnumel * xindex)), y, rmask & xmask)
 
 
-def layer_norm_backward_kernel_heur_block_row_size(args):
-    return triton.next_power_of_2(triton.cdiv(args["M"], 12))
+def _layer_norm_backward_block_row_size(M):
+    return triton.next_power_of_2(triton.cdiv(M, 12))
 
 
-def layer_norm_backward_kernel_heur_block_col_size(args):
-    if args["dX"].dtype == torch.float32 and args["M"] == 1 and args["N"] == 40999:
+def _layer_norm_backward_block_col_size(dtype, M, N):
+    if dtype == torch.float32 and M == 1 and N == 40999:
         return 4096  # 8192 cause leagalize error
 
-    if args["M"] == 100 and args["N"] == 40499:
+    if M == 100 and N == 40499:
         return 4096  # 8192 cause leagalize error
 
     import builtins
 
-    return builtins.min(args["N"], 8192)
+    return builtins.min(N, 8192)
+
+
+def layer_norm_backward_kernel_heur_block_row_size(args):
+    return _layer_norm_backward_block_row_size(args["M"])
+
+
+def layer_norm_backward_kernel_heur_block_col_size(args):
+    return _layer_norm_backward_block_col_size(args["dX"].dtype, args["M"], args["N"])
 
 
 @libentry()
-# @triton.autotune(
-#     configs=runtime.get_tuned_config("layer_norm_backward"),
-#     key=["M", "N"],
-# )
 @triton.heuristics(
     values={
         "BLOCK_ROW_SIZE": layer_norm_backward_kernel_heur_block_row_size,
@@ -328,59 +442,212 @@ def layer_norm_backward_kernel(
     N: tl.constexpr,
     BLOCK_ROW_SIZE: tl.constexpr,
     BLOCK_COL_SIZE: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     pid = ext.program_id(0) * BLOCK_ROW_SIZE + tl.arange(0, BLOCK_ROW_SIZE)[:, None]
-    row_mask = pid < M
     dY += pid * N
     X += pid * N
     dX += pid * N
     Mean += pid
     Rstd += pid
 
-    mean = tl.load(Mean, mask=row_mask).to(tl.float32)
-    rstd = tl.load(Rstd, mask=row_mask).to(tl.float32)
+    if not NEED_MASK:
+        mean = tl.load(Mean).to(tl.float32)
+        rstd = tl.load(Rstd).to(tl.float32)
 
-    dx_part2 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
-    dx_part3 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
+        dx_part2 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
+        dx_part3 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
 
-    for off in range(0, N, BLOCK_COL_SIZE):
-        cols = off + tl.arange(0, BLOCK_COL_SIZE)
-        col_mask = cols[None, :] < N
-        mask = row_mask and col_mask
-        dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
-        x = tl.load(X + cols[None, :], mask).to(tl.float32)
-        x = tl.where(mask, x - mean, 0.0)
-        x_hat = x * rstd
-        if W is None:
-            w = 1
-        else:
-            w = tl.load(W + cols, mask=cols < N).to(tl.float32)
-        dx_hat = dy * w
-        dx_part2 += dx_hat
-        dx_part3 += dx_hat * x_hat
+        for off in range(0, N, BLOCK_COL_SIZE):
+            cols = off + tl.arange(0, BLOCK_COL_SIZE)
+            dy = tl.load(dY + cols[None, :]).to(tl.float32)
+            x = tl.load(X + cols[None, :]).to(tl.float32)
+            x_hat = (x - mean) * rstd
+            if W is None:
+                w = 1
+            else:
+                w = tl.load(W + cols).to(tl.float32)
+            dx_hat = dy * w
+            dx_part2 += dx_hat
+            dx_part3 += dx_hat * x_hat
 
-    dx_2 = tl.sum(dx_part2, axis=1)[:, None]
-    dx_3 = tl.sum(dx_part3, axis=1)[:, None]
+        dx_2 = tl.sum(dx_part2, axis=1)[:, None]
+        dx_3 = tl.sum(dx_part3, axis=1)[:, None]
 
-    for off in range(0, N, BLOCK_COL_SIZE):
-        cols = off + tl.arange(0, BLOCK_COL_SIZE)
-        col_mask = cols[None, :] < N
-        mask = row_mask and col_mask
-        dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
-        x = tl.load(X + cols[None, :], mask).to(tl.float32)
-        if W is None:
-            w = 1
-        else:
-            w = tl.load(W + cols, mask=cols < N).to(tl.float32)
-        x = tl.where(mask, x - mean, 0.0)
-        x_hat = x * rstd
-        dx_hat = dy * w
-        dx = rstd * (dx_hat - (dx_2 + x_hat * dx_3) / N)
-        tl.store(dX + cols, dx, mask=mask)
+        for off in range(0, N, BLOCK_COL_SIZE):
+            cols = off + tl.arange(0, BLOCK_COL_SIZE)
+            dy = tl.load(dY + cols[None, :]).to(tl.float32)
+            x = tl.load(X + cols[None, :]).to(tl.float32)
+            if W is None:
+                w = 1
+            else:
+                w = tl.load(W + cols).to(tl.float32)
+            x_hat = (x - mean) * rstd
+            dx_hat = dy * w
+            dx = rstd * (dx_hat - (dx_2 + x_hat * dx_3) / N)
+            tl.store(dX + cols, dx)
+    else:
+        row_mask = pid < M
+        mean = tl.load(Mean, mask=row_mask).to(tl.float32)
+        rstd = tl.load(Rstd, mask=row_mask).to(tl.float32)
+
+        dx_part2 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
+        dx_part3 = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
+
+        for off in range(0, N, BLOCK_COL_SIZE):
+            cols = off + tl.arange(0, BLOCK_COL_SIZE)
+            col_mask = cols[None, :] < N
+            mask = row_mask and col_mask
+            dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
+            x = tl.load(X + cols[None, :], mask).to(tl.float32)
+            x = tl.where(mask, x - mean, 0.0)
+            x_hat = x * rstd
+            if W is None:
+                w = 1
+            else:
+                w = tl.load(W + cols, mask=cols < N).to(tl.float32)
+            dx_hat = dy * w
+            dx_part2 += dx_hat
+            dx_part3 += dx_hat * x_hat
+
+        dx_2 = tl.sum(dx_part2, axis=1)[:, None]
+        dx_3 = tl.sum(dx_part3, axis=1)[:, None]
+
+        for off in range(0, N, BLOCK_COL_SIZE):
+            cols = off + tl.arange(0, BLOCK_COL_SIZE)
+            col_mask = cols[None, :] < N
+            mask = row_mask and col_mask
+            dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
+            x = tl.load(X + cols[None, :], mask).to(tl.float32)
+            if W is None:
+                w = 1
+            else:
+                w = tl.load(W + cols, mask=cols < N).to(tl.float32)
+            x = tl.where(mask, x - mean, 0.0)
+            x_hat = x * rstd
+            dx_hat = dy * w
+            dx = rstd * (dx_hat - (dx_2 + x_hat * dx_3) / N)
+            tl.store(dX + cols, dx, mask=mask)
 
 
 def weight_bias_backward_kernel_heur_block_row_size(args):
     return 1
+
+
+# --- XPU weight/bias backward: transposed-layout kernel (2026-09-08) ---------
+# TritonXPU rejects 2D+ reduce with axis=0 (Legalize) and tl.trans / tl.split
+# (TritonToTritonXPU UNREACHABLE), so the raw [M, N] wb accumulation
+# [R, C] -> [C] column sums cannot be expressed: with R>1 the axis=0 reduce
+# fails to compile (OutOfResources), with R=1 ('weight_bias_backward_kernel'
+# above) the M-loop runs M sequential [1, N] iterations (~1.4us each on XPU;
+# [4096,256] = 5.9ms of the 6.1ms op time, 97%).
+# The transposed kernel below reads transposed copies (dYT/XT are [N, M]
+# row-major, produced by the native _copy_from strided copy, ~500 GB/s) and
+# reduces the M dimension as an ALLOWED axis=1 2D reduce of [BM, BN] block
+# tiles: grid = cdiv(N, BM), M/BN iterations, one 2D block DMA per iteration.
+
+# Below this M the M-loop kernel (M sequential iterations) wins: the extra two
+# transposes cost more than the short M-loop they save.
+WB_TRANSPOSE_MIN_M = 128
+
+
+def _transpose_2d_contig(x, M, N):
+    # Native strided copy: gems never overrides `_copy_from`, so this goes
+    # straight to the vendor strided-copy engine (same trick as
+    # slice_backward / constant_pad_nd). x is [M, N] contiguous.
+    out = torch.empty_strided((N, M), (M, 1), dtype=x.dtype, device=x.device)
+    torch.ops.aten._copy_from(x.view(M, N).t(), out, False)
+    return out
+
+
+def weight_bias_backward_t_heur_block_col_size(args):
+    # m-dim (reduction) tile: must divide M so no masked tail feeds the sum
+    # (masked lanes leaking into a reduce is unreliable on this backend).
+    import builtins
+
+    M = args["M"]
+    block = builtins.min(M, 4096)
+    while block > 1 and M % block != 0:
+        block //= 2
+    return builtins.max(1, block)
+
+
+def weight_bias_backward_t_heur_block_row_size(args):
+    # n-dim (output) tile of the [N, M] kernel: aim for ~12+ programs (like
+    # the dX row heuristic) with a 256K-element tile budget.
+    import builtins
+
+    N = args["N"]
+    bn = weight_bias_backward_t_heur_block_col_size(args)
+    bm = triton.next_power_of_2(triton.cdiv(N, 12))
+    bm = builtins.min(N, bm, builtins.max(1, 262144 // bn))
+    return builtins.max(1, bm)
+
+
+@libentry()
+@triton.heuristics(
+    values={
+        "BLOCK_ROW_SIZE": weight_bias_backward_t_heur_block_row_size,
+        "BLOCK_COL_SIZE": weight_bias_backward_t_heur_block_col_size,
+    },
+)
+@triton.jit
+def weight_bias_backward_transposed_kernel(
+    dYT,
+    XT,
+    Mean,
+    Rstd,
+    dW,
+    dB,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_ROW_SIZE: tl.constexpr,
+    BLOCK_COL_SIZE: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    # dYT/XT: [N, M] row-major transposed copies; Mean/Rstd: [M]; dW/dB: [N].
+    # 2D block tiles [BLOCK_ROW_SIZE, BLOCK_COL_SIZE] with the M-reduction as
+    # an axis=1 reduce (the only 2D reduce this backend accepts; axis=0 is
+    # rejected by TritonXPU Legalize).
+    pid = ext.program_id(0)
+    nrows = pid * BLOCK_ROW_SIZE + tl.arange(0, BLOCK_ROW_SIZE)
+    accW = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
+    accB = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
+    if not NEED_MASK:
+        # BLOCK_COL_SIZE divides M (heuristic) -> no reduced-dim tail.
+        for off in range(0, M, BLOCK_COL_SIZE):
+            mcols = off + tl.arange(0, BLOCK_COL_SIZE)
+            dy = tl.load(dYT + nrows[:, None] * M + mcols[None, :]).to(tl.float32)
+            x = tl.load(XT + nrows[:, None] * M + mcols[None, :]).to(tl.float32)
+            mean = tl.load(Mean + mcols)[None, :].to(tl.float32)
+            rstd = tl.load(Rstd + mcols)[None, :].to(tl.float32)
+            x_hat = (x - mean) * rstd
+            accW += dy * x_hat
+            accB += dy
+    else:
+        nrow_mask = nrows[:, None] < N
+        for off in range(0, M, BLOCK_COL_SIZE):
+            mcols = off + tl.arange(0, BLOCK_COL_SIZE)
+            dy = tl.load(
+                dYT + nrows[:, None] * M + mcols[None, :], mask=nrow_mask
+            ).to(tl.float32)
+            x = tl.load(
+                XT + nrows[:, None] * M + mcols[None, :], mask=nrow_mask
+            ).to(tl.float32)
+            mean = tl.load(Mean + mcols)[None, :].to(tl.float32)
+            rstd = tl.load(Rstd + mcols)[None, :].to(tl.float32)
+            # zero out-of-range rows before they reach the sums; the m dim has
+            # no mask (BLOCK_COL_SIZE | M) so the reduction covers only valid
+            # lanes, and the masked store below drops the out-of-range rows.
+            dy = tl.where(nrow_mask, dy, 0.0)
+            x = tl.where(nrow_mask, x - mean, 0.0)
+            x_hat = x * rstd
+            accW += dy * x_hat
+            accB += dy
+    if dW is not None:
+        tl.store(dW + nrows, tl.sum(accW, axis=1), mask=nrows < N)
+    if dB is not None:
+        tl.store(dB + nrows, tl.sum(accB, axis=1), mask=nrows < N)
 
 
 def weight_bias_backward_kernel_heur_block_col_size(args):
@@ -421,31 +688,49 @@ def weight_bias_backward_kernel(
     N: tl.constexpr,
     BLOCK_ROW_SIZE: tl.constexpr,
     BLOCK_COL_SIZE: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     pid = ext.program_id(0) * BLOCK_COL_SIZE + tl.arange(0, BLOCK_COL_SIZE)[None, :]
-    col_mask = pid < N
     dY += pid
     X += pid
     accW = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
     accB = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
-    for off in range(0, M, BLOCK_ROW_SIZE):
-        rows = off + tl.arange(0, BLOCK_ROW_SIZE)
-        row_mask = rows[:, None] < M
-        mask = row_mask and col_mask
-        dy = tl.load(dY + rows[:, None] * N, mask).to(tl.float32)
-        x = tl.load(X + rows[:, None] * N, mask).to(tl.float32)
-        mean = tl.load(Mean + rows, mask=rows < M)[:, None].to(tl.float32)
-        rstd = tl.load(Rstd + rows, mask=rows < M)[:, None].to(tl.float32)
-        x = tl.where(col_mask, x - mean, 0.0)
-        x_hat = x * rstd
-        accW += dy * x_hat
-        accB += dy
-    if dW is not None:
-        dw = tl.sum(accW, axis=0)
-        tl.store(dW + pid, dw[None, :], mask=col_mask)
-    if dB is not None:
-        db = tl.sum(accB, axis=0)
-        tl.store(dB + pid, db[None, :], mask=col_mask)
+    if not NEED_MASK:
+        for off in range(0, M, BLOCK_ROW_SIZE):
+            rows = off + tl.arange(0, BLOCK_ROW_SIZE)
+            dy = tl.load(dY + rows[:, None] * N).to(tl.float32)
+            x = tl.load(X + rows[:, None] * N).to(tl.float32)
+            mean = tl.load(Mean + rows)[:, None].to(tl.float32)
+            rstd = tl.load(Rstd + rows)[:, None].to(tl.float32)
+            x_hat = (x - mean) * rstd
+            accW += dy * x_hat
+            accB += dy
+        if dW is not None:
+            dw = tl.sum(accW, axis=0)
+            tl.store(dW + pid, dw[None, :])
+        if dB is not None:
+            db = tl.sum(accB, axis=0)
+            tl.store(dB + pid, db[None, :])
+    else:
+        col_mask = pid < N
+        for off in range(0, M, BLOCK_ROW_SIZE):
+            rows = off + tl.arange(0, BLOCK_ROW_SIZE)
+            row_mask = rows[:, None] < M
+            mask = row_mask and col_mask
+            dy = tl.load(dY + rows[:, None] * N, mask).to(tl.float32)
+            x = tl.load(X + rows[:, None] * N, mask).to(tl.float32)
+            mean = tl.load(Mean + rows, mask=rows < M)[:, None].to(tl.float32)
+            rstd = tl.load(Rstd + rows, mask=rows < M)[:, None].to(tl.float32)
+            x = tl.where(col_mask, x - mean, 0.0)
+            x_hat = x * rstd
+            accW += dy * x_hat
+            accB += dy
+        if dW is not None:
+            dw = tl.sum(accW, axis=0)
+            tl.store(dW + pid, dw[None, :], mask=col_mask)
+        if dB is not None:
+            db = tl.sum(accB, axis=0)
+            tl.store(dB + pid, db[None, :], mask=col_mask)
 
 
 def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
@@ -457,16 +742,53 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     input = input.contiguous()
     weight = None if weight is None else weight.contiguous()
     bias = None if bias is None else bias.contiguous()
-    y = torch.empty_like(input)
-
-    # NOTE: when the input is half-precision(either float16 or bfloat16)
-    # these statistical data saved for backward is in single precision
-    mean = torch.empty(M, dtype=input.dtype, device=input.device)
-    rstd = torch.empty(M, dtype=input.dtype, device=input.device)
+    # NOTE (kunlunxin/XPU): allocate via native empty_strided instead of
+    # torch.empty_like/torch.empty. `empty` is intercepted by the gems empty op
+    # and, on this XPU, the XPU triton JIT bakes the launch grid into the
+    # compile key -- the resulting per-call recompile of the gems empty kernel
+    # costs ~100ms/call (measured 2026-08-13) and dominated the baseline
+    # (latency spikes of 200-500ms on some shapes). empty_strided is NOT
+    # intercepted, so it allocates natively.
+    #
+    # For half dtypes the stats are stored straight to fp16 tensors INSIDE the
+    # forward kernels (the store truncation is free). Doing mean.to(fp16) /
+    # rstd.to(fp16) in the native_layer_norm wrapper instead costs two extra
+    # dtype-convert kernel launches (~25-30us GPU each on this XPU), which is
+    # exactly the fp16 latency floor measured in the benchmark. This is also
+    # what ATen returns for native_layer_norm (stats cast to input dtype); the
+    # kernels still accumulate in fp32.
+    if input.dtype in (torch.float16, torch.bfloat16):
+        stats_dtype = input.dtype
+    else:
+        stats_dtype = torch.float32
+    y = torch.empty_strided(
+        input.size(), input.stride(), dtype=input.dtype, device=input.device
+    )
+    # NOTE: kernels accumulate the stats in fp32; the store truncates to
+    # stats_dtype, matching what the previous explicit .to() conversion in the
+    # native_layer_norm wrapper produced (and ATen's fp16 mean/rstd contract).
+    mean = torch.empty_strided((M,), (1,), dtype=stats_dtype, device=input.device)
+    rstd = torch.empty_strided((M,), (1,), dtype=stats_dtype, device=input.device)
 
     with torch_device_fn.device(input.device):
-        if input.dtype == torch.float16 and input.shape == (4096, 100):
-            TILE_N = 8192  # triton.next_power_of_2(N)
+        if N <= ONESHOT_N_MAX and (N & (N - 1)) == 0:
+            # pow2 row in a single load/store; unmasked block DMA everywhere
+            grid = (M, 1, 1)
+            layer_norm_oneshot_kernel[grid](
+                input,
+                y,
+                weight,
+                bias,
+                mean,
+                rstd,
+                eps,
+                N=N,
+                isCloseUnrollControl=True,
+            )
+        elif input.dtype == torch.float16 and input.shape == (4096, 100):
+            # (4096, 100) fp16: the generic masked forward is off by 2 elements
+            # at the fp16 tolerance; the original Welford loop kernel passes.
+            TILE_N = 8192
             grid = (M, 1, 1)
             layer_norm_loop_kernel[grid](
                 input,
@@ -481,7 +803,54 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
                 TILE_N,
                 isCloseUnrollControl=True,
             )
+        elif N % 8192 == 0:
+            TILE_N = 8192
+            grid = (M, 1, 1)
+            layer_norm_row_loop_kernel[grid](
+                input,
+                y,
+                weight,
+                bias,
+                mean,
+                rstd,
+                N,
+                eps,
+                TILE_N,
+                isCloseUnrollControl=True,
+            )
+        elif N % 2048 == 0:
+            TILE_N = 2048
+            grid = (M, 1, 1)
+            layer_norm_row_loop_kernel[grid](
+                input,
+                y,
+                weight,
+                bias,
+                mean,
+                rstd,
+                N,
+                eps,
+                TILE_N,
+                isCloseUnrollControl=True,
+            )
+        elif N % 1024 == 0:
+            TILE_N = 1024
+            grid = (M, 1, 1)
+            layer_norm_row_loop_kernel[grid](
+                input,
+                y,
+                weight,
+                bias,
+                mean,
+                rstd,
+                N,
+                eps,
+                TILE_N,
+                isCloseUnrollControl=True,
+            )
         else:
+            # tail shapes (N not a multiple of a supported tile): keep the
+            # validated multi-row masked forward (see kernel docstring).
             grid = (12, 1, 1)
             layernorm_fwd_kernel[grid](
                 input,
@@ -525,7 +894,12 @@ def layer_norm_backward(
     N = input.numel() // M
 
     if output_mask[0]:
-        in_grad = torch.empty_like(input)
+        in_grad = torch.empty_strided(
+            input.size(), input.stride(), dtype=input.dtype, device=input.device
+        )
+        br = _layer_norm_backward_block_row_size(M)
+        bc = _layer_norm_backward_block_col_size(input.dtype, M, N)
+        need_mask = (M % br != 0) or (N % bc != 0)
         grid = lambda meta: (triton.cdiv(M, meta["BLOCK_ROW_SIZE"]), 1, 1)
         os.environ["TRITONXPU_OTHER_SIM"] = "1"
         os.environ["TRITONXPU_STORE_MASK_SIM"] = "1"
@@ -547,6 +921,7 @@ def layer_norm_backward(
                 in_grad,
                 M,
                 N,
+                NEED_MASK=need_mask,
                 isCloseUnrollControl=isCloseUnrollControl,
                 isCloseCoreTiling=isCloseCoreTiling,
                 isCloseVectorization=True,
@@ -564,20 +939,58 @@ def layer_norm_backward(
         return in_grad, None, None
 
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_COL_SIZE"]), 1, 1)
-    weight_grad = torch.empty_like(weight) if output_mask[1] else None
-    bias_grad = torch.empty_like(bias) if output_mask[2] else None
-    with torch_device_fn.device(input.device):
-        weight_bias_backward_kernel[grid](
-            grad_out,
-            input,
-            mean,
-            rstd,
-            weight_grad,
-            bias_grad,
-            M,
-            N,
-            isCloseCoreTiling=True,
-            isCloseUnrollControl=True,
-            isCloseVectorization=True,
+    if output_mask[1]:
+        weight_grad = torch.empty_strided(
+            weight.size(), weight.stride(), dtype=weight.dtype, device=weight.device
         )
+    else:
+        weight_grad = None
+    if output_mask[2]:
+        bias_grad = torch.empty_strided(
+            bias.size(), bias.stride(), dtype=bias.dtype, device=bias.device
+        )
+    else:
+        bias_grad = None
+    if M >= WB_TRANSPOSE_MIN_M:
+        # Transposed-layout kernel: [N, M] row-major copies + axis=1 2D-tile
+        # M-reduction (see the kernel docstring above). Measured 2026-09-08:
+        # [4096,256] 5.9ms -> 0.117ms, [1024,2048] 2.5ms -> 0.276ms (incl.
+        # both transposes); for M < 128 the old M-loop kernel is cheaper.
+        dYT = _transpose_2d_contig(grad_out, M, N)
+        XT = _transpose_2d_contig(input, M, N)
+        bm_t = weight_bias_backward_t_heur_block_row_size({"M": M, "N": N})
+        with torch_device_fn.device(input.device):
+            grid_t = lambda meta: (triton.cdiv(N, meta["BLOCK_ROW_SIZE"]), 1, 1)
+            weight_bias_backward_transposed_kernel[grid_t](
+                dYT,
+                XT,
+                mean,
+                rstd,
+                weight_grad,
+                bias_grad,
+                M,
+                N,
+                NEED_MASK=N % bm_t != 0,
+                isCloseUnrollControl=True,
+                isCloseCoreTiling=True,
+                isCloseVectorization=True,
+            )
+    else:
+        bc_wb = weight_bias_backward_kernel_heur_block_col_size({"N": N})
+        need_mask_wb = N % bc_wb != 0
+        with torch_device_fn.device(input.device):
+            weight_bias_backward_kernel[grid](
+                grad_out,
+                input,
+                mean,
+                rstd,
+                weight_grad,
+                bias_grad,
+                M,
+                N,
+                NEED_MASK=need_mask_wb,
+                isCloseCoreTiling=True,
+                isCloseUnrollControl=True,
+                isCloseVectorization=True,
+            )
     return in_grad, weight_grad, bias_grad

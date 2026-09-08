@@ -34,18 +34,6 @@ cluster_num = 12
 core_num = 64
 buf_len_per_core = 2048
 vector_size = 16
-# Threshold on the reduced-axis length N for the `max_kernel_dim` (N>=256) path.
-# max_kernel_dim upcasts on load, so an explicit `inp.to(torch.float)` is only worth
-# it for large N: there the extra (contiguous, cheap) cast lets the kernel read fp32,
-# which is markedly faster on XPU than reading fp16/bf16 and converting in-kernel.
-# For small/mid N the cast's fixed launch overhead (pathological _to_copy kernel)
-# dominates, so we feed `inp` directly and skip the cast entirely.
-# NOTE: a dtype-aware variant (bf16/bool crossing over at 4096 instead of 8192) was
-# tried and REJECTED — isolated kernel micro-benchmarks suggested a ~28% bool win at
-# N=4096, but per-process end-to-end measurement through this operator showed it to be
-# an artifact (bool nocast/precast identical, bf16 within noise). A single uniform
-# threshold is correct; see harness/solution/any_dim_perf_fix.md.
-large_n_precast = 8192
 
 
 def heur_m_block_size(args):
@@ -133,6 +121,38 @@ def max_kernel_dim(
 
 @libentry()
 @triton.jit
+def any_word_stage1(in_ptr, mid, n_words, BLOCK_SIZE: tl.constexpr):
+    """Stage 1 (int32-word bitmap path) of the global-any reduction.
+
+    Reads the input as raw int32 words (valid whenever element_size divides 4:
+    word != 0  <=>  at least one element in that word is nonzero, bit-exact).
+    Maps the word to 0 (zero word) / INT32_MAX (nonzero word) with an integer
+    select, then reduces each chunk with an int32 max -> INT32_MAX iff the
+    chunk contains any nonzero element. Integer-only pipeline (no fcmp->i1
+    per-element converts and no i1 OR-tree), which is markedly faster on XPU.
+    Masked tail lanes load `other=0` (a zero word) and cannot create a false
+    positive. `mid` receives INT32_MAX / 0 per chunk."""
+    pid = ext.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    w = tl.load(in_ptr + offs, mask=offs < n_words, other=0)
+    m = tl.max(tl.where(w == 0, 0, 2147483647), axis=0)
+    tl.store(mid + pid, m)
+
+
+@libentry()
+@triton.jit
+def any_word_stage2(mid, out, MID_SIZE, BLOCK_MID: tl.constexpr):
+    """Stage 2: single program reduces the per-chunk int32 flags; masked
+    lanes load 0 (matches the "zero chunk" encoding) and cannot flip the
+    result. Outputs boolean (mx == INT32_MAX)."""
+    offs = tl.arange(0, BLOCK_MID)
+    m = tl.load(mid + offs, mask=offs < MID_SIZE, other=0)
+    mx = tl.max(m, axis=0)
+    tl.store(out, mx == 2147483647)
+
+
+@libentry()
+@triton.jit
 def any_kernel_1(
     inp,
     mid,
@@ -160,6 +180,47 @@ def any_kernel_1(
     nz = tl.where(mask, val != 0, False)
     any_val = tl.reduce(nz, axis=0, combine_fn=reduce_any)
     tl.store(mid + pid, any_val)
+
+
+@libentry()
+@triton.jit
+def any_kernel_dim_v2(
+    inp,
+    out,
+    M,
+    N,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    """Per-row `any` over the last axis of a contiguous [M, N] view.
+
+    int1-OR reduction (no fp32 upcast), fixed bounded tiles
+    (BLOCK_M x BLOCK_N <= 64x4096), and a NEED_MASK constexpr so that
+    evenly-dividing shapes take the unmasked (contiguous DMA) load/store
+    path (HARNESS_SUMMARY 2.4). Caller only sets NEED_MASK=False when
+    M % BLOCK_M == 0 and N % BLOCK_N == 0, so unmasked accesses are
+    in-bounds; tail `other=0.0` keeps the reduction neutral and never
+    creates a false positive.
+    """
+    pid = ext.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    inp = inp + rows * N
+    out = out + rows
+
+    _any = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int1)
+    for off in range(0, N, BLOCK_N):
+        cols = off + tl.arange(0, BLOCK_N)[None, :]
+        if NEED_MASK:
+            a = tl.load(inp + cols, (rows < M) and (cols < N), other=0.0)
+        else:
+            a = tl.load(inp + cols)
+        _any = _any or (a != 0)
+    any = tl.reduce(_any, axis=1, combine_fn=reduce_any)
+    if NEED_MASK:
+        tl.store(out, any[:, None], rows < M)
+    else:
+        tl.store(out, any[:, None])
 
 
 @libentry()
@@ -237,12 +298,45 @@ def _any_dims_reduce(inp, M, N, out_shape):
 def any(inp):
     logger.debug("GEMS_KUNLUNXIN ANY")
     n_elements = inp.numel()
-    block_size = get_block_size_1d(n_elements, inp.element_size())
+    elem = inp.element_size()
+    bytes_total = n_elements * elem
+
+    # Faster int32-word bitmap path: valid when the flat byte count is a
+    # multiple of 4 and the input is contiguous (flat view without copies).
+    # word != 0 <=> some element in the word is nonzero holds bit-exactly for
+    # any element size dividing 4 (fp16/bf16/fp32/bool/int*...), including
+    # NaN (nonzero bits) and the pre-existing +/-0.0 handling of the old
+    # `!= 0` element compare (a -0.0 bit pattern is nonzero here as well).
+    if inp.is_contiguous() and bytes_total % 4 == 0:
+        view = inp.reshape(-1).view(torch.uint8).view(torch.int32)
+        n_words = view.numel()
+        block_size = get_block_size_1d(n_words, 4)
+        mid_size = triton.cdiv(n_words, block_size)
+        block_mid = triton.next_power_of_2(mid_size)
+        # empty_strided (not registered by gems) -> native allocator,
+        # avoids the per-call gems empty tax on the mid/out buffers.
+        mid = torch.empty_strided(
+            (mid_size,), (1,), dtype=torch.int32, device=inp.device
+        )
+        out = torch.empty_strided((), (), dtype=torch.bool, device=inp.device)
+        with torch_device_fn.device(inp.device):
+            any_word_stage1[(mid_size, 1)](
+                view, mid, n_words, block_size, buffer_size_limit=2048
+            )
+            if mid_size == 1:
+                return (mid == 2147483647).reshape([])
+            any_word_stage2[(1, 1)](
+                mid, out, mid_size, block_mid, buffer_size_limit=2048
+            )
+        return out
+
+    # generic elementwise two-stage path (any byte alignment / layout)
+    block_size = get_block_size_1d(n_elements, elem)
     mid_size = triton.cdiv(n_elements, block_size)
     block_mid = triton.next_power_of_2(mid_size)
 
-    mid = torch.empty((mid_size,), dtype=torch.bool, device=inp.device)
-    out = torch.empty([], dtype=torch.bool, device=inp.device)
+    mid = torch.empty_strided((mid_size,), (1,), dtype=torch.bool, device=inp.device)
+    out = torch.empty_strided((), (), dtype=torch.bool, device=inp.device)
     with torch_device_fn.device(inp.device):
         any_kernel_1[(mid_size, 1)](
             inp, mid, n_elements, block_size, buffer_size_limit=2048
@@ -251,6 +345,35 @@ def any(inp):
             return mid.reshape([])
         any_kernel_2[(1, 1)](mid, out, mid_size, block_mid, buffer_size_limit=2048)
     return out
+
+
+def _move_dim_last_contig(inp, dim):
+    """Return a contiguous view of `inp` with `dim` moved to the last position.
+
+    Replaces `dim_compress(inp, dim)` (= `permute(order).contiguous()`): the
+    trailing `.contiguous()` dispatches through the vendor `contiguous`/
+    `copy_` strided kernel (~1.1 GB/s discrete point-to-point) whenever the
+    reduced dim is not already last (e.g. [64, N, 64] with dim=1 -> 3D
+    transpose copy). `torch.ops.aten._copy_from` is NOT overridden by gems
+    -> native strided-copy engine (HARNESS_SUMMARY 3.4), ~100x faster on
+    the mid-dim shapes. Zero-copy when the dim is already last/contiguous.
+    """
+    if dim == inp.ndim - 1 and inp.is_contiguous():
+        return inp
+    order = [i for i in range(inp.ndim) if i != dim] + [dim]
+    permuted = inp.permute(order)
+    if permuted.is_contiguous():
+        return permuted
+    new_shape = tuple(permuted.shape)
+    strides = [1] * len(new_shape)
+    for i in range(len(new_shape) - 2, -1, -1):
+        strides[i] = strides[i + 1] * new_shape[i + 1]
+    # empty_strided is not registered by gems -> native allocator/copy.
+    dst = torch.empty_strided(
+        new_shape, tuple(strides), dtype=inp.dtype, device=inp.device
+    )
+    torch.ops.aten._copy_from(permuted, dst, False)
+    return dst
 
 
 def any_dim(inp, dim=None, keepdim=False):
@@ -263,27 +386,70 @@ def any_dim(inp, dim=None, keepdim=False):
     else:
         assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
         dim = dim % inp.ndim
-        inp = dim_compress(inp, dim)
         N = shape[dim]
         shape[dim] = 1
-        M = inp.numel() // N
 
-        if N >= vector_size * vector_size:
-            # according to api, op == any, use max to calculate.
-            # max_kernel_dim already upcasts on load; only pre-cast for large N
-            # (see `large_n_precast` note above) where fp32 reads pay off.
-            kin = inp.to(torch.float) if N >= large_n_precast else inp
-            outf = torch.empty(shape, dtype=torch.float, device=inp.device)
+        # Contiguous [M, N] view with the reduced dim last (see helper).
+        if dim == inp.ndim - 1 and inp.is_contiguous():
+            inpc = inp
+        else:
+            inpc = _move_dim_last_contig(inp, dim)
+        M = inpc.numel() // N
 
-            grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
+        if inp.dtype == torch.bool:
+            # bool: int1-OR reduction instead of the fp32-max proxy, whose
+            # byte->fp32 lane upcast is ~10x slower at large N
+            # ([1024,1048576]: ~160ms vs ~15.7ms, any_dim_xpu2 archive).
+            # Fixed bounded tiles; BLOCK_N <= 4096 stays inside the proven
+            # tl.reduce/BLOCK<=8192 safe window (HARNESS_SUMMARY 2.5).
+            if N <= 512:
+                block_m, block_n = 64, triton.next_power_of_2(N)
+            elif N <= 4096:
+                block_m, block_n = 64, 512
+            else:
+                block_m, block_n = 8, 4096
+            need_mask = (M % block_m != 0) or (N % block_n != 0)
+            out = torch.empty(shape, dtype=torch.bool, device=inp.device)
+            grid = (triton.cdiv(M, block_m),)
             with torch_device_fn.device(inp.device):
-                max_kernel_dim[grid](kin, outf, M, N, buffer_size_limit=2048)
+                any_kernel_dim_v2[grid](
+                    inpc,
+                    out,
+                    M,
+                    N,
+                    BLOCK_M=block_m,
+                    BLOCK_N=block_n,
+                    NEED_MASK=need_mask,
+                    buffer_size_limit=2048,
+                )
+        elif N >= vector_size * vector_size:
+            # float: use max to calculate (per api, op == any).
+            # Feed the tensor directly: max_kernel_dim upcasts on load
+            # (`.to(tl.float32)`), and on this XPU tree any external
+            # fp16/bf16->fp32 cast (`.to(torch.float)` / aten::_to_copy)
+            # runs at ~15GB/s (measured [1024,65536] fp16: 22ms cast +
+            # 0.74ms kernel vs 0.74ms direct-read), so a pre-cast is a
+            # strict loss (the old `large_n_precast` threshold predates
+            # this tree's cast path).
+            outf = torch.empty(shape, dtype=torch.float, device=inp.device)
+            # Fixed tuple grid: host-computed BLOCK_M must match the
+            # @triton.heuristics formula (any_dim_xpu2: a mismatched grid
+            # under-covers rows and leaves `outf` half-uninitialized).
+            block_m = triton.next_power_of_2(
+                min(triton.cdiv(M, cluster_num), core_num)
+            )
+            grid = (triton.cdiv(M, block_m),)
+            with torch_device_fn.device(inp.device):
+                max_kernel_dim[grid](inpc, outf, M, N, buffer_size_limit=2048)
             out = outf.to(torch.bool)
         else:
             out = torch.empty(shape, dtype=torch.bool, device=inp.device)
-            grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]),)
+            block_m = triton.next_power_of_2(
+                min(triton.cdiv(M, cluster_num), core_num)
+            )
+            grid = (triton.cdiv(M, block_m),)
             with torch_device_fn.device(inp.device):
-                any_kernel_dim[grid](inp, out, M, N, buffer_size_limit=2048)
+                any_kernel_dim[grid](inpc, out, M, N, buffer_size_limit=2048)
 
         if not keepdim:
             out = out.squeeze(dim=dim)

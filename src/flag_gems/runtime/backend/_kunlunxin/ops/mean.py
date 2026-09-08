@@ -141,6 +141,42 @@ def mean_dim_kernel(X, Mean, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr)
     tl.store(Mean, mean, row_mask)
 
 
+@libentry()
+@triton.jit
+def mean_dim_mid_kernel(X, Out, M, N, K, BLOCK_K: tl.constexpr):
+    """Mid-dim (K>1) row-reduce WITHOUT the dim_compress transpose copy.
+
+    X is the original [M, N, K] (M = outer product, N = reduction length,
+    K = inner product) contiguous layout; each program handles one m-row and
+    one BLOCK_K-slice of K. Per XPU constraints (HARNESS_SUMMARY 2.5/3.6):
+    fully UNMASKED loads with the K index clamped in-bounds (no OOB read, no
+    garbage), fp32 accumulation, NO tl.sum / where-in-reduce inside the loop
+    (pure elementwise add), the clamped tail lanes are zeroed by an arithmetic
+    multiply (not tl.where inside a reduce), and stores are masked.
+    """
+    if tl.constexpr(X.dtype.element_ty == tl.float16) or tl.constexpr(
+        X.dtype.element_ty == tl.bfloat16
+    ):
+        cdtype = tl.float32
+    else:
+        cdtype = X.dtype.element_ty
+
+    pid_m = ext.program_id(0)
+    pid_k = ext.program_id(1)
+
+    k_off = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_clamped = tl.minimum(k_off, K - 1)
+    k_mask = k_off < K
+
+    base = pid_m * N * K
+    acc = tl.zeros([BLOCK_K], dtype=cdtype)
+    for n in range(0, N):
+        v = tl.load(X + base + n * K + k_clamped).to(cdtype)
+        acc += v
+    mean = (acc / N) * k_mask.to(cdtype)
+    tl.store(Out + pid_m * K + k_off, mean, mask=k_mask)
+
+
 def mean_dim(x, dim, keepdim=False, *, dtype=None):
     logger.debug("GEMS_KUNLUNXIN MEAN_DIM")
 
@@ -155,52 +191,63 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
     shape = list(x.shape)
     dim = [d % x.ndim for d in dim]
 
-    # Fast path: reduce a SINGLE non-last dim of a contiguous fp16/bf16 tensor.
-    # Reducing the middle dim of a [M0, N, M1] view is exactly
-    #   bmm(ones[M0, 1, N], x[M0, N, M1]) / N  ->  [M0, M1].
-    # This reads x in its native (contiguous) layout through the matmul unit, so
-    # it AVOIDS the dim_compress .contiguous() transpose copy that dominates the
-    # 3-D middle-axis case (the "transpose wall": ~447ms of the 452ms for
-    # [100,65536,100]). Under use_gems, torch.bmm re-dispatches to the fast gems
-    # matmul kernel. gems fp32 bmm is broken on XPU (wrong results for non-pow2
-    # M1), so this path is fp16/bf16 only; fp32 falls through to the reduce
-    # kernel. We sum with ones=1.0 and divide afterwards (bmm accumulates in
-    # fp32; dividing after keeps the accumulator well-scaled).
-    #
-    # The gems bmm kernel can fail to compile (uni_sram OOM / SDNN combine
-    # failure) for extreme matmul shapes -- a huge output free dim (large M1) or
-    # a tiny free dim paired with a large odd contraction dim (e.g. M1=3,
-    # K=40999). We therefore try the bmm path and, on ANY compile/runtime error,
-    # fall through to the numerically-correct reduce kernel below. This keeps
-    # the speedup for the shapes bmm handles while guaranteeing correctness.
-    if (
-        len(dim) == 1
-        and dim[0] != x.ndim - 1
-        and dtype == x.dtype
-        and x.dtype in (torch.float16, torch.bfloat16)
-        and x.is_contiguous()
-        and shape[dim[0]] > 1
-    ):
-        d = dim[0]
-        N = shape[d]
-        M0 = 1
-        for s in shape[:d]:
-            M0 *= s
-        M1 = 1
-        for s in shape[d + 1 :]:
-            M1 *= s
-        try:
-            x3 = x.reshape(M0, N, M1)
-            ones = torch.ones((M0, 1, N), dtype=x.dtype, device=x.device)
-            out = (torch.bmm(ones, x3).reshape(M0, M1) / N).to(dtype)
-            out_shape = list(shape)
-            out_shape[d] = 1
-            out = out.reshape(out_shape)
+    # -------- mid-dim (K>1) single-dim reduction: no-transpose path --------
+    # The generic path below does dim_compress = permute(...).contiguous(),
+    # a strided transpose copy that is ~1GB/s on XPU (62-2450ms for the
+    # benchmark's 3D shapes). Instead read the original [M, N, K] layout
+    # directly (strided kernel below; bmm(ones, x)/N fast path for fp16/bf16,
+    # see solution/performance/kernel/mean_dim_perf_fix.md).
+    if len(dim) == 1:
+        dim0 = dim[0]
+        N = shape[dim0]
+        M = 1
+        for i in shape[:dim0]:
+            M *= i
+        K = (x.numel() // (M * N)) if (M * N) else 0
+        if K > 1 and M > 0 and N > 0:
+            x = x.contiguous()
+            out_shape = shape[:dim0] + [1] + shape[dim0 + 1 :]
+            if N == 1:
+                # N=1: mean over a size-1 dim is the identity (same as the
+                # historic N==1 fast path; no dim_compress here, so this is a
+                # zero-copy view / dtype cast only).
+                out = x.to(dtype=dtype).reshape(out_shape)
+                if not keepdim:
+                    out = out.squeeze(dim=dim0)
+                return out
+            if x.dtype in (torch.float16, torch.bfloat16):
+                # bmm-as-reduction: out[m, k] = sum_n x[m, n, k] / N via the
+                # (vendor) matmul unit on the native layout, no transpose.
+                # The 1/N is folded into the ones multiplier (NOT divided
+                # after bmm): a fp16/bf16 bmm output = the raw sum, which
+                # overflows to inf for large-N high-magnitude inputs
+                # (e.g. all-1.5, N=65536 -> 98304 > fp16 max 65504).
+                # try/except: gems bmm_kernel refuses some extreme shapes
+                # (huge M1 / tiny M1 with large odd K); those fall through to
+                # the strided kernel below (zero regression).
+                try:
+                    xv = x.view(M, N, K)
+                    ones = torch.full(
+                        (M, 1, N), 1.0 / N, dtype=x.dtype, device=x.device
+                    )
+                    bmm_out = torch.bmm(ones, xv)
+                    out = bmm_out.reshape(out_shape)
+                    if not keepdim:
+                        out = out.squeeze(dim=dim0)
+                    return out
+                except Exception:
+                    pass
+            out = torch.empty(out_shape, dtype=dtype, device=x.device)
+            BLOCK_K = 128 if K >= 128 else triton.next_power_of_2(K)
+            grid = (M, triton.cdiv(K, BLOCK_K))
+            with torch_device_fn.device(x.device):
+                mean_dim_mid_kernel[grid](
+                    x, out, M, N, K, BLOCK_K=BLOCK_K, buffer_size_limit=2048
+                )
             if not keepdim:
-                out = out.squeeze(d)
+                out = out.squeeze(dim=dim0)
             return out
-        except Exception:
-            logger.debug("GEMS_KUNLUNXIN MEAN_DIM bmm fast path unavailable, fallback")
+    # ------------------------------------------------------------------------
 
     x = dim_compress(x, dim)
     N = 1

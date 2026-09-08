@@ -13,8 +13,10 @@
 # TRITONXPU_COMPARE_FUSION / TRITONXPU_FP16_FAST launch env vars for the tensor
 # path. Kernel body / algorithm unchanged (zero correctness risk).
 import logging
+import math
 import os
 
+import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
@@ -111,13 +113,206 @@ def greater_scalar(A, B):
     # trips `arith.cmpf requires all operands to have the same type` and blows the
     # uni_sram budget -> `out of resource: uni_sram` compile failure (fp16). The
     # sibling gt_scalar deliberately omits them for the same reason.
+    numel = A.numel()
+    dtype = A.dtype
+    if (
+        A.is_contiguous()
+        and dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and float(B) == float(torch.tensor(float(B), dtype=dtype).item())
+    ):
+        if (
+            numel >= _GREATER_SCALAR_FAST_TILE * _GREATER_SCALAR_MIN_GRID
+            and numel % _GREATER_SCALAR_FAST_TILE == 0
+        ):
+            # exact-multiple flat tiles (grid = numel / TILE >= MIN_GRID): no
+            # mask, no i1 -- a saturating fp32 store + vendor bool conversion.
+            return _greater_scalar_fast(A, float(B))
+        if numel >= _GREATER_SCALAR_MASKED_MIN and numel % _GREATER_SCALAR_FAST_TILE != 0:
+            # non-multiple mid sizes (e.g. 2.56M): flat tiles with a real tail
+            # mask. The mask is genuine (only the OOB tail of the last block is
+            # masked -- every in-buffer element is still written), so the
+            # masked-memory path is the only penalty and the i1/bool-store
+            # catastrophe is still avoided.
+            return _greater_scalar_fast_masked(A, float(B), numel)
     res = greater_func_scalar(A, B)
     return res
+
+
+# ---------------------------------------------------------------------------
+# Fast path for large contiguous float tensors whose numel is an exact
+# multiple of _GREATER_SCALAR_FAST_TILE with a scalar exactly representable in
+# A.dtype.
+#
+# Why: the generic scalar-compare path (pointwise_dynamic 1d-tile codegen)
+# materializes `arith.cmpf -> i1 -> bool store` per lane, which the XPU backend
+# lowers to a ~10x slower path (measured XPU 3: direct fp32 compare [10000,
+# 65536] fp16 13.06 ms vs a generic fp32 store of the saturating result
+# 2.16 ms; the same compare/i1/bool-store root cause is documented for the
+# lt_/gt_/ge_ family in HARNESS_SUMMARY §2.6 and the lt_scalar/ge closures).
+# The runtime mask (`tid < num_tasks`) is always-true here and adds a second,
+# smaller penalty (masked-memory path, ~2-3%, same as the lt_scalar closure).
+#
+# Strategy -- two stages, no i1 is ever materialized in Triton:
+#   1. saturating fp arithmetic on the fp32-upcast value (family recipe:
+#      t = (x - s) * 1e30; max(0,t); min(1,t)) -> exactly 0.0/1.0 written into
+#      a fp32 buffer. M = 1e30 saturates every representable x != s gap of
+#      fp16/bf16/fp32 to +-inf, so the result is bit-exact 0.0/1.0.
+#   2. fp32 -> bool conversion via `torch.ops.aten._copy_from` (NOT in
+#      `_FULL_CONFIG`, so it reaches the vendor's native conversion kernel
+#      even inside `use_gems`; measured 1.97 ms on [10000,65536] fp32). The
+#      FlagGems `_to_copy`/`copy_` overrides are deliberately not used: they
+#      compute a per-lane fp->bool cast, i.e. the same slow lowering we avoid
+#      (measured ~2s on the same shape under use_gems).
+# Measured on XPU 3 [10000,65536]: fp16 13.40 -> 4.13 ms, bf16 13.41 -> 4.13 ms,
+# fp32 12.53 -> 4.75 ms (torch ~1.09/1.09/1.86 ms).
+#
+# Semantics: torch.greater compares against the scalar rounded to A.dtype
+# (wrapped scalar), and the gate `float(B) == float(torch.tensor(B,
+# dtype=A.dtype).item())` restricts the fast path to scalars exactly
+# representable in A.dtype (e.g. benchmark scalar 0.5, test scalar 0), so the
+# fp32 compare against float(B) is bit-identical to torch. NaN inputs settle
+# to 0.0 (max/min on this backend prefer the non-NaN operand; torch: NaN > s
+# == False); +-inf, +-0, equality and subnormal gaps are exact. Corner
+# behavior verified against torch on device for all three dtypes
+# (iso_midf32.py; also consistent with the ge_/lt_ family closures).
+_GREATER_SCALAR_FAST_TILE = 131072
+_GREATER_SCALAR_MIN_GRID = 128
+_GREATER_SCALAR_MASKED_MIN = 1 << 20
+
+
+@triton.jit
+def greater_scalar_fast_kernel(out_ptr, x_ptr, scalar, TILE: tl.constexpr):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    x = tl.load(x_ptr + tid).to(tl.float32)
+    t = (x - scalar) * 1.0e30
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(out_ptr + tid, t)
+
+
+def _greater_scalar_fast(A, scalar):
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (A.numel() // _GREATER_SCALAR_FAST_TILE,)
+    greater_scalar_fast_kernel[grid](
+        out32,
+        A,
+        scalar,
+        TILE=_GREATER_SCALAR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
+@triton.jit
+def greater_scalar_fast_masked_kernel(
+    out_ptr, x_ptr, scalar, numel, TILE: tl.constexpr
+):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    mask = tid < numel
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    t = (x - scalar) * 1.0e30
+    t = tl.maximum(0.0, t)
+    t = tl.minimum(1.0, t)
+    tl.store(out_ptr + tid, t, mask=mask)
+
+
+def _greater_scalar_fast_masked(A, scalar, numel):
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (math.ceil(numel / _GREATER_SCALAR_FAST_TILE),)
+    greater_scalar_fast_masked_kernel[grid](
+        out32,
+        A,
+        scalar,
+        numel,
+        TILE=_GREATER_SCALAR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    out = torch.empty_like(A, dtype=torch.bool)
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
+def _greater_scalar_out_fast(A, scalar, out):
+    # Two-stage recipe identical to _greater_scalar_fast, but stage 2 converts
+    # into the caller-provided bool `out` instead of an internal buffer. Stage 1
+    # writes the saturating fp32 result (0.0/1.0) into a fresh fp32 buffer; stage
+    # 2 is the vendor-native fp32->bool conversion via aten._copy_from, which is
+    # not in _FULL_CONFIG and therefore bypasses the slow per-lane fp->bool
+    # lowering under use_gems (see _greater_scalar_fast docstring for the full
+    # rationale). out is required contiguous with the same numel as A on this
+    # path (enforced by the gate in greater_scalar_out).
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (A.numel() // _GREATER_SCALAR_FAST_TILE,)
+    greater_scalar_fast_kernel[grid](
+        out32,
+        A,
+        scalar,
+        TILE=_GREATER_SCALAR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
+
+
+def _greater_scalar_out_fast_masked(A, scalar, out, numel):
+    # Out-variant of the masked two-stage path (real tail mask in the last
+    # block, every in-buffer element still written). Same recipe as
+    # _greater_scalar_fast_masked but stage 2 converts into the caller-provided
+    # contiguous bool `out`.
+    out32 = torch.empty_like(A, dtype=torch.float32)
+    grid = (math.ceil(numel / _GREATER_SCALAR_FAST_TILE),)
+    greater_scalar_fast_masked_kernel[grid](
+        out32,
+        A,
+        scalar,
+        numel,
+        TILE=_GREATER_SCALAR_FAST_TILE,
+        num_warps=4,
+        buffer_size_limit=8192,
+        unroll_num=16,
+        isCloseMemoryAsync=False,
+    )
+    torch.ops.aten._copy_from(out32, out, False)
+    return out
 
 
 def greater_scalar_out(A, B, *, out=None):
     logger.debug("GEMS_KUNLUNXIN GREATER_SCALAR_OUT")
     # See greater_scalar: no fusion env vars on the scalar path (fp16 compile).
+    # Same fast-path gate as greater_scalar (big contiguous float tensors,
+    # tile-divisible numel, enough grid, scalar exactly representable in
+    # A.dtype); additionally requires the caller-provided out to be contiguous
+    # so the two-stage write lands byte-for-byte in the same layout the generic
+    # out0= kernel would produce. Non-gated cases fall through to the original
+    # greater_func_scalar(out0=out) path, behavior unchanged.
+    if (
+        out is not None
+        and A.is_contiguous()
+        and out.is_contiguous()
+        and A.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and float(B) == float(torch.tensor(float(B), dtype=A.dtype).item())
+    ):
+        numel = A.numel()
+        if (
+            numel >= _GREATER_SCALAR_FAST_TILE * _GREATER_SCALAR_MIN_GRID
+            and numel % _GREATER_SCALAR_FAST_TILE == 0
+        ):
+            return _greater_scalar_out_fast(A, float(B), out)
+        if numel >= _GREATER_SCALAR_MASKED_MIN and numel % _GREATER_SCALAR_FAST_TILE != 0:
+            return _greater_scalar_out_fast_masked(A, float(B), out, numel)
     if out is None:
         res = greater_func_scalar(A, B)
     else:
