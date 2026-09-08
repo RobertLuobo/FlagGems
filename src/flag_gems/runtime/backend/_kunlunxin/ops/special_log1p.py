@@ -14,6 +14,7 @@
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
@@ -44,4 +45,10 @@ def special_log1p_out_func(x):
 
 def special_log1p_out(A, out):
     logger.debug("GEMS_KUNLUNXIN SPECIAL_LOG1P_OUT")
+    return special_log1p_out_func(A, out0=out)
+
+
+def special_log1p(A):
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_LOG1P")
+    out = torch.empty_like(A)
     return special_log1p_out_func(A, out0=out)

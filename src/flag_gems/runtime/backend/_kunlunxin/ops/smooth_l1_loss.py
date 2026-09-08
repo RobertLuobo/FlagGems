@@ -18,9 +18,13 @@ import os
 import torch
 import triton
 import triton.language as tl
+from _kunlunxin.utils.block_size_utils import get_block_size_1d
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
+from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import libentry
 from flag_gems.utils import pointwise_dynamic
+from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
