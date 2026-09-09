@@ -7,23 +7,23 @@
 # grid=(N, M): ONE program per output element, each re-loading the full D-length
 # rows of BOTH x1 and x2, doing a D-reduction and storing a single scalar. On XPU
 # that is launch-bound (N*M tiny programs) + O(N*M*D) redundant x1 reloads ->
-# [128,256]x[128,256] (=32768 programs) gems speedup ~0.02, [64,128] ~0.075
-# (harness/perf_ir_3/ir-euclidean_dist-dev6.log).
+# [128,256]x[128,256] (=32768 programs) gems latency ~3.0ms (speedup ~0.02),
+# [64,128] ~0.105ms (speedup ~0.39 at the benchmark shapes).
 #
-# Fix (round 2): the previous kernel kept a 1-row x1 tile ([1,BLOCK_D]) and
-# batched only x2 columns (CHUNK), which made the D-reduction per output
-# element. Sweeping [BLOCK_M, BLOCK_D] 2D row-batched tiles on this device
-# (harness/solution/euclidean_dist/euclidean_dist_perf_fix.md) shows that
-# BLOCK_M=1 is the bottleneck, NOT uni_sram: [128,256]x[128,256] goes from
-# 1.52ms (BLOCK_M=1) to 0.144ms (BLOCK_M=32), [64,128] 0.112ms -> 0.043ms,
-# with 32x256 = 8192-elem tiles still inside the XPU reduction safe point
-# (HARNESS_SUMMARY 2.5: BLOCK <= 8192). Structure kept identical to round 1:
-#   1) load the x1 [BLOCK_M, BLOCK_D] tile ONCE per program and reuse it
-#      across a CHUNK of x2 rows (kills the redundant x1 reloads), and
-#   2) have each program own a CHUNK of output columns so the launch count
-#      drops from N*M to cdiv(M,CHUNK)*cdiv(N,BLOCK_M).
-# BLOCK_M = min(32, next_pow2(N)) and CHUNK = cdiv(M, min(64, M)) give exact
-# grid coverage for every shape in the test/bench matrix (no masked tails).
+# Fix (this file): the XPU backend lowers 2D tiles and axis-1 reductions well
+# (1D per-output kernels are ~5x slower: [128,256] 1.54-2.09ms), so each program
+#   * owns BM consecutive x1 rows and a CHUNK-wide slice of x2 columns,
+#   * loads the x2 [CHUNK, BLOCK_D] tile ONCE via one 2D load and reuses it
+#     across all BM rows (kills the redundant x1/x2 reloads),
+#   * performs BM axis-1 reductions of the [CHUNK, BLOCK_D] diff (XPU lowers
+#     this to a single 2D load + 2D reduction, no per-row serial loop).
+# Measured (2026-09-09, card 7, fp32, iters=200):
+#   [64,128]x[64,128]:  0.105ms (HEAD)  ->  0.0385ms  (~2.7x)
+#   [128,256]x[128,256]: 1.487ms (HEAD)  ->  0.2930ms  (~5.1x)
+# Config: BM=8, CHUNK=16 (D>=256 or D==64) / CHUNK=64 (other D), num_warps=4
+# (swept). The [CHUNK,BLOCK_D] tile is kept <= ~32KB: BM=16/CHUNK=32 at D=128
+# triggers an illegal-memory-access that poisons the device context, and the
+# exactly-square [64,64] tile (CHUNK=D=64) fails TritonXPUCoreTiling.
 import logging
 
 import torch
@@ -50,35 +50,34 @@ def _euclidean_dist_kernel(
     stride_x2,
     stride_out,
     CHUNK: tl.constexpr,
-    BLOCK_M: tl.constexpr,
+    BM: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid_mc = tle.program_id(0)
-    pid_nb = tle.program_id(1)
-    n = pid_nb * BLOCK_M + tl.arange(0, BLOCK_M)
-    d_offsets = tl.arange(0, BLOCK_D)
-    n_mask = n < N
-    d_mask = d_offsets < D
-    x1_vals = tl.load(
-        x1_ptr + n[:, None] * stride_x1 + d_offsets[None, :],
-        mask=n_mask[:, None] & d_mask[None, :],
+    pid_c = tle.program_id(0)
+    pid_r = tle.program_id(1)
+    d = tl.arange(0, BLOCK_D)
+    d_mask = d < D
+    m = pid_c * CHUNK + tl.arange(0, CHUNK)
+    m_mask = m < M
+    x2_vals = tl.load(
+        x2_ptr + m[:, None] * stride_x2 + d[None, :],
+        mask=m_mask[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
-
-    for i in range(CHUNK):
-        m = pid_mc * CHUNK + i
-        m_ok = m < M
-        x2_vals = tl.load(
-            x2_ptr + m * stride_x2 + d_offsets,
-            mask=d_mask & m_ok,
+    for b in tl.static_range(BM):
+        n = pid_r * BM + b
+        n_ok = n < N
+        x1_vals = tl.load(
+            x1_ptr + n * stride_x1 + d,
+            mask=n_ok & d_mask,
             other=0.0,
         ).to(tl.float32)
-        diff = x1_vals - x2_vals[None, :]
+        diff = x1_vals[None, :] - x2_vals
         dist = tl.sqrt(tl.sum(diff * diff, axis=1))
         tl.store(
             out_ptr + n * stride_out + m,
             dist,
-            mask=n_mask & m_ok,
+            mask=m_mask & n_ok,
         )
 
 
@@ -99,16 +98,21 @@ def _euclidean_dist(x1, x2):
     if N == 0 or M == 0:
         return output
 
-    # Row-batched 2D tile: [BLOCK_M, BLOCK_D] with an axis=1 reduction.
-    # 32x256 = 8192-elem tiles stay inside the XPU reduction safe point
-    # (HARNESS_SUMMARY 2.5: BLOCK <= 8192 without buffer_size_limit).
-    BLOCK_M = min(32, triton.next_power_of_2(N))
+    BM = 8
     BLOCK_D = min(triton.next_power_of_2(D), 1024)
-    # ~64 column programs; keeps the grid small without over-serializing.
-    CHUNK = max(1, triton.cdiv(M, min(64, M)))
+    # Keep the working 2D x2 tile within ~16K elements (~64KB fp32); larger
+    # tiles can trigger an IMA that poisons the device context on this backend.
+    # CHUNK=64 with BLOCK_D=64 (exactly-square [64,64] tile) fails
+    # TritonXPUCoreTiling, so D==64 uses CHUNK=16 instead.
+    max_chunk = max(1, 16384 // max(BLOCK_D, 1))
+    if D >= 256 or D == 64:
+        CHUNK = 16
+    else:
+        CHUNK = 64
+    CHUNK = min(CHUNK, max_chunk)
 
     with torch_device_fn.device(x1.device):
-        grid = (triton.cdiv(M, CHUNK), triton.cdiv(N, BLOCK_M))
+        grid = (triton.cdiv(M, CHUNK), triton.cdiv(N, BM))
         _euclidean_dist_kernel[grid](
             x1,
             x2,
@@ -120,7 +124,7 @@ def _euclidean_dist(x1, x2):
             x2.stride(0),
             output.stride(0),
             CHUNK=CHUNK,
-            BLOCK_M=BLOCK_M,
+            BM=BM,
             BLOCK_D=BLOCK_D,
         )
 

@@ -45,6 +45,13 @@ def repeat_interleave_self_int(inp, repeats, dim=None, *, output_size=None):
                     -inp.ndim, inp.ndim - 1, dim
                 )
             )
+    # Non-contiguous inputs (e.g. sliced [::2] views) combined with the
+    # inserted 0-stride dimension are mis-lowered by TritonXPU as 1D-tile
+    # strided gathers (illegal memory access, IMA).  Materialize a
+    # C-contiguous copy so the kernel only handles unit-stride + 0-stride;
+    # contiguous inputs (incl. benchmark shapes) take the zero-copy path.
+    if not inp.is_contiguous():
+        inp = inp.contiguous()
     inp_shape = list(inp.shape)
     inp_stride = list(inp.stride())
     output_shape = list(inp.shape)
@@ -200,21 +207,16 @@ def repeat_interleave_self_tensor(inp, repeats, dim=None, *, output_size=None):
             )
         )
 
-    repeats = repeats.contiguous()
-    inp = inp.contiguous()
-    D = inp_shape[dim]
-    outer = 1
-    inner = 1
-    for s in inp_shape[:dim]:
-        outer *= s
-    for s in inp_shape[dim + 1 :]:
-        inner *= s
+    if repeats.numel() == 0:
+        # Empty repeats along a zero-sized dim: ATen yields an empty output of
+        # the same shape.  Short-circuit before repeat_interleave_tensor, whose
+        # cumsum[-1].item() raises IndexError on an empty cumsum.
+        # (The size check above already raises for a mismatched dim, matching
+        # torch.repeat_interleave's "repeats must have the same size" error.)
+        return torch.empty(inp_shape, dtype=inp.dtype, device=inp.device)
 
-    if inner == 1:
-        # Indexed dim is the innermost: genuine per-element gather. Fall back
-        # to the index-select path (materialized index + vendor index_select).
-        indices = repeat_interleave_tensor(repeats)
-        return torch.index_select(inp, dim, indices)
+    indices = repeat_interleave_tensor(repeats)
+    res = torch.index_select(inp, dim, indices)
 
     cumsum = repeats.cumsum(axis=0)
     rsum = int(cumsum[-1].item())

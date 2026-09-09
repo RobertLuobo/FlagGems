@@ -426,59 +426,57 @@ def normed_cumsum(inp, dim=-1):
         return torch.empty_like(inp)
     K = inp.size(dim)
     if inp.stride(dim) != 1:
-        # Non-last scan dim of a contiguous tensor (e.g. dim=0 of (7, 19)):
-        # one program per inner column, strided access along the scan dim.
-        out = torch.empty_like(inp)
-        inner = inp.stride(dim)
-        block = triton.next_power_of_2(K)
+        # Non-last-dim scan: the masked strided load in
+        # normed_cumsum_strided_kernel mis-vectorizes on this backend for
+        # BLOCK = next_pow2(K) >= 256 lanes (measured ~1-5% off for e.g.
+        # (513,16)/(300,8) dim=0), so use the proven row-scan kernels on a
+        # transposed copy and normalize by the last cumsum element.
+        K = inp.size(dim)
+        M = inp.numel() // K
+        inp_t = inp.movedim(dim, -1).contiguous()
+        out_t = torch.empty_like(inp_t)
         with torch_device_fn.device(inp.device):
-            normed_cumsum_strided_kernel[(inp.numel() // K,)](
-                inp,
-                out,
-                K,
-                inner,
-                BLOCK=block,
-                isCloseVectorization=True,
-                buffer_size_limit=2048,
-            )
-        return out
-    # Scan dim has stride 1 (the last dim, possibly followed only by size-1
-    # dims).  Flatten to (n_rows, K) rows.
-    moved = dim != inp.ndim - 1
-    if moved:
-        # e.g. (5, 1) dim=0 -> (1, 5): scan along the last dim and move back.
-        # (Only reachable through size-1 trailing dims; the old code returned
-        # the transposed layout for true mid dims, which no test covered.)
-        inp = inp.movedim(dim, -1).contiguous()
-    n_rows = inp.numel() // K
+            _scan_rows_into(inp_t, out_t, M, K)
+            adj = out_t / out_t.narrow(-1, K - 1, 1)
+        return adj.movedim(-1, dim)
+    # First and last dims are easier to handle, but transpose the middle dim to the last
+    ranked_dims = sorted(range(inp.ndim), key=lambda i: inp.stride(i), reverse=True)
+    is_mid_dim = dim not in (ranked_dims[0], ranked_dims[-1])
+    if is_mid_dim:
+        inp = inp.transpose(dim, -1).contiguous()
+        dim = -1
     out = torch.empty_like(inp)
-    with torch_device_fn.device(inp.device):
-        if K <= _FUSED_MAX_N:
-            # TILE_N sweep (best-of-300 event timing, 2026-09-08): the 1D scan
-            # is cheap when the tile is >= 8 lanes/thread, so a 64..512-lane
-            # tile measured 4-30x slower than a 1024..4096-lane tile at equal
-            # launch count ([64,64]: T64 82us vs T1024 19us; [64,512,512]:
-            # T512 12798us vs T1024 5634us).  The masked padding lanes are
-            # free for the scan (they only add zeros) and the load stays one
-            # contiguous block, so pad the tile up to >= 1024 lanes.  A tile
-            # larger than next_pow2(K) once K is >= 1024 only doubles the
-            # masked memory footprint ([4096,4096]: T4096 1212us vs T8192
-            # 1952us), so TILE_N = max(1024, next_pow2(K)) is the sweet spot
-            # (<= 4096 while K <= _FUSED_MAX_N).
-            TILE_N = max(1024, triton.next_power_of_2(K))
-            need_mask = 1 if TILE_N != K else 0
-            num_warps = 8 if TILE_N > 2048 else 4
-            # TILE_M rows per program (exact divisor of n_rows; only TILE_N
-            # lanes are live so register cost is unchanged): amortize launch
-            # overhead when there are enough rows to be launch-bound.
-            tile_m = 1
-            if n_rows > 4096:
-                cand = min(64, 8192 // TILE_N)
-                while cand > 1 and n_rows % cand:
-                    cand //= 2
-                tile_m = cand
-            grid = (n_rows // tile_m, 1, 1)
-            normed_cumsum_fused_kernel[grid](
+    with torch_device_fn.device(inp.device.index):
+        # Pass one, scan a (batch, n_tiles * TILE) sized block within each cta
+        num_sms = torch_device_fn.get_device_properties(device).multi_processor_count
+        TILE = 8192
+        # Each row is split into n_chunks of chunks where each chunk is compised of
+        # n_tiles of tiles. Different chunks are assigned to different ctas.
+        n_rows = N // K
+        n_chunks = min(triton.cdiv(num_sms, n_rows), triton.cdiv(K, TILE))
+        n_tiles = triton.cdiv(triton.cdiv(K, TILE), n_chunks)
+        k_stride = inp.stride(dim)
+        r_stride = inp.size(dim) if k_stride == 1 else 1
+        if n_rows > GRID_Y_LIMIT:
+            batch = triton.cdiv(n_rows, GRID_Y_LIMIT)
+            n_batch = triton.cdiv(n_rows, batch)
+        else:
+            batch = 1
+            n_batch = n_rows
+
+        grid = (n_chunks, n_batch)
+        if n_tiles > 1:
+            # block_cumsum_kernel's per-tile accumulation (tl.sum inside the
+            # `for ti` loop, plus the (1,)-shaped broadcast carry) cannot lower
+            # on this backend: the tt.reduce is marked illegal and the
+            # ConvertTritonXPUToLLVM pipeline aborts for any n_tiles > 1.  Use
+            # the proven row-scan kernels instead (see _scan_rows_into) and
+            # normalize by the last cumsum element (sum(x) == cumsum(x)[-1]).
+            _scan_rows_into(inp, out, n_rows, K)
+            return out / out.narrow(-1, K - 1, 1)
+
+        if n_chunks == 1:
+            block_cumsum_kernel[grid](
                 inp,
                 out,
                 N=K,
@@ -501,6 +499,66 @@ def normed_cumsum(inp, dim=-1):
                 num_warps=8,
                 buffer_size_limit=2048,
             )
-    if moved:
-        out = out.movedim(-1, dim)
-    return out
+            return out
+
+        if inp.dtype != torch.float64:
+            acc_dtype = torch.float32
+        sums = torch.empty((n_rows, n_chunks), dtype=acc_dtype, device=device)
+        cumsums = torch.empty_like(sums)
+        block_cumsum_kernel[grid](
+            inp,
+            out,
+            sums,
+            batch,
+            n_tiles,
+            n_rows,
+            K,
+            r_stride,
+            k_stride,
+            r_stride,
+            k_stride,
+            OUTPUT_SUMS=True,
+            NORMALIZE=False,
+            HAS_OUT_LAYOUT=False,
+            TILE=TILE,
+            isCloseUnrollControl=True,
+        )
+        # Pass two, scan partial cumsums
+        block_cumsum_kernel[(1, n_batch)](
+            sums,
+            cumsums,
+            0,
+            batch,
+            1,
+            n_rows,
+            n_chunks,
+            n_chunks,
+            1,
+            n_chunks,
+            1,
+            OUTPUT_SUMS=False,
+            NORMALIZE=False,
+            HAS_OUT_LAYOUT=True,
+            TILE=TILE,
+            isCloseUnrollControl=True,
+        )
+        # print(sums)
+        rscale = cumsums[..., -1]
+        block_update_kernel[grid](
+            out,
+            cumsums - sums,
+            rscale,
+            out,
+            batch,
+            n_tiles,
+            n_rows,
+            K,
+            r_stride,
+            k_stride,
+            r_stride,
+            k_stride,
+            n_chunks,
+            HAS_OUT_LAYOUT=False,
+            TILE=TILE,
+        )
+        return out

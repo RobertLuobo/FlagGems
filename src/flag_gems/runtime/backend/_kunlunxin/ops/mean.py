@@ -54,6 +54,10 @@ def mean(inp, *, dtype=None):
     M = inp.numel()
     if dtype is None:
         dtype = inp.dtype
+    if M == 0:
+        # torch.mean of an empty tensor is 0/0 = NaN; the flat kernel below
+        # cannot handle a zero trip count.
+        return torch.full([], float("nan"), dtype=dtype, device=inp.device)
     BLOCK_SIZE = get_block_size_1d(M, inp.element_size())
     out = torch.empty([], dtype=dtype, device=inp.device)
 
@@ -182,9 +186,12 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
 
     if dtype is None:
         dtype = x.dtype
-    if dim is None:
+    if dim is None or dim == () or dim == []:
+        # Global mean (dim=None or empty dim list). keepdim only affects the
+        # output shape: mean.dim(self, None, keepdim) is 0-d when keepdim is
+        # False and all-ones when keepdim is True (matching ATen).
         out = mean(x, dtype=dtype)
-        if not keepdim:
+        if keepdim:
             out = out.reshape([1] * x.ndim)
         return out
 
@@ -254,7 +261,22 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
     for i in dim:
         N *= shape[i]
         shape[i] = 1
-    M = x.numel() // N
+    M = x.numel() // N if N > 0 else 0
+
+    # Reducing over an empty (size-0) dimension means 0/0 = NaN for every
+    # output element, matching torch's reference behavior.
+    if N == 0:
+        out = torch.full(shape, float("nan"), dtype=dtype, device=x.device)
+        if not keepdim:
+            out = out.squeeze(dim)
+        return out
+
+    # No output rows at all: the result is empty, no computation needed.
+    if M == 0:
+        out = torch.empty(shape, dtype=dtype, device=x.device)
+        if not keepdim:
+            out = out.squeeze(dim)
+        return out
 
     # Edge case: M=1 means all dims are reduced → global mean over N elements.
     # mean_dim XPU API does not support M=1.

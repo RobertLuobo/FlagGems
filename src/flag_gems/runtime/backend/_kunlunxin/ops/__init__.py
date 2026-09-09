@@ -17,6 +17,7 @@ from ._amp_foreach_non_finite_check_and_unscale_ import (
 )
 from ._batch_norm_impl_index import batch_norm_impl_index as _batch_norm_impl_index
 from ._batch_norm_no_update import _batch_norm_no_update
+from ._conj import _conj  # noqa: F401
 from ._dyn_quant_pack_4bit_weight import _dyn_quant_pack_4bit_weight
 from ._embedding_bag_dense_backward import _embedding_bag_dense_backward
 from ._euclidean_dist import _euclidean_dist
@@ -47,6 +48,7 @@ from ._unsafe_masked_index_put_accumulate import _unsafe_masked_index_put_accumu
 from ._upsample_bilinear2d_aa import _upsample_bilinear2d_aa  # noqa: F401
 from ._upsample_nearest_exact2d_backward import _upsample_nearest_exact2d_backward
 from ._upsample_nearest_exact3d import _upsample_nearest_exact3d
+from .__irshift__ import __irshift__  # noqa: F401
 from .abs import abs, abs_
 from .absolute import absolute, absolute_
 from .acos import acos, acos_
@@ -214,7 +216,7 @@ from .div import (
     true_divide_tensor_,
 )
 from .dot import dot
-from .dropout import dropout, dropout_backward
+from .dropout import dropout, dropout_backward, native_dropout_backward
 from .elu import elu, elu_, elu_backward
 from .embedding import embedding, embedding_backward, embedding_dense_backward
 from .eq import eq, eq_, eq_scalar, eq_scalar_
@@ -342,6 +344,8 @@ from .linalg_solve_triangular import (
     linalg_solve_triangular_out,
 )
 from .linalg_svd import linalg_svd
+from .linalg_svdvals import linalg_svdvals
+from .linear import linear
 from .linear_backward import linear_backward
 from .linspace import linspace
 from .log import log
@@ -664,8 +668,10 @@ from .zeros_like import zeros_like
 __all__ = [
     "_functional_sym_constrain_range",
     "_functional_sym_constrain_range_for_size",
+    "_conj",
     "_euclidean_dist",
     "_is_all_true",
+    "__irshift__",
     "_thnn_fused_lstm_cell_backward_impl",
     "_conv_depthwise2d",
     "_safe_softmax",
@@ -807,6 +813,7 @@ __all__ = [
     "dot",
     "dropout",
     "dropout_backward",
+    "native_dropout_backward",
     "elu",
     "elu_",
     "elu_backward",
@@ -1355,6 +1362,8 @@ __all__ = [
     "linalg_solve_triangular",
     "linalg_solve_triangular_out",
     "linalg_svd",
+    "linalg_svdvals",
+    "linear",
     "linear_backward",
     "lu_unpack",
     "lu_unpack_out",
