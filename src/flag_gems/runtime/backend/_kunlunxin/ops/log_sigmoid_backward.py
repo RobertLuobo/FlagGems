@@ -20,6 +20,10 @@ import triton.language as tl
 
 from flag_gems.utils import pointwise_dynamic
 from flag_gems.utils import triton_lang_extension as ext
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+from ..utils.pointwise_dynamic import (
+    pointwise_dynamic as xpu_pointwise_dynamic,
+)
 
 logger = logging.getLogger(__name__)
 

@@ -179,7 +179,8 @@ from .conv_depthwise2d import _conv_depthwise2d
 from .conv_transpose1d import conv_transpose1d
 from .conv_transpose2d import conv_transpose2d
 from .copy import copy, copy_
-from .copysign import copysign, copysign_, copysign_out
+from .copysign import copysign, copysign_out
+from .copysign_ import copysign_
 from .cos import cos, cos_
 from .cosh import cosh, cosh_, cosh_out  # noqa: F401
 from .count_nonzero import count_nonzero
@@ -216,7 +217,7 @@ from .div import (
     true_divide_tensor_,
 )
 from .dot import dot
-from .dropout import dropout, dropout_backward, native_dropout_backward
+from .dropout import dropout, dropout_backward
 from .elu import elu, elu_, elu_backward
 from .embedding import embedding, embedding_backward, embedding_dense_backward
 from .eq import eq, eq_, eq_scalar, eq_scalar_
@@ -288,7 +289,7 @@ from .hardtanh_backward import hardtanh_backward  # noqa: F401
 from .heaviside_ import heaviside_  # noqa: F401
 from .histc import histc
 from .hstack import hstack
-from .hypot import hypot, hypot_
+from .hypot import hypot
 from .igamma_ import igamma_  # noqa: F401
 from .igammac import igammac, igammac_out
 from .igammac_ import igammac_
