@@ -517,7 +517,10 @@ from .sort import sort, sort_stable
 from .special_legendre_polynomial_p import special_legendre_polynomial_p
 from .special_log_softmax import special_log_softmax
 from .special_logsumexp import special_logsumexp
-from .special_shifted_chebyshev_polynomial_u import special_shifted_chebyshev_polynomial_u, special_shifted_chebyshev_polynomial_u_
+from .special_shifted_chebyshev_polynomial_u import (
+    special_shifted_chebyshev_polynomial_u,
+    special_shifted_chebyshev_polynomial_u_,
+)
 from .sqrt import sqrt, sqrt_
 from .square import square, square_, square_out
 from .squeeze_copy import squeeze_copy  # noqa: F401
@@ -591,15 +594,14 @@ __all__ = [
     "_thnn_fused_lstm_cell_backward_impl",
     "_conv_depthwise2d",
     "_safe_softmax",
-    "_segment_reduce_backward",
-    "_segment_reduce_backward_out",
     "digamma_",
     "soft_margin_loss",
     "soft_margin_loss_out",
     "soft_margin_loss_backward",
-    "special_legendre_polynomial_p",
     "special_log_softmax",
     "special_logsumexp",
+    "special_shifted_chebyshev_polynomial_u",
+    "special_shifted_chebyshev_polynomial_u_",
     "softshrink",
     "softshrink_out",
     "_unique2",
