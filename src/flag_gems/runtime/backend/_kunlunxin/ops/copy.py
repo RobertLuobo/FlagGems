@@ -120,9 +120,18 @@ def _validate_triton_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
             "copy_ for quantized tensors is not supported on Kunlunxin"
         )
     if src.is_complex() or dst.is_complex():
-        raise NotImplementedError(
-            "copy_ for complex tensors is not supported on Kunlunxin"
-        )
+        # Preserve PyTorch's behaviour of warning when casting complex to real
+        # by forcing the redispatch path, which issues the warning internally.
+        return False
+    if not src.is_contiguous() and src.dtype != dst.dtype:
+        # kunlunxin: same-dtype strided src uses the triton kernel
+        # (probe 2026-09-07: transpose/permute/expand/slice exact;
+        # upstream generic backend has no contiguity gate; native
+        # path hits XMLIR invalid device function, 08 report L2).
+        # Dtype-converting strided copies stay native: klx make_llir
+        # can abort compiling those kernels (int->float family).
+        return False
+    return True
 
 
 def _expand_like(src: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
