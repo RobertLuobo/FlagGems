@@ -1375,7 +1375,9 @@ def softmax_backward(grad_output, output, dim, input_dtype, grad_input=None):
             # M and K axes, so it never copies and never needs .contiguous()
             # (the old rank-2/3 branches raised UnboundLocalError for
             # ndim >= 4, e.g. (2, 3, 4, 5) with dim = 1).
-            in_grad = in_grad_reshaped.view(M, K, N).transpose(1, 2).view(output.shape)
+            in_grad = (
+                in_grad_reshaped.view(M, K, N).transpose(1, 2).view(output.shape)
+            )
         else:
             _softmax_backward_launch_k1(output, grad_output, in_grad, M, N, input_dtype)
     return in_grad

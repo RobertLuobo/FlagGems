@@ -427,14 +427,21 @@ def sum_dim_out(inp, dim=None, keepdim=False, *, dtype=None, out):
     out_dtype = _resolve_out_dtype(inp.dtype, dtype)
 
     if inp.numel() == 0:
-        dims = (
-            dim
-            if isinstance(dim, (list, tuple))
-            else ([dim] if dim is not None else [])
-        )
-        if keepdim:
-            for d in dims:
-                pass  # out shape already correct from caller
+        # Mirror ATen out-variant semantics: resize `out` to the correct
+        # (possibly empty) result shape before zero-filling (native resizes
+        # too; the previous no-resize path returned a (1,)-shaped out).
+        out_shape = list(inp.shape)
+        if dim is None or dim == []:
+            out_shape = [1] * len(out_shape) if keepdim else []
+        else:
+            dims = dim if isinstance(dim, (list, tuple)) else [dim]
+            if keepdim:
+                for d in dims:
+                    out_shape[d % inp.ndim] = 1
+            else:
+                for d in sorted(dims, key=lambda x: x % inp.ndim, reverse=True):
+                    out_shape.pop(d % inp.ndim)
+        out.resize_(out_shape)
         zero_(out)
         return out
 

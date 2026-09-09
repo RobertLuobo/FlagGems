@@ -142,6 +142,10 @@ def _launch(x, out):
 
 def special_expit(A):
     logger.debug("GEMS_KUNLUNXIN SPECIAL_EXPIT")
+    # Match the generic flag_gems/ops/special_expit.py INT_TO_FLOAT promotion:
+    # torch.special.expit promotes integer/bool input to float32 (opmath).
+    if A.dtype not in (torch.float16, torch.float32, torch.bfloat16, torch.float64):
+        A = A.to(torch.float32)
     x = A.contiguous()
     out = torch.empty_like(x)
     _launch(x, out)

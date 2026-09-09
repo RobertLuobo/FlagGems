@@ -133,10 +133,7 @@ def _jagged_to_padded_dense_forward(values, offsets, max_lengths, padding_value=
         )
 
     output = torch.full(
-        (batch_size, max_length),
-        padding_value,
-        dtype=values.dtype,
-        device=values.device,
+        (batch_size, max_length), padding_value, dtype=values.dtype, device=values.device
     )
 
     total_length = int(values.numel())

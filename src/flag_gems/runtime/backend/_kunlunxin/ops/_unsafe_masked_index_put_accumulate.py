@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # 0.002x scan).
 _SCAN_MAX_WORK = 1 << 20
 
-_PIPELINE_BLOCK = 2048  # tl.cumsum-free; only loads/stores, BLOCK free
+_PIPELINE_BLOCK = 2048   # tl.cumsum-free; only loads/stores, BLOCK free
 _BLEND_BLOCK = 4096
 
 
@@ -142,7 +142,9 @@ def _run_totals(st, sv, N, BLOCK):
     M2 = st.numel()
     pad = (BLOCK - M2 % BLOCK) % BLOCK
     if pad:
-        st = torch.cat([st, torch.arange(N, N + pad, dtype=st.dtype, device=st.device)])
+        st = torch.cat(
+            [st, torch.arange(N, N + pad, dtype=st.dtype, device=st.device)]
+        )
         sv = torch.cat([sv, torch.zeros(pad, dtype=sv.dtype, device=sv.device)])
     pfx = torch.cumsum(sv.to(torch.float32), 0)  # inclusive
     is_start = torch.ones_like(st, dtype=torch.bool)
@@ -223,9 +225,7 @@ def _pipeline_impl(input, mask, indices, values):
     st, w = _run_totals(st, sv, N, _PIPELINE_BLOCK)
     contrib = torch.zeros(N + _PIPELINE_BLOCK, dtype=input.dtype, device=input.device)
     with torch_device_fn.device(input.device):
-        _unsafe_masked_index_put_accumulate_scatter_kernel[
-            (st.numel() // _PIPELINE_BLOCK,)
-        ](
+        _unsafe_masked_index_put_accumulate_scatter_kernel[(st.numel() // _PIPELINE_BLOCK,)](
             contrib,
             st,
             w,

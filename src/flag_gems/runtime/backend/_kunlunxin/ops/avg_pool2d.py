@@ -740,7 +740,11 @@ def avg_pool2d_backward_tap_kernel(
             kw = w_rem + jw * stride_w
             w_out = w_base - jw
             out_mask = (
-                input_mask & h_ok & (kw < kernel_w) & (w_out >= 0) & (w_out < out_w)
+                input_mask
+                & h_ok
+                & (kw < kernel_w)
+                & (w_out >= 0)
+                & (w_out < out_w)
             )
             w_start = w_out * stride_w - padding_w
             if COUNT_INCLUDE_PAD:

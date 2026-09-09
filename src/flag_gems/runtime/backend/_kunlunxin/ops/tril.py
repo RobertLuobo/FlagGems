@@ -1070,7 +1070,9 @@ def _launch_tril_inplace_contiguous(
         # ~21.6ms -> ~12.8ms). In-place aliasing (in_ptr == out_ptr) is fine:
         # kept cells are rewritten with their loaded values and strict-upper
         # cells become 0; `active_rows` restricts the pass to the band.
-        return _launch_v2_pow2(input, input, int(diagonal), active_rows=active_rows)
+        return _launch_v2_pow2(
+            input, input, int(diagonal), active_rows=active_rows
+        )
 
     MN = M * N
     active_total = active_rows * N
