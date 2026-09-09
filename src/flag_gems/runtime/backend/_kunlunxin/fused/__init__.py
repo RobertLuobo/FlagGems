@@ -31,19 +31,7 @@ from .geglu import dgeglu, geglu
 from .gelu_and_mul import gelu_and_mul
 from .instance_norm import instance_norm
 from .matmul_bias_activation import matmul_bias_activation
-
-# matmuladd vendor kernel (XPU): forwards to the vendor addmm production path
-# (see .matmuladd for the 2026-09-09 rationale: the generic fused kernel is
-# correct but 4-10x slower than torch at 4096^3 on this backend).
 from .matmuladd import matmuladd
-
-# mhc_pre vendor kernel (XPU): self-installs the direct-import entrypoint
-from .mhc_pre import mhc_pre
-from .mhc_bwd import mhc_bwd
-# hc_head_fused_kernel vendor kernel (XPU): self-installs the direct-import entrypoint
-from .hc_head_fused_kernel import hc_head_fused_kernel
-from .hc_split_sinkhorn import hc_split_sinkhorn
-from .bin_topk import bucket_sort_topk_xpu
 from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
 from .outer import outer
 from .reglu import dreglu, reglu

@@ -344,10 +344,9 @@ from .linalg_solve_triangular import (
     linalg_solve_triangular,
     linalg_solve_triangular_out,
 )
-from .linalg_svd import linalg_svd
-from .linalg_svdvals import linalg_svdvals
 from .linear import linear
 from .linear_backward import linear_backward
+from .linalg_svdvals import linalg_svdvals
 from .linspace import linspace
 from .log import log
 from .log1p import log1p, log1p_
@@ -793,6 +792,8 @@ __all__ = [
     "conv1d",
     "conv2d",
     "conv3d",
+    "conv_transpose1d",
+    "conv_transpose2d",
     "copy",
     "copy_",
     "copysign",
@@ -921,7 +922,24 @@ __all__ = [
     "lgamma",
     "lgamma_",
     "lift_fresh_copy",
-    "linalg_ldl_solve",
+    "linalg_cholesky",
+    "linalg_cross",
+    "linalg_cross_out",
+    "linalg_det",
+    "linalg_det_out",
+    "linalg_householder_product",
+    "linalg_lstsq",
+    "linalg_lu_factor",
+    "linalg_lu_factor_ex",
+    "linalg_lu_factor_ex_out",
+    "linalg_lu_factor_out",
+    "linalg_matrix_norm",
+    "linalg_slogdet",
+    "linalg_solve_triangular",
+    "linalg_solve_triangular_out",
+    "linalg_svdvals",
+    "linear",
+    "linear_backward",
     "linspace",
     "log",
     "log1p",

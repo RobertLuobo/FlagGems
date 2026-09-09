@@ -215,22 +215,8 @@ def repeat_interleave_self_tensor(inp, repeats, dim=None, *, output_size=None):
         # torch.repeat_interleave's "repeats must have the same size" error.)
         return torch.empty(inp_shape, dtype=inp.dtype, device=inp.device)
 
-    # The kernel below indexes rows by row-major offsets
-    # (base_in = pid * inner), so materialize a C-contiguous copy for
-    # non-contiguous inputs; contiguous inputs (incl. all benchmark shapes)
-    # take the zero-copy path.
-    if not inp.is_contiguous():
-        inp = inp.contiguous()
-    if not repeats.is_contiguous():
-        repeats = repeats.contiguous()
-
-    D = inp_shape[dim]
-    outer = 1
-    for s in inp_shape[:dim]:
-        outer *= s
-    inner = 1
-    for s in inp_shape[dim + 1 :]:
-        inner *= s
+    indices = repeat_interleave_tensor(repeats)
+    res = torch.index_select(inp, dim, indices)
 
     cumsum = repeats.cumsum(axis=0)
     rsum = int(cumsum[-1].item())
