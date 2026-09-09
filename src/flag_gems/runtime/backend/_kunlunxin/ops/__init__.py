@@ -162,6 +162,7 @@ from .conv1d import conv1d
 from .conv2d import conv2d
 from .conv3d import conv3d
 from .conv_depthwise2d import _conv_depthwise2d
+from .conv_transpose1d import conv_transpose1d
 from .conv_transpose2d import conv_transpose2d
 from .copy import copy, copy_
 from .copysign import copysign, copysign_, copysign_out
@@ -302,7 +303,9 @@ from .linalg_solve_triangular import (
     linalg_solve_triangular,
     linalg_solve_triangular_out,
 )
+from .linear import linear
 from .linear_backward import linear_backward
+from .linalg_svdvals import linalg_svdvals
 from .linspace import linspace
 from .log import log
 from .log1p import log1p, log1p_
@@ -766,6 +769,7 @@ __all__ = [
     "conv1d",
     "conv2d",
     "conv3d",
+    "conv_transpose1d",
     "conv_transpose2d",
     "copy",
     "copy_",
@@ -948,6 +952,8 @@ __all__ = [
     "linalg_slogdet",
     "linalg_solve_triangular",
     "linalg_solve_triangular_out",
+    "linalg_svdvals",
+    "linear",
     "linear_backward",
     "linspace",
     "log",
