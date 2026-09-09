@@ -278,7 +278,9 @@ def launch_replication_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
     # 3-segment `_copy_from` path paid ~80us per edge `expand` (stride-0)
     # copy, replaced by the edge kernel).
     if has_neg_pad or total_out <= FLAT_LIMIT:
-        kout = out3 if out3.is_contiguous() else torch.empty_like(out3)
+        kout = out3 if out3.is_contiguous() else torch.empty(
+            out3.shape, dtype=out3.dtype, device=out3.device
+        )
         with torch_device_fn.device(x.device):
             _launch_flat_clamp(x, kout, W_in, W_out, pad_l, total_out)
         if kout is not out3:
@@ -294,7 +296,9 @@ def launch_replication_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
     # writes to a contiguous temp first, then `_copy_from` back (same as the
     # flat path).
     with torch_device_fn.device(x.device):
-        dst3 = out3 if out3.is_contiguous() else torch.empty_like(out3)
+        dst3 = out3 if out3.is_contiguous() else torch.empty(
+            out3.shape, dtype=out3.dtype, device=out3.device
+        )
         torch.ops.aten._copy_from(x, dst3[:, :, pad_l : pad_l + W_in])
         if pad_l or pad_r:
             total_e = N * C * (pad_l + pad_r)

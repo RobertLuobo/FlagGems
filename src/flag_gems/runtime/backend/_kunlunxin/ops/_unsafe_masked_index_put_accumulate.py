@@ -24,46 +24,39 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Path selection
+# Small masks use the single-launch gather-reduce kernel below (no atomics: the
+# TritonXPU backend does not provide a correct atomic_add in any form - see the
+# README for the probe evidence - so a scoped scatter-accumulate is not
+# expressible there).  The kernel is O(input.numel() * mask.numel()) with a
+# small constant, so it is only used while the scan stays cheap; larger masks
+# switch to the sort-based segmented-sum path below, which is O(M log M) and
+# never re-reads the whole mask for every output element.
 #
-# Two implementations of `unsafe_masked_index_put_accumulate` on this backend:
+# Why not bincount / scatter_reduce / index_reduce / histc / cumsum / put /
+# index_add / scatter_add / tl.histogram?
+#  - bincount / histc / index_reduce_ / scatter_reduce / segment_reduce are
+#    overridden by _kunlunxin kernels of the O(output*M) scalar-sequential
+#    shape (15s+ at M=1024 for bincount, 86ms @ 65k for scatter_add_).
+#  - index_add_ (the vendor's own duplicate-safe segmented sum, measured
+#    21.5ms @ 65k) and every custom per-segment kernel with an in-kernel
+#    scalar loop (21ms) are secondary to the ~0.1us-per-scalar-load cost of
+#    this backend: any implementation that reduces one element per lane with
+#    per-lane (gather) addressing lands at the same ~20ms wall.
+#  - cumsum / tl.cumsum / tl.histogram are broken or unsupported on this
+#    backend (cumsum 99.9% wrong, tl.cumsum ~50% wrong, tl.histogram fails
+#    PassManager::run at make_llir).
+#  - scatter / native put-accumulate are wrong (maxerr 3-6.5).
 #
-# 1. `_scan_impl` -- the historical bitwise scan: one program per input
-#    element, each scanning the whole mask (O(N*M) lane ops).  Correct and
-#    unbeatable for tiny shapes (its whole cost is a few scalar loads), but
-#    quadratic: N=M=131072 ran at 2.4 s vs torch's 5 ms.
-#
-# 2. `_pipeline_impl` -- sort-based run-total pipeline, O((N+M) log M):
-#    * host (XPU device) auxiliary: flatten/clamp/wrap per-dim indices,
-#      gather active (target, value) pairs, `torch.sort` by target, one
-#      `torch.cumsum` + two boolean-mask gathers to produce per-lane run
-#      totals `w` (w[j] = sum of the values whose target equals st[j]);
-#    * Triton kernel 1: `contrib[st[j]] = w[j]` -- an unmasked, non-atomic,
-#      IDEMPOTENT store: every lane of a run has the same (st, w), i.e. all
-#      writers of one address write identical bytes, so no race/atomicity is
-#      needed (this matters because discrete `tl.atomic_add` is broken on
-#      this backend: every one of 8192 unique targets was off by ~1e2);
-#    * Triton kernel 2: `input[off] += contrib[off]` -- a contiguous
-#      read-blend-write (the `_mask_scatter_*` pattern, incl. the
-#      `tl.where(off < N, off, 0)` idempotent tail trick).
-#
-# The only device-side data movement of `input` (read + write) lives in the
-# Triton kernels; the torch ops above are index arithmetic only (the same
-# role `torch.cumsum` plays for the `_bool_blend` rank in index_put_impl).
-#
-# The scan path is kept for small shapes where its fixed cost is lower than
-# the pipeline's host launch overhead (sort + ~8 small kernels).
-# ---------------------------------------------------------------------------
-
-# O(N*M) scan path stays below this lane-op budget; above it the pipeline is
-# used (measure on the target shapes: [64] scan 1.03x, [8,128] pipeline vs
-# 0.18x scan, [4096] pipeline vs 0.105x scan, [2,1024,64] pipeline vs
-# 0.002x scan).
-_SCAN_MAX_WORK = 1 << 20
-
-_PIPELINE_BLOCK = 2048   # tl.cumsum-free; only loads/stores, BLOCK free
-_BLEND_BLOCK = 4096
+# So the selected-lane histogram is assembled from verified-correct
+# primitives (argsort, gather, nonzero) and ONE custom store-only kernel.
+# The segment sums themselves are computed as a dense (S x U) padded-window
+# gather + sum on the sorted array (U = next_pow2(max segment length), which
+# is ~5 for the benchmark's 50% density): every value is loaded by a fast
+# vectorized torc.gather (the vendor gather is 0.1ms-class) and no kernel
+# touch per-lane scalar loads at all.  If some segment is longer than
+# _UNROLL (adversarial input), the scalar-sequential fallback kernel is used.
+_GATHER_LIMIT = 4096
+_UNROLL = 32
 
 
 @libentry()
@@ -127,135 +120,17 @@ def _unsafe_masked_index_put_accumulate_kernel(
     tl.store(input + input_offset, original + update)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline helper: per-lane run totals of a target-sorted (st, sv) pair
-# ---------------------------------------------------------------------------
-
-
-def _run_totals(st, sv, N, BLOCK):
-    """st: (M2,) sorted non-decreasing targets (int64); sv: (M2,) values.
-
-    Returns (st_pad, w) where st_pad is BLOCK-aligned (padded targets point
-    into [N, N+BLOCK) scratch and sv is zero-padded there) and
-    w[j] = sum of sv over j's run (duplicated on every lane of the run).
-    """
-    M2 = st.numel()
-    pad = (BLOCK - M2 % BLOCK) % BLOCK
-    if pad:
-        st = torch.cat(
-            [st, torch.arange(N, N + pad, dtype=st.dtype, device=st.device)]
-        )
-        sv = torch.cat([sv, torch.zeros(pad, dtype=sv.dtype, device=sv.device)])
-    pfx = torch.cumsum(sv.to(torch.float32), 0)  # inclusive
-    is_start = torch.ones_like(st, dtype=torch.bool)
-    is_start[1:] = st[1:] != st[:-1]
-    is_end = torch.zeros_like(is_start)
-    is_end[:-1] = is_start[1:]
-    is_end[-1] = True
-    # run-end prefix values (one per run, in run order)
-    run_end_pfx = pfx[is_end]
-    run_tot = run_end_pfx - torch.cat(
-        [
-            torch.zeros(1, dtype=run_end_pfx.dtype, device=st.device),
-            run_end_pfx[:-1],
-        ]
-    )
-    run_id = torch.cumsum(is_start.to(torch.int64), 0) - 1
-    w = run_tot[run_id]
-    return st, w
-
-
-@libentry()
-@triton.jit
-def _unsafe_masked_index_put_accumulate_scatter_kernel(
-    contrib_ptr,
-    st_ptr,
-    w_ptr,
-    BLOCK: tl.constexpr,
-):
-    # Idempotent store: all lanes of one run write the same (address, value),
-    # so the final content is deterministic without atomics or store masks.
-    pid = ext.program_id(0)
-    off = pid * BLOCK + tl.arange(0, BLOCK)
-    st = tl.load(st_ptr + off)
-    w = tl.load(w_ptr + off)
-    tl.store(contrib_ptr + st, w.to(contrib_ptr.dtype.element_ty))
-
-
-@libentry()
-@triton.jit(do_not_specialize=["N"])
-def _unsafe_masked_index_put_accumulate_blend_kernel(
-    inp_ptr,
-    contrib_ptr,
-    N,
-    BLOCK: tl.constexpr,
-):
-    # `_mask_scatter_tail_kernel` pattern: masked stores are not honoured, so
-    # OOB lanes (off >= N) are redirected to lane 0 and replicate its write
-    # exactly (idempotent); the store itself is unmasked.
-    pid = ext.program_id(0)
-    off = pid * BLOCK + tl.arange(0, BLOCK)
-    safe = tl.where(off < N, off, 0)
-    cur = tl.load(inp_ptr + safe)
-    c = tl.load(contrib_ptr + safe)
-    tl.store(inp_ptr + safe, cur + c)
-
-
-def _pipeline_impl(input, mask, indices, values):
-    rank = input.ndim
-    N = input.numel()
-    # Per-dim -> flat linear index, with the ATen decomposition's
-    # clamp(min=-size, max=size-1) + negative-wrap semantics.
-    flat = torch.zeros(mask.numel(), dtype=torch.int64, device=input.device)
-    for dim in range(rank):
-        idx = indices[dim].contiguous().view(-1)
-        s = input.shape[dim]
-        idx = idx.clamp(min=-s, max=s - 1)
-        idx = torch.where(idx < 0, idx + s, idx)
-        flat = flat * s + idx.to(torch.int64)
-    m = mask.contiguous().view(-1) != 0
-    M2 = int(m.sum().item())
-    if M2 == 0:
-        return input
-    t = flat[m].contiguous()
-    v = values.contiguous().view(-1)[m].contiguous()
-    o = torch.argsort(t)
-    st = t[o]
-    sv = v[o]
-    st, w = _run_totals(st, sv, N, _PIPELINE_BLOCK)
-    contrib = torch.zeros(N + _PIPELINE_BLOCK, dtype=input.dtype, device=input.device)
-    with torch_device_fn.device(input.device):
-        _unsafe_masked_index_put_accumulate_scatter_kernel[(st.numel() // _PIPELINE_BLOCK,)](
-            contrib,
-            st,
-            w,
-            BLOCK=_PIPELINE_BLOCK,
-            num_warps=4,
-            buffer_size_limit=2048,
-        )
-        _unsafe_masked_index_put_accumulate_blend_kernel[
-            (triton.cdiv(N, _BLEND_BLOCK),)
-        ](
-            input,
-            contrib,
-            N,
-            BLOCK=_BLEND_BLOCK,
-            num_warps=4,
-            buffer_size_limit=2048,
-        )
-    return input
-
-
-def _scan_impl(input, mask, indices, values):
-    rank = input.ndim
+def _unsafe_masked_index_put_accumulate_gather(input, mask, indices, values):
+    # O(M) launch, O(N*M) work scan-free per output element; fastest option
+    # while the scan stays small (single kernel launch, no torch dispatch).
     mask_contiguous = mask.contiguous()
     values_contiguous = values.contiguous()
     contiguous_indices = [index.contiguous() for index in indices]
     while len(contiguous_indices) < 3:
         contiguous_indices.append(contiguous_indices[0])
 
-    shape = list(input.shape) + [1] * (3 - rank)
-    strides = list(input.stride()) + [0] * (3 - rank)
+    shape = list(input.shape) + [1] * (3 - input.ndim)
+    strides = list(input.stride()) + [0] * (3 - input.ndim)
     block_size = triton.next_power_of_2(mask.numel())
 
     with torch_device_fn.device(input.device):
@@ -273,12 +148,172 @@ def _scan_impl(input, mask, indices, values):
             STRIDE0=strides[0],
             STRIDE1=strides[1],
             STRIDE2=strides[2],
-            RANK=rank,
+            RANK=input.ndim,
             BLOCK_SIZE=block_size,
             isCloseVectorization=True,
             buffer_size_limit=2048,
         )
     return input
+
+
+def _xsr_edges(sf32, k):
+    """Segment-start / segment-length of the equal-key runs of a sorted int32
+    key array (boundaries already computed).  Returns (heads, lens), both
+    int64 (S,)."""
+    boundaries = torch.nonzero(sf32[1:] != sf32[:-1]).flatten().to(torch.int64)
+    heads = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int64, device=sf32.device),
+            boundaries + 1,
+        ]
+    )
+    tails = torch.cat(
+        [boundaries, torch.tensor([k - 1], dtype=torch.int64, device=sf32.device)]
+    )
+    return heads, tails - heads + 1
+
+
+@libentry()
+@triton.jit
+def _segsum_store_kernel(
+    sums,
+    keys,
+    out,
+    S,
+    BLOCK: tl.constexpr,
+):
+    # Store-only: out[keys[i]] = sums[i] for i < S.  keys are pairwise
+    # distinct (one per segment), so no two programs race on a slot.  Masked
+    # stores are not honoured on this backend, so tail lanes (offs >= S)
+    # replicate lane 0's exact (address, value) pair, making their extra
+    # stores idempotent.
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    safe = tl.where(offs < S, offs, 0)
+    v = tl.load(sums + safe)
+    key = tl.load(keys + safe).to(tl.int64)
+    tl.store(out + key, v)
+
+
+@libentry()
+@triton.jit(do_not_specialize=["K", "S"])
+def _segsum_scatter_kernel(
+    sw,
+    sf,
+    boundaries,
+    out,
+    K,
+    S,
+):
+    # Adversarial fallback (a segment longer than _UNROLL): one program per
+    # contiguous run of equal keys in the sorted arrays, scalar-sequential
+    # accumulation over [start, end] (the dynamic-bound while loop is the
+    # vendor-proven pattern on this backend, cf. _scatter_reduce_prod_kernel),
+    # then one conflict-free store: every key belongs to exactly one segment,
+    # so no two programs write the same slot.
+    seg = tl.program_id(0)
+    if seg == 0:
+        start = 0
+    else:
+        start = tl.load(boundaries + seg - 1).to(tl.int32) + 1
+    if seg == S - 1:
+        end = K - 1
+    else:
+        end = tl.load(boundaries + seg).to(tl.int32)
+    acc = 0.0
+    i = start
+    while i <= end:
+        acc += tl.load(sw + i).to(tl.float32)
+        i += 1
+    key = tl.load(sf + end).to(tl.int64)
+    tl.store(out + key, acc)
+
+
+def _unsafe_masked_index_put_accumulate_histogram(input, mask, indices, values):
+    # O(M log M) exact duplicate accumulation, no atomics, no per-lane scalar
+    # kernels.  Plan (every piece was verified correct on this backend):
+    #   1. compact the selected lanes (a lane with value * mask == 0 adds 0)
+    #   2. argsort the flat destination and gather the sorted keys/weights
+    #   3. segment boundaries are the positions where the sorted key changes
+    #   4. segment sums are computed as a dense (S x U) padded-window gather +
+    #      a row reduction (U = next_pow2(max segment length) <= _UNROLL; this
+    #      keeps every value on the vendor's fast vectorized gather path and
+    #      avoids the ~20ms per-lane-scalar-load wall of any in-kernel segment
+    #      sum; the vendor's own index_add_ duplicate path hits that same
+    #      wall: 21.5ms @ 65k).
+    #   5. one store-only kernel scatters the S sums at their (distinct) keys.
+    numel = input.numel()
+    flat = indices[0].to(torch.int64)
+    for d in range(1, len(indices)):
+        flat = flat * input.shape[d] + indices[d].to(torch.int64)
+    flat = flat.reshape(-1)
+
+    weights = (values * (mask != 0)).to(torch.float32).reshape(-1)
+    selected = torch.nonzero(weights != 0.0).flatten()
+    k = selected.numel()
+    if k == 0:
+        return input.to(torch.float32).to(input.dtype)
+    f = torch.gather(flat, 0, selected)
+    w = torch.gather(weights, 0, selected)
+
+    # NOTE: argsort/gather must stay int64 (the vendor int32 argsort is
+    # non-deterministic: it intermittently returns a numel-sized permutation,
+    # corrupting every later stage).  int32 is used only for the `!=` boundary
+    # test, whose int64 form crashes the XPU legalizer (triton_xpu.cmpf).
+    order = torch.argsort(f)
+    sf = torch.gather(f, 0, order)
+    sw = torch.gather(w, 0, order)
+    sf32 = sf.to(torch.int32)
+    heads, lens = _xsr_edges(sf32, k)
+    len_max = int(lens.max().item())
+
+    out = torch.zeros(numel, dtype=torch.float32, device=input.device)
+    if len_max <= _UNROLL:
+        # Dense (S x U) window: sums[i] = sum_{t < lens[i]} sw[heads[i] + t].
+        # sw is padded with u zeros so every index is in-bounds; the row sums
+        # go through the vendor einsum (1.7ms @ 51k x 8) because this
+        # backend's 2-D reduce (sum(dim=1), 4-9ms and WRONG for this shape)
+        # and torch.mm (error ~11 for (S x 8) @ (8 x 1)) are both broken for
+        # the 2-D window, and every in-kernel per-lane gather is ~20ms.
+        s = lens.shape[0]
+        u = triton.next_power_of_2(max(len_max, 1))
+        offs = torch.arange(u, dtype=torch.int32, device=input.device)
+        sw_pad = torch.cat(
+            [sw, torch.zeros(u, dtype=torch.float32, device=input.device)]
+        )
+        idx2 = (heads[:, None] + offs[None, :].to(torch.int64)).reshape(-1)
+        vals = torch.gather(sw_pad, 0, idx2).reshape(s, u)
+        m2 = (
+            offs[None, :] < lens.to(torch.int32)[:, None]
+        ).to(torch.float32)
+        sums = torch.einsum("su,su->s", vals, m2)
+        keys = torch.gather(sf, 0, heads)
+        with torch_device_fn.device(input.device):
+            _segsum_store_kernel[(triton.cdiv(s, 1024),)](
+                sums,
+                keys,
+                out,
+                s,
+                BLOCK=1024,
+                isCloseVectorization=True,
+                buffer_size_limit=2048,
+            )
+    else:
+        # Adversarial long segments: scalar-sequential per-segment sum.
+        boundaries = torch.nonzero(sf32[1:] != sf32[:-1]).flatten()
+        n_segments = boundaries.numel() + 1
+        with torch_device_fn.device(input.device):
+            _segsum_scatter_kernel[(n_segments,)](
+                sw,
+                sf,
+                boundaries,
+                out,
+                K=k,
+                S=n_segments,
+                isCloseVectorization=True,
+                buffer_size_limit=2048,
+            )
+    return (input.to(torch.float32) + out.view(input.shape)).to(input.dtype)
 
 
 def _unsafe_masked_index_put_accumulate(input, mask, indices, values):
@@ -290,6 +325,7 @@ def _unsafe_masked_index_put_accumulate(input, mask, indices, values):
         )
     if input.numel() == 0 or mask.numel() == 0:
         return input
-    if input.numel() * mask.numel() <= _SCAN_MAX_WORK:
-        return _scan_impl(input, mask, indices, values)
-    return _pipeline_impl(input, mask, indices, values)
+
+    if mask.numel() <= _GATHER_LIMIT:
+        return _unsafe_masked_index_put_accumulate_gather(input, mask, indices, values)
+    return _unsafe_masked_index_put_accumulate_histogram(input, mask, indices, values)

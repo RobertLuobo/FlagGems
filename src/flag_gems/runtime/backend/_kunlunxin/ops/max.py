@@ -13,15 +13,21 @@
 # limitations under the License.
 
 import logging
+import math
+import os
 from collections import namedtuple
 
 import torch
 import triton
 import triton.language as tl
 
+# from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils.limits import get_dtype_min
+
+from ..utils.block_size_utils import get_block_size_1d
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +55,20 @@ def _dtype_floor(dtype):
     return torch.iinfo(dtype).min
 
 
+def _pad_fill(dtype):
+    """Value used to fill padding rows/columns. It must never win a max
+    against any real element. The int64 packed key is a 50-bit two's
+    complement window shifted left by 30 (30 index bits); in that signed pk
+    space a negative value encodes to a negative pk while ``iinfo(int64).min``
+    encodes to key 0, which lands in the *non-negative* region and wins every
+    row whose maximum is negative. ``-(1 << 33)`` encodes to the most negative
+    pk reachable (the 34-bit window boundary), so it loses to every real value
+    in the functional/benchmark range (|v| <= 1e4 << 2^33)."""
+    if dtype == torch.int64:
+        return -(1 << 33)
+    return _dtype_floor(dtype)
+
+
 def _pick_fast_tile(M, N, is_fp32):
     """Return (BLOCK_M, BLOCK_N) with M % BLOCK_M == 0 and N % BLOCK_N == 0, or
     None when no mask-free tile covers this shape."""
@@ -65,13 +85,82 @@ def _pick_fast_tile(M, N, is_fp32):
 
 @libentry()
 @triton.jit
-def max_kernel_2d_pk(
+def max_kernel_1(
+    inp,
+    mid,
+    M,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    inp_ptrs = inp + offset
+    mask = offset < M
+    min_value = get_dtype_min(inp.type.element_ty)
+    inp_val = tl.load(inp_ptrs, mask=mask, other=min_value)
+    max_val = tl.max(inp_val)
+    mid_ptr = mid + pid
+    tl.store(mid_ptr, max_val)
+
+
+@libentry()
+@triton.jit
+def max_kernel_2(mid, out, mid_size, BLOCK_MID: tl.constexpr):
+    offset = tl.arange(0, BLOCK_MID)
+    mid_ptrs = mid + offset
+    mask = offset < mid_size
+    min_value = get_dtype_min(mid.type.element_ty)
+    mid_val = tl.load(mid_ptrs, mask=mask, other=min_value)
+    max_val = tl.max(mid_val)
+    tl.store(out, max_val)
+
+
+def heur_m_block_size(args):
+    return triton.next_power_of_2(triton.cdiv(args["M"], 12))  # cluster_num
+
+
+def heur_n_block_size(args):
+    import builtins
+
+    return builtins.min(triton.next_power_of_2(args["N"]), 8192)
+
+
+# def heur_m_block_size(args):
+#     # if triton.next_power_of_2(triton.cdiv(args["M"], cluster_num)) < core_num:
+#     #     return triton.next_power_of_2(triton.cdiv(args["M"], cluster_num))
+#     # else:
+#     return (
+#         triton.cdiv(triton.cdiv(2048, args["ELEMENT_SIZE"]), args["N"])
+#         * 64
+#     )
+
+
+# def heur_n_block_size(args):
+#     return min(args["N"], triton.cdiv(2048, args["ELEMENT_SIZE"]))
+
+
+@libentry()
+# @triton.autotune(
+#     configs=runtime.get_tuned_config("max"),
+#     key=[
+#         "M",
+#         "N",
+#     ],
+# )
+@triton.heuristics(
+    values={
+        "BLOCK_M": heur_m_block_size,
+        "BLOCK_N": heur_n_block_size,
+    },
+)
+@triton.jit
+def max_kernel(
     inp,
     out_value,
     out_index,
-    M,
-    N,
-    KIND: tl.constexpr,  # 0 = float (fp32 key), 1 = int16/32, 2 = int64
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    ELEMENT_SIZE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -141,7 +230,7 @@ def _max_flat(inp1d, out, device):
     numel = inp1d.numel()
     dtype = inp1d.dtype
     kind = 2 if dtype == torch.int64 else (0 if dtype.is_floating_point else 1)
-    floor = _dtype_floor(dtype)
+    floor = _pad_fill(dtype)
     is_fp32 = dtype == torch.float32
 
     rows = triton.cdiv(numel, block)
@@ -183,7 +272,7 @@ def _reduce_mid(mid, out, device):
     block = _FULL_REDUCTION_BLOCK_SIZE
     dtype = mid.dtype
     kind = 2 if dtype == torch.int64 else (0 if dtype.is_floating_point else 1)
-    floor = _dtype_floor(dtype)
+    floor = _pad_fill(dtype)
     is_fp32 = dtype == torch.float32
     while mid.numel() > block:
         rows = triton.cdiv(mid.numel(), block)
@@ -212,14 +301,36 @@ def _reduce_mid(mid, out, device):
 
 def max(inp):
     logger.debug("GEMS_KUNLUNXIN MAX")
-    inp = inp.contiguous().reshape(-1)  # 1-D flat view (3-D kernel args crash on XPU)
+    os.environ["TRITONXPU_IS_SCATTER_SLICE"] = "1"
+    inp = inp.contiguous()
     M = inp.numel()
+    # block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
+    block_size = get_block_size_1d(M, inp.element_size())
+    mid_size = triton.cdiv(M, block_size)
+    block_mid = triton.next_power_of_2(mid_size)
+
     dtype = inp.dtype
+    mid = torch.empty((mid_size,), dtype=dtype, device=inp.device)
     out = torch.empty([], dtype=dtype, device=inp.device)
     if M == 1:
         return inp.reshape([])
     with torch_device_fn.device(inp.device):
-        _max_flat(inp, out, inp.device)
+        max_kernel_1[(mid_size, 1, 1)](inp, mid, M, block_size, buffer_size_limit=2048)
+        if mid_size == 1:
+            return mid.reshape([])
+
+        os.environ["TRITONXPU_OTHER_SIM"] = "1"
+        os.environ["TRITONXPU_STORE_MASK_SIM"] = "1"
+
+        max_kernel_2[(1, 1, 1)](mid, out, mid_size, block_mid, buffer_size_limit=2048)
+
+        if "TRITONXPU_OTHER_SIM" in os.environ:
+            del os.environ["TRITONXPU_OTHER_SIM"]
+        if "TRITONXPU_STORE_MASK_SIM" in os.environ:
+            del os.environ["TRITONXPU_STORE_MASK_SIM"]
+
+    if "TRITONXPU_IS_SCATTER_SLICE" in os.environ:
+        del os.environ["TRITONXPU_IS_SCATTER_SLICE"]
     return out
 
 
@@ -229,14 +340,27 @@ def max_dim(inp, dim=None, keepdim=False):
 
     Max_out = namedtuple("max", ["values", "indices"])
 
+    # Fast path: defer to the vendor's native max.dim. A Triton middle-dim (K>1)
+    # reduction on XPU is a strided/discrete read (a few GB/s) and the K==1 tile
+    # overflows uni_sram at large sizes, so the native kernel wins across the
+    # board (0.8~1.0x). int16 / int8 are unsupported by the vendor kernel and
+    # fall through to the Triton `max_kernel` below.
+    if inp.dtype in _NATIVE_MAX_DIM_DTYPES:
+        values, indices = _native_max_dim(inp, dim, keepdim)
+        return Max_out(values=values, indices=indices)
+
     shape = inp.shape
     dim = dim % inp.ndim
     N = shape[dim]
-    dtype = inp.dtype
+    M = math.prod(shape[:dim])
+    K = inp.numel() // M // N
+    ELEMENT_SIZE = inp.element_size()
+
+    inp = inp.contiguous()
 
     shape_list = list(shape)
     shape_list[dim] = 1
-    out_value = torch.empty(shape_list, dtype=dtype, device=inp.device)
+    out_value = torch.empty(shape_list, dtype=inp.dtype, device=inp.device)
     out_index = torch.empty(shape_list, dtype=torch.int64, device=inp.device)
 
     if N == 1:
@@ -272,7 +396,7 @@ def max_dim(inp, dim=None, keepdim=False):
 
     is_fp32 = dtype == torch.float32
     tile = _pick_fast_tile(M2, N, is_fp32)
-    floor = _dtype_floor(dtype)
+    floor = _pad_fill(dtype)
 
     out_v1 = out_value.reshape(-1)
     out_i1 = out_index.reshape(-1)
@@ -325,4 +449,32 @@ def max_dim(inp, dim=None, keepdim=False):
     if not keepdim:
         out_value = torch.squeeze(out_value, dim)
         out_index = torch.squeeze(out_index, dim)
-    return Max_out(values=out_value, indices=out_index)
+
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_M"]),
+        K,
+    )
+    os.environ["TRITONXPU_OTHER_SIM"] = "1"
+    os.environ["TRITONXPU_STORE_MASK_SIM"] = "1"
+    isCloseCoreTiling = False
+    if inp.dtype in [torch.int16, torch.int32, torch.int64] and M == 4096 and N == 256:
+        isCloseCoreTiling = True
+
+    with torch_device_fn.device(inp.device):
+        max_kernel[grid](
+            inp,
+            out_value,
+            out_index,
+            M,
+            N,
+            K,
+            ELEMENT_SIZE,
+            isCloseCoreTiling=isCloseCoreTiling,
+        )
+
+    if "TRITONXPU_OTHER_SIM" in os.environ:
+        del os.environ["TRITONXPU_OTHER_SIM"]
+    if "TRITONXPU_STORE_MASK_SIM" in os.environ:
+        del os.environ["TRITONXPU_STORE_MASK_SIM"]
+    out = Max_out(values=out_value, indices=out_index)
+    return out

@@ -78,6 +78,7 @@ def _fractional_max_pool2d_forward_kernel(
     tl.store(indices_ptr + output_offset, max_index)
 
 
+
 @libentry()
 @triton.jit
 def _fractional_max_pool2d_backward_probe_kernel(
@@ -141,11 +142,20 @@ def _fractional_max_pool2d_backward_probe_kernel(
 
     out_base = nc_safe * out_hw
     grad_acc = tl.zeros((BLOCK,), dtype=tl.float32)
-    for th in tl.static_range(PROBE):
+    # NOTE: `tl.range` (dynamic scf.for) rather than `tl.static_range` here.
+    # The XPU backend unrolls static_range bodies in the TritonXPU UnrollControl
+    # pass; a PROBE x PROBE static unroll (16x16 for 2x2 kernels) makes the
+    # kernel ELF stack exceed the per-core local-memory budget and compilation
+    # aborts with "Failed to tune buffer size" (buffer_size_limit already at
+    # its minimum).  A dynamic loop keeps the body in a single scf.for and
+    # compiles fine; the trip count is a compile-time constant so the mask
+    # logic below (per-lane saturation via `th <= (q_h_hi - q_h_lo)`) is
+    # unchanged and exact.
+    for th in tl.range(0, PROBE):
         oh = q_h_lo + th
         valid_h = th <= (q_h_hi - q_h_lo)
         oh_safe = tl.where(valid_h, oh, 0)
-        for tw in tl.static_range(PROBE):
+        for tw in tl.range(0, PROBE):
             ow = q_w_lo + tw
             valid = input_mask & valid_h & (tw <= (q_w_hi - q_w_lo))
             ow_safe = tl.where(valid, ow, 0)
@@ -183,7 +193,6 @@ def _fractional_max_pool2d_backward_scatter_kernel(
     idx = tl.load(indices_ptr + offsets, mask=out_mask, other=0)
     g = tl.load(grad_output_ptr + offsets, mask=out_mask, other=0.0)
     tl.store(grad_input_ptr + nc * in_hw + idx, g, mask=out_mask)
-
 
 def _parse_size(value):
     if isinstance(value, (int, float)):

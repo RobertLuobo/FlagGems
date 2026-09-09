@@ -66,8 +66,8 @@ _DST_ALIGN_BYTES = 32
 _TRITON_MAX_BYTES = 1 << 16
 # Padding the output only pays off once the copy is bandwidth bound.
 _ALIGN_MIN_BYTES = 1 << 18
-# Number of wrap dims the fused gather kernel understands.
-_MAX_WRAP_DIMS = 4
+# Number of roll dims the fused gather kernel understands (max tensor rank).
+_MAX_GATHER_DIMS = 5
 _TRITON_BLOCK = 512
 
 
@@ -106,9 +106,9 @@ def roll(inp: torch.Tensor, shifts, dims=None) -> torch.Tensor:
 
     if (
         numel * src.element_size() <= _TRITON_MAX_BYTES
-        and len(wrap_dims) <= _MAX_WRAP_DIMS
+        and len(active) <= _MAX_GATHER_DIMS
     ):
-        return _roll_gather(src, numel, delta, effective, wrap_dims)
+        return _roll_gather(src, numel, active)
 
     out = _rotate_flat(src.reshape(-1), delta).view(shape)
     for combo in _fixup_blocks(shape, active):
@@ -180,17 +180,15 @@ def _fixup_blocks(shape: Sequence[int], active: Sequence[tuple]) -> list:
 def _roll_gather(
     src: torch.Tensor,
     numel: int,
-    delta: int,
-    effective: Sequence[int],
-    wrap_dims: Sequence[int],
+    active: Sequence[tuple],
 ) -> torch.Tensor:
     out = torch.empty_like(src)
     strides = src.stride()
     params = []
-    for index in range(_MAX_WRAP_DIMS):
-        if index < len(wrap_dims):
-            dim = wrap_dims[index]
-            params.extend((src.size(dim), strides[dim], effective[dim]))
+    for index in range(_MAX_GATHER_DIMS):
+        if index < len(active):
+            dim, shift = active[index]
+            params.extend((src.size(dim), strides[dim], shift))
         else:
             params.extend((1, 1, 0))
     need_mask = numel % _TRITON_BLOCK != 0
@@ -199,9 +197,8 @@ def _roll_gather(
         src.reshape(-1),
         out.reshape(-1),
         numel,
-        delta,
         *params,
-        NWRAP=len(wrap_dims),
+        NDIM=len(active),
         BLOCK=_TRITON_BLOCK,
         NEED_MASK=need_mask,
     )
@@ -214,7 +211,6 @@ def _roll_gather_kernel(
     in_ptr,
     out_ptr,
     numel,
-    delta,
     size0,
     stride0,
     shift0,
@@ -227,21 +223,35 @@ def _roll_gather_kernel(
     size3,
     stride3,
     shift3,
-    NWRAP: tl.constexpr,
+    size4,
+    stride4,
+    shift4,
+    NDIM: tl.constexpr,
     BLOCK: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
+    # Per-element index decode: source = offsets + sum_d ((idx_d - shift_d)
+    # mod size_d - idx_d) * stride_d over the rolled dims.  The earlier
+    # `tl.where`-based formulation of the same math was miscompiled by
+    # TritonXPU (garbage sources on some lanes), so it is kept as pure
+    # integer arithmetic like the generic roll kernels.
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    source = offsets - delta
-    if NWRAP >= 1:
-        source += tl.where((offsets // stride0) % size0 < shift0, size0 * stride0, 0)
-    if NWRAP >= 2:
-        source += tl.where((offsets // stride1) % size1 < shift1, size1 * stride1, 0)
-    if NWRAP >= 3:
-        source += tl.where((offsets // stride2) % size2 < shift2, size2 * stride2, 0)
-    if NWRAP >= 4:
-        source += tl.where((offsets // stride3) % size3 < shift3, size3 * stride3, 0)
-    source = tl.where(source < 0, source + numel, source)
+    source = offsets
+    if NDIM >= 1:
+        idx0 = (offsets // stride0) % size0
+        source += ((idx0 + size0 - shift0) % size0 - idx0) * stride0
+    if NDIM >= 2:
+        idx1 = (offsets // stride1) % size1
+        source += ((idx1 + size1 - shift1) % size1 - idx1) * stride1
+    if NDIM >= 3:
+        idx2 = (offsets // stride2) % size2
+        source += ((idx2 + size2 - shift2) % size2 - idx2) * stride2
+    if NDIM >= 4:
+        idx3 = (offsets // stride3) % size3
+        source += ((idx3 + size3 - shift3) % size3 - idx3) * stride3
+    if NDIM >= 5:
+        idx4 = (offsets // stride4) % size4
+        source += ((idx4 + size4 - shift4) % size4 - idx4) * stride4
     if NEED_MASK:
         # Clamp instead of relying on masked loads: XPU ignores `other=` on
         # some paths, and the store mask already discards the tail lanes.

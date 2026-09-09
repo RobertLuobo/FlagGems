@@ -52,6 +52,7 @@ def _assert_async(tensor: torch.Tensor, msg: str = "Assertion failed"):
     scratch = torch.empty((), dtype=torch.bool, device=tensor.device)
     with torch_device_fn.device(tensor.device):
         _assert_async_kernel[(1,)](tensor, scratch, MSG=msg)
-    torch_device_fn.synchronize()
+    # scratch.item() already synchronizes the device; an explicit
+    # synchronize() before it would add a second device sync.
     if not scratch.item():
         raise RuntimeError(msg)

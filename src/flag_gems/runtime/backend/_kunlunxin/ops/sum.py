@@ -275,16 +275,17 @@ def _sum_row_tail_kernel(
     inp,
     in_sum,
     out,
-    M,
     N,
     N0,
     NTAIL,
-    BLOCK_M: tl.constexpr,
     TL: tl.constexpr,
 ):
-    """Row tail (rows' trailing NTAIL < 8192 lanes): out[r] = in_sum[r] +
-    sum(inp[r, N0:N0+NTAIL]). Single-shot masked 1-D tiles per row
-    (static-unrolled over rows; validated 2026-08-22)."""
+    """Row tail: one program per row, single-shot masked 1-D tile
+    (out[r] = in_sum[r] + sum(inp[r, N0:N0+NTAIL])).
+    Single-shot (non-loop) masked tiles are the only reliable form here; the
+    previous static-unrolled in-loop masked load + i32->i64 2x-width cast
+    miscompiles on this XPU (KL3 illegal memory access for int inputs;
+    validated 2026-09-09)."""
     if tl.constexpr(inp.dtype.element_ty == tl.float64):
         cdtype = tl.float64
     elif (
@@ -296,12 +297,9 @@ def _sum_row_tail_kernel(
         cdtype = tl.int64
     pid = ext.program_id(0)
     off = tl.arange(0, TL)
-    for ri in tl.static_range(BLOCK_M):
-        row = pid * BLOCK_M + ri
-        row_c = tl.minimum(row, M - 1)
-        a = tl.load(inp + row_c * N + N0 + off, mask=off < NTAIL, other=0).to(cdtype)
-        s = tl.sum(a) + tl.load(in_sum + row_c).to(cdtype)
-        tl.store(out + row, s, row < M)
+    a = tl.load(inp + pid * N + N0 + off, mask=off < NTAIL, other=0).to(cdtype)
+    s = tl.sum(a) + tl.load(in_sum + pid).to(cdtype)
+    tl.store(out + pid, s)
 
 
 def _launch_sum_dim(inp, out, M, N):
@@ -342,15 +340,13 @@ def _launch_sum_dim(inp, out, M, N):
             _sum_row_full_kernel[(triton.cdiv(M, block_m), 1, 1)](
                 inp, full, M, N, n0, block_m, _ROW_BN, buffer_size_limit=2048
             )
-            _sum_row_tail_kernel[(triton.cdiv(M, _TAIL_BLOCK_M), 1, 1)](
+            _sum_row_tail_kernel[(M, 1, 1)](
                 inp,
                 full,
                 out,
-                M,
                 N,
                 n0,
                 tail,
-                _TAIL_BLOCK_M,
                 triton.next_power_of_2(tail),
             )
 

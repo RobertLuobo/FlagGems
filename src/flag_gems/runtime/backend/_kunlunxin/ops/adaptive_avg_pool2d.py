@@ -82,14 +82,15 @@ def _adaptive_avg_pool2d_int_kernel(
     c = tl.arange(0, BKW)
     base = ((nc * OH + oh) * KH) * IW
 
-    value = tl.zeros((BG,), dtype=tl.float32)
-    for kh in tl.static_range(KH):
+    value = tl.zeros((BG, BKW), dtype=tl.float32)
+    for kh in range(0, KH):
         tile = tl.load(
             input + base + kh * IW + r[:, None] * KW + c[None, :],
             mask=(r[:, None] < G) & (c[None, :] < KW),
             other=0.0,
         ).to(tl.float32)
-        value += tl.sum(tile, axis=1)
+        value += tile
+    value = tl.sum(value, axis=1)
 
     ow = tl.arange(0, BG)
     tl.store(output + (nc * OH + oh) * OW + ow, value / AREA, mask=ow < OW)

@@ -37,6 +37,7 @@ from .geglu import dgeglu, geglu
 from .gelu_and_mul import gelu_and_mul
 from .instance_norm import instance_norm
 from .matmul_bias_activation import matmul_bias_activation
+from .matmuladd import matmuladd
 
 # mhc_pre vendor kernel (XPU): self-installs the direct-import entrypoint
 from .mhc_pre import mhc_pre
@@ -89,6 +90,7 @@ __all__ = [
     "hc_split_sinkhorn",
     "instance_norm",
     "matmul_bias_activation",
+    "matmuladd",
     "mhc_bwd",
     "mhc_pre",
     "moe_align_block_size",

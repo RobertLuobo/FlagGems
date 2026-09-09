@@ -164,31 +164,30 @@ def bernoulli(self, *, generator=None):
         increment, generator=generator
     )
     with torch_device_fn.device(device):
+        # Single-launch kernel for every size. On the XPU triton fork the
+        # top-level (non-scf.if) 4-wide unmasked vselect+store sequence of
+        # `bernoulli_kernel` compiles to a 512-bit (16xf32) unmasked store
+        # that deterministically faults with a KL_XID_KERNEL_EXCEPTION
+        # (kl3 error 2097866 / status 719) for float32 inputs, at every
+        # N % (BLOCK*UNROLL) == 0 (reproduced with grids 1..160000 in fresh
+        # processes). `bernoulli_kernel_with_tail` wraps the identical main
+        # body in `if pid < NMAIN` so the backend lowers the stores to the
+        # reliable masked/evict_first form and executes correctly for every
+        # N and dtype. For N % block_elems == 0 the extra tail program only
+        # runs fully-masked-off lanes, so no OOB access and no RNG stream
+        # change (generator state is only advanced by `increment` in
+        # philox_backend_seed_offset).
         block_elems = BLOCK * UNROLL
         nmain = N // block_elems
-        if N % block_elems == 0:
-            # all blocks fully in-bounds -> branchless kernel
-            bernoulli_kernel[(nmain,)](
-                out,
-                self,
-                N,
-                philox_seed,
-                philox_offset,
-                BLOCK=BLOCK,
-                ROUNDS=PHILOX_ROUNDS,
-                num_warps=NUM_WARPS,
-            )
-        else:
-            # branchless full blocks + in-kernel per-element masked tail
-            bernoulli_kernel_with_tail[(nmain + 1,)](
-                out,
-                self,
-                N,
-                philox_seed,
-                philox_offset,
-                NMAIN=nmain,
-                BLOCK=BLOCK,
-                ROUNDS=PHILOX_ROUNDS,
-                num_warps=NUM_WARPS,
-            )
+        bernoulli_kernel_with_tail[(nmain + 1,)](
+            out,
+            self,
+            N,
+            philox_seed,
+            philox_offset,
+            NMAIN=nmain,
+            BLOCK=BLOCK,
+            ROUNDS=PHILOX_ROUNDS,
+            num_warps=NUM_WARPS,
+        )
     return out

@@ -63,6 +63,18 @@ def logical_not_func(x):
     #                                    sign mask -> False.
     # Result matches torch.logical_not bit-exactly for all float edge cases
     # (NaN, +/-inf, -0.0, subnormals) verified on-device.
+    #
+    # int8/int16: the i8/i16 -> f32 -> bitcast(i32) widening convert above
+    # makes ConvertTritonXPUToLLVM crash on XPU for 1D tiles of 2048..32768
+    # elements ("size mismatch when packing elements for LLVM struct expected
+    # 2 but got 1"), for both logical_not and logical_not_ (int8/int16 only;
+    # fp16/bf16/fp32/int32/int64 are unaffected -- measured 2026-09-08 on
+    # card 5). The tests' POINTWISE_SHAPES never contain a 1D tensor in that
+    # window, so the crash only surfaces through the benchmark's rank-1
+    # (1073741824,) / (1024*1024*1024,) shapes. An integer `x == 0` is a plain
+    # icmp with no convert at all and is exact for every int8/int16 value.
+    if (x.dtype == tl.int8) or (x.dtype == tl.int16):
+        return x == 0
     u = x.to(tl.float32).to(tl.int32, bitcast=True)
     return (u & 0x7FFFFFFF) == 0
 

@@ -51,7 +51,15 @@ def _dequantize_kernel(
     # valid lanes. Lanes past n_elements read undefined bytes and land in
     # the padded tail of `out_ptr`, which the caller never exposes.
     raw = tl.load(x_ptr + offsets, mask=offsets < n_elements)
-    values = raw.to(tl.float32)
+    # Two-step i8->i32->f32 instead of a single-step i8->f32: TritonXPU's
+    # vectorizer lowers a direct i8->f32 conversion into triton_xpu.vsitofp
+    # whose source (sizePerCore=2) and result (sizePerCore=8) layouts differ
+    # in elems/thread; ConvertTritonXPUToLLVM then fails with "size mismatch
+    # when packing elements for LLVM struct expected 8 but got 2". The width
+    # extension raw.to(tl.int32) keeps the source layout stable and the
+    # subsequent i32->f32 vsitofp has matching layouts. Sign extension is
+    # exact, so the UNSIGNED (quint8 alias) fold afterwards is unaffected.
+    values = raw.to(tl.int32).to(tl.float32)
     if UNSIGNED:
         values = tl.where(values < 0.0, values + 256.0, values)
     tl.store(out_ptr + offsets, (values - zero_point) * scale)

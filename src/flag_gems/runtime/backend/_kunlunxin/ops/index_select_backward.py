@@ -15,13 +15,18 @@ logger = logging.getLogger(__name__)
 
 _MAX_ONE_HOT_ELEMENTS = 20_000_000
 
-# One-hot build tile: each program covers R rows = 32 of the exact inner
-# length. The inner length is auto-padded by the backend internally; the XPU
-# lowering is only correct when the masked-out lane budget stays small
-# (heavy-masked column chunks miscompile), so never chunk the inner
-# dimension -- instead bound the inner length and fall back to the generic
-# path for huge dims.
-_MAX_ROW_TILE = 32
+# One-hot build config (2026-09-09 XPU3): the previous 2-D row-block kernel
+# (R=32 rows x C=dim_size_out cols) is the measured hot spot of the whole op:
+# for the (4096, 4104) benchmark shape it takes ~26 ms because dim_size_out is
+# not a power of two, so the inner tl.arange tile is padded to 8192 lanes and
+# every 2-D masked store is scalarised/spilled (measuring ~1.3 GB/s).  Every
+# 2-D masked store variant measured is also numerically wrong (the backend
+# drops/loses lanes when the mask kills a large share of a store tile), so the
+# builder is rewritten as one program per row with only 1-D chunked masked
+# stores (1-D masked stores are safe, measured 25x faster: ~26 ms -> ~1.05 ms
+# at 4096x4104 fp16).  The inner chunk CB is a compile-time power of two and
+# the last chunk carries the (light) remainder mask.
+_ONE_HOT_CB = 2048
 _MAX_ONE_HOT_INNER = 8192
 
 # The one-hot gemm is the hot path for the large benchmark shapes. The
@@ -87,27 +92,26 @@ def _make_one_hot_rows_kernel(
     index,
     index_len,
     dim_size_out,
-    R: tl.constexpr,
-    C: tl.constexpr,
+    CB: tl.constexpr,
+    NCHUNK: tl.constexpr,
     IS_FP16: tl.constexpr,
     IS_BF16: tl.constexpr,
 ):
-    # one-hot (index_len, dim_size_out); rows are the index positions.
-    pid = tl.program_id(0)
-    rows = pid * R + tl.arange(0, R)
-    cols = tl.arange(0, C)
-    rmask = rows < index_len
-    cmask = cols < dim_size_out
-    idx = tl.load(index + rows, mask=rmask, other=-1)
-    val = idx[:, None] == cols[None, :]
-    offs = rows[:, None] * dim_size_out + cols[None, :]
-    mask = rmask[:, None] & cmask[None, :]
-    if IS_FP16:
-        tl.store(out + offs, val.to(tl.float16), mask=mask)
-    elif IS_BF16:
-        tl.store(out + offs, val.to(tl.bfloat16), mask=mask)
-    else:
-        tl.store(out + offs, val.to(tl.float32), mask=mask)
+    # one-hot (index_len, dim_size_out); one program per index position, all
+    # stores 1-D chunked (2-D masked stores miscompile on this backend).
+    i = tl.program_id(0)
+    if i < index_len:
+        idx = tl.load(index + i)
+        for j in tl.static_range(NCHUNK):
+            cols = j * CB + tl.arange(0, CB)
+            cmask = cols < dim_size_out
+            val = (cols == idx)
+            if IS_FP16:
+                tl.store(out + i * dim_size_out + cols, val.to(tl.float16), mask=cmask)
+            elif IS_BF16:
+                tl.store(out + i * dim_size_out + cols, val.to(tl.bfloat16), mask=cmask)
+            else:
+                tl.store(out + i * dim_size_out + cols, val.to(tl.float32), mask=cmask)
 
 
 @libentry()
@@ -117,28 +121,26 @@ def _make_one_hot_cols_kernel(
     index,
     dim_size_out,
     index_len,
-    R: tl.constexpr,
-    C: tl.constexpr,
+    CB: tl.constexpr,
+    NCHUNK: tl.constexpr,
     IS_FP16: tl.constexpr,
     IS_BF16: tl.constexpr,
 ):
     # Transposed one-hot (dim_size_out, index_len): out[n, i] = (index[i] == n).
-    # Rows are the output buckets; columns are the index positions.
-    pid = tl.program_id(0)
-    rows = pid * R + tl.arange(0, R)
-    cols = tl.arange(0, C)
-    rmask = rows < dim_size_out
-    cmask = cols < index_len
-    idx = tl.load(index + cols, mask=cmask, other=-1)
-    val = rows[:, None] == idx[None, :]
-    offs = rows[:, None] * index_len + cols[None, :]
-    mask = rmask[:, None] & cmask[None, :]
-    if IS_FP16:
-        tl.store(out + offs, val.to(tl.float16), mask=mask)
-    elif IS_BF16:
-        tl.store(out + offs, val.to(tl.bfloat16), mask=mask)
-    else:
-        tl.store(out + offs, val.to(tl.float32), mask=mask)
+    # One program per output bucket row, 1-D chunked stores only.
+    n = tl.program_id(0)
+    if n < dim_size_out:
+        for j in tl.static_range(NCHUNK):
+            cols = j * CB + tl.arange(0, CB)
+            cmask = cols < index_len
+            idx = tl.load(index + cols, mask=cmask, other=-1)
+            val = (idx == n)
+            if IS_FP16:
+                tl.store(out + n * index_len + cols, val.to(tl.float16), mask=cmask)
+            elif IS_BF16:
+                tl.store(out + n * index_len + cols, val.to(tl.bfloat16), mask=cmask)
+            else:
+                tl.store(out + n * index_len + cols, val.to(tl.float32), mask=cmask)
 
 
 def index_select_backward(grad, self_sizes, dim, index):
@@ -162,7 +164,6 @@ def index_select_backward(grad, self_sizes, dim, index):
     orig_dtype = grad.dtype
     is_fp16 = orig_dtype == torch.float16
     is_bf16 = orig_dtype == torch.bfloat16
-    r_tile = _MAX_ROW_TILE
 
     if dim == grad.ndim - 1:
         # out[..., k] = sum_i grad[..., i] * (index[i] == k)
@@ -171,13 +172,13 @@ def index_select_backward(grad, self_sizes, dim, index):
         one_hot = torch.empty(
             (index_len, dim_size_out), dtype=orig_dtype, device=grad.device
         )
-        _make_one_hot_rows_kernel[(triton.cdiv(index_len, r_tile),)](
+        _make_one_hot_rows_kernel[(index_len,)](
             one_hot,
             index,
             index_len,
             dim_size_out,
-            R=r_tile,
-            C=dim_size_out,
+            CB=_ONE_HOT_CB,
+            NCHUNK=triton.cdiv(dim_size_out, _ONE_HOT_CB),
             IS_FP16=is_fp16,
             IS_BF16=is_bf16,
         )
@@ -191,13 +192,13 @@ def index_select_backward(grad, self_sizes, dim, index):
         one_hot_t = torch.empty(
             (dim_size_out, index_len), dtype=orig_dtype, device=grad.device
         )
-        _make_one_hot_cols_kernel[(triton.cdiv(dim_size_out, r_tile),)](
+        _make_one_hot_cols_kernel[(dim_size_out,)](
             one_hot_t,
             index,
             dim_size_out,
             index_len,
-            R=r_tile,
-            C=index_len,
+            CB=_ONE_HOT_CB,
+            NCHUNK=triton.cdiv(index_len, _ONE_HOT_CB),
             IS_FP16=is_fp16,
             IS_BF16=is_bf16,
         )
@@ -213,13 +214,13 @@ def index_select_backward(grad, self_sizes, dim, index):
         dtype=orig_dtype,
         device=grad.device,
     )
-    _make_one_hot_rows_kernel[(triton.cdiv(index_len, r_tile),)](
+    _make_one_hot_rows_kernel[(index_len,)](
         one_hot,
         index,
         index_len,
         dim_size_out,
-        R=r_tile,
-        C=dim_size_out,
+        CB=_ONE_HOT_CB,
+        NCHUNK=triton.cdiv(dim_size_out, _ONE_HOT_CB),
         IS_FP16=is_fp16,
         IS_BF16=is_bf16,
     )

@@ -66,7 +66,8 @@ def _functional_assert_async(
     scratch = torch.empty((), dtype=torch.bool, device=tensor.device)
     with torch_device_fn.device(tensor.device):
         _functional_assert_async_kernel[(1,)](tensor, scratch, MSG=assert_msg)
-    torch_device_fn.synchronize()
+    # scratch.item() already synchronizes the device; an explicit
+    # synchronize() before it would add a second device sync.
     if not scratch.item():
         raise RuntimeError(assert_msg)
 

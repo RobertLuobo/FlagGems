@@ -23,6 +23,7 @@ from flag_gems.utils import tl_extra_shim
 from flag_gems.utils import triton_lang_extension as ext
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
+from .to import _to_copy_func_close_interleave
 
 logger = logging.getLogger(__name__)
 _pow = tl_extra_shim.pow
@@ -338,6 +339,21 @@ def pow_scalar(A, exponent):
     ):
         x = exponent.contiguous()
         out = torch.empty_like(x)
+        # XPU triton miscompiles the bf16-load -> f32-extf -> mulf chain: the
+        # vectorizer emits a <16 x bf16> local load addressed with a <32 x bf16>
+        # GEP scale (2x stride), reading past the 256-bf16 local buffer and
+        # producing garbage/NaN for large tiles (bf16-only; fp16/fp32 clean).
+        # Feed f32 directly; the bf16 f32->bf16 store path is unaffected.
+        # Use the vendor's bf16-safe cast (_to_copy_func_close_interleave,
+        # isCloseInterleave pointwise kernel): plain x.float() routes under
+        # use_gems to _to_copy_contiguous (BLOCK=256 -> 65536 launch-bound
+        # programs, ~6.3ms at 16.7M elements => 0.04x), while the
+        # close-interleave kernel is ~72x faster (0.087ms, same bf16-load
+        # miscompile workaround as this conversion's motivation).
+        if x.dtype == torch.bfloat16:
+            x = _to_copy_func_close_interleave(
+                x, out0=torch.empty_like(x, dtype=torch.float32)
+            )
         _launch_pow_scalar_fast(x, out, math.log(base))
         return out
     return pow_func_scalar_tensor(A, exponent)

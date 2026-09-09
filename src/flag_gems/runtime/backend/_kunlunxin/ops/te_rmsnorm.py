@@ -119,4 +119,29 @@ def te_rmsnorm_bwd(
     return dx.reshape(original_shape), dgamma
 
 
+def _install():
+    """Wire the XPU entry into the direct-import entrypoint.
+
+    Both tests/test_te_rmsnorm.py and benchmark/test_te_rmsnorm.py import the
+    bwd entry via ``from flag_gems.ops.te_rmsnorm import te_rmsnorm_bwd`` (a
+    direct module import), so the normal SpecOpRegistrar namespace swap on the
+    ``flag_gems`` package can not reach it. The generic
+    ``flag_gems.ops.te_rmsnorm.rmsnorm_bwd_dgamma_kernel`` reduces a 2D
+    accumulator with ``tl.sum(axis=0)`` and stores a 2D block pointer, which the
+    XPU Triton backend rejects (``axis must not be 0 for 2D+ shapes`` ->
+    OutOfResources). Replace the attribute on the already-imported module
+    (loaded during ``import flag_gems``) with this backend implementation.
+    """
+    import sys
+
+    mod = sys.modules.get("flag_gems.ops.te_rmsnorm")
+    if mod is not None:
+        cur = getattr(mod, "te_rmsnorm_bwd", None)
+        if cur is not te_rmsnorm_bwd:
+            mod.te_rmsnorm_bwd = te_rmsnorm_bwd
+
+
+_install()
+
+
 __all__ = ["te_rmsnorm_bwd"]

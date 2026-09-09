@@ -311,7 +311,7 @@ def _ebdb_max_kernel(
     max_idx_ptr,
     out_ptr,
     total,
-    num_bags,
+    nb_buf,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -322,7 +322,12 @@ def _ebdb_max_kernel(
     row = flat_safe // D
     col = flat_safe % D
     acc = tl.zeros([BLOCK], dtype=tl.float32)
-    for b in range(num_bags):
+    # Same dynamic tl.max-of-a-loaded-tile bound as the other kernels: a
+    # scalar/constexpr loop bound with a 256-lane body fails TritonXPUUnrollControl
+    # (see _ebdb_tile_total_kernel), so the trip count is loaded from a full
+    # BLOCK-wide buffer instead of being passed as an argument.
+    nb = tl.max(tl.load(nb_buf + tl.arange(0, BLOCK)))
+    for b in range(nb):
         mv = tl.load(max_idx_ptr + b * D + col).to(tl.int32)
         gv = tl.load(grad_ptr + b * D + col).to(tl.float32)
         acc += tl.where(inb & (mv == row), gv, 0.0)
@@ -521,12 +526,13 @@ def _embedding_bag_dense_backward(
         block = max(64, min(1024, triton.next_power_of_2(dim)))
         n_blocks = triton.cdiv(total, block)
         buf = torch.empty(n_blocks * block, dtype=grad.dtype, device=device)
+        nb_buf = torch.full((block,), num_bags, dtype=torch.int32, device=device)
         _ebdb_max_kernel[(n_blocks,)](
             grad,
             maximum_indices,
             buf,
             total,
-            num_bags,
+            nb_buf,
             D=dim,
             BLOCK=block,
         )

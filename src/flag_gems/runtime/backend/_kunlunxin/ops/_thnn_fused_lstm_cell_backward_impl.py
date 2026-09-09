@@ -9,6 +9,8 @@ from flag_gems.utils import libentry, tl_extra_shim
 
 logger = logging.getLogger(__name__)
 
+_tanh = tl_extra_shim.tanh
+
 # The GENERIC ops/_thnn_fused_lstm_cell_backward_impl.py is a PURE-TORCH composite:
 # it slices the workspace into 4 gate views, then runs ~10 elementwise ops
 # (tanh / mul / rsub / add), a torch.cat and a sum(dim=0). Under use_gems every one
@@ -21,21 +23,10 @@ logger = logging.getLogger(__name__)
 # Fix: fuse the WHOLE elementwise backward (10 pointwise ops + the torch.cat) into ONE
 # @libentry Triton kernel that reads all inputs and the 4 gate slices in a single pass
 # and writes grad_input_gates (the cat result, straight into the 4 column bands) +
-# grad_cx. The bias gradient used to be a single grad_input_gates.sum(dim=0) (one
-# cached gems reduction); on XPU the use_gems `sum` op wrapper + its inner reduce
-# kernel measured ~55-100us on the benchmark's small shapes (probes on device 1,
-# 2026-08-17), which dominates the whole op (~130us vs torch native ~10-12us).
-# It is now a dedicated lean @libentry reduction kernel (`_bias_grad_kernel`, one
-# masked BLOCK_M=128 tile, fp32 accumulation, B-row serial loop): single launch,
-# no aten `sum` dispatch. @libentry caches the compiled kernel and BLOCK/num_warps
-# are passed EXPLICITLY (never via @triton.heuristics) so there is no per-launch
-# recompile. Algorithm is byte-identical to the generic chain rule.
-#
-# Perf sweep on P800 (2026-08-17, device 1): bwd kernel BLOCK=128 fastest for
-# batch<=16/hidden<=64 (10-25us; BLOCK 256 -> +30-40%, BLOCK 512 -> +70-90%);
-# BLOCK_M=128 for the bias kernel (5-14us); BLOCK_M>=256 OOMs the XPU uni_sram.
-
-_tanh = tl_extra_shim.tanh
+# grad_cx. The bias gradient stays a single grad_input_gates.sum(dim=0) (one cached
+# gems reduction). @libentry caches the compiled kernel and BLOCK/num_warps are passed
+# EXPLICITLY (never via @triton.heuristics) so there is no per-launch recompile.
+# Algorithm is byte-identical to the generic chain rule.
 
 
 @libentry()
@@ -100,18 +91,31 @@ def _bias_grad_kernel(
     B,
     M,
     BLOCK_M: tl.constexpr,
+    BLOCK_B: tl.constexpr,
 ):
     # grad_biases[j] = sum_b grad_gates[b, j]  for j in [0, M)
+    # Replicates the validated _sum_row_full_kernel (sum.py) reduction pattern:
+    # 2D tile (BLOCK_M, BLOCK_B) with the reduce dim on the LAST axis (XPU's
+    # tl.sum only supports axis=1; axis=0 / tl.trans are rejected by the
+    # backend), unmasked clamped loads (lane reads the last valid element and
+    # is zeroed by tl.where), 2D loop-carried accumulator, single
+    # tl.sum(acc, axis=1) after the loop. The 1D `acc += ` inside the runtime
+    # B-loop form crashes TritonXPUUnrollControl (OutOfResources: uni_sram).
     pid = tl.program_id(0)
-    offs = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = offs < M
-    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    for b in range(B):
-        acc += tl.load(grad_gates_ptr + b * M + offs, mask=m_mask, other=0.0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    rows_c = tl.where(rows < M, rows, M - 1)
+    row_mask = rows < M
+    acc = tl.zeros((BLOCK_M, BLOCK_B), dtype=tl.float32)
+    for b0 in range(0, B, BLOCK_B):
+        cols = b0 + tl.arange(0, BLOCK_B)
+        cols_c = tl.where(cols < B, cols, B - 1)
+        val = tl.load(grad_gates_ptr + rows_c[:, None] + cols_c[None, :] * M)
+        val = tl.where((cols < B)[None, :], val, 0.0)
+        acc += val.to(tl.float32)
     tl.store(
-        grad_biases_ptr + offs,
-        acc.to(grad_biases_ptr.dtype.element_ty),
-        mask=m_mask,
+        grad_biases_ptr + rows[:, None],
+        tl.sum(acc, axis=1)[:, None],
+        row_mask[:, None],
     )
 
 
@@ -139,13 +143,10 @@ def _thnn_fused_lstm_cell_backward_impl(
     grad_cx = torch.empty((batch_size, hidden_size), device=cx.device, dtype=cx.dtype)
 
     N = batch_size * hidden_size
-    with torch_device_fn.device(cx.device):
-        if N > 0:
-            # BLOCK is tl.constexpr. Keep it fixed so all shapes reuse one compiled
-            # specialization instead of compiling once per shape-dependent block.
-            # BLOCK=128 measured fastest on XPU for this op's small shapes.
-            BLOCK = 128
-            grid = (triton.cdiv(N, BLOCK),)
+    if N > 0:
+        BLOCK = min(triton.next_power_of_2(N), 256)
+        grid = (triton.cdiv(N, BLOCK),)
+        with torch_device_fn.device(cx.device):
             _lstm_cell_bwd_kernel[grid](
                 grad_hy,
                 grad_cy,
@@ -165,6 +166,7 @@ def _thnn_fused_lstm_cell_backward_impl(
             )
             if batch_size > 0:
                 BLOCK_M = 128
+                BLOCK_B = 16
                 grid = (triton.cdiv(4 * hidden_size, BLOCK_M),)
                 _bias_grad_kernel[grid](
                     grad_input_gates,
@@ -172,6 +174,7 @@ def _thnn_fused_lstm_cell_backward_impl(
                     batch_size,
                     4 * hidden_size,
                     BLOCK_M,
+                    BLOCK_B,
                     num_warps=4,
                 )
         else:
