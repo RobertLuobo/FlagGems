@@ -62,10 +62,10 @@ from .adaptive_max_pool2d_backward import adaptive_max_pool2d_backward
 from .adaptive_max_pool3d import adaptive_max_pool3d
 from .adaptive_max_pool3d_backward import adaptive_max_pool3d_backward
 from .add import add, add_
+from .add_relu import _add_relu, _add_relu_
 from .addbmm import addbmm, addbmm_  # noqa: F401
 from .addcdiv import addcdiv, addcdiv_, addcdiv_out
 from .addcmul import addcmul, addcmul_, addcmul_out
-from .add_relu import _add_relu, _add_relu_  # noqa: F401
 from .addmm import addmm, addmm_dtype, addmm_dtype_out, addmm_out  # noqa: F401
 from .addmm_ import addmm_
 from .addmv import addmv, addmv_, addmv_out  # noqa: F401
@@ -697,6 +697,8 @@ __all__ = [
     "acos",
     "add",
     "add_",
+    "add_relu",
+    "add_relu_",
     "addbmm",
     "addbmm_",
     "addcdiv",
