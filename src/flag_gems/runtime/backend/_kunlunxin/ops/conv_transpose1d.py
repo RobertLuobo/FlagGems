@@ -24,13 +24,11 @@ def conv_transpose1d(
     dilation=1,
 ):
     logger.debug("GEMS_KUNLUNXIN CONV_TRANSPOSE1D")
-    output_dtype = input.dtype
-    needs_upcast = output_dtype in (torch.float16, torch.bfloat16)
-    if needs_upcast:
-        input = input.float()
-        weight = weight.float()
-        bias = None if bias is None else bias.float()
-
+    # The vendor XDNN conv_transpose1d loads fp16/bf16 inputs and accumulates in
+    # fp32 internally (verified: passing an already-upcast fp32 input yields
+    # bit-identical output to the native low-precision path), so the historical
+    # explicit upcast only added two extra copies and a second kernel launch per
+    # call.  Pass the tensors through unchanged.
     output = torch.ops.aten.conv_transpose1d.default.redispatch(
         _FALLBACK_KEYSET,
         input,
@@ -42,4 +40,4 @@ def conv_transpose1d(
         groups,
         _single(dilation),
     )
-    return output.to(output_dtype) if needs_upcast else output
+    return output
