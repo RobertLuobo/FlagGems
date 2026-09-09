@@ -57,6 +57,7 @@ from .acos import acos, acos_
 from .adaptive_avg_pool2d import adaptive_avg_pool2d
 from .adaptive_max_pool2d import adaptive_max_pool2d
 from .add import add, add_
+from .add_relu import _add_relu, _add_relu_
 from .addbmm import addbmm, addbmm_  # noqa: F401
 from .addcdiv import addcdiv, addcdiv_, addcdiv_out
 from .addcmul import addcmul, addcmul_, addcmul_out
@@ -666,6 +667,8 @@ __all__ = [
     "adaptive_max_pool2d",
     "add",
     "add_",
+    "add_relu",
+    "add_relu_",
     "addcdiv",
     "addcdiv_",
     "addcdiv_out",
