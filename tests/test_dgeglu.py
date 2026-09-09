@@ -67,6 +67,5 @@ def test_dgeglu(shape, dtype):
     )
     ref_out = te_dgeglu(grad_output, input_tensor)
     ref_out = utils.to_reference(ref_out)
-    with flag_gems.use_gems():
-        res_out = flag_gems.dgeglu(grad_output, input_tensor)
+    res_out = flag_gems.dgeglu(grad_output, input_tensor)
     utils.gems_assert_close(res_out, ref_out, dtype)

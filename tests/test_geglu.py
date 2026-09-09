@@ -63,6 +63,5 @@ def test_geglu(shape, dtype):
     ref_out = te_geglu(input_tensor)
     ref_out = utils.to_reference(ref_out)
 
-    with flag_gems.use_gems():
-        res_out = flag_gems.geglu(input_tensor)
+    res_out = flag_gems.geglu(input_tensor)
     utils.gems_assert_close(res_out, ref_out, dtype)
