@@ -1,0 +1,19 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.15, pytest-9.1.1, pluggy-1.6.0 -- /root/miniconda/envs/python310_torch29_cuda/bin/python3.10
+cachedir: .pytest_cache
+metadata: {'Python': '3.10.15', 'Platform': 'Linux-5.10.0-1.0.0.35-x86_64-with-glibc2.31', 'Packages': {'pytest': '9.1.1', 'pluggy': '1.6.0'}, 'Plugins': {'metadata': '3.1.1', 'html': '4.1.1', 'typeguard': '4.4.4', 'timeout': '2.3.1', 'anyio': '4.12.0'}}
+rootdir: /ssd4/luoboyuan/FlagGems
+configfile: pytest.ini
+plugins: metadata-3.1.1, html-4.1.1, typeguard-4.4.4, timeout-2.3.1, anyio-4.12.0
+collecting ... vLLM not installed, the native pytorch implementation of FlashMLA for comparison
+collected 69629 items / 69629 deselected / 0 selected
+
+=============================== warnings summary ===============================
+../src/flag_gems/utils/libentry.py:413
+../src/flag_gems/utils/libentry.py:413
+../src/flag_gems/utils/libentry.py:413
+  /ssd4/luoboyuan/FlagGems/src/flag_gems/utils/libentry.py:413: RuntimeWarning: active Triton backend does not provide a replay benchmarker; falling back to event timing
+    resolved_benchmark = resolve_benchmarker(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+==================== 69629 deselected, 3 warnings in 9.01s =====================
