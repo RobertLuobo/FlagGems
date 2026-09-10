@@ -667,6 +667,8 @@ from .zeros_like import zeros_like
 
 __all__ = [
     "__irshift__",
+    "_add_relu",
+    "_add_relu_",
     "_amp_foreach_non_finite_check_and_unscale_",
     "_assert_async",
     "_batch_norm_impl_index",
