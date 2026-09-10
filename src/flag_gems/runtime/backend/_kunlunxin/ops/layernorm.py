@@ -628,12 +628,12 @@ def weight_bias_backward_transposed_kernel(
         nrow_mask = nrows[:, None] < N
         for off in range(0, M, BLOCK_COL_SIZE):
             mcols = off + tl.arange(0, BLOCK_COL_SIZE)
-            dy = tl.load(
-                dYT + nrows[:, None] * M + mcols[None, :], mask=nrow_mask
-            ).to(tl.float32)
-            x = tl.load(
-                XT + nrows[:, None] * M + mcols[None, :], mask=nrow_mask
-            ).to(tl.float32)
+            dy = tl.load(dYT + nrows[:, None] * M + mcols[None, :], mask=nrow_mask).to(
+                tl.float32
+            )
+            x = tl.load(XT + nrows[:, None] * M + mcols[None, :], mask=nrow_mask).to(
+                tl.float32
+            )
             mean = tl.load(Mean + mcols)[None, :].to(tl.float32)
             rstd = tl.load(Rstd + mcols)[None, :].to(tl.float32)
             # zero out-of-range rows before they reach the sums; the m dim has

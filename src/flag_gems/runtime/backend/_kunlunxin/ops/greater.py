@@ -127,7 +127,10 @@ def greater_scalar(A, B):
             # exact-multiple flat tiles (grid = numel / TILE >= MIN_GRID): no
             # mask, no i1 -- a saturating fp32 store + vendor bool conversion.
             return _greater_scalar_fast(A, float(B))
-        if numel >= _GREATER_SCALAR_MASKED_MIN and numel % _GREATER_SCALAR_FAST_TILE != 0:
+        if (
+            numel >= _GREATER_SCALAR_MASKED_MIN
+            and numel % _GREATER_SCALAR_FAST_TILE != 0
+        ):
             # non-multiple mid sizes (e.g. 2.56M): flat tiles with a real tail
             # mask. The mask is genuine (only the OOB tail of the last block is
             # masked -- every in-buffer element is still written), so the
@@ -311,7 +314,10 @@ def greater_scalar_out(A, B, *, out=None):
             and numel % _GREATER_SCALAR_FAST_TILE == 0
         ):
             return _greater_scalar_out_fast(A, float(B), out)
-        if numel >= _GREATER_SCALAR_MASKED_MIN and numel % _GREATER_SCALAR_FAST_TILE != 0:
+        if (
+            numel >= _GREATER_SCALAR_MASKED_MIN
+            and numel % _GREATER_SCALAR_FAST_TILE != 0
+        ):
             return _greater_scalar_out_fast_masked(A, float(B), out, numel)
     if out is None:
         res = greater_func_scalar(A, B)
