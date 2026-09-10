@@ -146,10 +146,8 @@ def adaptive_max_pool2d_forward_wide64_kernel(
                             .to(tl.float32)
                         )
                     else:
-                        v = (
-                            (((raw >> (16 * s)) & 0xFFFF).to(tl.uint32) << 16).to(
-                                tl.float32, bitcast=True
-                            )
+                        v = (((raw >> (16 * s)) & 0xFFFF).to(tl.uint32) << 16).to(
+                            tl.float32, bitcast=True
                         )
                     idx = base_off + kh * IW + 4 * kw2 + s
                     is_new = (v > acc_val) | (v != v) | (acc_idx < 0)
@@ -160,8 +158,10 @@ def adaptive_max_pool2d_forward_wide64_kernel(
             for kw2 in range(KW // 2):
                 raw = tl.load(input64 + base + (kh * IW // 2) + kw2)
                 for s in tl.static_range(2):
-                    v = ((raw >> (32 * s)) & 0xFFFFFFFF).to(tl.uint32).to(
-                        tl.float32, bitcast=True
+                    v = (
+                        ((raw >> (32 * s)) & 0xFFFFFFFF)
+                        .to(tl.uint32)
+                        .to(tl.float32, bitcast=True)
                     )
                     idx = base_off + kh * IW + 2 * kw2 + s
                     is_new = (v > acc_val) | (v != v) | (acc_idx < 0)
@@ -248,7 +248,11 @@ def adaptive_max_pool2d(
         and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
     ):
         k_w = in_w // out_w
-        if input.dtype in (torch.float16, torch.bfloat16) and in_w % 4 == 0 and k_w % 4 == 0:
+        if (
+            input.dtype in (torch.float16, torch.bfloat16)
+            and in_w % 4 == 0
+            and k_w % 4 == 0
+        ):
             sub = 4
         elif input.dtype == torch.float32 and in_w % 2 == 0 and k_w % 2 == 0:
             sub = 2

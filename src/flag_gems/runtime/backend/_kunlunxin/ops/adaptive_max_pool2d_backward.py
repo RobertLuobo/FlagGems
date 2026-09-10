@@ -190,9 +190,7 @@ def adaptive_max_pool2d_backward(
             # Fast path: exact division -> each output's argmax is a distinct
             # input position, one lane per output, no atomics, no races.
             n_out = grad_output.numel()
-            _adaptive_max_pool2d_backward_scatter_kernel[
-                (triton.cdiv(n_out, 256),)
-            ](
+            _adaptive_max_pool2d_backward_scatter_kernel[(triton.cdiv(n_out, 256),)](
                 grad_output,
                 indices,
                 grad_input,

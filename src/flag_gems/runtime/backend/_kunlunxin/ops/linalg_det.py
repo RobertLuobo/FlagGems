@@ -331,17 +331,32 @@ class _DetGraphEntry:
             if self.nblk > 1:
                 if self.padded:
                     _det_pack_kernel[(b, self.nblk)](
-                        src, work, n, LDA=self.lda, BLK=self.blk, TOT=self.tot,
+                        src,
+                        work,
+                        n,
+                        LDA=self.lda,
+                        BLK=self.blk,
+                        TOT=self.tot,
                         num_warps=1,
                     )
                 for k in range(n):
                     _det_pivot_swap_kernel[(b,)](
-                        work, dg, n, k, LDA=self.lda, ROWS=self.rows,
+                        work,
+                        dg,
+                        n,
+                        k,
+                        LDA=self.lda,
+                        ROWS=self.rows,
                         num_warps=1,
                     )
                     if k + 1 < n:
                         _det_update_kernel[(b, self.nblk)](
-                            work, n, k, LDA=self.lda, BLK=self.blk, TOT=self.tot,
+                            work,
+                            n,
+                            k,
+                            LDA=self.lda,
+                            BLK=self.blk,
+                            TOT=self.tot,
                             num_warps=1,
                         )
             else:

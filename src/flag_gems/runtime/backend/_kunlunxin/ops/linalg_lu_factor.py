@@ -116,9 +116,7 @@ def _lu_swap_rows_kernel(
 
 
 @triton.jit
-def _lu_scale_column_kernel(
-    LU, M, N, J, BLOCKS: tl.constexpr, BLOCK_M: tl.constexpr
-):
+def _lu_scale_column_kernel(LU, M, N, J, BLOCKS: tl.constexpr, BLOCK_M: tl.constexpr):
     # J is a runtime scalar (see _lu_find_pivot_main_kernel).
     pid = tl.program_id(0)
     batch = pid // BLOCKS

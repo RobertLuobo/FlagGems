@@ -111,7 +111,9 @@ def linalg_lu_out(input, *, pivot=True, P=None, L=None, U=None, out=None):
     p_out, l_out, u_out = _resolve_linalg_lu_out_args(P, L, U, out)
     with torch_device_fn.device(input.device):
         lu, pivots = _linalg_lu_factor(input, pivot)
-        P_res, L_res, U_res = lu_unpack(lu, pivots, unpack_data=True, unpack_pivots=True)
+        P_res, L_res, U_res = lu_unpack(
+            lu, pivots, unpack_data=True, unpack_pivots=True
+        )
     # Write back through the raw native strided-copy engine
     # (``aten::_copy_from``) instead of the gems-registered ``copy_``
     # to avoid a nested dispatch through the overridden operator.

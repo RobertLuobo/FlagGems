@@ -202,13 +202,13 @@ def hc_head_fused_kernel(
         x2d = residual_c.reshape(num_tokens, K)
         fn_eff = fn
     else:
-        x2d = torch.nn.functional.pad(
-            residual_c.reshape(num_tokens, K), (0, K_eff - K)
-        )
+        x2d = torch.nn.functional.pad(residual_c.reshape(num_tokens, K), (0, K_eff - K))
         fn_eff = torch.nn.functional.pad(fn, (0, K_eff - K))
 
     # 1) rms sqrsum partials (exact unmasked tiles)
-    part = torch.empty(num_tokens, K_eff // B, dtype=torch.float32, device=hs_flat.device)
+    part = torch.empty(
+        num_tokens, K_eff // B, dtype=torch.float32, device=hs_flat.device
+    )
     _sqrsum_partials_kernel[(num_tokens, K_eff // B)](
         x2d,
         part,

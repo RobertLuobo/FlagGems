@@ -105,12 +105,7 @@ def _chunk_gated_delta_rule_fwd_kernel(
     p_beta = beta + t0 * stride_beta_t + i_hv * stride_beta_hv
     p_o = o + t0 * stride_o_t + i_hv * stride_o_hv + i_v * stride_o_v
 
-    p_h = (
-        h0
-        + (i_seq * H0_STRIDE_S + i_hv * H0_STRIDE_HV).to(tl.int64)
-        + offs * V
-        + i_v
-    )
+    p_h = h0 + (i_seq * H0_STRIDE_S + i_hv * H0_STRIDE_HV).to(tl.int64) + offs * V + i_v
     h = tl.load(p_h).to(tl.float32)
 
     # S_t = exp(g_t) * S_{t-1} + beta_t * k_t^T (v_t - k_t @ S_{t-1})
@@ -283,9 +278,7 @@ def chunk_gated_delta_rule_fwd(
 
     o = torch.empty(B, T, HV, V, device=q.device, dtype=v.dtype)
     if output_final_state:
-        final_state = torch.empty(
-            N, HV, K, V, device=q.device, dtype=torch.float32
-        )
+        final_state = torch.empty(N, HV, K, V, device=q.device, dtype=torch.float32)
     else:
         final_state = None
 
@@ -327,9 +320,7 @@ def chunk_gated_delta_rule_fwd(
         BK=BK,
         H0_STRIDE_S=h0.stride(0),
         H0_STRIDE_HV=h0.stride(1),
-        HT_STRIDE_S=(
-            final_state.stride(0) if final_state is not None else o.stride(0)
-        ),
+        HT_STRIDE_S=(final_state.stride(0) if final_state is not None else o.stride(0)),
         HT_STRIDE_HV=(
             final_state.stride(1) if final_state is not None else o.stride(1)
         ),

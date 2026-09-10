@@ -21,6 +21,7 @@ import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from flag_gems.runtime import torch_device_fn
+
 # Vendor codegen (auto-grid, tl.constexpr strides) is ~50x faster than the
 # generic codegen (runtime strides -> discrete access) on this XPU backend.
 from _kunlunxin.utils.pointwise_dynamic import pointwise_dynamic
@@ -118,8 +119,14 @@ def _smooth_backward_scalar(input, target, grad_output, beta):
 @libentry()
 @triton.jit(do_not_specialize=["grad_scale", "rcp_beta"])
 def _smooth_backward_scalar_clamp_kernel(
-    in0, in1, out, M, grad_scale, rcp_beta,
-    BLOCK: tl.constexpr, NEED_MASK: tl.constexpr,
+    in0,
+    in1,
+    out,
+    M,
+    grad_scale,
+    rcp_beta,
+    BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     # Smooth-L1 derivative with beta > 0, scalar-grad path:
     #     grad = clamp((input - target) / beta, -1, 1) * grad_scale
@@ -171,7 +178,12 @@ def _loss_values(input, target, beta):
 @libentry()
 @triton.jit
 def _smooth_l1_loss_partial_sum_kernel(
-    inp, target, mid, M, beta: tl.constexpr, reduction: tl.constexpr,
+    inp,
+    target,
+    mid,
+    M,
+    beta: tl.constexpr,
+    reduction: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # Masked stage-1 (legacy path): one program sums BLOCK_SIZE elements of
@@ -197,7 +209,12 @@ def _smooth_l1_loss_partial_sum_kernel(
 @libentry()
 @triton.jit
 def _smooth_l1_loss_partial_sum_unmasked_kernel(
-    inp, target, mid, M, beta: tl.constexpr, reduction: tl.constexpr,
+    inp,
+    target,
+    mid,
+    M,
+    beta: tl.constexpr,
+    reduction: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     # Unmasked stage-1 over a full 32768-lane block (M % BLOCK_SIZE == 0
@@ -293,7 +310,13 @@ def _smooth_l1_loss_reduce_fused(input, target, beta, reduction):
     os.environ["TRITONXPU_OTHER_SIM"] = "1"
     with torch_device_fn.device(input.device):
         _smooth_l1_loss_partial_sum_kernel[(mid_size, 1, 1)](
-            input, target, mid, M, beta, reduction, block_size,
+            input,
+            target,
+            mid,
+            M,
+            beta,
+            reduction,
+            block_size,
             buffer_size_limit=2048,
         )
         if mid_size == 1:
@@ -361,11 +384,17 @@ def smooth_l1_loss_backward(grad_output, input, target, reduction, beta: float):
         # tl.where + tl.abs) is ALU-bound on this backend (~4x slower); the
         # min/max form is memory-bound at ~800 GB/s.  Broadcast / non-contiguous
         # shapes keep the general pwd path.
-        if input.shape == target.shape and input.is_contiguous() and target.is_contiguous():
+        if (
+            input.shape == target.shape
+            and input.is_contiguous()
+            and target.is_contiguous()
+        ):
             M = input.numel()
             out = torch.empty_like(input)
             with torch_device_fn.device(input.device):
-                _smooth_backward_scalar_clamp_kernel[(triton.cdiv(M, _SMOOTH_BWD_BLOCK),)](
+                _smooth_backward_scalar_clamp_kernel[
+                    (triton.cdiv(M, _SMOOTH_BWD_BLOCK),)
+                ](
                     input,
                     target,
                     out,

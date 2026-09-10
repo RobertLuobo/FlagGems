@@ -116,8 +116,7 @@ def diff(input, n=1, dim=-1, prepend=None, append=None) -> torch.Tensor:
         # total-(k+1) valid elements, and consecutive stages are ordered on the
         # current stream (no host sync required).
         bufs = [
-            torch.empty(total, device=input.device, dtype=input.dtype)
-            for _ in range(2)
+            torch.empty(total, device=input.device, dtype=input.dtype) for _ in range(2)
         ]
         for k in range(n):
             n_comp = total - (k + 1)

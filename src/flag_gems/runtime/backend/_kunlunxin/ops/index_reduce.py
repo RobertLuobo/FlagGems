@@ -39,13 +39,25 @@ def _index_reduce_kernel(
     self_value = tl.load(inp + base + offs, mask=within, other=0.0).to(tl.float32)
 
     if REDUCE == 0:
-        accumulator = self_value if INCLUDE_SELF else tl.full((BLOCK,), 1.0, dtype=tl.float32)
+        accumulator = (
+            self_value if INCLUDE_SELF else tl.full((BLOCK,), 1.0, dtype=tl.float32)
+        )
     elif REDUCE == 1:
-        accumulator = self_value if INCLUDE_SELF else tl.zeros((BLOCK,), dtype=tl.float32)
+        accumulator = (
+            self_value if INCLUDE_SELF else tl.zeros((BLOCK,), dtype=tl.float32)
+        )
     elif REDUCE == 2:
-        accumulator = self_value if INCLUDE_SELF else tl.full((BLOCK,), float("-inf"), dtype=tl.float32)
+        accumulator = (
+            self_value
+            if INCLUDE_SELF
+            else tl.full((BLOCK,), float("-inf"), dtype=tl.float32)
+        )
     else:
-        accumulator = self_value if INCLUDE_SELF else tl.full((BLOCK,), float("inf"), dtype=tl.float32)
+        accumulator = (
+            self_value
+            if INCLUDE_SELF
+            else tl.full((BLOCK,), float("inf"), dtype=tl.float32)
+        )
     count = tl.full((BLOCK,), 1 if INCLUDE_SELF else 0, dtype=tl.int32)
 
     for source_dim_offset in tl.range(0, SOURCE_DIM_SIZE):

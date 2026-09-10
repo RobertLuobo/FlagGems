@@ -137,7 +137,9 @@ def addbmm_kernel(
     # overlapping) tile, so the read-before-write ordering is safe.
     c_ptrs = O + offs_am[:, None] * N + offs_bn[None, :]
     c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
-    bias_value = tl.load(bias + offs_am[:, None] * N + offs_bn[None, :], mask=c_mask, other=0.0)
+    bias_value = tl.load(
+        bias + offs_am[:, None] * N + offs_bn[None, :], mask=c_mask, other=0.0
+    )
 
     out = accumulator * alpha + bias_value * beta
     # tl.store converts to the output pointer dtype.

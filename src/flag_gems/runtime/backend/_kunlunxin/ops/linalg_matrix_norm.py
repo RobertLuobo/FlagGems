@@ -997,9 +997,7 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
             _bidiag_update_left_kernel[(B, int(_BD_L), int(RP // _BD_C))](
                 Wh, Wl, v_h, v_l, th, tl_, wh_b, wl_b, B, RP, PROW
             )
-            _bidiag_row_h_kernel[(B,)](
-                Wh, Wl, u_h, u_l, rh, rl, B, j, int(R), RP, PROW
-            )
+            _bidiag_row_h_kernel[(B,)](Wh, Wl, u_h, u_l, rh, rl, B, j, int(R), RP, PROW)
             _bidiag_right_w_kernel[(B, int(_BD_L))](
                 Wh, Wl, u_h, u_l, rh, rl, wr_b, wr_l, B, j, int(R), RP
             )
@@ -1026,7 +1024,7 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
         _sturm_eig_kernel[(B, int(_BD_L // _BD_C))](td, tdl, te, tel, lam, B, int(K))
         sig = torch.sqrt(torch.clamp(lam, min=0.0))
         if mode == 0:
-            return sig[:, K - 1:K].reshape(B)
+            return sig[:, K - 1 : K].reshape(B)
         if mode == 1:
             return sig[:, 0:1].reshape(B)
         return sig[:, :K].sum(dim=1)

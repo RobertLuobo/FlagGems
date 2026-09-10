@@ -103,9 +103,7 @@ def _adaptive_max_pool3d_backward_recompute_indices_kernel(
                     plane_base + d_safe * in_hw + h_safe * in_w + w_safe
                 ).to(tl.float32)
                 active = d_ok & h_ok & w_ok
-                is_new = active & (
-                    (value > acc_val) | (value != value) | (acc_idx < 0)
-                )
+                is_new = active & ((value > acc_val) | (value != value) | (acc_idx < 0))
                 acc_val = tl.where(is_new, value, acc_val)
                 acc_idx = tl.where(is_new, d * in_hw + h * in_w + w, acc_idx)
 
@@ -265,7 +263,9 @@ def adaptive_max_pool3d_backward(
     recompute_block = 128 if max(win_d, win_h, win_w) <= 2 else 64
     recompute_warps = 2 if recompute_block == 128 else 1
     with torch_device_fn.device(self.device):
-        _adaptive_max_pool3d_backward_recompute_indices_kernel[(triton.cdiv(n_out, recompute_block),)](
+        _adaptive_max_pool3d_backward_recompute_indices_kernel[
+            (triton.cdiv(n_out, recompute_block),)
+        ](
             self,
             indices_tmp,
             n_out,

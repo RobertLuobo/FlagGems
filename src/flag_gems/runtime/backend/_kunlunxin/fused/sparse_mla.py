@@ -93,9 +93,7 @@ def _spmla_gather_dt(
     # clamp the address instead of using ``other=``: a masked load whose fill
     # value carries semantics (an invalid-index sentinel) is not reliable here.
     t_off = tl.minimum(offs_t, TOPK - 1)
-    ids = tl.load(
-        indices + i0 * (VGC * TOPK) + i_g * TOPK + t_off
-    ).to(tl.int64)
+    ids = tl.load(indices + i0 * (VGC * TOPK) + i_g * TOPK + t_off).to(tl.int64)
     m = in_range & (ids >= 0) & (ids < SKV)
     ids_safe = tl.where(m, ids, 0)
     # [BD, BT] tile: outer stride 1 (d contiguous), inner stride stride_kvn
@@ -140,9 +138,7 @@ def _spmla_gather_td(
     offs_d = i_d * BD + tl.arange(0, BD)
     in_range = offs_t < TOPK
     t_off = tl.minimum(offs_t, TOPK - 1)
-    ids = tl.load(
-        indices + i0 * (VGC * TOPK) + i_g * TOPK + t_off
-    ).to(tl.int64)
+    ids = tl.load(indices + i0 * (VGC * TOPK) + i_g * TOPK + t_off).to(tl.int64)
     m = in_range & (ids >= 0) & (ids < SKV)
     ids_safe = tl.where(m, ids, 0)
     # [BT, BD] tile: rows are gathered kv rows, d contiguous
@@ -194,10 +190,7 @@ def _spmla_qk(
         other=0.0,
     )
     kb = tl.load(
-        gkv_dt
-        + (i0 * VGC + i_g) * (DT * TP)
-        + offs_d[:, None] * TP
-        + offs_t[None, :]
+        gkv_dt + (i0 * VGC + i_g) * (DT * TP) + offs_d[:, None] * TP + offs_t[None, :]
     )
     acc = tl.dot(qb, kb, out_dtype=tl.float32)
     if TD > 0:
@@ -324,7 +317,9 @@ def _spmla_pv(
         vb = tl.load(v_base + (it * BT + offs_t)[:, None] * DT + offs_v[None, :])
         acc = tl.dot(pb, vb, acc, out_dtype=tl.float32)
 
-    tl.store(out + (i0 * APP + offs_h[:, None]) * DV + offs_v[None, :], acc.to(tl.bfloat16))
+    tl.store(
+        out + (i0 * APP + offs_h[:, None]) * DV + offs_v[None, :], acc.to(tl.bfloat16)
+    )
 
 
 def triton_sparse_mla_fwd_interface(
@@ -359,9 +354,7 @@ def triton_sparse_mla_fwd_interface(
     NDV = triton.cdiv(D, BDV)
     SQC = B * SQ
 
-    lse = torch.full(
-        (B, SQ, H), float("-inf"), device=q.device, dtype=torch.bfloat16
-    )
+    lse = torch.full((B, SQ, H), float("-inf"), device=q.device, dtype=torch.bfloat16)
 
     gkv_dt = torch.empty((B, SQ, VG, DT, TP), device=q.device, dtype=q.dtype)
     gkv_td = torch.empty((B, SQ, VG, TP, DT), device=q.device, dtype=q.dtype)

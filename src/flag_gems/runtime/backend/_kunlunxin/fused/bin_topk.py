@@ -60,9 +60,9 @@ import torch
 import triton
 import triton.language as tl
 
-BS = 8192   # count/rank tile = rank buffer width (sum/cumsum safe block size)
-RANK_SUB = 512   # sub-tile width of the cumulative scan inside _bst_rank_kernel
-RANK_NSUB = BS // RANK_SUB   # number of sub-tiles per row buffer (16)
+BS = 8192  # count/rank tile = rank buffer width (sum/cumsum safe block size)
+RANK_SUB = 512  # sub-tile width of the cumulative scan inside _bst_rank_kernel
+RANK_NSUB = BS // RANK_SUB  # number of sub-tiles per row buffer (16)
 
 
 @triton.jit
@@ -83,7 +83,9 @@ def _ugt(a, b):
 
 
 @triton.jit
-def _bst_count_kernel(inputs, starts, ends, cands, cnts, S: tl.constexpr, BS: tl.constexpr):
+def _bst_count_kernel(
+    inputs, starts, ends, cands, cnts, S: tl.constexpr, BS: tl.constexpr
+):
     b = tl.program_id(0)
     s_base = inputs + b * S
     start = tl.load(starts + b).to(tl.int32)
@@ -103,8 +105,15 @@ def _bst_count_kernel(inputs, starts, ends, cands, cnts, S: tl.constexpr, BS: tl
 
 @triton.jit
 def _bst_rank_kernel(
-    inputs, ranks, starts, ends, thrs,
-    S: tl.constexpr, RB: tl.constexpr, SUB: tl.constexpr, NSUB: tl.constexpr,
+    inputs,
+    ranks,
+    starts,
+    ends,
+    thrs,
+    S: tl.constexpr,
+    RB: tl.constexpr,
+    SUB: tl.constexpr,
+    NSUB: tl.constexpr,
 ):
     # per-lane signed rank: +r for u > thr (r = 1..c1), -r for u == thr (r = 1..c2), 0 otherwise
     # The cumulative scan is done in SUB-lane sub-tiles (SUB=512) with a running
@@ -132,7 +141,9 @@ def _bst_rank_kernel(
         cums_eq = tl.cumsum(eq.to(tl.int32), axis=0)
         # signed rank: +r (gt) / -r (eq) / 0 (neither), via pure arithmetic
         # (a nested tl.where as the stored value mis-pairs lanes on XPU)
-        val = (cums_gt + prev_gt) * gt.to(tl.int32) - (cums_eq + prev_eq) * eq.to(tl.int32)
+        val = (cums_gt + prev_gt) * gt.to(tl.int32) - (cums_eq + prev_eq) * eq.to(
+            tl.int32
+        )
         tl.store(rank_base + offs, val, mask=m)
         prev_gt += tl.sum(gt.to(tl.int32), axis=0)
         prev_eq += tl.sum(eq.to(tl.int32), axis=0)
@@ -140,8 +151,16 @@ def _bst_rank_kernel(
 
 @triton.jit
 def _bst_fill_kernel(
-    ranks, out, scratch, n_arr, starts, gmap,
-    K: tl.constexpr, BSF: tl.constexpr, RB: tl.constexpr, HAS_GMAP: tl.constexpr,
+    ranks,
+    out,
+    scratch,
+    n_arr,
+    starts,
+    gmap,
+    K: tl.constexpr,
+    BSF: tl.constexpr,
+    RB: tl.constexpr,
+    HAS_GMAP: tl.constexpr,
 ):
     b = tl.program_id(0)
     rank_base = ranks + b * RB
@@ -216,24 +235,62 @@ def _bst_select(x, starts, ends, n, k_eff, K, out, gmap=None):
     one = torch.tensor(1, dtype=torch.int32, device=x.device)
     for bit in range(31, -1, -1):
         cands = thrs | (one << bit)
-        _bst_count_kernel[(Bb,)](x, starts, ends, cands, cnts, x.shape[1], BS, num_warps=4, num_stages=1)
+        _bst_count_kernel[(Bb,)](
+            x, starts, ends, cands, cnts, x.shape[1], BS, num_warps=4, num_stages=1
+        )
         thrs = torch.where(cnts >= k_eff, cands, thrs)
     ranks = torch.zeros(Bb, BS, dtype=torch.int32, device=x.device)
-    _bst_rank_kernel[(Bb,)](x, ranks, starts, ends, thrs, x.shape[1], BS, RANK_SUB, RANK_NSUB, num_warps=4, num_stages=1)
+    _bst_rank_kernel[(Bb,)](
+        x,
+        ranks,
+        starts,
+        ends,
+        thrs,
+        x.shape[1],
+        BS,
+        RANK_SUB,
+        RANK_NSUB,
+        num_warps=4,
+        num_stages=1,
+    )
     scratch = torch.zeros(Bb, 2 * K + 8, dtype=torch.int32, device=x.device)
     if gmap is None:
         gm = torch.zeros(1, dtype=torch.int32, device=x.device)
-        _bst_fill_kernel[(Bb,)](ranks, out, scratch, n, starts, gm, K, BS, BS, False,
-                                num_warps=4, num_stages=1)
+        _bst_fill_kernel[(Bb,)](
+            ranks,
+            out,
+            scratch,
+            n,
+            starts,
+            gm,
+            K,
+            BS,
+            BS,
+            False,
+            num_warps=4,
+            num_stages=1,
+        )
     else:
-        _bst_fill_kernel[(Bb,)](ranks, out, scratch, n, starts, gmap, K, BS, BS, True,
-                                num_warps=4, num_stages=1)
+        _bst_fill_kernel[(Bb,)](
+            ranks,
+            out,
+            scratch,
+            n,
+            starts,
+            gmap,
+            K,
+            BS,
+            BS,
+            True,
+            num_warps=4,
+            num_stages=1,
+        )
 
 
 def _bst_rows(xv, st_val, en_val, n_val, K, out, gmap=None):
     """Recursive chunked select on a single row. xv: (1, S) values;
-       st_val/en_val: (1,) int32 row [start, end); gmap: (S,) global index map
-       or None; out: (1, K) global indices."""
+    st_val/en_val: (1,) int32 row [start, end); gmap: (S,) global index map
+    or None; out: (1, K) global indices."""
     nn = int(n_val[0].item())
     if nn <= 0:
         return
@@ -258,7 +315,7 @@ def _bst_rows(xv, st_val, en_val, n_val, K, out, gmap=None):
         k_c = torch.tensor([min(K, cn)], dtype=torch.int32, device=xv.device)
         # chunk candidates are POSITIONS in xv (no gmap); the composition happens
         # via _bst_map_idx_kernel below.
-        _bst_select(xv, st_c, en_c, n_c, k_c, K, cidx[j:j + 1])
+        _bst_select(xv, st_c, en_c, n_c, k_c, K, cidx[j : j + 1])
     cflat = cidx.reshape(-1)
     M = nch * K
     cvals = torch.full((M,), float("-inf"), device=xv.device)
@@ -267,7 +324,9 @@ def _bst_rows(xv, st_val, en_val, n_val, K, out, gmap=None):
         gm = cflat
     else:
         gm = torch.full((M,), -1, dtype=torch.int32, device=xv.device)
-        _bst_map_idx_kernel[((M + 1023) // 1024,)](gmap, cflat, gm, M, num_warps=4, num_stages=1)
+        _bst_map_idx_kernel[((M + 1023) // 1024,)](
+            gmap, cflat, gm, M, num_warps=4, num_stages=1
+        )
     z1 = torch.tensor([0], dtype=torch.int32, device=xv.device)
     n1 = torch.tensor([M], dtype=torch.int32, device=xv.device)
     _bst_rows(cvals.view(1, M), z1, n1, n1, K, out, gm)
@@ -283,7 +342,14 @@ def bucket_sort_topk_xpu(inputs, starts, ends, topk):
     n = (ends - starts).to(torch.int32)
     with torch.no_grad():
         for b in range(B):
-            _bst_rows(x[b:b + 1], starts[b:b + 1], ends[b:b + 1], n[b:b + 1], K, out[b:b + 1])
+            _bst_rows(
+                x[b : b + 1],
+                starts[b : b + 1],
+                ends[b : b + 1],
+                n[b : b + 1],
+                K,
+                out[b : b + 1],
+            )
     return out
 
 

@@ -336,17 +336,13 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
                 # Unmasked 2D tile: strictly faster than any masked per-row /
                 # masked multirow variant (see _pick_tile_m / rms_norm body).
                 grid = (M // TILE_M,)
-                add_rms_norm_tile2d_kernel[grid](
-                    y, x1, x2, weight, eps, TILE_M, N
-                )
+                add_rms_norm_tile2d_kernel[grid](y, x1, x2, weight, eps, TILE_M, N)
             elif N <= MULTIROW_N and M >= MULTIROW_M:
                 # Small N + many rows with M not divisible by any TILE_M
                 # candidate: batched masked multi-row fallback.
                 TILE_M = builtins.max(1, TILE_BUDGET // N)
                 grid = (triton.cdiv(M, TILE_M),)
-                add_rms_norm_multirow_kernel[grid](
-                    y, x1, x2, weight, M, eps, TILE_M, N
-                )
+                add_rms_norm_multirow_kernel[grid](y, x1, x2, weight, M, eps, TILE_M, N)
             else:
                 BLOCK_SIZE = builtins.min(MAX_BLOCK, triton.next_power_of_2(N))
                 need_mask = (N % BLOCK_SIZE) != 0

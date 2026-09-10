@@ -94,7 +94,14 @@ def _bessel_k0_kernel_xpu(x_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # --- Large region x > 2 (A&S 9.8.2, 6-term polynomial in t = 2/x) ---
     t = 2.0 / x_f32
     q = 1.25331414
-    q = q + t * (-0.07832358 + t * (0.02189568 + t * (-0.01062446 + t * (0.00587872 + t * (-0.00251540 + t * 0.00053208)))))
+    q = q + t * (
+        -0.07832358
+        + t
+        * (
+            0.02189568
+            + t * (-0.01062446 + t * (0.00587872 + t * (-0.00251540 + t * 0.00053208)))
+        )
+    )
     large_result = q * tl.exp(-x_f32) / tl.sqrt(x_f32)
 
     result = tl.where(x_f32 <= 2.0, small_result, large_result)

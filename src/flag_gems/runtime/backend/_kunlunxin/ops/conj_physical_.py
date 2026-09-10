@@ -58,8 +58,6 @@ def conj_physical_(input: torch.Tensor) -> torch.Tensor:
 
     BLOCK_SIZE = 8192
     grid = (triton.cdiv(n, BLOCK_SIZE),)
-    conj_physical__kernel[grid](
-        flat, n, BLOCK_SIZE=BLOCK_SIZE, num_warps=8
-    )
+    conj_physical__kernel[grid](flat, n, BLOCK_SIZE=BLOCK_SIZE, num_warps=8)
 
     return input

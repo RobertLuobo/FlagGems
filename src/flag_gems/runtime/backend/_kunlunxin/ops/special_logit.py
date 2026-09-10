@@ -24,6 +24,7 @@ comparisons (`x < lo` / `x > hi`): for NaN both predicates are false, so the
 value passes through unchanged and NaN is preserved, and the ordered
 predicates are selectable on XPU.
 """
+
 import logging
 
 import torch

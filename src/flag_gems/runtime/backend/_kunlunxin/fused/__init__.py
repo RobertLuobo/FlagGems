@@ -14,6 +14,7 @@
 
 from .add_rms_norm import add_rms_norm
 from .beam_search_score import beam_search_score, beam_search_score_
+
 # bf16_paged_mqa_logits vendor kernel (XPU): the generic fused kernel crashes
 # ConvertTritonSDNNToLLVM (any elementwise max/select on the MMA result);
 # self-installs the direct-import entrypoint.
@@ -40,6 +41,7 @@ from .matmul_bias_activation import matmul_bias_activation
 # mhc_pre vendor kernel (XPU): self-installs the direct-import entrypoint
 from .mhc_pre import mhc_pre
 from .mhc_bwd import mhc_bwd
+
 # hc_head_fused_kernel vendor kernel (XPU): self-installs the direct-import entrypoint
 from .hc_head_fused_kernel import hc_head_fused_kernel
 from .hc_split_sinkhorn import hc_split_sinkhorn

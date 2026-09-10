@@ -149,9 +149,7 @@ def linalg_slogdet(A):
     logabs_flat = logabsdet.reshape(-1)
 
     with torch_device_fn.device(A.device):
-        _slogdet_pack_kernel[(batch_size,)](
-            A3, work, n, LDA=lda, TOT=tot, num_warps=1
-        )
+        _slogdet_pack_kernel[(batch_size,)](A3, work, n, LDA=lda, TOT=tot, num_warps=1)
         for k in range(n):
             _slogdet_step_kernel[(batch_size,)](
                 work, dg, n, k, LDA=lda, TOT=tot, num_warps=1

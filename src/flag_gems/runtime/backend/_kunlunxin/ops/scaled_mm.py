@@ -171,7 +171,9 @@ def _scaled_mm_fused(a, mat2, scale_a, scale_b, bias, out, M, K, N):
     # are broadcast to the full row/col extent.
     def _pad_scale(scale, extent):
         if scale.numel() == 1:
-            return torch.full((extent,), float(scale), dtype=torch.float32, device=scale.device)
+            return torch.full(
+                (extent,), float(scale), dtype=torch.float32, device=scale.device
+            )
         buf = torch.empty((extent,), dtype=torch.float32, device=scale.device)
         torch.ops.aten._copy_from(scale, buf[: scale.numel()], False)
         return buf
@@ -183,12 +185,10 @@ def _scaled_mm_fused(a, mat2, scale_a, scale_b, bias, out, M, K, N):
     bias_buf = None
     if bias is not None:
         bias_buf = torch.zeros((np_,), dtype=torch.float32, device=bias.device)
-        torch.ops.aten._copy_from(bias, bias_buf[: N], False)
+        torch.ops.aten._copy_from(bias, bias_buf[:N], False)
 
     def launch(c):
-        grid = (
-            triton.cdiv(M, blk_m) * triton.cdiv(N, blk_n),
-        )
+        grid = (triton.cdiv(M, blk_m) * triton.cdiv(N, blk_n),)
         _scaled_mm_kernel[grid](
             a,
             mat2,

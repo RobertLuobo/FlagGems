@@ -78,7 +78,6 @@ def _fractional_max_pool2d_forward_kernel(
     tl.store(indices_ptr + output_offset, max_index)
 
 
-
 @libentry()
 @triton.jit
 def _fractional_max_pool2d_backward_probe_kernel(
@@ -184,6 +183,7 @@ def _fractional_max_pool2d_backward_scatter_kernel(
     idx = tl.load(indices_ptr + offsets, mask=out_mask, other=0)
     g = tl.load(grad_output_ptr + offsets, mask=out_mask, other=0.0)
     tl.store(grad_input_ptr + nc * in_hw + idx, g, mask=out_mask)
+
 
 def _parse_size(value):
     if isinstance(value, (int, float)):

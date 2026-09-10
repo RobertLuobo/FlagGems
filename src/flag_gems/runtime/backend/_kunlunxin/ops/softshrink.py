@@ -74,7 +74,9 @@ def _softshrink_big_func(x, lambd):
 
 
 @triton.jit
-def _softshrink_small_kernel(x_ptr, out_ptr, n_elements, lambd, BLOCK_SIZE: tl.constexpr):
+def _softshrink_small_kernel(
+    x_ptr, out_ptr, n_elements, lambd, BLOCK_SIZE: tl.constexpr
+):
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)

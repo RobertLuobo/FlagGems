@@ -587,10 +587,20 @@ def _gather_backward_kernel(
     tl.store(output + output_offsets_flat, result, mask=output_valid_flat)
 
 
-@triton.jit(do_not_specialize=[
-    "N", "SLICE", "index_dim_size", "stride_dim",
-    "i_s0", "i_s1", "i_s2", "o_s0", "o_s1", "o_s2",
-])
+@triton.jit(
+    do_not_specialize=[
+        "N",
+        "SLICE",
+        "index_dim_size",
+        "stride_dim",
+        "i_s0",
+        "i_s1",
+        "i_s2",
+        "o_s0",
+        "o_s1",
+        "o_s2",
+    ]
+)
 def _gather_backward_scatter_kernel(
     index,
     grad,

@@ -502,7 +502,9 @@ def _lstsq_wide(A, B, rcond):
                 RHS, YI, YS, DIAG, RMAX, rcond, c, m, NW=MIP, KP=KP
             )
             _colcpy_kernel[(batch,)](W, COL, NRP * MP, c, LD=MP, NW=MIP)
-            _upd_kernel[(batch, 1, 1)](RHS, YI, COL, 0, 0, NCP=KP, MP=MIP, BC=KP, BN=MIP)
+            _upd_kernel[(batch, 1, 1)](
+                RHS, YI, COL, 0, 0, NCP=KP, MP=MIP, BC=KP, BN=MIP
+            )
 
         # x = Q y = H_0 .. H_{m-1} [y; 0]
         Z = torch.zeros((batch, KP, MP), dtype=dt, device=dev)

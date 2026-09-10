@@ -139,45 +139,31 @@ def _dist_piece_sum(
     if NP >= 2:
         a = tl.load(x_ptr + base + S + tl.arange(0, S)).to(tl.float32)
         b = tl.load(y_ptr + base + S + tl.arange(0, S)).to(tl.float32)
-        acc = _dist_combine(
-            acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE
-        )
+        acc = _dist_combine(acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE)
     if NP >= 3:
         a = tl.load(x_ptr + base + 2 * S + tl.arange(0, S)).to(tl.float32)
         b = tl.load(y_ptr + base + 2 * S + tl.arange(0, S)).to(tl.float32)
-        acc = _dist_combine(
-            acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE
-        )
+        acc = _dist_combine(acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE)
     if NP >= 4:
         a = tl.load(x_ptr + base + 3 * S + tl.arange(0, S)).to(tl.float32)
         b = tl.load(y_ptr + base + 3 * S + tl.arange(0, S)).to(tl.float32)
-        acc = _dist_combine(
-            acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE
-        )
+        acc = _dist_combine(acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE)
     if NP >= 5:
         a = tl.load(x_ptr + base + 4 * S + tl.arange(0, S)).to(tl.float32)
         b = tl.load(y_ptr + base + 4 * S + tl.arange(0, S)).to(tl.float32)
-        acc = _dist_combine(
-            acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE
-        )
+        acc = _dist_combine(acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE)
     if NP >= 6:
         a = tl.load(x_ptr + base + 5 * S + tl.arange(0, S)).to(tl.float32)
         b = tl.load(y_ptr + base + 5 * S + tl.arange(0, S)).to(tl.float32)
-        acc = _dist_combine(
-            acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE
-        )
+        acc = _dist_combine(acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE)
     if NP >= 7:
         a = tl.load(x_ptr + base + 6 * S + tl.arange(0, S)).to(tl.float32)
         b = tl.load(y_ptr + base + 6 * S + tl.arange(0, S)).to(tl.float32)
-        acc = _dist_combine(
-            acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE
-        )
+        acc = _dist_combine(acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE)
     if NP >= 8:
         a = tl.load(x_ptr + base + 7 * S + tl.arange(0, S)).to(tl.float32)
         b = tl.load(y_ptr + base + 7 * S + tl.arange(0, S)).to(tl.float32)
-        acc = _dist_combine(
-            acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE
-        )
+        acc = _dist_combine(acc, _dist_mode_reduce(tl.abs(a - b), p_scalar, MODE), MODE)
     if NSCALAR > 0:
         # Plain `range` (not static_range): a non-unrolled scf.for keeps the
         # live set small (a long remainder would otherwise push the ELF stack
@@ -431,9 +417,7 @@ def dist(input, other, p=2):
                 device=input.device,
                 dtype=torch.float32,
             )
-            _dist_mid_reduce_kernel[(g,)](
-                cur, nxt, MODE=mode, BLOCK=_MID_BLOCK
-            )
+            _dist_mid_reduce_kernel[(g,)](cur, nxt, MODE=mode, BLOCK=_MID_BLOCK)
             cur = nxt
             cur_n = g
         _dist_final_kernel[(1,)](

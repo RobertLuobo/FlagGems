@@ -264,7 +264,15 @@ def _pd_small_multi_kernel(
         if row < N:
             base = row * D
             acc = _pd_piece_sum(
-                x1_ptr, x2_ptr, base, eps, p_scalar, MODE, S, NP, NSCALAR,
+                x1_ptr,
+                x2_ptr,
+                base,
+                eps,
+                p_scalar,
+                MODE,
+                S,
+                NP,
+                NSCALAR,
             )
             tl.store(out_ptr + row, _pd_finalize(acc, p_scalar, MODE))
 

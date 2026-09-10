@@ -154,8 +154,17 @@ def _osj_svd_impl(A, sweeps=12, full_matrices=False):
     total = sweeps * (nw - 1) * (nw // 2)
     for b in range(batch):
         _osj_pipeline[(1,)](
-            A[b], B[b], U[b], m, n, nw, total, MP=MP, NW=NW,
-            num_warps=1, num_stages=1,
+            A[b],
+            B[b],
+            U[b],
+            m,
+            n,
+            nw,
+            total,
+            MP=MP,
+            NW=NW,
+            num_warps=1,
+            num_stages=1,
         )
 
     # S = column norms of B, computed on host (scalar-store workaround);

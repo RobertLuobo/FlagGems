@@ -131,20 +131,11 @@ def _adaptive_avg_pool3d_backward_general_kernel(
                 ws = (c_w * in_w) // out_w
                 we = tl.minimum(((c_w + 1) * in_w + out_w - 1) // out_w, in_w)
                 in_region = (
-                    (d >= ds)
-                    & (d < de)
-                    & (h >= hs)
-                    & (h < he)
-                    & (w >= ws)
-                    & (w < we)
+                    (d >= ds) & (d < de) & (h >= hs) & (h < he) & (w >= ws) & (w < we)
                 )
                 area = (de - ds) * (he - hs) * (we - ws)
-                val = tl.load(
-                    gop + c_d * (out_h * out_w) + c_h * out_w + c_w
-                )
-                contrib = tl.where(in_region, val, 0.0) / tl.cast(
-                    area, tl.float32
-                )
+                val = tl.load(gop + c_d * (out_h * out_w) + c_h * out_w + c_w)
+                contrib = tl.where(in_region, val, 0.0) / tl.cast(area, tl.float32)
                 acc += tl.where(active, contrib, 0.0)
 
     gip = grad_input_ptr + ((nc * in_d + d) * in_h + h) * in_w
@@ -165,11 +156,7 @@ def _adaptive_avg_pool3d_backward(grad_output, input):
         return grad_input
 
     with torch_device_fn.device(input.device):
-        if (
-            in_d % out_d == 0
-            and in_h % out_h == 0
-            and in_w % out_w == 0
-        ):
+        if in_d % out_d == 0 and in_h % out_h == 0 and in_w % out_w == 0:
             kd, kh, kw = in_d // out_d, in_h // out_h, in_w // out_w
             n_elems = in_n * in_c * in_d * in_h * in_w
             grid = (triton.cdiv(n_elems, 1024),)

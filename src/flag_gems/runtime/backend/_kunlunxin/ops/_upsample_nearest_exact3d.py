@@ -80,27 +80,21 @@ def _upsample_nearest_exact3d_kernel(
         id = od
     else:
         id = tl.minimum(
-            tl.math.floor((od.to(tl.float32) + 0.5) * reciprocal_scale_d).to(
-                tl.int32
-            ),
+            tl.math.floor((od.to(tl.float32) + 0.5) * reciprocal_scale_d).to(tl.int32),
             ID - 1,
         )
     if SAME_H:
         ih = oh
     else:
         ih = tl.minimum(
-            tl.math.floor((oh.to(tl.float32) + 0.5) * reciprocal_scale_h).to(
-                tl.int32
-            ),
+            tl.math.floor((oh.to(tl.float32) + 0.5) * reciprocal_scale_h).to(tl.int32),
             IH - 1,
         )
     if SAME_W:
         iw = ow
     else:
         iw = tl.minimum(
-            tl.math.floor((ow.to(tl.float32) + 0.5) * reciprocal_scale_w).to(
-                tl.int32
-            ),
+            tl.math.floor((ow.to(tl.float32) + 0.5) * reciprocal_scale_w).to(tl.int32),
             IW - 1,
         )
 
@@ -155,9 +149,7 @@ def _upsample_nearest_exact3d(
     reciprocal_scale_h = calculate_scale(IH, OH, scales_h)
     reciprocal_scale_w = calculate_scale(IW, OW, scales_w)
 
-    output = torch.empty(
-        (N, C, OD, OH, OW), device=input.device, dtype=input.dtype
-    )
+    output = torch.empty((N, C, OD, OH, OW), device=input.device, dtype=input.dtype)
     if output.numel() == 0:
         return output
 

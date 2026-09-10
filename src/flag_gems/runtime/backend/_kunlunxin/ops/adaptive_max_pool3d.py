@@ -102,9 +102,7 @@ def adaptive_max_pool3d_forward_kernel(
                     plane_base + d_safe * in_hw + h_safe * in_w + w_safe
                 ).to(tl.float32)
                 active = d_ok & h_ok & w_ok
-                is_new = active & (
-                    (value > acc_val) | (value != value) | (acc_idx < 0)
-                )
+                is_new = active & ((value > acc_val) | (value != value) | (acc_idx < 0))
                 acc_val = tl.where(is_new, value, acc_val)
                 acc_idx = tl.where(is_new, d * in_hw + h * in_w + w, acc_idx)
 

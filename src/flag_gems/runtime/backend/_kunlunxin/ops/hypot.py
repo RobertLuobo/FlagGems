@@ -308,11 +308,7 @@ def hypot_(self: torch.Tensor, other: torch.Tensor):
 
     # Fast path: contiguous same-shape in-place (read + write same offset per
     # lane), reusing the flat block-DMA kernel.
-    if (
-        self.is_contiguous()
-        and other.is_contiguous()
-        and other.shape == self.shape
-    ):
+    if self.is_contiguous() and other.is_contiguous() and other.shape == self.shape:
         _launch_hypot_inplace_flat(self, other)
         return self
 
@@ -330,12 +326,8 @@ def hypot_(self: torch.Tensor, other: torch.Tensor):
             y_strides.append(other.stride(d - pad))
 
     shapes = torch.tensor(list(self.shape), dtype=torch.int64, device=self.device)
-    x_strides = torch.tensor(
-        list(self.stride()), dtype=torch.int64, device=self.device
-    )
-    y_strides_t = torch.tensor(
-        y_strides, dtype=torch.int64, device=self.device
-    )
+    x_strides = torch.tensor(list(self.stride()), dtype=torch.int64, device=self.device)
+    y_strides_t = torch.tensor(y_strides, dtype=torch.int64, device=self.device)
 
     _launch_hypot_inplace_strided(self, other, shapes, x_strides, y_strides_t)
     return self

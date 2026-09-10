@@ -496,14 +496,12 @@ def l1_norm_rows_tail_kernel(
     total = 0.0
     full_size = (TAIL_N // 8) * 8
     for offset in tl.range(0, full_size, 8):
-        value = tl.load(
-            X + row * N + TAIL_OFFSET + offset + tl.arange(0, 8)
-        ).to(tl.float32)
+        value = tl.load(X + row * N + TAIL_OFFSET + offset + tl.arange(0, 8)).to(
+            tl.float32
+        )
         total += tl.sum(tl.abs(value))
     for offset in tl.range(0, TAIL_N - full_size):
-        value = tl.load(
-            X + row * N + TAIL_OFFSET + full_size + offset
-        ).to(tl.float32)
+        value = tl.load(X + row * N + TAIL_OFFSET + full_size + offset).to(tl.float32)
         total += tl.abs(value)
     tl.store(Mid + row * MID_SIZE + MID_SIZE - 1, total, mask=row < M)
 
@@ -550,14 +548,14 @@ def l1_norm_rows_reduce_tail_kernel(
     full_size = (TAIL_N // 8) * 8
     for offset in tl.range(0, full_size, 8):
         total += tl.sum(
-            tl.load(
-                Mid + row * MID_SIZE + TAIL_OFFSET + offset + tl.arange(0, 8)
-            ).to(tl.float32)
+            tl.load(Mid + row * MID_SIZE + TAIL_OFFSET + offset + tl.arange(0, 8)).to(
+                tl.float32
+            )
         )
     for offset in tl.range(0, TAIL_N - full_size):
-        total += tl.load(
-            Mid + row * MID_SIZE + TAIL_OFFSET + full_size + offset
-        ).to(tl.float32)
+        total += tl.load(Mid + row * MID_SIZE + TAIL_OFFSET + full_size + offset).to(
+            tl.float32
+        )
     tl.store(Next + row * NEXT_SIZE + NEXT_SIZE - 1, total, mask=row < M)
 
 

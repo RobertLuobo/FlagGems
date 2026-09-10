@@ -230,20 +230,13 @@ def _segment_reduce_uniform_other_backward_kernel(
     mask = segment_offsets < segment_end
     safe_offsets = tl.minimum(segment_offsets, data_size_axis - 1)
     data_offsets = (
-        outer_idx * data_size_axis * inner_size
-        + safe_offsets * inner_size
-        + inner_idx
+        outer_idx * data_size_axis * inner_size + safe_offsets * inner_size + inner_idx
     )
     if IS_MAX or IS_MIN:
-        values = tl.load(
-            data + data_offsets, mask=mask, other=0.0
-        ).to(compute_dtype)
+        values = tl.load(data + data_offsets, mask=mask, other=0.0).to(compute_dtype)
         values = tl.where(mask, values, 0.0)
         output_is_nan = output_value != output_value
-        match = (
-            tl.where(output_is_nan, values != values, values == output_value)
-            & mask
-        )
+        match = tl.where(output_is_nan, values != values, values == output_value) & mask
         counter = tl.sum(match.to(tl.int64), axis=0)
 
         store_value = tl.where(
@@ -260,9 +253,7 @@ def _segment_reduce_uniform_other_backward_kernel(
             mask=mask,
         )
     else:
-        values = tl.load(
-            data + data_offsets, mask=mask, other=1.0
-        ).to(compute_dtype)
+        values = tl.load(data + data_offsets, mask=mask, other=1.0).to(compute_dtype)
         values = tl.where(mask, values, 1.0)
         nan_mask = (values != values) & mask
         zero_mask = (values == 0) & mask & ~nan_mask
@@ -423,38 +414,32 @@ def _segment_reduce_uniform_forward_kernel(
     mask = segment_offsets < segment_end
     safe_offsets = tl.minimum(segment_offsets, data_size_axis - 1)
     data_offsets = (
-        outer_idx * data_size_axis * inner_size
-        + safe_offsets * inner_size
-        + inner_idx
+        outer_idx * data_size_axis * inner_size + safe_offsets * inner_size + inner_idx
     )
 
     if IS_SUM or IS_MEAN:
-        values = tl.load(
-            data + data_offsets, mask=mask, other=0.0
-        ).to(compute_dtype)
+        values = tl.load(data + data_offsets, mask=mask, other=0.0).to(compute_dtype)
         values = tl.where(mask, values, 0.0)
         acc = tl.sum(values, axis=0)
         if IS_MEAN:
             acc = acc / segment_length
     elif IS_PROD:
-        values = tl.load(
-            data + data_offsets, mask=mask, other=1.0
-        ).to(compute_dtype)
+        values = tl.load(data + data_offsets, mask=mask, other=1.0).to(compute_dtype)
         values = tl.where(mask, values, 1.0)
         acc = tl.reduce(values, axis=0, combine_fn=_multiply)
     elif IS_MAX:
-        values = tl.load(
-            data + data_offsets, mask=mask, other=float("-inf")
-        ).to(compute_dtype)
+        values = tl.load(data + data_offsets, mask=mask, other=float("-inf")).to(
+            compute_dtype
+        )
         nan_mask = (values != values) & mask
         has_nan = tl.sum(nan_mask.to(tl.int32), axis=0) > 0
         nan_value = tl.sum(tl.where(nan_mask, values, 0.0), axis=0)
         acc = tl.max(tl.where(mask & ~nan_mask, values, float("-inf")), axis=0)
         acc = tl.where(has_nan, nan_value, acc)
     elif IS_MIN:
-        values = tl.load(
-            data + data_offsets, mask=mask, other=float("inf")
-        ).to(compute_dtype)
+        values = tl.load(data + data_offsets, mask=mask, other=float("inf")).to(
+            compute_dtype
+        )
         nan_mask = (values != values) & mask
         has_nan = tl.sum(nan_mask.to(tl.int32), axis=0) > 0
         nan_value = tl.sum(tl.where(nan_mask, values, 0.0), axis=0)
@@ -980,9 +965,7 @@ def _segment_reduce_backward_element_kernel(
     lane = tl.arange(0, BLOCK_SIZE)
     segment_offsets = segment_start + lane
     in_segment = segment_offsets < segment_end
-    safe_segment_offset = tl.minimum(
-        segment_offsets, tl.maximum(data_size_axis - 1, 0)
-    )
+    safe_segment_offset = tl.minimum(segment_offsets, tl.maximum(data_size_axis - 1, 0))
     load_mask = in_segment | ((lane == 0) & (data_size_axis > 0))
     data_offset = (
         outer_idx * data_size_axis * inner_size
@@ -990,9 +973,7 @@ def _segment_reduce_backward_element_kernel(
         + inner_idx
     )
     if IS_MAX_OR_MIN:
-        value = tl.load(data + data_offset, mask=load_mask, other=0.0).to(
-            compute_dtype
-        )
+        value = tl.load(data + data_offset, mask=load_mask, other=0.0).to(compute_dtype)
         output_is_nan = output_value != output_value
         match = in_segment & tl.where(
             output_is_nan, value != value, value == output_value
@@ -1009,15 +990,11 @@ def _segment_reduce_backward_element_kernel(
         )
         result = tl.where(valid_segment & current_match, store_value, 0.0)
     else:
-        value = tl.load(data + data_offset, mask=load_mask, other=1.0).to(
-            compute_dtype
-        )
+        value = tl.load(data + data_offset, mask=load_mask, other=1.0).to(compute_dtype)
         include = in_segment & (segment_offsets != axis_idx)
         included = tl.where(include, value, 1.0)
         product = tl.reduce(included, axis=0, combine_fn=_multiply)
-        result = tl.where(
-            valid_segment, grad_value * product * INITIAL_PROD_VALUE, 0.0
-        )
+        result = tl.where(valid_segment, grad_value * product * INITIAL_PROD_VALUE, 0.0)
 
     tl.store(grad_input + pid, result)
 

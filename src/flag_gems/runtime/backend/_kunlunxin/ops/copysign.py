@@ -143,6 +143,7 @@ def copysign_(input, other):
 # version above, which the tests already validate bit-for-bit).
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _copysign_pair_kernel(a_ptr, b_ptr, o_ptr, n_lanes, BLOCK: tl.constexpr):
     # 16-bit dtypes (fp16/bf16) viewed as int32: two elements per lane.
@@ -211,18 +212,30 @@ def _copysign_fast_(input, other):
         b32 = other.view(-1).view(torch.int32)
         n_lanes = n // 2
         block, warps = _pick_lane_cfg(n_lanes)
-        _copysign_pair_kernel[
-            (triton.cdiv(n_lanes, block),)
-        ](a32, b32, a32, n_lanes, BLOCK=block, num_warps=warps,
-          unroll_num=16, isCloseVectorization=True)
+        _copysign_pair_kernel[(triton.cdiv(n_lanes, block),)](
+            a32,
+            b32,
+            a32,
+            n_lanes,
+            BLOCK=block,
+            num_warps=warps,
+            unroll_num=16,
+            isCloseVectorization=True,
+        )
         return True
     if dt == torch.float32:
         a32 = input.view(-1).view(torch.int32)
         b32 = other.view(-1).view(torch.int32)
         block, warps = _pick_lane_cfg(n)
-        _copysign_single_kernel[
-            (triton.cdiv(n, block),)
-        ](a32, b32, a32, n, BLOCK=block, num_warps=warps,
-          unroll_num=16, isCloseVectorization=True)
+        _copysign_single_kernel[(triton.cdiv(n, block),)](
+            a32,
+            b32,
+            a32,
+            n,
+            BLOCK=block,
+            num_warps=warps,
+            unroll_num=16,
+            isCloseVectorization=True,
+        )
         return True
     return False

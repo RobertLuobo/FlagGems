@@ -80,7 +80,8 @@ def _trunc_impl(A, out=None):
         A.dtype in (torch.float16, torch.float32)
         and A.is_contiguous()
         and A.dim() > 0
-        and numel > 1024  # tiny tensors: generic pointwise path is at/below the launch floor
+        and numel
+        > 1024  # tiny tensors: generic pointwise path is at/below the launch floor
     ):
         block = min(_FAST_BLOCK, triton.next_power_of_2(numel))
         if out is None:

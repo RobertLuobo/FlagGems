@@ -291,9 +291,7 @@ def masked_scatter_backward(grad_output, mask, sizes):
         counts = torch.empty(np_blocks, dtype=torch.int32, device=device)
         offsets = torch.empty(np_blocks, dtype=torch.int32, device=device)
 
-        _msb_count_kernel[(np_blocks,)](
-            mask_flat, counts, N=n, BLOCK=block
-        )
+        _msb_count_kernel[(np_blocks,)](mask_flat, counts, N=n, BLOCK=block)
         _msb_scan_kernel[(1,)](counts, offsets, NP=np_blocks)
         _msb_write_kernel[(n_mask_blocks,)](
             grad_flat, mask_flat, offsets, out, N=n, SCRATCH=scratch, BLOCK=block
