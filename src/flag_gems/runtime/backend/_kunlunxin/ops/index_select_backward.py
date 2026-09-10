@@ -105,7 +105,7 @@ def _make_one_hot_rows_kernel(
         for j in tl.static_range(NCHUNK):
             cols = j * CB + tl.arange(0, CB)
             cmask = cols < dim_size_out
-            val = (cols == idx)
+            val = cols == idx
             if IS_FP16:
                 tl.store(out + i * dim_size_out + cols, val.to(tl.float16), mask=cmask)
             elif IS_BF16:
@@ -134,7 +134,7 @@ def _make_one_hot_cols_kernel(
             cols = j * CB + tl.arange(0, CB)
             cmask = cols < index_len
             idx = tl.load(index + cols, mask=cmask, other=-1)
-            val = (idx == n)
+            val = idx == n
             if IS_FP16:
                 tl.store(out + n * index_len + cols, val.to(tl.float16), mask=cmask)
             elif IS_BF16:

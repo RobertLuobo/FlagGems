@@ -51,12 +51,7 @@ def scaled_softmax_forward_kernel(
     h_idx = tl.program_id(1)
     b_idx = tl.program_id(2)
 
-    row_ptr = (
-        input_ptr
-        + b_idx * stride_b
-        + h_idx * stride_h
-        + q_idx * stride_q
-    )
+    row_ptr = input_ptr + b_idx * stride_b + h_idx * stride_h + q_idx * stride_q
     k_offsets = tl.arange(0, BLOCK_K)
 
     m = -float("inf")
@@ -71,12 +66,7 @@ def scaled_softmax_forward_kernel(
         m = m_c
 
     inv = 1.0 / z
-    out_row_ptr = (
-        output_ptr
-        + b_idx * stride_b
-        + h_idx * stride_h
-        + q_idx * stride_q
-    )
+    out_row_ptr = output_ptr + b_idx * stride_b + h_idx * stride_h + q_idx * stride_q
     for k0 in range(0, tl.cdiv(key_seq_len, BLOCK_K)):
         offs = k0 * BLOCK_K + k_offsets
         mask = offs < key_seq_len
@@ -132,18 +122,8 @@ def scaled_softmax_backward_kernel(
     h_idx = tl.program_id(1)
     b_idx = tl.program_id(2)
 
-    P_row = (
-        output_ptr
-        + b_idx * stride_b
-        + h_idx * stride_h
-        + q_idx * stride_q
-    )
-    dP_row = (
-        grad_output_ptr
-        + b_idx * stride_b
-        + h_idx * stride_h
-        + q_idx * stride_q
-    )
+    P_row = output_ptr + b_idx * stride_b + h_idx * stride_h + q_idx * stride_q
+    dP_row = grad_output_ptr + b_idx * stride_b + h_idx * stride_h + q_idx * stride_q
     k_offsets = tl.arange(0, BLOCK_K)
 
     d = 0.0
@@ -154,12 +134,7 @@ def scaled_softmax_backward_kernel(
         dP = tl.load(dP_row + offs, mask=mask, other=0.0)
         d += tl.sum(tl.where(mask, P * dP, 0.0), 0)
 
-    dS_row = (
-        grad_input_ptr
-        + b_idx * stride_b
-        + h_idx * stride_h
-        + q_idx * stride_q
-    )
+    dS_row = grad_input_ptr + b_idx * stride_b + h_idx * stride_h + q_idx * stride_q
     for k0 in range(0, tl.cdiv(key_seq_len, BLOCK_K)):
         offs = k0 * BLOCK_K + k_offsets
         mask = offs < key_seq_len

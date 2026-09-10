@@ -283,9 +283,7 @@ def _unsafe_masked_index_put_accumulate_histogram(input, mask, indices, values):
         )
         idx2 = (heads[:, None] + offs[None, :].to(torch.int64)).reshape(-1)
         vals = torch.gather(sw_pad, 0, idx2).reshape(s, u)
-        m2 = (
-            offs[None, :] < lens.to(torch.int32)[:, None]
-        ).to(torch.float32)
+        m2 = (offs[None, :] < lens.to(torch.int32)[:, None]).to(torch.float32)
         sums = torch.einsum("su,su->s", vals, m2)
         keys = torch.gather(sf, 0, heads)
         with torch_device_fn.device(input.device):

@@ -117,13 +117,23 @@ def _launch_flat(x, n, numel):
     need_mask = (numel % _BLOCK) != 0
     if isinstance(n, torch.Tensor):
         _chebyshev_polynomial_u_tensor_n_kernel[grid](
-            x, n, out, numel,
-            BLOCK=_BLOCK, NEED_MASK=need_mask, num_warps=_NUM_WARPS,
+            x,
+            n,
+            out,
+            numel,
+            BLOCK=_BLOCK,
+            NEED_MASK=need_mask,
+            num_warps=_NUM_WARPS,
         )
     else:
         _chebyshev_polynomial_u_scalar_n_kernel[grid](
-            x, n, out, numel,
-            BLOCK=_BLOCK, NEED_MASK=need_mask, num_warps=_NUM_WARPS,
+            x,
+            n,
+            out,
+            numel,
+            BLOCK=_BLOCK,
+            NEED_MASK=need_mask,
+            num_warps=_NUM_WARPS,
         )
     return out
 

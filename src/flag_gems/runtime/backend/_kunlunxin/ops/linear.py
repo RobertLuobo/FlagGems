@@ -226,9 +226,7 @@ def linear(input, weight, bias=None):
             output.stride(1),
             bias.stride(0) if bias is not None else 0,
             BIAS=bias is not None,
-            EVEN=(
-                _even(M, _EVEN_M) and _even(N, _EVEN_N) and _even(K, _EVEN_K)
-            ),
+            EVEN=(_even(M, _EVEN_M) and _even(N, _EVEN_N) and _even(K, _EVEN_K)),
         )
 
     # Reshape output: (M, N) -> (*, N)

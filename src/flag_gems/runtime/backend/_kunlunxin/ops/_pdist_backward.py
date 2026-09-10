@@ -86,14 +86,30 @@ def _pdist_backward_p2_kernel(
     nmain = (N - j_start) // 8 * 8
     for k in range(0, nmain, 8):
         jj = j_start + k
-        xj0 = tl.load(x_ptr + (jj + 0) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj1 = tl.load(x_ptr + (jj + 1) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj2 = tl.load(x_ptr + (jj + 2) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj3 = tl.load(x_ptr + (jj + 3) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj4 = tl.load(x_ptr + (jj + 4) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj5 = tl.load(x_ptr + (jj + 5) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj6 = tl.load(x_ptr + (jj + 6) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj7 = tl.load(x_ptr + (jj + 7) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
+        xj0 = tl.load(
+            x_ptr + (jj + 0) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj1 = tl.load(
+            x_ptr + (jj + 1) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj2 = tl.load(
+            x_ptr + (jj + 2) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj3 = tl.load(
+            x_ptr + (jj + 3) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj4 = tl.load(
+            x_ptr + (jj + 4) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj5 = tl.load(
+            x_ptr + (jj + 5) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj6 = tl.load(
+            x_ptr + (jj + 6) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj7 = tl.load(
+            x_ptr + (jj + 7) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
         g0 = tl.load(grad_ptr + base_idx + (jj + 0)).to(tl.float32)
         g1 = tl.load(grad_ptr + base_idx + (jj + 1)).to(tl.float32)
         g2 = tl.load(grad_ptr + base_idx + (jj + 2)).to(tl.float32)
@@ -158,14 +174,30 @@ def _pdist_backward_p2_kernel(
         idx5 = s5 * N - (s5 * (s5 + 1)) // 2 + (pid_n - s5 - 1)
         idx6 = s6 * N - (s6 * (s6 + 1)) // 2 + (pid_n - s6 - 1)
         idx7 = s7 * N - (s7 * (s7 + 1)) // 2 + (pid_n - s7 - 1)
-        xj0 = tl.load(x_ptr + (j0 + 0) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj1 = tl.load(x_ptr + (j0 + 1) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj2 = tl.load(x_ptr + (j0 + 2) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj3 = tl.load(x_ptr + (j0 + 3) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj4 = tl.load(x_ptr + (j0 + 4) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj5 = tl.load(x_ptr + (j0 + 5) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj6 = tl.load(x_ptr + (j0 + 6) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
-        xj7 = tl.load(x_ptr + (j0 + 7) * stride_x + m_offsets, mask=m_mask, other=0.0).to(tl.float32)
+        xj0 = tl.load(
+            x_ptr + (j0 + 0) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj1 = tl.load(
+            x_ptr + (j0 + 1) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj2 = tl.load(
+            x_ptr + (j0 + 2) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj3 = tl.load(
+            x_ptr + (j0 + 3) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj4 = tl.load(
+            x_ptr + (j0 + 4) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj5 = tl.load(
+            x_ptr + (j0 + 5) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj6 = tl.load(
+            x_ptr + (j0 + 6) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
+        xj7 = tl.load(
+            x_ptr + (j0 + 7) * stride_x + m_offsets, mask=m_mask, other=0.0
+        ).to(tl.float32)
         g0 = tl.load(grad_ptr + idx0).to(tl.float32)
         g1 = tl.load(grad_ptr + idx1).to(tl.float32)
         g2 = tl.load(grad_ptr + idx2).to(tl.float32)

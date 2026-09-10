@@ -245,9 +245,7 @@ def log_softmax_kernel_singlepass_tail(
     mask = n_offsets < N
     x = tl.load(input_ptr + off, mask=mask, other=-float("inf")).to(tl.float32)
     if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
+        m = _k_fwd_decode_key(tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0))
     else:
         m = tl.max(x, 0)
     z = tl.sum(tl.exp(x - m), 0)
@@ -276,9 +274,7 @@ def log_softmax_kernel_chunk(
     off = pid * BLOCK_N + n_offsets
     x = tl.load(input_ptr + off).to(tl.float32)
     if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
+        m = _k_fwd_decode_key(tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0))
     else:
         m = tl.max(x, 0)
     z = tl.sum(tl.exp(x - m), 0)
@@ -353,9 +349,7 @@ def log_softmax_chunk_strided(
     off = row * N + c * BLOCK_N + n_offsets
     x = tl.load(input_ptr + off).to(tl.float32)
     if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
+        m = _k_fwd_decode_key(tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0))
     else:
         m = tl.max(x, 0)
     z = tl.sum(tl.exp(x - m), 0)
@@ -411,9 +405,7 @@ def log_softmax_tail_piece_partial(
     off = pid * N + n_offsets
     x = tl.load(input_ptr + off).to(tl.float32)
     if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
+        m = _k_fwd_decode_key(tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0))
     else:
         m = tl.max(x, 0)
     z = tl.sum(tl.exp(x - m), 0)
@@ -468,9 +460,7 @@ def log_softmax_tail_masked_partial(
     off = pid * N + TAIL_BASE + n_offsets
     x = tl.load(input_ptr + off, mask=within, other=float("-inf")).to(tl.float32)
     if USE_KEY:
-        m = _k_fwd_decode_key(
-            tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0)
-        )
+        m = _k_fwd_decode_key(tl.max(_k_fwd_key_u32(x.to(tl.uint32, bitcast=True)), 0))
     else:
         m = tl.max(x, 0)
     z = tl.sum(tl.exp(x - m), 0)

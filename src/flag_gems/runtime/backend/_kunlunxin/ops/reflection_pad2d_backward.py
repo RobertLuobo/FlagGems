@@ -324,8 +324,7 @@ def _reflection_pad2d_backward_impl(grad_output, self, padding):
                 # 3) reflection columns on non-edge rows:
                 #    C = [1, pl] U [W-1-pr, W-2] (dedup, sorted)
                 edge_cols = sorted(
-                    (set(range(1, pad_left + 1))
-                     | set(range(W - 1 - pad_right, W - 1)))
+                    (set(range(1, pad_left + 1)) | set(range(W - 1 - pad_right, W - 1)))
                     & set(range(W))
                 )
                 plain_rows = sorted(all_rows - set(edge_rows))

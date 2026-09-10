@@ -435,18 +435,14 @@ def any_dim(inp, dim=None, keepdim=False):
             # Fixed tuple grid: host-computed BLOCK_M must match the
             # @triton.heuristics formula (any_dim_xpu2: a mismatched grid
             # under-covers rows and leaves `outf` half-uninitialized).
-            block_m = triton.next_power_of_2(
-                min(triton.cdiv(M, cluster_num), core_num)
-            )
+            block_m = triton.next_power_of_2(min(triton.cdiv(M, cluster_num), core_num))
             grid = (triton.cdiv(M, block_m),)
             with torch_device_fn.device(inp.device):
                 max_kernel_dim[grid](inpc, outf, M, N, buffer_size_limit=2048)
             out = outf.to(torch.bool)
         else:
             out = torch.empty(shape, dtype=torch.bool, device=inp.device)
-            block_m = triton.next_power_of_2(
-                min(triton.cdiv(M, cluster_num), core_num)
-            )
+            block_m = triton.next_power_of_2(min(triton.cdiv(M, cluster_num), core_num))
             grid = (triton.cdiv(M, block_m),)
             with torch_device_fn.device(inp.device):
                 any_kernel_dim[grid](inpc, out, M, N, buffer_size_limit=2048)

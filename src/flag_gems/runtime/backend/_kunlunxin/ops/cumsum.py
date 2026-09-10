@@ -211,7 +211,9 @@ _GROUP = 4096
 
 @libentry()
 @triton.jit
-def scan_group_sum_kernel(inp, sums, N: tl.constexpr, NG: tl.constexpr, GROUP: tl.constexpr):
+def scan_group_sum_kernel(
+    inp, sums, N: tl.constexpr, NG: tl.constexpr, GROUP: tl.constexpr
+):
     """(R, NG) grid: sum one GROUP-wide group.  The input is zero-padded to
     exactly NG * GROUP columns, so the load is always fully in-bounds and
     needs no mask (masked loads that can read adjacent memory are the one
@@ -235,7 +237,9 @@ def scan_group_sum_kernel(inp, sums, N: tl.constexpr, NG: tl.constexpr, GROUP: t
 
 @libentry()
 @triton.jit
-def scan_group_add_kernel(inp, out, sums, N: tl.constexpr, NG: tl.constexpr, GROUP: tl.constexpr):
+def scan_group_add_kernel(
+    inp, out, sums, N: tl.constexpr, NG: tl.constexpr, GROUP: tl.constexpr
+):
     """(R, NG) grid: single-shot 1D scan of one group plus the prefix of all
     groups before it (read directly from the pre-scanned `sums`)."""
     pid_r = ext.program_id(0)
@@ -259,7 +263,7 @@ def scan_group_add_kernel(inp, out, sums, N: tl.constexpr, NG: tl.constexpr, GRO
 
 
 def _scan_mid_into(inp, out, M, N, K):
-    """"(M, N, K) -> (M, K, N) -> padded group scan -> transpose back."""
+    """ "(M, N, K) -> (M, K, N) -> padded group scan -> transpose back."""
     R = M * K
     n_groups = (N + _GROUP - 1) // _GROUP
     Np = n_groups * _GROUP

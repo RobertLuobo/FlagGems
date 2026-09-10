@@ -141,9 +141,7 @@ def _nonzero_static_fill_tail_kernel(
     # regardless of the actual count), so the destination is computed with
     # pure arithmetic instead of tl.where.
     keep = (rows >= valid_count).to(tl.int64)
-    destination = (
-        (size + (rows % BLOCK_SIZE)) * (1 - keep) + rows * keep
-    )
+    destination = (size + (rows % BLOCK_SIZE)) * (1 - keep) + rows * keep
     for column in tl.static_range(0, ndim):
         tl.store(workspace_ptr + destination * ndim + column, fill_value)
 
@@ -302,9 +300,7 @@ def _multiblock_nonzero_static(input, size, fill_value, out):
             BLOCK_SIZE=_MULTI_BLOCK_TILE_SIZE,
         )
         if size:
-            _nonzero_static_fill_tail_kernel[
-                (triton.cdiv(size, _FILL_BLOCK_SIZE),)
-            ](
+            _nonzero_static_fill_tail_kernel[(triton.cdiv(size, _FILL_BLOCK_SIZE),)](
                 workspace,
                 prefix[-1],
                 fill_value,
@@ -368,9 +364,9 @@ def _small_nonzero_static(input, size, fill_value, out):
             BLOCK_SIZE=block_size,
         )
         if size:
-            _nonzero_static_fill_tail_kernel[
-                (triton.cdiv(size, _FILL_BLOCK_SIZE),)
-            ](workspace, count, fill_value, size, ndim, BLOCK_SIZE=_FILL_BLOCK_SIZE)
+            _nonzero_static_fill_tail_kernel[(triton.cdiv(size, _FILL_BLOCK_SIZE),)](
+                workspace, count, fill_value, size, ndim, BLOCK_SIZE=_FILL_BLOCK_SIZE
+            )
 
     result = workspace[:size]
     if out is None:

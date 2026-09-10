@@ -295,9 +295,7 @@ def _pad_full(a, b, bias, M, K, N, mp, np_, kp, device, dtype):
     bp = torch.zeros((kp, np_), device=device, dtype=dtype)
     torch.ops.aten._copy_from(b, bp.narrow(0, 0, K).narrow(1, 0, N), False)
     bias_pad = torch.zeros((mp, np_), device=device, dtype=dtype)
-    torch.ops.aten._copy_from(
-        bias, bias_pad.narrow(0, 0, M).narrow(1, 0, N), False
-    )
+    torch.ops.aten._copy_from(bias, bias_pad.narrow(0, 0, M).narrow(1, 0, N), False)
     return ap, bp, bias_pad
 
 
@@ -383,8 +381,17 @@ def matmul_bias_activation(input, weight, bias):
                 mp = triton.cdiv(M, blk_m) * blk_m
                 np_ = triton.cdiv(N, blk_n) * blk_n
                 a_pad, w_pad, bias_pad = _pad_full(
-                    input, weight, bias, M, K, N, mp, np_, kp,
-                    input.device, input.dtype,
+                    input,
+                    weight,
+                    bias,
+                    M,
+                    K,
+                    N,
+                    mp,
+                    np_,
+                    kp,
+                    input.device,
+                    input.dtype,
                 )
                 c = torch.empty((mp, np_), device=input.device, dtype=input.dtype)
                 # Launched on the padded extents (M'=mp, N'=np_, K'=kp): the
@@ -416,9 +423,7 @@ def matmul_bias_activation(input, weight, bias):
                 # ``narrow`` instead of python ``[:M, :N]`` (dispatches
                 # slice.Tensor without ``step`` under use_gems()); the copy
                 # goes through the native ``_copy_from`` engine.
-                torch.ops.aten._copy_from(
-                    c.narrow(0, 0, M).narrow(1, 0, N), out, False
-                )
+                torch.ops.aten._copy_from(c.narrow(0, 0, M).narrow(1, 0, N), out, False)
     finally:
         _restore_matmul_fast_mode(saved)
     return out

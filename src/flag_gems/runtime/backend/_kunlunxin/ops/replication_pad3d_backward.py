@@ -6,7 +6,6 @@ import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
 
-
 # Kunlunxin (XPU) override of aten::replication_pad3d_backward.
 #
 # The generic implementation (src/flag_gems/ops/replication_pad3d_backward.py)
@@ -165,12 +164,7 @@ def _replication_pad3d_backward_dhfold_kernel(
         dd = tl.minimum(a, tl.maximum(cnt_d - 1, 0))
         for b in tl.static_range(MAXH):
             hh = tl.minimum(b, tl.maximum(cnt_h - 1, 0))
-            cf_off = (
-                cf_base
-                + (lo_d + dd) * (h_eff * W_in)
-                + (lo_h + hh) * W_in
-                + iw
-            )
+            cf_off = cf_base + (lo_d + dd) * (h_eff * W_in) + (lo_h + hh) * W_in + iw
             v = tl.load(cf_ptr + cf_off, mask=mask, other=0.0).to(tl.float32)
             acc += tl.where((a < cnt_d) & (b < cnt_h), v, 0.0)
 
