@@ -9,9 +9,7 @@ from . import accuracy_utils as utils
 # On platforms without native fp64 (e.g. kunlunxin/XPU, where a requested
 # float64 device tensor is silently created as float32), test fp32 only;
 # same convention as test_special_modified_bessel_k0 / test_polar.
-FLOAT_DTYPES = [torch.float32] + (
-    [torch.float64] if utils.fp64_is_supported else []
-)
+FLOAT_DTYPES = [torch.float32] + ([torch.float64] if utils.fp64_is_supported else [])
 
 # Pointwise shapes covering small, medium, and batched 2D tensors
 POINTWISE_SHAPES = [(128,), (512, 256), (2, 128, 128)]

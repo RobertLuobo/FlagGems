@@ -86,16 +86,13 @@ def _reference_grid_sample(
                 align_corners=align_corners,
             )
             return ref.to(input.dtype).to(input.device)
-        return (
-            torch.nn.functional.grid_sample(
-                input.cpu(),
-                grid.cpu(),
-                mode=mode,
-                padding_mode=padding_mode,
-                align_corners=align_corners,
-            )
-            .to(input.device)
-        )
+        return torch.nn.functional.grid_sample(
+            input.cpu(),
+            grid.cpu(),
+            mode=mode,
+            padding_mode=padding_mode,
+            align_corners=align_corners,
+        ).to(input.device)
     return torch.nn.functional.grid_sample(
         input, grid, mode=mode, padding_mode=padding_mode, align_corners=align_corners
     )

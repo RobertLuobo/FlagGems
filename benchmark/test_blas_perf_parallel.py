@@ -1484,6 +1484,8 @@ def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
         torch_op=torch_op,
         dtypes=FLOAT_DTYPES,
     )
+
+
 bench.run()
 
 

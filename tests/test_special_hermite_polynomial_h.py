@@ -23,9 +23,7 @@ from . import accuracy_utils as utils
 # When the device does not support float64 (e.g. kunlunxin: a float64
 # device tensor is silently created as float32), test fp32 only; see
 # test_special_bessel_y0.py for the same pattern.
-FLOAT_DTYPES = [torch.float32] + (
-    [torch.float64] if utils.fp64_is_supported else []
-)
+FLOAT_DTYPES = [torch.float32] + ([torch.float64] if utils.fp64_is_supported else [])
 
 
 @pytest.mark.special_hermite_polynomial_h

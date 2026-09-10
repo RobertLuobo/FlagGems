@@ -25,7 +25,9 @@ HOUSEHOLDER_BATCH_SHAPES = [
 # Kunlunxin (XPU) TorchAdapter cannot produce fp64 device tensors (a requested
 # fp64 tensor is silently mapped to fp32, so gems_assert_close's
 # res.dtype == fp64 assertion can never hold). Skip fp64 on such backends.
-HOUSEHOLDER_DTYPES = [torch.float32] + ([torch.float64] if utils.fp64_is_supported else [])
+HOUSEHOLDER_DTYPES = [torch.float32] + (
+    [torch.float64] if utils.fp64_is_supported else []
+)
 
 
 @pytest.mark.linalg_householder_product

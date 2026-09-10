@@ -5,9 +5,7 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
-FLOAT_DTYPES = [torch.float32] + (
-    [torch.float64] if utils.fp64_is_supported else []
-)
+FLOAT_DTYPES = [torch.float32] + ([torch.float64] if utils.fp64_is_supported else [])
 
 
 @pytest.mark.special_bessel_y1

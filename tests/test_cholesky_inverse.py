@@ -22,7 +22,9 @@ CHOLESKY_INVERSE_BATCH_SHAPES = [
 ]
 
 # cholesky_inverse only supports float32/float64
-CHOLESKY_INVERSE_DTYPES = [torch.float32] + ([torch.float64] if utils.fp64_is_supported else [])
+CHOLESKY_INVERSE_DTYPES = [torch.float32] + (
+    [torch.float64] if utils.fp64_is_supported else []
+)
 
 
 def _make_positive_definite(shape, dtype, device):
