@@ -49,15 +49,12 @@ _RAW_MAX_BLOCKS = 64
 if _TLE_OK:
 
     @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "bd_raw.xpu"))
-    def bd_raw(ptrs, out, n, br, bc, esz, total_rows, rows_start, rows_count):
-        ...
+    def bd_raw(ptrs, out, n, br, bc, esz, total_rows, rows_start, rows_count): ...
 
     @triton.jit(do_not_specialize=["n", "br", "bc", "esz", "per"])
     def block_diag_raw_kernel(Ptrs, Out, n, br, bc, esz, per):
         pid = tl.program_id(0)
-        tle.raw.call(
-            bd_raw, (Ptrs, Out, n, br, bc, esz, n * br, pid * per, per)
-        )
+        tle.raw.call(bd_raw, (Ptrs, Out, n, br, bc, esz, n * br, pid * per, per))
 
 
 @libentry()
@@ -265,9 +262,7 @@ def block_diag(*tensors):
         # from a device array (no staging pass) and needs a single kernel.
         if _TLE_OK and n <= _RAW_MAX_BLOCKS:
             ptrs = _get_ptrs_tensor(tensors, device)
-            out = torch.empty(
-                (total_rows, total_cols), dtype=dtype0, device=device
-            )
+            out = torch.empty((total_rows, total_cols), dtype=dtype0, device=device)
             per = (total_rows + _NCLUSTER - 1) // _NCLUSTER
             with torch_device_fn.device(device):
                 block_diag_raw_kernel[(_NCLUSTER,)](
@@ -325,9 +320,7 @@ def block_diag(*tensors):
             # under use_gems(), and per-row pointer loads inside the row
             # kernel serialize on XPU because of synchronous scalar loads.
             ptrs = _get_ptrs_tensor(tensors, device)
-            staging = torch.empty(
-                n * block_numel, dtype=dtype0, device=device
-            )
+            staging = torch.empty(n * block_numel, dtype=dtype0, device=device)
             stage_grid = (
                 n,
                 (block_numel + _STAGE_BLOCK - 1) // _STAGE_BLOCK,

@@ -59,7 +59,11 @@ _SILU_BW_MAX_BLOCK = 65536
 @libentry()
 @triton.jit(do_not_specialize=["n_elements"])
 def silu_backward_kernel_xpu(
-    x_ptr, dy_ptr, out_ptr, n_elements, BLOCK: tl.constexpr,
+    x_ptr,
+    dy_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     tid = pid * BLOCK + tl.arange(0, BLOCK)

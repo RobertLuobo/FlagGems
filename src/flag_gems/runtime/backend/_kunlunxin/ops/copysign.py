@@ -34,7 +34,13 @@ _INT_VIEW = {2: torch.int16, 4: torch.int32, 8: torch.int64}
 @libentry()
 @triton.jit(do_not_specialize=["num_tasks"])
 def _copysign_kernel(
-    A, B, OUT, num_tasks, TILE: tl.constexpr, TILES_PER_CTA: tl.constexpr, ONE_TILE: tl.constexpr
+    A,
+    B,
+    OUT,
+    num_tasks,
+    TILE: tl.constexpr,
+    TILES_PER_CTA: tl.constexpr,
+    ONE_TILE: tl.constexpr,
 ):
     # Operates on integer views of the operands (see wrapper): pure sign-bit
     # manipulation, out = (|a| bits) | (sign bit of b). A fixed small CTA count
@@ -73,7 +79,11 @@ def _copysign_run(input, other, out):
         return out
     ity = _INT_VIEW[input.element_size()]
     a = input.view(ity)
-    b = other.view(ity) if other.dtype == input.dtype else other.to(input.dtype).view(ity)
+    b = (
+        other.view(ity)
+        if other.dtype == input.dtype
+        else other.to(input.dtype).view(ity)
+    )
     o = out.view(ity)
     num_ctas = 12
     num_tiles = num_ctas
