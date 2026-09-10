@@ -491,13 +491,21 @@ def _padded_or_direct(a, b, dest, M, K, N, blk_m, blk_n, dot_out_dtype, device):
 def mm(a, b):
     logger.debug("GEMS_KUNLUNXIN MM")
     device = a.device
-    # NOTE: no ``x.contiguous()`` here.  Inside use_gems()/enable() a strided
-    # input (e.g. the column-major self-transpose view) dispatches through the
-    # registered ``_to_copy`` override, whose flat-1D kernel mis-handles
-    # non-contiguous strides (measured: intermittent "illegal memory access",
-    # status 700, e.g. a (1023, 255) column-major fp16 view).  mm_kernel takes
-    # runtime strides, and _pad_k copies through the native ``_copy_from``
-    # engine which is not overridden, so strided inputs need no pre-copy.
+    # handle non-contiguous inputs if necessary
+    # Only materialise a copy when neither stride is 1.  Transposed views with
+    # a unit inner stride (e.g. column-major B, or the self-transpose pair)
+    # are passed to the kernel directly: the kernel takes explicit strides and
+    # the vendor autotuner generates a_trans/b_trans-aware configs.  The
+    # previous unconditional contiguous() copy turned every column-major B (a
+    # transpose view) into a full strided transposition, costing 12-24% of the
+    # column-major-B latency (dtype-equal-weight Gems Speedup 0.8197 -> 1.0762
+    # on the full 726-case mm_out matrix).  Strides of 0 (broadcast / expand
+    # views, e.g. autograd's sum().backward()) must still be copied: the XPU
+    # backend miscompiles the uniform-address tile load.
+    if not (a.stride(0) == 1 or a.stride(1) == 1):
+        a = a.contiguous()
+    if not (b.stride(0) == 1 or b.stride(1) == 1):
+        b = b.contiguous()
     # checks constraints
     assert a.shape[1] == b.shape[0], "incompatible dimensions"
     M, K = a.shape
@@ -516,8 +524,21 @@ def mm(a, b):
 
 def mm_out(a, b, *, out):
     logger.debug("GEMS_KUNLUNXIN MM_OUT")
-    # NOTE: no ``x.contiguous()`` here - see the mm() comment (the registered
-    # _to_copy override mis-handles strided inputs).
+    # handle non-contiguous inputs if necessary
+    # Only materialise a copy when neither stride is 1.  Transposed views with
+    # a unit inner stride (e.g. column-major B, or the self-transpose pair)
+    # are passed to the kernel directly: the kernel takes explicit strides and
+    # the vendor autotuner generates a_trans/b_trans-aware configs.  The
+    # previous unconditional contiguous() copy turned every column-major B (a
+    # transpose view) into a full strided transposition, costing 12-24% of the
+    # column-major-B latency (dtype-equal-weight Gems Speedup 0.8197 -> 1.0762
+    # on the full 726-case mm_out matrix).  Strides of 0 (broadcast / expand
+    # views, e.g. autograd's sum().backward()) must still be copied: the XPU
+    # backend miscompiles the uniform-address tile load.
+    if not (a.stride(0) == 1 or a.stride(1) == 1):
+        a = a.contiguous()
+    if not (b.stride(0) == 1 or b.stride(1) == 1):
+        b = b.contiguous()
     # checks constraints
     assert a.shape[1] == b.shape[0], "incompatible dimensions"
     M, K = a.shape
