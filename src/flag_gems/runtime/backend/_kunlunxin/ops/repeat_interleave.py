@@ -215,8 +215,21 @@ def repeat_interleave_self_tensor(inp, repeats, dim=None, *, output_size=None):
         # torch.repeat_interleave's "repeats must have the same size" error.)
         return torch.empty(inp_shape, dtype=inp.dtype, device=inp.device)
 
-    indices = repeat_interleave_tensor(repeats)
-    res = torch.index_select(inp, dim, indices)
+    repeats = repeats.contiguous()
+    inp = inp.contiguous()
+    D = inp_shape[dim]
+    outer = 1
+    inner = 1
+    for s in inp_shape[:dim]:
+        outer *= s
+    for s in inp_shape[dim + 1 :]:
+        inner *= s
+
+    if inner == 1:
+        # Indexed dim is the innermost: genuine per-element gather. Fall back
+        # to the index-select path (materialized index + vendor index_select).
+        indices = repeat_interleave_tensor(repeats)
+        return torch.index_select(inp, dim, indices)
 
     cumsum = repeats.cumsum(axis=0)
     rsum = int(cumsum[-1].item())

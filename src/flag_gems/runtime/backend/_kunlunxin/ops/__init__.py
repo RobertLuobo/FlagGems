@@ -254,7 +254,6 @@ from .gt import gt, gt_scalar, gt_scalar_, gt_tensor_
 from .hadamard_transform import hadamard_transform
 from .hardsigmoid import hardsigmoid, hardsigmoid_out
 from .hardsigmoid_backward import hardsigmoid_backward  # noqa: F401
-from .hardsigmoid_backward import hardsigmoid_backward  # noqa: F401
 from .heaviside_ import heaviside_  # noqa: F401
 from .histc import histc
 from .hstack import hstack
@@ -524,7 +523,6 @@ from .special_digamma import special_digamma
 from .special_erfcx import special_erfcx
 from .special_erfinv import special_erfinv, special_erfinv_, special_erfinv_out
 from .special_exp2 import special_exp2
-from .special_expit import special_expit  # noqa: F401
 from .special_expit import special_expit  # noqa: F401
 from .special_gammainc import special_gammainc
 from .special_gammaincc import special_gammaincc
@@ -1234,7 +1232,6 @@ __all__ = [
     "special_erfinv_",
     "special_erfinv_out",
     "special_exp2",
-    "special_expit",
     "special_expit",
     "special_gammainc",
     "special_gammaincc",
