@@ -47,7 +47,7 @@ from .__irshift__ import __irshift__  # noqa: F401
 from .abs import abs, abs_
 from .absolute import absolute
 from .acos import acos
-from .adaptive_avg_pool2d_backward import _adaptive_avg_pool2d_backward
+from .acosh import acosh, acosh_
 from .add import add, add_
 from .add_relu import _add_relu, _add_relu_
 from .addbmm import addbmm, addbmm_  # noqa: F401
@@ -615,7 +615,8 @@ __all__ = [
     "abs_",
     "absolute",
     "acos",
-    "adaptive_max_pool2d_backward",
+    "acosh",
+    "acosh_",
     "add",
     "add_",
     "add_relu",
