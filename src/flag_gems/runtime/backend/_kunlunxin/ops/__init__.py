@@ -32,6 +32,9 @@ from ._functional_sym_constrain_range_for_size import (
 from ._fused_adam import _fused_adam, _fused_adam_
 from ._fused_rms_norm import _fused_rms_norm  # noqa: F401
 from ._is_all_true import _is_all_true
+from ._jagged_to_padded_dense_forward import (
+    _jagged_to_padded_dense_forward,
+)
 from ._native_batch_norm_legit_functional import _native_batch_norm_legit_functional
 from ._native_batch_norm_legit_no_training import _native_batch_norm_legit_no_training
 from ._nested_view_from_buffer_copy import _nested_view_from_buffer_copy
@@ -131,6 +134,7 @@ from .bitwise_xor import (
     xor_scalar_tensor,
 )
 from .bmm import bmm, bmm_out
+from .block_diag import block_diag
 from .broadcast_tensors import broadcast_tensors
 from .broadcast_to import broadcast_to
 from .bucketize import bucketize
@@ -158,6 +162,7 @@ from .conv1d import conv1d
 from .conv2d import conv2d
 from .conv3d import conv3d
 from .conv_depthwise2d import _conv_depthwise2d
+from .conv_transpose1d import conv_transpose1d
 from .conv_transpose2d import conv_transpose2d
 from .copy import copy, copy_
 from .copysign import copysign, copysign_, copysign_out
@@ -202,7 +207,9 @@ from .erfinv import erfinv
 from .erfinv_ import erfinv_  # noqa: F401
 from .exp import exp, exp_, exp_out
 from .exp2 import exp2, exp2_
+from .expand_copy import expand_copy
 from .expm1 import expm1, expm1_, expm1_out
+from .exponential import exponential  # noqa: F401
 from .exponential_ import exponential_
 from .eye import eye
 from .eye_m import eye_m
@@ -245,6 +252,7 @@ from .groupnorm import group_norm, group_norm_backward
 from .gt import gt, gt_scalar, gt_scalar_, gt_tensor_
 from .hadamard_transform import hadamard_transform
 from .hardsigmoid import hardsigmoid, hardsigmoid_out
+from .hardsigmoid_backward import hardsigmoid_backward  # noqa: F401
 from .heaviside_ import heaviside_  # noqa: F401
 from .histc import histc
 from .hstack import hstack
@@ -279,6 +287,7 @@ from .less_equal import less_equal, less_equal_scalar
 from .lgamma import lgamma, lgamma_
 from .lift_fresh import lift_fresh  # noqa: F401
 from .lift_fresh_copy import lift_fresh_copy
+from .lift_out import lift_out  # noqa: F401
 from .linalg_cholesky import linalg_cholesky
 from .linalg_cross import linalg_cross, linalg_cross_out
 from .linalg_det import linalg_det, linalg_det_out
@@ -294,7 +303,9 @@ from .linalg_solve_triangular import (
     linalg_solve_triangular,
     linalg_solve_triangular_out,
 )
+from .linear import linear
 from .linear_backward import linear_backward
+from .linalg_svdvals import linalg_svdvals
 from .linspace import linspace
 from .log import log
 from .log1p import log1p, log1p_
@@ -361,6 +372,7 @@ from .nanmedian import nanmedian, nanmedian_dim, nanmedian_dim_values, nanmedian
 from .nansum import nansum, nansum_out
 from .narrow_copy import narrow_copy
 from .native_batch_norm import native_batch_norm
+from .native_dropout_backward import native_dropout_backward
 from .native_group_norm import native_group_norm
 from .native_layer_norm import native_layer_norm
 from .ne import ne, ne_, ne_scalar, ne_scalar_
@@ -510,6 +522,7 @@ from .special_digamma import special_digamma
 from .special_erfcx import special_erfcx
 from .special_erfinv import special_erfinv, special_erfinv_, special_erfinv_out
 from .special_exp2 import special_exp2
+from .special_expit import special_expit  # noqa: F401
 from .special_gammainc import special_gammainc
 from .special_gammaincc import special_gammaincc
 from .special_gammaln import special_gammaln, special_gammaln_out
@@ -526,6 +539,7 @@ from .special_modified_bessel_k0 import (
 )
 from .special_multigammaln import special_multigammaln
 from .special_ndtri import special_ndtri
+from .special_round import special_round, special_round_out
 from .special_shifted_chebyshev_polynomial_t import (
     special_shifted_chebyshev_polynomial_t,
 )
@@ -565,6 +579,7 @@ from .uniform import uniform_
 from .unique import _unique2
 from .unique_consecutive import unique_consecutive
 from .unique_dim import unique_dim
+from .unsqueeze import unsqueeze_  # noqa: F401 (in-place dim insertion, XPU fast path)
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
 from .upsample_bicubic2d_aa_backward import _upsample_bicubic2d_aa_backward
 from .upsample_linear1d import upsample_linear1d
@@ -754,6 +769,7 @@ __all__ = [
     "conv1d",
     "conv2d",
     "conv3d",
+    "conv_transpose1d",
     "conv_transpose2d",
     "copy",
     "copy_",
@@ -807,6 +823,8 @@ __all__ = [
     "expm1",
     "expm1_",
     "expm1_out",
+    "expand_copy",
+    "exponential",
     "exponential_",
     "eye",
     "eye_m",
@@ -934,6 +952,8 @@ __all__ = [
     "linalg_slogdet",
     "linalg_solve_triangular",
     "linalg_solve_triangular_out",
+    "linalg_svdvals",
+    "linear",
     "linear_backward",
     "linspace",
     "log",
@@ -1024,6 +1044,7 @@ __all__ = [
     "nansum_out",
     "narrow_copy",
     "native_batch_norm",
+    "native_dropout_backward",
     "native_group_norm",
     "native_layer_norm",
     "ne",
@@ -1210,6 +1231,7 @@ __all__ = [
     "special_erfinv_",
     "special_erfinv_out",
     "special_exp2",
+    "special_expit",
     "special_gammainc",
     "special_gammaincc",
     "special_gammaln",
@@ -1226,6 +1248,8 @@ __all__ = [
     "special_modified_bessel_k0_out",
     "special_multigammaln",
     "special_ndtri",
+    "special_round",
+    "special_round_out",
     "special_shifted_chebyshev_polynomial_t",
     "special_shifted_chebyshev_polynomial_u",
     "special_shifted_chebyshev_polynomial_u_",

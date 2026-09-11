@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import sys
 from typing import Optional
 
 import torch
@@ -221,6 +222,81 @@ def moe_align_block_size_triton(
     moe_align_copy_prefix_i32[(ceil_div(numel_sorted, tile),)](
         scratch, sorted_token_ids, numel_sorted, TILE=tile
     )
+
+
+@triton.jit(do_not_specialize=["num_routes"])
+def moe_align_singleton_kernel(
+    topk_ids_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_pad_ptr,
+    num_routes,
+    BLOCK_SIZE_M: tl.constexpr,
+):
+    # XPU note: the generic ``_moe_align_block_size_singleton_kernel``
+    # materialises the per-lane value with ``tl.full`` + ``tl.where(lane == 0,
+    # route_idx, num_routes)`` and stores the whole tile in one go.  On this
+    # backend that store is unreliable: stress (20 in-process runs, 2 routes)
+    # dropped the lane-0 value in 9 runs, leaving sorted[route*block] at the
+    # sentinel (nondeterministic).  Use two verified stores instead: a
+    # constant full-block store (every lane writes the same value -> one
+    # contiguous block, no per-lane data-dependent value) plus one scalar
+    # store of the program id (the only store whose value depends on the
+    # program).
+    route_idx = tl.program_id(0)
+    offsets = route_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    tl.store(
+        sorted_token_ids_ptr + offsets,
+        tl.full((BLOCK_SIZE_M,), num_routes, dtype=tl.int32),
+    )
+    tl.store(sorted_token_ids_ptr + route_idx * BLOCK_SIZE_M, route_idx)
+    tl.store(expert_ids_ptr + route_idx, tl.load(topk_ids_ptr + route_idx))
+    if route_idx == 0:
+        tl.store(num_tokens_post_pad_ptr, num_routes * BLOCK_SIZE_M)
+
+
+def moe_align_block_size_singleton(
+    topk_ids: torch.Tensor,
+    block_size: int,
+) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor]":
+    num_routes = topk_ids.numel()
+    sorted_token_ids = torch.empty(
+        (num_routes * block_size,), dtype=torch.int32, device=topk_ids.device
+    )
+    expert_ids = torch.empty((num_routes,), dtype=torch.int32, device=topk_ids.device)
+    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
+    if num_routes > 0:
+        moe_align_singleton_kernel[(num_routes,)](
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            num_routes,
+            BLOCK_SIZE_M=block_size,
+        )
+    else:
+        moe_align_fill_i32[(1,)](num_tokens_post_pad, 0, 1, TILE=_MOE_TILE)
+    return sorted_token_ids, expert_ids, num_tokens_post_pad
+
+
+def _install():
+    """Replace ``flag_gems.fused.moe_align_block_size.moe_align_block_size_singleton``
+    with the XPU-safe implementation.
+
+    tests/test_moe_align_block_size.py imports the fast paths through the
+    direct module import (``from flag_gems.fused.moe_align_block_size import
+    moe_align_block_size_singleton``), which the ATen spec registry (reached
+    through ``_state.fused_module``) can not reach.  Patch the attribute on the
+    already-imported generic module, mirroring bf16_paged_mqa_logits.
+    """
+    mod = sys.modules.get("flag_gems.fused.moe_align_block_size")
+    if mod is not None:
+        cur = getattr(mod, "moe_align_block_size_singleton", None)
+        if cur is not moe_align_block_size_singleton:
+            mod.moe_align_block_size_singleton = moe_align_block_size_singleton
+
+
+_install()
 
 
 def moe_align_block_size(
