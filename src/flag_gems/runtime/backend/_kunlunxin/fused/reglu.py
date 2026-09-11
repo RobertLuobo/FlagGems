@@ -21,7 +21,7 @@ import triton.language as tl
 
 from flag_gems.utils import libentry
 
-from ..heuristics_config_utils import dreglu_dswiglu_config, reglu_swiglu_config
+from ..heuristics_config_utils import reglu_swiglu_config
 
 logger = logging.getLogger(__name__)
 
