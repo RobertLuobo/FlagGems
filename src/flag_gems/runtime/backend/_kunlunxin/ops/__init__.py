@@ -971,6 +971,8 @@ __all__ = [
     "linear_backward",
     "linspace",
     "log",
+    "log10_",
+    "log10_out",
     "log1p",
     "log1p_",
     "log2",
