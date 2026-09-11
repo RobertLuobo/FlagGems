@@ -1023,7 +1023,7 @@ __all__ = [
     "min",
     "min_dim",
     "minimum",
-"miopen_batch_norm_backward",
+    "miopen_batch_norm_backward",
     "mish_backward",
     "mkldnn_rnn_layer",
     "mm",
