@@ -45,14 +45,9 @@ from ._upsample_nearest_exact2d_backward import _upsample_nearest_exact2d_backwa
 from ._upsample_nearest_exact3d import _upsample_nearest_exact3d
 from .__irshift__ import __irshift__  # noqa: F401
 from .abs import abs, abs_
-from .absolute import absolute, absolute_
-from .acos import acos, acos_
-from .acosh import acosh, acosh_  # noqa: F401
-from .adaptive_avg_pool2d import adaptive_avg_pool2d
-from .adaptive_max_pool2d import adaptive_max_pool2d
+from .absolute import absolute
+from .acos import acos
 from .adaptive_max_pool2d_backward import adaptive_max_pool2d_backward
-from .adaptive_max_pool3d import adaptive_max_pool3d
-from .adaptive_max_pool3d_backward import adaptive_max_pool3d_backward
 from .add import add, add_
 from .add_relu import _add_relu, _add_relu_
 from .addbmm import addbmm, addbmm_  # noqa: F401
@@ -146,11 +141,6 @@ from .cdist_backward import _cdist_backward
 from .ceil import ceil, ceil_, ceil_out
 from .celu import celu, celu_
 from .cholesky_inverse import cholesky_inverse
-from .cholesky_solve import cholesky_solve, cholesky_solve_out
-from .chunk import chunk
-from .chunk_cat import chunk_cat  # noqa: F401
-from .chunk_cat import chunk_cat as _chunk_cat
-from .conj_physical_ import conj_physical_  # noqa: F401
 from .clamp import (
     clamp,
     clamp_,
@@ -630,6 +620,7 @@ __all__ = [
     "abs_",
     "absolute",
     "acos",
+    "adaptive_max_pool2d_backward",
     "add",
     "add_",
     "add_relu",
@@ -708,9 +699,7 @@ __all__ = [
     "ceil_out",
     "celu",
     "celu_",
-    "chunk",
-    "_chunk_cat",
-    "chunk_cat",
+    "cholesky_inverse",
     "clamp",
     "clamp_",
     "clamp_max",
