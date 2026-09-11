@@ -313,6 +313,7 @@ from .lift_fresh_copy import lift_fresh_copy
 from .linalg_householder_product import linalg_householder_product
 from .linspace import linspace
 from .log import log
+from .log10 import log10_, log10_out
 from .log1p import log1p, log1p_
 from .log2 import log2, log2_
 from .log10 import log10, log10_, log10_out  # noqa: F401
@@ -868,6 +869,8 @@ __all__ = [
     "linalg_householder_product",
     "linspace",
     "log",
+    "log10_",
+    "log10_out",
     "log1p",
     "log1p_",
     "log_sigmoid",
