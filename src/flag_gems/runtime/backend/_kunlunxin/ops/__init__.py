@@ -411,6 +411,7 @@ from .pairwise_distance import pairwise_distance
 from .per_token_group_quant_fp8 import SUPPORTED_FP8_DTYPE, per_token_group_quant_fp8
 from .permute_copy import permute_copy
 from .pixel_unshuffle import pixel_unshuffle, pixel_unshuffle_out
+from .pairwise_distance import pairwise_distance
 from .polar import polar
 from .polygamma import polygamma, polygamma_, polygamma_out
 from .pow import (
@@ -490,6 +491,12 @@ from .segment_reduce import (
 )
 from .select_backward import select_backward
 from .select_scatter import select_scatter
+from .segment_reduce import (
+    _segment_reduce_backward,
+    _segment_reduce_backward_out,
+    segment_reduce,
+    segment_reduce_out,
+)
 from .selu import selu, selu_
 from .sgn import sgn, sgn_out
 from .sgn_ import sgn_
@@ -604,6 +611,8 @@ __all__ = [
     "_thnn_fused_lstm_cell_backward_impl",
     "_conv_depthwise2d",
     "_safe_softmax",
+    "_segment_reduce_backward",
+    "_segment_reduce_backward_out",
     "digamma_",
     "soft_margin_loss",
     "soft_margin_loss_out",
@@ -937,6 +946,7 @@ __all__ = [
     "pixel_unshuffle",
     "pixel_unshuffle_out",
     "permute_copy",
+    "pairwise_distance",
     "polar",
     "pow_scalar",
     "pow_tensor_scalar",
@@ -998,6 +1008,8 @@ __all__ = [
     "scatter_add",
     "scatter_add_",
     "select_scatter",
+    "segment_reduce",
+    "segment_reduce_out",
     "selu",
     "selu_",
     "sigmoid",
