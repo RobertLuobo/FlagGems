@@ -216,10 +216,14 @@ def _bst_select(x, starts, ends, n, k_eff, K, out, gmap=None):
     one = torch.tensor(1, dtype=torch.int32, device=x.device)
     for bit in range(31, -1, -1):
         cands = thrs | (one << bit)
-        _bst_count_kernel[(Bb,)](x, starts, ends, cands, cnts, x.shape[1], BS, num_warps=4, num_stages=1)
+        _bst_count_kernel[(Bb,)](
+            x, starts, ends, cands, cnts, x.shape[1], BS, num_warps=4, num_stages=1
+        )
         thrs = torch.where(cnts >= k_eff, cands, thrs)
     ranks = torch.zeros(Bb, BS, dtype=torch.int32, device=x.device)
-    _bst_rank_kernel[(Bb,)](x, ranks, starts, ends, thrs, x.shape[1], BS, RANK_SUB, RANK_NSUB, num_warps=4, num_stages=1)
+    _bst_rank_kernel[(Bb,)](
+        x, ranks, starts, ends, thrs, x.shape[1], BS, RANK_SUB, RANK_NSUB, num_warps=4, num_stages=1
+    )
     scratch = torch.zeros(Bb, 2 * K + 8, dtype=torch.int32, device=x.device)
     if gmap is None:
         gm = torch.zeros(1, dtype=torch.int32, device=x.device)
@@ -237,7 +241,6 @@ def _bst_rows(xv, st_val, en_val, n_val, K, out, gmap=None):
     nn = int(n_val[0].item())
     if nn <= 0:
         return
-    S = xv.shape[1]
     st0 = int(st_val[0].item())
     starts = torch.tensor([st0], dtype=torch.int32, device=xv.device)
     if nn <= BS:
