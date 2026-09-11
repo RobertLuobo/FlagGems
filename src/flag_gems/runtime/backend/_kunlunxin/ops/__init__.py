@@ -788,6 +788,7 @@ __all__ = [
     "copysign_out",
     "cos",
     "cos_",
+    "cosh_out",
     "count_nonzero",
     "cummax",
     "cummin",
