@@ -1495,20 +1495,6 @@ def test_blas_benchmark(op_name, torch_op, input_fn, bench_cls):
     bench.run()
 
 
-@pytest.mark.mm_w8a8_fp8
-def test_mm_w8a8_fp8():
-    if not hasattr(flag_gems, "mm_w8a8_fp8_out"):
-        pytest.skip("mm_w8a8_fp8 benchmark requires the Hopper W8A8 backend")
-    bench = ParallelMmW8A8Fp8Benchmark(
-        input_fn=mm_input_fn,
-        op_name="mm_w8a8_fp8",
-        torch_op=torch.Tensor.mm,
-        dtypes=FLOAT_DTYPES,
-    )
-    bench.set_gems(_mm_w8a8_fp8_out_cached)
-    bench.run()
-
-
 @pytest.mark.w8a8_block_fp8_matmul
 def test_perf_w8a8_block_fp8_matmul():
     if not VLLM_W8A8_BLOCK_FP8_AVAILABLE:
