@@ -116,22 +116,22 @@ def _use_flat(A):
     return A.is_contiguous()
 
 
-def _launch_flat(A, O):
+def _launch_flat(A, out):
     n_elements = A.numel()
     if n_elements == 0:
-        return O
+        return out
     block, warps = _pick_tier(n_elements)
     need_mask = (n_elements % block) != 0
     grid = (triton.cdiv(n_elements, block),)
     selu_flat_kernel[grid](
         A.reshape(-1),
-        O,
+        out,
         n_elements,
         BLOCK_SIZE=block,
         NEED_MASK=need_mask,
         num_warps=warps,
     )
-    return O
+    return out
 
 
 def selu(A):
