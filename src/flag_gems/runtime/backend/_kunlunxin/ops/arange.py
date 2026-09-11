@@ -14,6 +14,7 @@
 
 import logging
 import math
+import operator
 
 import torch
 import triton
@@ -24,6 +25,17 @@ from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
+
+
+def _is_integral_scalar(x):
+    """True for scalars that behave as integers (int/bool/numpy ints)."""
+    if isinstance(x, (int, bool)):
+        return True
+    try:
+        operator.index(x)
+        return True
+    except TypeError:
+        return False
 
 
 @libentry()
@@ -74,6 +86,16 @@ def arange_start(
     start, end, step=1, *, dtype=None, layout=None, device=None, pin_memory=None
 ):
     logger.debug("GEMS_KUNLUNXIN ARANGE")
+    if dtype is None:
+        # Match ATen default dtype inference (range factory): all-integral
+        # scalars -> int64, any floating-point scalar -> float32. Previously
+        # dtype was unconditionally forced to int64, which truncated float
+        # outputs (e.g. torch.arange(1.5, 5.5, 1.0) -> [1,2,3,4] instead of
+        # [1.5,2.5,3.5,4.5]).
+        if all(_is_integral_scalar(x) for x in (start, end, step)):
+            dtype = torch.int64
+        else:
+            dtype = torch.float32
     if dtype is torch.int64:
         start = int(start)
         end = int(end)
@@ -83,19 +105,8 @@ def arange_start(
         sgn = (step > 0) - (step < 0)
         size = (end - start + step - sgn) // step
     else:
-        if dtype is torch.int64 and (
-            isinstance(step, float)
-            or isinstance(start, float)
-            or isinstance(end, float)
-        ):
-            int_step = int(step)
-            if int_step == 0:
-                raise RuntimeError("step must be nonzero")
         size = math.ceil((end - start) / step)
     size = int(size)
-
-    if dtype is None:
-        dtype = torch.int64
 
     if pin_memory is None:
         pin_memory = False
