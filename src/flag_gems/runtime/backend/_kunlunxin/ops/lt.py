@@ -129,6 +129,7 @@ def _raw_lt_scalar(A, B):
             _view_u8(A), _view_u8(out), M, esz, type_code, s_bits, per)
     return out
 
+
 logger = logging.getLogger(__name__)
 
 config_ = CodeGenConfig(
