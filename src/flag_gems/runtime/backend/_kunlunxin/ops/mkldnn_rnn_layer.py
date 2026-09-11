@@ -1,4 +1,4 @@
-# Copyright 2026, The FlagOS Contributors.
+# Copyright 2026 FlagOS Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,46 +12,215 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""kunlunxin (XPU) backend implementation of ``mkldnn_rnn_layer``.
-
-The GENERIC ``flag_gems/ops/mkldnn_rnn_layer.py`` is a KernelGen Triton kernel
-that cannot compile on the XPU triton fork:
-
-    OutOfResources out of resource: uni_sram
-    TritonXPUCoreTiling: 'arith.addi' op requires the same encoding for all
-    operands and results
-
-(``mkldnn_rnn_layer.py:101``, the gate-offset computation). The kernel keeps
-eight masked ``(BLOCK_H, BLOCK_IN/BLOCK_H)`` weight tiles live across the whole
-time loop; the XPU core-tiling pass runs out of uni_sram and emits the
-encoding error (probe matrix on card 7, 2026-09-05: the identical pattern
-fails at 8x8 / 16x16 shapes, and removing the masks moves the failure to the
-``cstate`` mul, i.e. it is the multi-tile liveness, not the mask).
-
-Per the backend convention for recurrent kernels (see ``rnn_relu``), the
-recurrence is instead evaluated with a minimal chain of native primitives on
-the device (fp32 accumulation, matching the oneDNN reference semantics):
-
-    pre    = x @ W_ih^T + b_ih + b_hh                 # batched over all steps
-    gates  = pre[t] + h @ W_hh^T
-    i,f,o  = sigmoid(gates_i/f/o);  g = tanh(gates_g)
-    c'     = f*c + i*g ;  h' = o*tanh(c')
-
-The chain is fully autograd-tracked (no custom backward needed) and matches
-the analytical reference that the tests use. ``@`` uses plain ``torch.mm``
-(never ``torch.addmm``: the kunlunxin ``addmm`` override raises under
-``use_gems``); under ``use_gems`` the mm/sigmoid/tanh/mul/add/stack calls
-dispatch to the (validated) kunlunxin vendor implementations.
-"""
-
 import logging
 
 import torch
 
+from flag_gems.ops.linear import linear as _linear
+
 logger = logging.getLogger(__name__)
 
-# Gate order of the packed (4H, *) oneDNN weights: i, f, g, o.
-_G_OFFSETS = (0, 1, 2, 3)
+
+def _lstm_gates(gates, hidden_size):
+    """Split the packed (batch, 4H) pre-activations into i/f/g/o gates."""
+    H = hidden_size
+    i_g = gates[:, 0:H]
+    f_g = gates[:, H : 2 * H]
+    g_g = gates[:, 2 * H : 3 * H]
+    o_g = gates[:, 3 * H : 4 * H]
+    return torch.sigmoid(i_g), torch.sigmoid(f_g), torch.tanh(g_g), torch.sigmoid(o_g)
+
+
+def _lstm_forward_folded(input, w_ih, w_hh, b_ih, b_hh, hx, cx, reverse):
+    """Folded single-layer unidirectional LSTM forward (mode=2).
+
+    XPU cannot compile the generic fused Triton kernel (a 2D weight tile + 2D
+    reduction inside the sequential time loop overflows ``uni_sram`` at
+    ``TritonXPUCoreTiling``), so the recurrence is folded into a minimal
+    sequence of primitive ops, mirroring the ``rnn_relu`` kunlunxin override:
+
+    * the input projection ``W_ih @ x + b_ih`` is pre-computed once as a single
+      batched ``linear`` (M = seq*batch);
+    * each step fuses the hidden recurrence with ``addmm`` (``pre[t] + h @ W_hh^T``);
+    * element-wise gates are ``sigmoid``/``tanh``/``mul``.
+
+    All accumulation is done in fp32 to match the oneDNN reference (which
+    computes in fp32 and casts back at the end) for fp16/bf16 inputs.
+    """
+    seq_len, batch_size, input_size = input.shape
+    hidden_size = w_hh.shape[1]  # w_hh is packed (4H, H)
+    H = hidden_size
+
+    x = input.float().contiguous()
+    w_ih_f = w_ih.float().contiguous()
+    w_hh_f = w_hh.float().contiguous()
+    h = hx.float().contiguous()  # (batch, H)
+    c = cx.float().contiguous()  # (batch, H)
+
+    if b_ih is not None:
+        b_ih_f = b_ih.float().contiguous()
+    else:
+        b_ih_f = torch.zeros(4 * H, dtype=torch.float32, device=input.device)
+    if b_hh is not None:
+        b_hh_f = b_hh.float().contiguous()
+    else:
+        b_hh_f = torch.zeros(4 * H, dtype=torch.float32, device=input.device)
+
+    steps = range(seq_len - 1, -1, -1) if reverse else range(seq_len)
+
+    try:
+        # ---- fast path: batched input projection + fused addmm recurrence ----
+        x2d = x.reshape(seq_len * batch_size, input_size)
+        pre = _linear(x2d, w_ih_f, b_ih_f).reshape(seq_len, batch_size, 4 * H)
+        w_hh_t = w_hh_f.t().contiguous()  # (H, 4H)
+        outputs = [None] * seq_len
+        for t in steps:
+            gates = pre[t] + torch.addmm(b_hh_f, h, w_hh_t)
+            i_g, f_g, g_g, o_g = _lstm_gates(gates, H)
+            c = f_g * c + i_g * g_g
+            h = o_g * torch.tanh(c)
+            outputs[t] = h
+    except ZeroDivisionError:
+        # ---- safe path: per-step small linear (M=batch), crash-free ----
+        # On very small shapes the libtuner do_bench estimate for the big-M
+        # linear rounds to 0 and raises ZeroDivisionError while cold-tuning.
+        # Per-step linear matmuls (M = batch) never hit that edge.
+        outputs = [None] * seq_len
+        for t in steps:
+            ih_t = _linear(x[t], w_ih_f, b_ih_f)  # (batch, 4H)
+            hh_t = _linear(h, w_hh_f, b_hh_f)  # (batch, 4H)
+            gates = ih_t + hh_t
+            i_g, f_g, g_g, o_g = _lstm_gates(gates, H)
+            c = f_g * c + i_g * g_g
+            h = o_g * torch.tanh(c)
+            outputs[t] = h
+
+    output = torch.stack(outputs, dim=0)  # (seq_len, batch, H)
+    return output.to(input.dtype), h.to(input.dtype), c.to(input.dtype)
+
+
+class MkldnnRnnLayerFunction(torch.autograd.Function):
+    """Autograd for a single-layer unidirectional LSTM (oneDNN mkldnn_rnn_layer).
+
+    Forward  → folded primitive ops (fast).
+    Backward → recompute the forward in native PyTorch, then let autograd
+               differentiate it. The folded forward is opaque to autograd, so
+               the graph is reconstructed from native ops for the backward.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        input,
+        w_ih,
+        w_hh,
+        b_ih,
+        b_hh,
+        hx,
+        cx,
+        reverse,
+        hidden_size,
+        has_biases,
+    ):
+        logger.debug("GEMS_KUNLUNXIN MKLDNN_RNN_LAYER FORWARD")
+
+        output, hy, cy = _lstm_forward_folded(
+            input, w_ih, w_hh, b_ih, b_hh, hx, cx, reverse
+        )
+
+        ctx.save_for_backward(input, w_ih, w_hh, b_ih, b_hh, hx, cx)
+        ctx.reverse = reverse
+        ctx.hidden_size = hidden_size
+        ctx.has_biases = has_biases
+
+        # workspace is an opaque oneDNN buffer only consumed by the (unsupported)
+        # mkldnn_rnn_layer_backward; expose an empty placeholder to satisfy the
+        # 4-tensor schema.
+        workspace = torch.empty(0, dtype=input.dtype, device=input.device)
+        return output, hy, cy, workspace
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_hy, grad_cy, grad_workspace):
+        logger.debug("GEMS_KUNLUNXIN MKLDNN_RNN_LAYER BACKWARD")
+
+        input, w_ih, w_hh, b_ih, b_hh, hx, cx = ctx.saved_tensors
+        reverse = ctx.reverse
+        has_biases = ctx.has_biases
+
+        seq_len = input.shape[0]
+
+        with torch.enable_grad():
+            h = hx.clone()
+            c = cx.clone()
+            outputs = []
+            steps = range(seq_len - 1, -1, -1) if reverse else range(seq_len)
+            for t_idx in steps:
+                xt = input[t_idx]
+                gates = (
+                    torch.addmm(b_ih, xt, w_ih.t())
+                    if has_biases
+                    else torch.mm(xt, w_ih.t())
+                )
+                gates = gates + (
+                    torch.addmm(b_hh, h, w_hh.t())
+                    if has_biases
+                    else torch.mm(h, w_hh.t())
+                )
+                i_g, f_g, g_g, o_g = gates.chunk(4, dim=1)
+                i_g = torch.sigmoid(i_g)
+                f_g = torch.sigmoid(f_g)
+                g_g = torch.tanh(g_g)
+                o_g = torch.sigmoid(o_g)
+                c = f_g * c + i_g * g_g
+                h = o_g * torch.tanh(c)
+                outputs.append(h)
+
+            if reverse:
+                outputs = outputs[::-1]
+            output_native = torch.stack(outputs, dim=0)
+            hy_native = h
+            cy_native = c
+
+            inputs = [input, w_ih, w_hh, hx, cx]
+            if has_biases:
+                inputs += [b_ih, b_hh]
+
+            grads = torch.autograd.grad(
+                outputs=[output_native, hy_native, cy_native],
+                inputs=inputs,
+                grad_outputs=[
+                    grad_output.reshape(output_native.shape),
+                    grad_hy.reshape(hy_native.shape),
+                    grad_cy.reshape(cy_native.shape),
+                ],
+                retain_graph=False,
+                allow_unused=True,
+            )
+
+        grad_input = grads[0]
+        grad_w_ih = grads[1]
+        grad_w_hh = grads[2]
+        grad_hx = grads[3]
+        grad_cx = grads[4]
+        if has_biases:
+            grad_b_ih = grads[5]
+            grad_b_hh = grads[6]
+        else:
+            grad_b_ih = None
+            grad_b_hh = None
+
+        return (
+            grad_input,
+            grad_w_ih,
+            grad_w_hh,
+            grad_b_ih,
+            grad_b_hh,
+            grad_hx,
+            grad_cx,
+            None,  # reverse
+            None,  # hidden_size
+            None,  # has_biases
+        )
 
 
 def mkldnn_rnn_layer(
@@ -74,12 +243,13 @@ def mkldnn_rnn_layer(
 ):
     """Single-layer unidirectional LSTM layer (oneDNN mkldnn_rnn_layer, mode=2).
 
-    Same contract as the generic ``flag_gems.ops.mkldnn_rnn_layer``:
-    ``weight0/weight1`` are the input- and hidden-to-hidden weights
-    ``(4H, input)`` / ``(4H, H)`` and ``weight2/weight3`` the corresponding
-    biases ``(4H,)``. Returns ``(output, hy, cy, workspace)`` with an empty
-    workspace placeholder. Multi-layer, bidirectional, packed (``batch_sizes``),
-    ``batch_first`` and non-LSTM ``mode`` raise ``NotImplementedError``.
+    Mirrors ``torch.mkldnn_rnn_layer``: ``weight0/weight1`` are the input- and
+    hidden-to-hidden weights ``(4H, input)`` / ``(4H, H)`` and ``weight2/weight3``
+    the corresponding biases ``(4H,)``. Returns ``(output, hy, cy, workspace)``;
+    the oneDNN ``workspace`` is opaque and only consumed by the backward pass, so
+    an empty placeholder is returned. Multi-layer, bidirectional, packed
+    (``batch_sizes``), ``batch_first`` and non-LSTM ``mode`` all raise
+    ``NotImplementedError``.
     """
     logger.debug("GEMS_KUNLUNXIN MKLDNN_RNN_LAYER")
 
@@ -99,92 +269,49 @@ def mkldnn_rnn_layer(
         )
 
     # ``train`` is part of the 16-arg aten schema but does not change the result
-    # for a single-layer LSTM (no dropout); the autograd graph is live either way.
+    # here: a single-layer LSTM has no dropout, so the forward output is
+    # train-independent, and backward is supplied by MkldnnRnnLayerFunction
+    # rather than a oneDNN train-mode reserve/workspace.
     del train
 
-    w_ih, w_hh, b_ih, b_hh = weight0, weight1, weight2, weight3
-    seq_len, batch_size, _ = input.shape
-
-    if not has_biases:
-        # oneDNN always applies both bias vectors; emulate no-bias by zeros.
-        b_ih = torch.zeros(4 * hidden_size, dtype=input.dtype, device=input.device)
-        b_hh = torch.zeros(4 * hidden_size, dtype=input.dtype, device=input.device)
-
-    # All accumulation in fp32 to match the oneDNN/analytical reference
-    # regardless of the input dtype (the tests cast to float as well).
-    x2d = input.reshape(seq_len * batch_size, -1).to(torch.float32)
-    w_ih_f = w_ih.to(torch.float32)
-    w_hh_f = w_hh.to(torch.float32)
-    b_ih_f = b_ih.to(torch.float32)
-    b_hh_f = b_hh.to(torch.float32)
-
-    # Input-to-hidden gates for all time steps in one batched matmul:
-    # (T*B, I) @ (I, 4H) + (b_ih + b_hh)  ->  (T*B, 4H)
-    pre = x2d @ w_ih_f.t()
-    pre = (pre + b_ih_f) + b_hh_f
-    pre = pre.reshape(seq_len, batch_size, 4 * hidden_size)
-
-    h = hx_.to(torch.float32)
-    c = cx_.to(torch.float32)
-    w_hh_t = w_hh_f.t().contiguous()
-
-    outputs = [None] * seq_len
-    steps = range(seq_len - 1, -1, -1) if reverse else range(seq_len)
-    for t in steps:
-        gates = pre[t] + h @ w_hh_t  # (B, 4H), fp32
-        i_g, f_g, g_g, o_g = gates.chunk(4, dim=1)
-        i_g = torch.sigmoid(i_g)
-        f_g = torch.sigmoid(f_g)
-        g_g = torch.tanh(g_g)
-        o_g = torch.sigmoid(o_g)
-        c = f_g * c + i_g * g_g
-        h = o_g * torch.tanh(c)
-        outputs[t] = h
-
-    output = torch.stack(outputs, dim=0).to(input.dtype)
-    hy = h.to(input.dtype)
-    cy = c.to(input.dtype)
-
-    # workspace is an opaque oneDNN buffer only consumed by the (unsupported)
-    # mkldnn_rnn_layer_backward; expose an empty placeholder to satisfy the
-    # 4-tensor schema.
-    workspace = torch.empty(0, dtype=input.dtype, device=input.device)
-
-    return output, hy, cy, workspace
+    return MkldnnRnnLayerFunction.apply(
+        input,
+        weight0,
+        weight1,
+        weight2,
+        weight3,
+        hx_,
+        cx_,
+        reverse,
+        hidden_size,
+        has_biases,
+    )
 
 
-__all__ = ["mkldnn_rnn_layer"]
+def _redirect_generic_entry_points():
+    """Redirect the generic ``flag_gems.ops.mkldnn_rnn_layer`` entry points here.
 
-
-def _patch_generic_wrapper():
-    """Route direct calls to the generic wrapper (flag_gems.ops.mkldnn_rnn_layer
-    module) to this backend override.
-
-    The direct-wrapper tests and ``flag_gems.ops`` benchmarks import the op
-    through ``flag_gems.ops.mkldnn_rnn_layer`` (bypassing the top-level
-    ``flag_gems`` registry that SpecOpRegistrar patches), so the generic
-    KernelGen Triton kernel would still be hit on XPU (it cannot compile
-    there: uni_sram / TritonXPUCoreTiling failures). Patching the module
-    attribute at import time keeps the change backend-local: the generic
-    module source is untouched and other vendor backends are unaffected
-    (this module is only imported for the kunlunxin backend).
+    ``SpecOpRegistrar`` only replaces the top-level ``flag_gems.mkldnn_rnn_layer``
+    (the ``torch.mkldnn_rnn_layer`` dispatch target under ``use_gems()``).  The
+    generic ``flag_gems.ops.mkldnn_rnn_layer`` is a fused Triton LSTM whose 2D
+    weight tile + reduction inside the sequential time loop cannot compile on XPU
+    (``TritonXPUCoreTiling`` / ``uni_sram`` overflow), so the direct-wrapper and
+    direct-backward tests (``from flag_gems.ops.mkldnn_rnn_layer import
+    mkldnn_rnn_layer``) and the benchmark (``gems_op=flag_gems.ops.mkldnn_rnn_layer``)
+    would still hit the broken kernel.  Patch both entry points to this folded
+    override so they exercise the XPU implementation.
     """
-    try:
-        import sys
+    import sys
 
-        _generic_module = sys.modules.get("flag_gems.ops.mkldnn_rnn_layer")
-        if _generic_module is not None and hasattr(_generic_module, "mkldnn_rnn_layer"):
-            _generic_module.mkldnn_rnn_layer = mkldnn_rnn_layer
-        # ``from .mkldnn_rnn_layer import mkldnn_rnn_layer`` in the ops package
-        # __init__ binds the *generic* function as the package attribute, so
-        # ``flag_gems.ops.mkldnn_rnn_layer`` (the benchmark entry point) must be
-        # re-bound to this backend implementation as well.
-        import flag_gems.ops as _ops
+    import flag_gems.ops as _flag_gems_ops
 
-        if hasattr(_ops, "mkldnn_rnn_layer"):
-            _ops.mkldnn_rnn_layer = mkldnn_rnn_layer
-    except ImportError:
-        pass
+    # (1) package attribute reached via `flag_gems.ops.mkldnn_rnn_layer`.
+    setattr(_flag_gems_ops, "mkldnn_rnn_layer", mkldnn_rnn_layer)
+    # (2) submodule function reached via `from flag_gems.ops.mkldnn_rnn_layer
+    #     import mkldnn_rnn_layer`.
+    _generic_submodule = sys.modules.get("flag_gems.ops.mkldnn_rnn_layer")
+    if _generic_submodule is not None:
+        setattr(_generic_submodule, "mkldnn_rnn_layer", mkldnn_rnn_layer)
 
 
-_patch_generic_wrapper()
+_redirect_generic_entry_points()

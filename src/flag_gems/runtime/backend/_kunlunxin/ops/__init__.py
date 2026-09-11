@@ -357,6 +357,7 @@ from .min import min, min_dim
 from .minimum import minimum
 from .miopen_batch_norm_backward import miopen_batch_norm_backward
 from .mish_backward import mish_backward
+from .mkldnn_rnn_layer import mkldnn_rnn_layer
 from .mm import mm, mm_out
 from .mode import mode
 from .moe_sum import moe_sum
@@ -1022,8 +1023,9 @@ __all__ = [
     "min",
     "min_dim",
     "minimum",
-    "miopen_batch_norm_backward",
+"miopen_batch_norm_backward",
     "mish_backward",
+    "mkldnn_rnn_layer",
     "mm",
     "mm_out",
     "mode",
