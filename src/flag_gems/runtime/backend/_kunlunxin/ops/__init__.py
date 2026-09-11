@@ -653,7 +653,7 @@ __all__ = [
     "absolute",
     "absolute_",
     "acos",
-"acos_",
+    "acos_",
     "acosh",
     "acosh_",
     "adaptive_avg_pool2d",
