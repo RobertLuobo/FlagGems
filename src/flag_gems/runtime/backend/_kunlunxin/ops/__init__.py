@@ -324,9 +324,9 @@ from .linalg_solve_triangular import (
 from .linear_backward import linear_backward
 from .linspace import linspace
 from .log import log
+from .log10 import log10, log10_, log10_out  # noqa: F401
 from .log1p import log1p, log1p_
 from .log2 import log2, log2_
-from .log10 import log10, log10_, log10_out  # noqa: F401
 from .log_ import log_  # noqa: F401
 from .log_sigmoid import log_sigmoid
 from .log_sigmoid_backward import log_sigmoid_backward, log_sigmoid_backward_out
@@ -1001,6 +1001,8 @@ __all__ = [
     "linear_backward",
     "linspace",
     "log",
+    "log10_",
+    "log10_out",
     "log1p",
     "log1p_",
     "log2",
