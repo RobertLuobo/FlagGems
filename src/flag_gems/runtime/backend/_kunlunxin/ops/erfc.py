@@ -33,13 +33,14 @@
 # NaN/Inf semantics: comparisons are false for NaN so the polynomial
 # propagates NaN; +/-Inf saturate to 0.0 / 2.0 exactly like torch.
 
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 import logging
 
 import torch
 import triton
 import triton.language as tl
 
-from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils import triton_lang_extension as ext, tl_extra_shim
 
 logger = logging.getLogger(__name__)
 

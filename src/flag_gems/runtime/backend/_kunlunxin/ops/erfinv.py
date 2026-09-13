@@ -33,6 +33,7 @@ Fixes, all branch-free:
     (already a single FMA chain) and only drop the selects.
 """
 
+from flag_gems.utils import tl_extra_shim, pointwise_dynamic
 import torch
 import triton
 import triton.language as tl

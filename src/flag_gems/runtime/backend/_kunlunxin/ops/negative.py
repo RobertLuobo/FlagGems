@@ -11,6 +11,8 @@
 #
 # Fix: reuse the exact tuned neg recipe by delegating to it. Zero algorithm
 # change (both are -x), zero correctness risk.
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+from flag_gems.utils import pointwise_dynamic
 import logging
 
 from .neg import neg_func

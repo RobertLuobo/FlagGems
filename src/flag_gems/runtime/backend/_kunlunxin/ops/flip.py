@@ -47,6 +47,7 @@ reversed gather) but
   allocation, and hands back a prefix view.
 """
 
+from flag_gems.utils import pointwise_dynamic
 import importlib.util
 import logging
 import os

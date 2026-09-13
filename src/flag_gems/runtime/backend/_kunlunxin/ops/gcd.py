@@ -315,3 +315,11 @@ def gcd_(A, B):
     _launch_gcd(lhs.reshape(-1), rhs.reshape(-1), flat_out)
     A.copy_(flat_out.view(A.shape))
     return A
+
+
+# auto-recovered symbol (merge fix)
+_ITERS_32 = 48
+
+
+# auto-recovered symbol (merge fix)
+_ITERS_64 = 96

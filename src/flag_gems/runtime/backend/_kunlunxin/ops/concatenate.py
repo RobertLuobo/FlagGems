@@ -13,6 +13,7 @@
 # Fix: route `concatenate` through the exact same tuned kunlunxin `cat`. Zero
 # algorithm change (byte-identical to the covered cat path) -> zero correctness
 # risk. Same class as the cat_out uncovered-variant fix.
+from flag_gems.utils import pointwise_dynamic
 import logging
 from typing import List, Tuple, Union
 

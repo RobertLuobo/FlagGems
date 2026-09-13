@@ -15,6 +15,7 @@
 # feeds `torch.randn(...)` (can be negative), so the reflection branch is
 # required. Both branches are evaluated unconditionally and blended with
 # `tl.where` to stay XPU-safe (no data-dependent control flow).
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import triton

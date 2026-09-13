@@ -6,6 +6,7 @@ from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
 from ..utils.tle_copy import tle_copy
+import triton.language as tl
 
 logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
 

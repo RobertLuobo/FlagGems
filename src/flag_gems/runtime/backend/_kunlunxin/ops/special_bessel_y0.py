@@ -54,6 +54,7 @@
 #   order of magnitude of accuracy, because the J0 factor's error is amplified by
 #   |(2/pi) log x| as x -> 0+ (assembled Y0 max abs error 3.1e-06 -> 1.27e-04).
 # No CPU/ATen/native/composite fallback.
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import torch

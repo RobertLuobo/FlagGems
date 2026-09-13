@@ -1,6 +1,8 @@
 import logging
 
-from .acos import acos, acos_
+import triton
+import triton.language as tl
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from flag_gems.utils import tl_extra_shim
 
@@ -43,9 +45,10 @@ def arccos_func(x):
 
 def arccos(A):
     logger.debug("GEMS_KUNLUNXIN ARCCOS")
-    return acos(A)
+    return arccos_func(A)
 
 
 def arccos_(A):
     logger.debug("GEMS_KUNLUNXIN ARCCOS_")
-    return acos_(A)
+    arccos_func(A, out0=A)
+    return A

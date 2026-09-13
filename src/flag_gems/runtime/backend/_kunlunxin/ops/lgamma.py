@@ -11,6 +11,7 @@
 # feed `torch.rand(...) + 0.1` (strictly positive), so the reflection formula
 # for z<=0 is unnecessary. Wired through `pointwise_dynamic` (same INT_TO_FLOAT
 # promotion as the generic) to preserve out0-aliased in-place behaviour.
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import triton

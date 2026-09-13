@@ -87,6 +87,7 @@
 # no gems-level function reference left to leave pointing at a stale object.
 #   0.7071067811865476 = 1/sqrt(2)
 # No CPU/ATen/native/composite fallback; the whole evaluation is in the kernel.
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import torch

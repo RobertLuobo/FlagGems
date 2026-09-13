@@ -1,3 +1,4 @@
+from flag_gems.utils import pointwise_dynamic
 import logging
 
 import torch

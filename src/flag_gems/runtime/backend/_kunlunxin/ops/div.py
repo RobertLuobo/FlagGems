@@ -632,3 +632,12 @@ def remainder_(A, B):
         if A.numel() >= REMAINDER_CFG_THRESHOLD:
             return rem_ts_cfg(A, B, out0=A)
         return rem_ts(A, B, out0=A)
+
+# torch.divide is an alias of torch.true_divide (PR 18 batch3 registers it).
+divide = true_divide
+
+
+# auto-recovered (merge fix): numel threshold above which the tuned
+# Kunlunxin kernel path is used for scalar division (measured 2026-08-19).
+# Restored from upstream baseline.
+DIV_SCALAR_CFG_THRESHOLD = 1 << 20

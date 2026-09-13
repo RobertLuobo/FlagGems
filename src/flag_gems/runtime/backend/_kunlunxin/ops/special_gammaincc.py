@@ -30,6 +30,7 @@
 # message is the generic one for the same reason (same convention as
 # special_ndtri.py); `record.pathname` still points at this file, which is what
 # the dispatch evidence uses.
+from flag_gems.utils import pointwise_dynamic
 import logging
 
 import torch

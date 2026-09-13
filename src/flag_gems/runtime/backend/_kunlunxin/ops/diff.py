@@ -1,3 +1,4 @@
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 import logging
 import math
 

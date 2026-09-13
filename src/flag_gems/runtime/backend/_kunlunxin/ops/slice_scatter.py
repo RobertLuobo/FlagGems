@@ -32,6 +32,7 @@
 # That turns the src gather into a recognizable strided load (~0.13-0.5ms). All
 # other shapes (arbitrary dim/start/partial slice) take the correct general
 # fused kernel.
+from flag_gems.utils import pointwise_dynamic
 import logging
 
 import torch

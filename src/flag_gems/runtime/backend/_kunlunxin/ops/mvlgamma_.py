@@ -12,6 +12,7 @@
 # `_lgamma_pos` used by the lgamma / special_gammainc overrides). Test
 # inputs are `torch.rand + (p-1)/2 + 1.0`, so `x - k/2 >= 1` for all k in
 # [0, p-1]; strictly positive, no reflection needed.
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import torch

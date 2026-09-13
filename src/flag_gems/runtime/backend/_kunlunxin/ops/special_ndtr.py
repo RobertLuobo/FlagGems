@@ -34,6 +34,7 @@
 # NaN/Inf semantics: comparisons are false for NaN so the polynomial
 # propagates NaN; +/-Inf saturate to 1.0 / 0.0 exactly like torch.
 
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 import logging
 
 import torch

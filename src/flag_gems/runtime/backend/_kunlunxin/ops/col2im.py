@@ -30,6 +30,7 @@
 #    into bounds (then `tl.where(valid, v, 0.0)`) is 15-25% faster.
 #  * num_warps/BLOCK/CodeGenConfig(buffer_size_limit, isCloseVectorization)
 #    have no measurable effect; BLOCK=1024 + num_warps=1 is kept.
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 import logging
 from typing import List
 

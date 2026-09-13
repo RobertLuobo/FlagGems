@@ -93,6 +93,7 @@
 # body); unroll_num, buffer_size_limit, isCloseVectorization, kunlunAutoGrid and
 # num_warps were measured to be inert on the sibling y0/y1 overrides.
 # No CPU/ATen/native/composite fallback.
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import torch

@@ -57,6 +57,7 @@
 # speed change (all three branches are evaluated for every lane and merged
 # with a mask-and-sum) but it moves the hardest series/CF inputs onto the
 # cheap, more accurate expansion, which is what allows (b).
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import torch

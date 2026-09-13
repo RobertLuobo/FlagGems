@@ -45,13 +45,14 @@
 #   Corners: x=-inf -> +inf, x=+inf -> 0, NaN -> NaN, +-0 -> 1 (verified
 #   on device against torch).
 
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 import logging
 
 import torch
 import triton
 import triton.language as tl
 
-from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils import triton_lang_extension as ext, tl_extra_shim
 
 logger = logging.getLogger(__name__)
 

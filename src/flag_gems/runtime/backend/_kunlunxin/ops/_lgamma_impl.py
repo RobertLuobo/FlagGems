@@ -10,6 +10,7 @@
 # - `_lgamma_full(z)`: full-domain log|Gamma(z)| using the reflection
 #   identity  Γ(z)·Γ(1−z) = π / sin(π z)  for z < 0.5. Not exact at negative
 #   integer poles (returns +inf via log(0)); torch.lgamma matches that.
+from flag_gems.utils import tl_extra_shim
 import triton
 import triton.language as tl
 

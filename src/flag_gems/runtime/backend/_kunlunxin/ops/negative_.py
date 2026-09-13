@@ -8,6 +8,7 @@
 # (CodeGenConfig tile 65536, unroll 8) at ~0.086ms and torch native ~0.15ms.
 # Alias semantics: input and output are the same tensor, handled by
 # `neg_func(A, out0=A)` exactly like the in-place `neg_` override.
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 import logging
 
 from .neg import neg_func

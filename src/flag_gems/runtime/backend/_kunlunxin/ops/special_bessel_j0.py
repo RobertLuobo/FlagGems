@@ -48,6 +48,7 @@
 #   Grid/tile geometry is *not* a lever here: num_ctas is hard-wired to 12 by the
 #   vendor pointwise_dynamic 1d-tile path and num_warps changes timing by <1%.
 # No CPU/ATen/native/composite fallback.
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import torch

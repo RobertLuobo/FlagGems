@@ -1134,3 +1134,9 @@ def _native_batch_norm_legit_no_training(
         input, weight, bias, running_mean, running_var, False, momentum, eps
     )
     return output, save_mean, save_invstd
+
+
+# auto-recovered (merge fix): per-channel element count threshold for the
+# grid=C fused route (2 launches) vs the 3-stage path (measured on P800,
+# 2026-08-21). Restored from upstream baseline.
+BN_FUSED_TRAIN_MAX_ELEMS = 2048

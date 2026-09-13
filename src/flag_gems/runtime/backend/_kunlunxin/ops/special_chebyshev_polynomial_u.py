@@ -21,6 +21,7 @@
 # Math: U_0=1, U_1=2x, U_k=2x*U_{k-1}-U_{k-2}, selected per element by the
 # (integer, guard-validated [0,5]) degree n; computed in fp32.
 
+from flag_gems.utils import pointwise_dynamic
 import logging
 
 import torch

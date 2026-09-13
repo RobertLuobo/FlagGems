@@ -77,6 +77,7 @@
 #   buffer_size_limit / isCloseVectorization / kunlunAutoGrid / num_warps were
 #   measured to be non-levers for this exact code shape on the Y0 sibling.
 # No CPU/ATen/native/composite fallback.
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import torch

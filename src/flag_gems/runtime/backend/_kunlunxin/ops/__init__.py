@@ -211,7 +211,6 @@ from .div import (
     true_divide_,
     true_divide_out,
     true_divide_tensor,
-    true_divide_tensor_,
 )
 from .dot import dot
 from .dropout import dropout, dropout_backward

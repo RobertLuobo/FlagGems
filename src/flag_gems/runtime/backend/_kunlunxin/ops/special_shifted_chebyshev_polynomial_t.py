@@ -38,6 +38,7 @@
 # it is the dominant term: [4096,4096] fp32 measures 3.42 ms at depth 9,
 # 5.74 ms at 17 and 10.63 ms at 33, so the depth is kept at the tested bound.
 # Inputs with n > 9 therefore return T_9; see the solution note for details.
+from flag_gems.utils import tl_extra_shim
 import logging
 
 import torch

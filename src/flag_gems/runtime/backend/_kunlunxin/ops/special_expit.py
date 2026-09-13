@@ -49,7 +49,7 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils import triton_lang_extension as ext, tl_extra_shim
 
 logger = logging.getLogger(__name__)
 
