@@ -50,14 +50,39 @@ class MaskedScaleBenchmark(base.Benchmark):
 # CUDA reference does not support float16/bf16 for this private op.
 FLOAT_DTYPES = [torch.float32]
 
+# aten::_masked_scale is a private op with no torch implementation on the
+# XPU/XMLIR stack (no CPU kernel either), so the torch reference cannot be
+# timed outside use_gems here. Compose the same math from primitives that run
+# natively on device -- the kernel itself is tl.where(mask != 0, input*scale,
+# 0.0) -- for the latency_base side, and time the vendor kernel directly via
+# gems_op (the harness would otherwise re-run torch_op under use_gems, which
+# never reaches this operator). Same pattern as test_polygamma.py /
+# test_linalg_lstsq.py. The composed baseline costs several launches per call
+# against one for the kernel, so the measured speedup is a lower bound.
+_DEVICE_REF = flag_gems.vendor_name not in ("nvidia", "cuda")
+
+
+def _masked_scale_reference(input, mask, scale):
+    return torch.where(mask != 0, input * scale, torch.zeros_like(input))
+
 
 @pytest.mark.masked_scale
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_masked_scale(dtype):
-    torch_op = lambda inp, mask, scale: torch.ops.aten._masked_scale(inp, mask, scale)
+    torch_op = (
+        (lambda inp, mask, scale: torch.ops.aten._masked_scale(inp, mask, scale))
+        if not _DEVICE_REF
+        else _masked_scale_reference
+    )
+    gems_op = (
+        (lambda inp, mask, scale: flag_gems._masked_scale(inp, mask, scale))
+        if _DEVICE_REF
+        else None
+    )
     bench = MaskedScaleBenchmark(
         op_name="masked_scale",
         torch_op=torch_op,
+        gems_op=gems_op,
         dtypes=[dtype],
     )
     bench.run()

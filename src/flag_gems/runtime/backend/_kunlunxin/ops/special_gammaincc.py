@@ -21,16 +21,25 @@
 # Fix: route the functional key at the same vendor kernel that already
 # serves the `.out` key. No fallback: this is the XPU Triton kernel from
 # `igammac.py`, not an ATen/CPU redispatch.
+#
+# The logger name is deliberately the *generic* module name: tests/
+# test_igammac_.py does `caplog.at_level("DEBUG", logger=
+# "flag_gems.ops.special_gammaincc")`, and a record emitted on
+# `_kunlunxin.ops.special_gammaincc` would inherit root's WARNING level and be
+# dropped, breaking the `assert "GEMS SPECIAL_GAMMAINCC" in caplog.text`.  The
+# message is the generic one for the same reason (same convention as
+# special_ndtri.py); `record.pathname` still points at this file, which is what
+# the dispatch evidence uses.
 import logging
 
 import torch
 
 from .igammac import igammac
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("flag_gems.ops.special_gammaincc")
 
 
 def special_gammaincc(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
     """Regularized upper incomplete gamma function Q(a, x) on Kunlunxin XPU."""
-    logger.debug("GEMS_KUNLUNXIN SPECIAL_GAMMAINCC")
+    logger.debug("GEMS SPECIAL_GAMMAINCC")
     return igammac(self, other)

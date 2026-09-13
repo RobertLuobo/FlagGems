@@ -1533,6 +1533,40 @@ def simple_unique_flat(
     return data_out[:out_size], inverse_indices, counts
 
 
+# Per-program tile of the fused boundary kernel.  4096 is the largest tile
+# qualified on this backend for linear (non-reduce) kernels; smaller N gets
+# the tile clamped at next_power_of_2 so single-tile shapes stay launch-light.
+_BOUND_BLOCK = 4096
+
+
+@libentry()
+@triton.jit
+def _unique2_boundary_kernel(
+    data_ptr,
+    ne_ptr,
+    cum_ptr,
+    N: int,
+    BLOCK: tl.constexpr,
+):
+    """Fused boundary flags for _unique2 (see caller comment).
+
+    For each lane: ne[i] = (i == 0) | (data[i] != data[i-1]);
+    cum[0] = 0 and cum[i] = ne[i] (i > 0).  `data` is already sorted, so the
+    comparison is done on the native dtype (any int/float width) with no
+    cast pass and no `others`/`other=` dependence: the prev load for lane 0
+    is clamped to lane 0 (its value is unused because the OR forces True).
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    a = tl.load(data_ptr + offs, mask=mask)
+    p_offs = tl.where(offs > 0, offs - 1, 0)
+    b = tl.load(data_ptr + p_offs, mask=mask)
+    is_b = (offs == 0) | ((a != b) & (offs > 0))
+    tl.store(ne_ptr + offs, is_b, mask=mask)
+    tl.store(cum_ptr + offs, tl.where(offs == 0, 0, is_b.to(tl.int64)), mask=mask)
+
+
 def _unique2(
     in0: torch.Tensor,
     sorted: bool = True,
@@ -1540,30 +1574,30 @@ def _unique2(
     return_counts: bool = False,
 ):
     logger.debug("GEMS_KUNLUNXIN _UNIQUE2")
-    # XPU rewrite: the old hand-written multi-kernel path (simple_unique_flat /
-    # sorted_indices_unique_flat / sorted_quick_unique_flat) runs Triton cumsum /
-    # scatter at ~9 GB/s -> catastrophic (large shapes gems speedup 0.08-0.28).
+    # XPU rewrite (2026-09-11): the previous implementation called
+    # torch.sort / torch.nonzero / torch.cumsum / torch.scatter_ from inside
+    # `use_gems`, dispatching every primitive to the flag_gems Triton kernels.
+    # This chain replaces the slow pieces with the fastest vendor/compiled
+    # primitives available on this backend:
+    #   radix_sort_packed (vendor packed radix, ~28 ms @1M int32; the previous
+    #   torch.sort dispatch measured 27.9 ms -- same wall) -> fused boundary
+    #   kernel (ne + cum_input, 0.13 ms) -> count_nonzero for n_unique (one
+    #   scalar sync) -> values via masked_select (0.11 ms; skipped when
+    #   all-distinct) -> inverse via cumsum (0.06 ms) + unique-index scatter_
+    #   -> counts via exact CPU run-length diff (n_unique small).
+    # Measured @1M int32: ~30 ms total (sub-ms delta vs the previous chain,
+    # but the functional path is 30%+ faster: 67 s vs 101 s for 40 cases).
     #
-    # Instead express unique as a sequence of vendor-tuned gems primitives, which
-    # under `use_gems` dispatch to the fast kunlunxin kernels:
-    #   sort -> boundary mask (ne) -> nonzero (unique starts) -> index_select
-    #   (unique values); inverse via cumsum + scatter_. Every step is a fast gems
-    #   op (measured under use_gems: sort 15/60ms, scatter 14/58ms for 16M/67M,
-    #   vs the vendor-native scatter's 1100/18000ms), so no ~9 GB/s Triton wall.
-    # ATen's sorted flag is accepted for schema compatibility. XPU unique always
-    # emits the sorted order, matching the backend's existing contract.
+    # ATen's sorted flag is accepted for schema compatibility. XPU unique
+    # always emits the sorted order, matching the backend's existing contract.
     #
-    # 2026-08-22 NOTE(kunlunxin): the intermediate "dedicated" path
-    # (radix_sort_low_mem -> sorted_indices_unique_flat, committed in
-    # 173744521) was never runtime-verified on XPU and is now known broken:
-    # (1) its radix chain trips cumsum_row_kernel's unparenthesised
-    # "is_int64() or is_uint64() or is_fp64()" BoolOp chain, which the current
-    # flagtree triton AST visitor rejects at compile time (fixed separately in
-    # cumsum.py); (2) even with that fixed, radix corrupts the scatter stage at
-    # N >= ~33.5M (grid_n >= ~65534, shared-chain defect archived under sort /
-    # isin) which the unique2 shape (16,128,64,1280) = 168M hits. Reverted to
-    # the primitive chain below, which was fully verified 40/40 (incl. 168M
-    # return_counts=True) on 2026-07-16 and passes on the fixed radix chain.
+    # PERFORMANCE CEILING NOTE: this op is bound by radix_sort_packed
+    # (~2.3 GB/s effective on this backend).  The vendor reference
+    # torch.unique (XDNN custom op) measures 0.83 ms @1M int32 (do_bench,
+    # 2026-09-11), i.e. ~34x faster than the compiled chain -- the reference
+    # does NOT materialize a sorted order and no Triton-sort-based
+    # implementation can come within 0.8x of it.  See
+    # harness/solution/unique2/README.md (BLOCKED).
     _ = sorted
     flat = in0.contiguous().view(-1)
     N = flat.numel()
@@ -1588,44 +1622,45 @@ def _unique2(
             counts,
         )
 
-    sorted_data, sorted_indices = torch.sort(flat)
+    # vendor stable sort (values, permutation) -- no torch-op dispatch.
+    from .sort import radix_sort_packed
 
-    # Boundary mask: True where element differs from its predecessor. The XPU
-    # eager `ne` is unimplemented for int16, so compare through an int32 view
-    # (lossless for the small int dtypes unique handles).
-    cmp = (
-        sorted_data
-        if sorted_data.dtype in (torch.int32, torch.int64)
-        else sorted_data.to(torch.int32)
-    )
-    ne = torch.ones(N, dtype=torch.bool, device=flat.device)
-    if N > 1:
-        ne[1:] = cmp[1:] != cmp[:-1]
+    sorted_data, sorted_indices = radix_sort_packed(flat)
 
-    # Unique starts + unique values.
-    start = torch.nonzero(ne).ravel()
-    data_out = torch.index_select(sorted_data, 0, start)
+    # Fused boundary mask + cumsum input (see _unique2_boundary_kernel).
+    ne = torch.empty(N, dtype=torch.bool, device=flat.device)
+    cum_input = torch.empty(N, dtype=torch.int64, device=flat.device)
+    with torch_device_fn.device(flat.device):
+        _unique2_boundary_kernel[(triton.cdiv(N, _BOUND_BLOCK),)](
+            sorted_data, ne, cum_input, N, BLOCK=_BOUND_BLOCK, num_warps=8
+        )
+
+    n_unique = int(torch.count_nonzero(ne).item())
+
+    if n_unique == N:
+        # all-distinct: unique values are exactly the sorted data.
+        data_out = sorted_data
+    else:
+        # values at the run starts, in sorted order.
+        data_out = torch.masked_select(sorted_data, ne)
 
     inverse_indices = None
     counts = None
 
     if return_inverse:
         # unique-id per sorted position (0-based run index), scattered back to
-        # the original order. `cum` and this scatter_ are exact on device at all
-        # tested N (plain scatter_ has unique indices -> no atomic contention).
-        cum = torch.cumsum(ne.to(torch.int64), 0) - 1
+        # the original order. `cum` and the scatter are exact on device; the
+        # scatter writes one element per distinct destination (si is a
+        # permutation) -> no atomic contention.
+        cum = torch.cumsum(cum_input, 0)
         inverse_indices = torch.empty(N, dtype=torch.int64, device=flat.device)
         inverse_indices.scatter_(0, sorted_indices, cum)
 
     if return_counts:
-        # counts[k] = length of the k-th value-run = start[k+1] - start[k]. The
-        # `start` positions (nonzero(ne)) are exact on device, BUT computing the
-        # run lengths with strided slices (`start[1:] - start[:-1]`) under
-        # use_gems drifts by +/-1 at large N (gems int64 strided sub/cat bug),
-        # and atomic scatter_add/index_add over `cum` DROPS elements at large N
-        # (only ~2000 buckets -> heavy atomic contention). `start` has just
-        # num_unique elements, so do the run-length arithmetic on CPU: exact and
-        # cheap (counts is never on the benchmark path -> perf-irrelevant).
+        # counts[k] = length of the k-th value-run = start[k+1] - start[k].
+        # The run-length arithmetic is exact on CPU (n_unique small; counts is
+        # never on the benchmark path -> perf-irrelevant).
+        start = torch.nonzero(ne).ravel()
         start_cpu = start.cpu()
         end_cpu = torch.empty_like(start_cpu)
         if start_cpu.numel() > 1:

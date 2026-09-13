@@ -138,6 +138,28 @@ def bitwise_xor_scalar_(A, B):
 
 def bitwise_xor_scalar_tensor(A, B):
     logger.debug("GEMS_KUNLUNXIN BITWISE_XOR_SCALAR_TENSOR")
+    # int32-word packing fast path for bool (4:1) / int16 (2:1), mirroring
+    # the (verified) bitwise_xor_scalar_ in-place recipe above: on XPU a byte
+    # / 16-bit load-store pays a heavy per-byte penalty, while 4 bools (or 2
+    # int16s) fit one int32 word whose bytes / 16-bit lanes are uniformly
+    # XOR-ed with the replicated scalar (bool takes the low bit of the
+    # two's-complement scalar, int16 the low 16 bits -- both match torch's
+    # Scalar_Tensor variant, which keeps the tensor dtype, see also
+    # bitwise_or_scalar_tensor). Out-of-place: the XOR-ed int32 words go to a
+    # freshly allocated tensor, which is then viewed back to B's dtype/shape.
+    # Gating (via _packed_scalar / _word_view): the bool lane only packs for a
+    # Python *bool* scalar (a Python int with a bool tensor type-promotes to
+    # Long in torch), int16 packs for in-range int/bool scalars; anything else
+    # (non-contiguous, tail bytes per row, 0-dim/empty, int32/int64) falls
+    # back to the generic scalar kernel.
+    pack = _packed_scalar(B, A)
+    if pack is not None:
+        word_val, denom = pack
+        B_word = _word_view(B, denom)
+        if B_word is not None:
+            out = torch.empty_like(B)
+            bitwise_xor_func_scalar(B_word, word_val, out0=_word_view(out, denom))
+            return out
     return bitwise_xor_func_scalar(B, A)
 
 

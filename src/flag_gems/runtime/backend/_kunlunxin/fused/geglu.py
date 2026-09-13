@@ -147,6 +147,49 @@ def dgeglu_kernel(
     tl.store(grad_b_ptr, grad_b.to(x_a.dtype), mask=mask)
 
 
+@libentry()
+@triton.jit
+def geglu_pair_kernel(
+    input_ptr,
+    output_ptr,
+    num_tasks,
+    H: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    """1D flattened "pair" kernel for geglu (2 loads + 1 store).
+
+    XPU-specialized variant used for H <= 1024 (see `_pick_geglu_pair_tile`).
+    The 2D (BLOCK_SIZE_M x BLOCK_SIZE_H) tiling above is pathological on this
+    backend whenever the row count M dwarfs the half-width H: with only a few
+    useful lanes per row the CoreTiling pass serializes BLOCK_SIZE_M rows one
+    by one and the many small programs stay launch/over-read bound, so e.g.
+    (16,7,57,32,30) fp32 runs ~19.7ms and (64,64,2) fp16 ~0.38ms.
+
+    Instead (same idea as the dreglu pair kernel) we iterate over the M*H
+    output elements, one "pair" per element: element t of row t//H reads
+    input[2H*(t//H) + t%H] (the a-half) and input[2H*(t//H) + t%H + H] (the
+    b-half) and writes output[t]. Every load/store then stays on wide
+    contiguous ranges (N elements per row), so the backend emits full-width
+    block DMA instead of row-serialized tiles; a handful of programs covers
+    the whole tensor.
+
+    H is a tl.constexpr (not a runtime arg) on purpose: with a runtime H the
+    (tid // H) * H division lowers to a hardware divide and, more importantly,
+    a subset of (dtype, TILE) combinations mis-lower and return wrong values
+    (probe 2026-09-10, see `_pick_geglu_pair_tile`). With a compile-time H the
+    division folds to a shift and every (H, TILE) cell in the probe grid is
+    numerically bit-identical to the 2D kernel.
+    """
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    mask = tid < num_tasks
+    a_off = (tid // H) * H
+    x_a = tl.load(input_ptr + tid + a_off, mask=mask).to(tl.float32)
+    x_b = tl.load(input_ptr + tid + a_off + H, mask=mask).to(tl.float32)
+    gelu_out = 0.5 * x_a * (1 + tanh(0.79788456 * x_a * (1 + 0.044715 * x_a * x_a)))
+    tl.store(output_ptr + tid, gelu_out * x_b, mask=mask)
+
+
 def _pick_geglu_config(dtype, M, H):
     """XPU2 probe-tuned fixed tiling for the geglu forward (2 loads + 1 store).
 
@@ -217,6 +260,50 @@ def _pick_geglu_config(dtype, M, H):
     return 8, 512, 4
 
 
+def _pick_geglu_pair_tile(dtype, M, H):
+    """XPU2 probe-tuned fixed tile for the 1D geglu pair kernel (H <= 1024).
+
+    Probe: 2026-09-10, XPU2 (card 3), the official benchmark + accuracy-test
+    matrix, constexpr-H pair kernel (`/tmp/ab_geglu4.py`,
+    `/tmp/warp_probe.py` -- timing, `triton.testing.do_bench(median)` with the
+    host-sync removed so small-kernel figures are not inflated) and a dense
+    (M x H) correctness grid (`/tmp/sweep_clean_{fp16,fp32,bf16}.py`, 168 cells
+    x 4 tiles, `d < 1e-4` vs the 2D kernel output -- with identical FP
+    expressions the pair kernel is bit-identical to the 2D kernel whenever it
+    does not mis-lower, so this is an exact codegen check).
+
+    Why the pair kernel wins for small H: on every H <= 1024 cell probed it
+    beats the 2D tiling, from 1.5x-2x at H ~ 256-1024
+    ((64,64,512) fp16 0.59ms -> 0.12ms; (4096,1024) fp32 0.65ms -> 0.18ms)
+    up to 15x-130x on the wide/short cells
+    ((16,7,57,32,30) fp32 19.7ms -> 0.15ms @ T=2048; (64,64,2) fp16 0.38ms
+    -> 0.006ms; (1024,2) fp16 0.11ms -> 0.006ms).
+
+    Numerics / the TILE minefield (constexpr-H, w4; the same pattern with a
+    runtime H keeps a subset of these mis-lowering cells):
+    - fp32: every (M, H, TILE) in the grid is clean -> free to pick the fastest.
+    - fp16: TILE 256/512/1024 clean everywhere; TILE 2048 mis-lowers on most
+      cells -> capped at 1024.
+    - bf16: clean-TILE depends on H: H <= 64 -> 512; 64 < H <= 1024 -> 1024.
+      (T=1024 is wrong at H <= 64 for large M, T=512 / T=2048 are wrong at
+      H in (64, 1024] for M >= ~1024; T=1024 is the only clean size in that
+      band.)
+    - num_warps is 4 (dreglu-consistent): A/B showed w4 == w8 within noise.
+    - H > 1024 keeps the 2D kernel below: the 2D wide-row tiles are as fast as
+      (H=1024/2048) or faster (H >= 4096) than the pair kernel there, e.g.
+      (1024,8192) 0.14ms 2D vs 0.9ms+ pair.
+    """
+    if dtype == torch.bfloat16:
+        # bf16: T=512 is clean for H <= 64 at every M in the grid; T=1024
+        # clean for 64 < H <= 1024 at every M in the grid + ext probe.
+        return 512 if H <= 64 else 1024
+    if dtype == torch.float32 and M >= 65536:
+        # fp32 large-M short-H cells (e.g. (16,7,57,32,30) H=15, M=204288)
+        # want the widest tile: 0.235ms @ T=1024 vs 0.150ms @ T=2048.
+        return 2048
+    return 1024
+
+
 def geglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.Tensor:
     shape = input_tensor.shape
     if input_tensor.dim() < 1:
@@ -236,6 +323,19 @@ def geglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
 
     input_2d = input_tensor.contiguous().view(M, last_dim)
     output_2d = torch.empty(M, H, device=input_tensor.device, dtype=input_tensor.dtype)
+
+    if H <= 1024:
+        tile = _pick_geglu_pair_tile(input_tensor.dtype, M, H)
+        num_tasks = M * H
+        geglu_pair_kernel[(triton.cdiv(num_tasks, tile),)](
+            input_2d,
+            output_2d,
+            num_tasks,
+            H=H,
+            TILE=tile,
+            num_warps=4,
+        )
+        return output_2d.view(output_shape)
 
     block_m, block_h, num_warps = _pick_geglu_config(input_tensor.dtype, M, H)
     need_mask = (M % block_m != 0) or (H % block_h != 0)
@@ -258,6 +358,46 @@ def geglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
     return output_2d.view(output_shape)
 
 
+def _pick_dgeglu_config(dtype, M, H):
+    """XPU2 probe-tuned fixed tiling for the dgeglu backward (2 loads + 2 stores).
+
+    Probe: 2026-09-10, XPU2 (card 5), the official benchmark matrix
+    (12 (M, H) cells x fp16/fp32/bf16), steady-state host timing
+    (`/tmp/probe_dgeglu_tiles.py`, `/tmp/probe_dgeglu_mid{,2}.py`), every
+    candidate validated against the previous 64x64 tiling and an fp64 oracle
+    (`/tmp/probe_dgeglu_correct.py`).
+
+    The old fixed 64x64 tile is catastrophically slow on wide rows:
+      (16384, 4096) fp16 258ms -> 4.42ms @ (1, 4096, w8),   ~58x
+      (1024, 65536) fp32 257ms -> 3.25ms @ (1, 8192, w8),  ~79x
+      (4096, 2048)  fp16 41.7ms -> 0.81ms @ (4, 2048, w8), ~52x
+      (64, 32)      fp16  0.15ms -> 0.033ms @ (8, 512, w4) ~5x
+    As with the forward `_pick_geglu_config`, wide half-rows want one row per
+    program and the widest legal tile; 2D 8x256/64x64 tiles cost 3-6x more
+    for the same element count.
+
+    Numerics (all within the accuracy-test windows; the accuracy-test
+    shapes, H <= 128, all land on the bitwise-identical 8x512/8x128 paths):
+    - fp32 at BLOCK_H >= 1024 differs from 64x64 by <= 7.1e-6 (FMA
+      reassociation; 0 elements beyond atol=1e-4/rtol=1.3e-6), unlike the
+      *forward* geglu where fp32 + BLOCK_H == 1024 masked tiles mis-lower.
+    - fp16/bf16 at BLOCK_H >= 1024 differ by <= 1 ULP on <= 0.06% of
+      elements (within the 0.016/1e-3 rtol windows).
+    - BLOCK_H <= 512 paths are bitwise-identical to the previous 64x64 run.
+    """
+    if H >= 2048:
+        if H % 8192 == 0:
+            return 1, 8192, 8
+        if H % 4096 == 0:
+            return 1, 4096, 8
+        return 4, 2048, 8
+    if H >= 256:
+        return 1, 1024, 8
+    if H == 1:
+        return 8, 128, 4
+    return 8, 512, 4
+
+
 def dgeglu(
     grad_output: torch.Tensor,
     input_tensor: torch.Tensor,
@@ -271,10 +411,8 @@ def dgeglu(
     input_2d = input_tensor.contiguous().view(M, 2 * H)
     grad_in_2d = torch.empty_like(input_2d)
 
-    grid = lambda META: (
-        triton.cdiv(M, META["BLOCK_SIZE_M"]),
-        triton.cdiv(H, META["BLOCK_SIZE_H"]),
-    )
+    block_m, block_h, num_warps = _pick_dgeglu_config(input_tensor.dtype, M, H)
+    grid = (triton.cdiv(M, block_m), triton.cdiv(H, block_h))
 
     dgeglu_kernel[grid](
         grad_out_2d,
@@ -288,8 +426,9 @@ def dgeglu(
         input_2d.stride(1),
         grad_in_2d.stride(0),
         grad_in_2d.stride(1),
-        BLOCK_SIZE_M=64,
-        BLOCK_SIZE_H=64,
+        BLOCK_SIZE_M=block_m,
+        BLOCK_SIZE_H=block_h,
+        num_warps=num_warps,
     )
     # print(dgeglu)
     return grad_in_2d.view_as(input_tensor)

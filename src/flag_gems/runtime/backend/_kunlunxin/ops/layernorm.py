@@ -399,37 +399,55 @@ def layernorm_fwd_kernel(
         tl.store(Y + (rindex + (rnumel * xindex)), y, rmask & xmask)
 
 
-def _layer_norm_backward_block_row_size(M):
-    return triton.next_power_of_2(triton.cdiv(M, 12))
+
+# --- layer_norm_backward (2026-09-10 1D-tile rewrite) ------------------------
+# Measured on the 14-shape kunlunxin benchmark matrix (2026-09-10): the old
+# backward used 2D [R, C] load tiles (BLOCK_ROW_SIZE = next_pow2(M/12),
+# BLOCK_COL_SIZE = min(N, 8192); e.g. [128, 2048] = 1MB fp32/accumulator on
+# (1024, 2048)) plus two _copy_from transposes for the weight/bias M-reduce.
+# 2D tiles are 20-60x slower than 1D on this backend (same finding as the
+# forward's [1, TILE_N] note: ~35GB/s vs ~700GB/s native) and the transposes
+# cost an extra 4MN of traffic, so the whole op ran at 0.05-0.40x vs native
+# (dtype-equal 0.2567 on the benchmark matrix).
+# The rewrite keeps every load/store 1D (per-row [C] blocks, block DMA):
+#   - dX: one program per row, two passes over N with [C] 1D loads/stores
+#     (a = sum(dy*w), b = sum(dy*w*x_hat) -> dx = rstd*(dy*w-(a+x_hat*b)/N));
+#   - weight/bias: 1D M-loop over [C] column blocks; when M > _WB1D_BM the
+#     sum is split into (M / _WB1D_BM) partial vectors + a second 1D kernel
+#     that reduces the partials (replaces the transposes: ~2MN instead of
+#     6MN).
+# 2D reduces stay axis=1 (axis=0 is rejected by TritonXPU Legalize and
+# tl.trans by TritonToTritonXPU), so the M-reduce is a loop, not a tile
+# reduce. The N-tail (N % C != 0) is masked with the (masked load + tl.where
+# 0.0) pattern the previous 2D kernel validated (a 1D reduce fed by
+# masked-load garbage lanes miscompiles: the forward's probed ~30x error).
+
+_WB1D_BM = 128  # rows per wb partial program; _wb_bm_size picks a divisor of M
 
 
-def _layer_norm_backward_block_col_size(dtype, M, N):
-    if dtype == torch.float32 and M == 1 and N == 40999:
-        return 4096  # 8192 cause leagalize error
-
-    if M == 100 and N == 40499:
-        return 4096  # 8192 cause leagalize error
-
+def _ln_bwd_col_size(N):
+    # column/chunk width: largest power of 2 <= min(N, 8192).  tl.arange must
+    # stay pow2: with a non-pow2 width TritonXPU pads the unmasked load/store
+    # tiles and the padded OOB stores stomp the adjacent partial rows of the
+    # two-stage wb buffers (measured: wrong dW/dB at (200, 36)/(4096, 100)).
+    # The N % C remainder is handled by the NEED_MASK/NEED_TAIL masked paths.
     import builtins
 
-    return builtins.min(N, 8192)
+    cap = builtins.min(N, 8192)
+    return 1 << (cap.bit_length() - 1)
 
 
-def layer_norm_backward_kernel_heur_block_row_size(args):
-    return _layer_norm_backward_block_row_size(args["M"])
+def _wb_bm_size(M):
+    # rows per wb partial program: largest divisor of M <= _WB1D_BM, so no
+    # masked m-tail leaks into the sums; min 1.
+    import builtins
+
+    block = builtins.min(M, _WB1D_BM)
+    while block > 1 and M % block != 0:
+        block //= 2
+    return builtins.max(1, block)
 
 
-def layer_norm_backward_kernel_heur_block_col_size(args):
-    return _layer_norm_backward_block_col_size(args["dX"].dtype, args["M"], args["N"])
-
-
-@libentry()
-@triton.heuristics(
-    values={
-        "BLOCK_ROW_SIZE": layer_norm_backward_kernel_heur_block_row_size,
-        "BLOCK_COL_SIZE": layer_norm_backward_kernel_heur_block_col_size,
-    },
-)
 @triton.jit
 def layer_norm_backward_kernel(
     dY,
@@ -444,6 +462,15 @@ def layer_norm_backward_kernel(
     BLOCK_COL_SIZE: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
+    # Two-pass 2D-tile dX (probed & validated on TritonXPU):
+    #   pass 1: acc2 = sum(dy*w), acc3 = sum(dy*w*x_hat) as [R, C] tiles
+    #   (axis=1 2D reduce -- axis=0 and tl.trans are rejected by the
+    #   backend's Legalize, and a 1D reduce fed by masked-load lanes
+    #   miscompiles: probed ~30x error.  A 2D axis=1 reduce of a masked
+    #   2D tile is the pattern the forward's tail kernel validates.)
+    #   pass 2: dx = rstd*(dy*w - (a + x_hat*b)/N), a/b = row sums.
+    # BLOCK_COL_SIZE is a power of 2 (tl.arange requires it); the N % C
+    # remainder is handled by the NEED_MASK masked path.
     pid = ext.program_id(0) * BLOCK_ROW_SIZE + tl.arange(0, BLOCK_ROW_SIZE)[:, None]
     dY += pid * N
     X += pid * N
@@ -464,7 +491,7 @@ def layer_norm_backward_kernel(
             x = tl.load(X + cols[None, :]).to(tl.float32)
             x_hat = (x - mean) * rstd
             if W is None:
-                w = 1
+                w = 1.0
             else:
                 w = tl.load(W + cols).to(tl.float32)
             dx_hat = dy * w
@@ -479,7 +506,7 @@ def layer_norm_backward_kernel(
             dy = tl.load(dY + cols[None, :]).to(tl.float32)
             x = tl.load(X + cols[None, :]).to(tl.float32)
             if W is None:
-                w = 1
+                w = 1.0
             else:
                 w = tl.load(W + cols).to(tl.float32)
             x_hat = (x - mean) * rstd
@@ -498,14 +525,17 @@ def layer_norm_backward_kernel(
             cols = off + tl.arange(0, BLOCK_COL_SIZE)
             col_mask = cols[None, :] < N
             mask = row_mask and col_mask
-            dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
-            x = tl.load(X + cols[None, :], mask).to(tl.float32)
+            # other=0.0 so OOB lanes are deterministic zeros (without it the
+            # backend leaves uninitialized garbage that occasionally leaks
+            # into the axis=1 reduce / adjacent rows: flaky at (200, 36)).
+            dy = tl.load(dY + cols[None, :], mask, other=0.0).to(tl.float32)
+            x = tl.load(X + cols[None, :], mask, other=0.0).to(tl.float32)
             x = tl.where(mask, x - mean, 0.0)
             x_hat = x * rstd
             if W is None:
-                w = 1
+                w = 1.0
             else:
-                w = tl.load(W + cols, mask=cols < N).to(tl.float32)
+                w = tl.load(W + cols, mask=cols < N, other=0.0).to(tl.float32)
             dx_hat = dy * w
             dx_part2 += dx_hat
             dx_part3 += dx_hat * x_hat
@@ -517,106 +547,125 @@ def layer_norm_backward_kernel(
             cols = off + tl.arange(0, BLOCK_COL_SIZE)
             col_mask = cols[None, :] < N
             mask = row_mask and col_mask
-            dy = tl.load(dY + cols[None, :], mask).to(tl.float32)
-            x = tl.load(X + cols[None, :], mask).to(tl.float32)
+            dy = tl.load(dY + cols[None, :], mask, other=0.0).to(tl.float32)
+            x = tl.load(X + cols[None, :], mask, other=0.0).to(tl.float32)
             if W is None:
-                w = 1
+                w = 1.0
             else:
-                w = tl.load(W + cols, mask=cols < N).to(tl.float32)
+                w = tl.load(W + cols, mask=cols < N, other=0.0).to(tl.float32)
             x = tl.where(mask, x - mean, 0.0)
             x_hat = x * rstd
             dx_hat = dy * w
             dx = rstd * (dx_hat - (dx_2 + x_hat * dx_3) / N)
+            # zero OOB lanes so a masked-store that is not fully respected
+            # cannot stomp the neighbouring rows of dX with garbage.
+            dx = tl.where(mask, dx, 0.0)
             tl.store(dX + cols, dx, mask=mask)
 
 
-def weight_bias_backward_kernel_heur_block_row_size(args):
-    return 1
-
-
-def weight_bias_backward_kernel_heur_block_col_size(args):
-    import builtins
-
-    # The wb kernel parallelizes over N: grid = cdiv(N, BLOCK_COL_SIZE). A fixed 8192
-    # under-utilizes the XPU clusters for mid-range N (e.g. N=16384 -> grid=2), while a
-    # too-small block wastes DMA width for large N (e.g. N=65568 with 2048 -> grid=32,
-    # narrow tiles, slower). Aim for ~12 programs (cluster count) with the widest tile,
-    # clamped to [2048, 8192] and capped by N. This also yields 4096 for N~=40499,
-    # matching the old special-case that avoided the 8192 legalize error.
-    N = args["N"]
-    block = triton.next_power_of_2(triton.cdiv(N, 12))
-    block = builtins.max(2048, builtins.min(block, 8192))
-    return builtins.min(N, block)
-
-
-@libentry()
-# @triton.autotune(
-#     configs=runtime.get_tuned_config("weight_bias_backward"),
-#     key=["N"],
-# )
-@triton.heuristics(
-    values={
-        "BLOCK_ROW_SIZE": weight_bias_backward_kernel_heur_block_row_size,
-        "BLOCK_COL_SIZE": weight_bias_backward_kernel_heur_block_col_size,
-    },
-)
 @triton.jit
-def weight_bias_backward_kernel(
+def weight_bias_backward_1d_kernel(
     dY,
     X,
     Mean,
     Rstd,
+    OutW,
+    OutB,
+    M,
+    N,
+    BM: tl.constexpr,
+    C: tl.constexpr,
+    NEED_TAIL: tl.constexpr,
+    DIRECT: tl.constexpr,
+):
+    # 1D M-loop over [C] column blocks.  grid = (cdiv(N, C), cdiv(M, BM)).
+    # DIRECT: OutW/OutB are dW/dB (BM covers all M, mi == 0); otherwise they
+    # are partialW/partialB [cdiv(M, BM), N] at row mi.
+    n0 = ext.program_id(0) * C
+    mi = ext.program_id(1)
+    m0 = mi * BM
+    accW = tl.zeros([C], dtype=tl.float32)
+    accB = tl.zeros([C], dtype=tl.float32)
+    if not NEED_TAIL:
+        for r in range(0, BM):
+            m = m0 + r
+            base = m * N + n0
+            cols = tl.arange(0, C)
+            dy = tl.load(dY + base + cols).to(tl.float32)
+            x = tl.load(X + base + cols).to(tl.float32)
+            mean = tl.load(Mean + m).to(tl.float32)
+            rstd = tl.load(Rstd + m).to(tl.float32)
+            accW += dy * ((x - mean) * rstd)
+            accB += dy
+    else:
+        for r in range(0, BM):
+            m = m0 + r
+            base = m * N + n0
+            cols = tl.arange(0, C)
+            cmask = n0 + cols < N
+            dy = tl.load(dY + base + cols, mask=cmask, other=0.0).to(tl.float32)
+            x = tl.load(X + base + cols, mask=cmask, other=0.0).to(tl.float32)
+            mean = tl.load(Mean + m).to(tl.float32)
+            rstd = tl.load(Rstd + m).to(tl.float32)
+            x = tl.where(cmask, x - mean, 0.0)
+            accW += tl.where(cmask, dy, 0.0) * (x * rstd)
+            accB += tl.where(cmask, dy, 0.0)
+    cols = tl.arange(0, C)
+    if DIRECT:
+        if OutW is not None:
+            tl.store(OutW + n0 + cols, accW)
+        if OutB is not None:
+            tl.store(OutB + n0 + cols, accB)
+    else:
+        if OutW is not None:
+            tl.store(OutW + mi * N + n0 + cols, accW)
+        if OutB is not None:
+            tl.store(OutB + mi * N + n0 + cols, accB)
+
+
+@triton.jit
+def weight_bias_backward_finish_kernel(
+    PW,
+    PB,
     dW,
     dB,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    BLOCK_ROW_SIZE: tl.constexpr,
-    BLOCK_COL_SIZE: tl.constexpr,
-    NEED_MASK: tl.constexpr,
+    P,
+    N,
+    C: tl.constexpr,
+    NEED_TAIL: tl.constexpr,
 ):
-    pid = ext.program_id(0) * BLOCK_COL_SIZE + tl.arange(0, BLOCK_COL_SIZE)[None, :]
-    dY += pid
-    X += pid
-    accW = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
-    accB = tl.zeros([BLOCK_ROW_SIZE, BLOCK_COL_SIZE], dtype=tl.float32)
-    if not NEED_MASK:
-        for off in range(0, M, BLOCK_ROW_SIZE):
-            rows = off + tl.arange(0, BLOCK_ROW_SIZE)
-            dy = tl.load(dY + rows[:, None] * N).to(tl.float32)
-            x = tl.load(X + rows[:, None] * N).to(tl.float32)
-            mean = tl.load(Mean + rows)[:, None].to(tl.float32)
-            rstd = tl.load(Rstd + rows)[:, None].to(tl.float32)
-            x_hat = (x - mean) * rstd
-            accW += dy * x_hat
-            accB += dy
-        if dW is not None:
-            dw = tl.sum(accW, axis=0)
-            tl.store(dW + pid, dw[None, :])
-        if dB is not None:
-            db = tl.sum(accB, axis=0)
-            tl.store(dB + pid, db[None, :])
+    # Reduce the (P, N) partials: dW[n] = sum_i PW[i, n].  1D [C] loads.
+    n0 = ext.program_id(0) * C
+    cols = n0 + tl.arange(0, C)
+    if not NEED_TAIL:
+        if PW is not None:
+            accW = tl.zeros([C], dtype=tl.float32)
+            for i in range(0, P):
+                accW += tl.load(PW + i * N + cols).to(tl.float32)
+            tl.store(dW + cols, accW)
+        if PB is not None:
+            accB = tl.zeros([C], dtype=tl.float32)
+            for i in range(0, P):
+                accB += tl.load(PB + i * N + cols).to(tl.float32)
+            tl.store(dB + cols, accB)
     else:
-        col_mask = pid < N
-        for off in range(0, M, BLOCK_ROW_SIZE):
-            rows = off + tl.arange(0, BLOCK_ROW_SIZE)
-            row_mask = rows[:, None] < M
-            mask = row_mask and col_mask
-            dy = tl.load(dY + rows[:, None] * N, mask).to(tl.float32)
-            x = tl.load(X + rows[:, None] * N, mask).to(tl.float32)
-            mean = tl.load(Mean + rows, mask=rows < M)[:, None].to(tl.float32)
-            rstd = tl.load(Rstd + rows, mask=rows < M)[:, None].to(tl.float32)
-            x = tl.where(col_mask, x - mean, 0.0)
-            x_hat = x * rstd
-            accW += dy * x_hat
-            accB += dy
-        if dW is not None:
-            dw = tl.sum(accW, axis=0)
-            tl.store(dW + pid, dw[None, :], mask=col_mask)
-        if dB is not None:
-            db = tl.sum(accB, axis=0)
-            tl.store(dB + pid, db[None, :], mask=col_mask)
-
-
+        cmask = cols < N
+        if PW is not None:
+            accW = tl.zeros([C], dtype=tl.float32)
+            for i in range(0, P):
+                w = tl.load(PW + i * N + cols, mask=cmask, other=0.0).to(
+                    tl.float32
+                )
+                accW += tl.where(cmask, w, 0.0)
+            tl.store(dW + cols, accW, mask=cmask)
+        if PB is not None:
+            accB = tl.zeros([C], dtype=tl.float32)
+            for i in range(0, P):
+                b = tl.load(PB + i * N + cols, mask=cmask, other=0.0).to(
+                    tl.float32
+                )
+                accB += tl.where(cmask, b, 0.0)
+            tl.store(dB + cols, accB, mask=cmask)
 def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     logger.debug("GEMS_KUNLUNXIN LAYER_NORM")
 
@@ -754,7 +803,6 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
 
     return y, mean, rstd
 
-
 def layer_norm_backward(
     grad_out,
     input,
@@ -776,27 +824,17 @@ def layer_norm_backward(
 
     M = input.shape[0]
     N = input.numel() // M
+    bc = _ln_bwd_col_size(N)
+    br = triton.next_power_of_2(triton.cdiv(M, 12))
+    need_mask = (M % br != 0) or (N % bc != 0)
+    need_tail = N % bc != 0
 
     if output_mask[0]:
         in_grad = torch.empty_strided(
             input.size(), input.stride(), dtype=input.dtype, device=input.device
         )
-        br = _layer_norm_backward_block_row_size(M)
-        bc = _layer_norm_backward_block_col_size(input.dtype, M, N)
-        need_mask = (M % br != 0) or (N % bc != 0)
-        grid = lambda meta: (triton.cdiv(M, meta["BLOCK_ROW_SIZE"]), 1, 1)
-        os.environ["TRITONXPU_OTHER_SIM"] = "1"
-        os.environ["TRITONXPU_STORE_MASK_SIM"] = "1"
-        os.environ["TRITONXPU_DTYPE_CONVERT"] = "1"
-        if M == 100 and N == 40499:
-            isCloseUnrollControl = True
-            isCloseCoreTiling = True
-        else:
-            isCloseUnrollControl = False
-            isCloseCoreTiling = False
-
         with torch_device_fn.device(input.device):
-            layer_norm_backward_kernel[grid](
+            layer_norm_backward_kernel[(triton.cdiv(M, br), 1, 1)](
                 grad_out,
                 input,
                 weight,
@@ -805,24 +843,25 @@ def layer_norm_backward(
                 in_grad,
                 M,
                 N,
+                BLOCK_ROW_SIZE=br,
+                BLOCK_COL_SIZE=bc,
                 NEED_MASK=need_mask,
-                isCloseUnrollControl=isCloseUnrollControl,
-                isCloseCoreTiling=isCloseCoreTiling,
+                # The masked N-tail path requires both isCloseUnrollControl
+                # and isCloseCoreTiling (with either off the tail tiles are
+                # miscompiled: OOR at (1,40999)/(100,40499), wrong values at
+                # (4096,100); with both on the masked shapes validate).
+                # Unmasked shapes skip both paths (measured 2-18x faster at
+                # M>=256) and validate exactly.
+                isCloseUnrollControl=need_mask,
+                isCloseCoreTiling=need_mask,
                 isCloseVectorization=True,
             )
-        if "TRITONXPU_OTHER_SIM" in os.environ:
-            del os.environ["TRITONXPU_OTHER_SIM"]
-        if "TRITONXPU_STORE_MASK_SIM" in os.environ:
-            del os.environ["TRITONXPU_STORE_MASK_SIM"]
-        if "TRITONXPU_DTYPE_CONVERT" in os.environ:
-            del os.environ["TRITONXPU_DTYPE_CONVERT"]
     else:
         in_grad = None
 
     if output_mask[1] is False and output_mask[2] is False:
         return in_grad, None, None
 
-    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_COL_SIZE"]), 1, 1)
     if output_mask[1]:
         weight_grad = torch.empty_strided(
             weight.size(), weight.stride(), dtype=weight.dtype, device=weight.device
@@ -835,21 +874,64 @@ def layer_norm_backward(
         )
     else:
         bias_grad = None
-    bc_wb = weight_bias_backward_kernel_heur_block_col_size({"N": N})
-    need_mask_wb = N % bc_wb != 0
-    with torch_device_fn.device(input.device):
-        weight_bias_backward_kernel[grid](
-            grad_out,
-            input,
-            mean,
-            rstd,
-            weight_grad,
-            bias_grad,
-            M,
-            N,
-            NEED_MASK=need_mask_wb,
-            isCloseCoreTiling=True,
-            isCloseUnrollControl=True,
-            isCloseVectorization=True,
+
+    bm = _wb_bm_size(M)
+    if bm >= M:
+        # one M-loop covers all rows: write dW/dB directly
+        with torch_device_fn.device(input.device):
+            weight_bias_backward_1d_kernel[(triton.cdiv(N, bc), 1, 1)](
+                grad_out,
+                input,
+                mean,
+                rstd,
+                weight_grad,
+                bias_grad,
+                M,
+                N,
+                BM=bm,
+                C=bc,
+                NEED_TAIL=need_tail,
+                DIRECT=True,
+                isCloseUnrollControl=True,
+            )
+    else:
+        # two-stage: (M / BM) partial vectors, then reduce them 1D
+        P = M // bm
+        pw = (
+            torch.empty_strided((P, N), (N, 1), dtype=torch.float32, device=input.device)
+            if weight_grad is not None
+            else None
         )
+        pb = (
+            torch.empty_strided((P, N), (N, 1), dtype=torch.float32, device=input.device)
+            if bias_grad is not None
+            else None
+        )
+        with torch_device_fn.device(input.device):
+            weight_bias_backward_1d_kernel[(triton.cdiv(N, bc), P, 1)](
+                grad_out,
+                input,
+                mean,
+                rstd,
+                pw,
+                pb,
+                M,
+                N,
+                BM=bm,
+                C=bc,
+                NEED_TAIL=need_tail,
+                DIRECT=False,
+                isCloseUnrollControl=True,
+            )
+            weight_bias_backward_finish_kernel[(triton.cdiv(N, bc), 1, 1)](
+                pw,
+                pb,
+                weight_grad,
+                bias_grad,
+                P,
+                N,
+                C=bc,
+                NEED_TAIL=need_tail,
+                isCloseUnrollControl=True,
+            )
     return in_grad, weight_grad, bias_grad

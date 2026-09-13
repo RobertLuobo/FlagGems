@@ -23,13 +23,15 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
-_BLOCK_SIZE = 16384
-_FLAG_BLOCK_SIZE = 8192
+_BLOCK_SIZE = 8192
 _NUM_WARPS = 8
-# Tensors with at least this many elements take the legacy pointwise path:
-# on this platform the per-lane scalar ALU math (no vectorized SIMD math for
-# elementwise ops) makes the raw-Triton pipeline ~3x slower than the native
-# path once tensors exceed a few MB of lanes.
+# Tensors with at least this many elements take the vendor-native pointwise
+# engine path. On this platform the raw-Triton pipeline runs at ~30 GB/s
+# (per-lane scalar ALU, no vectorized SIMD for elementwise ops) regardless of
+# block size, so unbounded per-block kernels lose ~8x to the native pointwise
+# engine (unscale_func) once tensors exceed a few MB of lanes, while the
+# pointwise engine + `(~isfinite).any()` reduction beats the raw pipeline by
+# ~2.3x on the 25M-element benchmark shapes.
 _LARGE_NUMEL = 2 * 1024 * 1024
 
 config_ = CodeGenConfig(
@@ -56,13 +58,21 @@ def unscale_func(value, inv_scale):
 
 
 @triton.jit
-def _unscale_kernel(
+def _unscale_flag_kernel(
     x_ptr,
     inv_scale,
+    flag_ptr,
     numel,
     BLOCK: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
+    """One fused pass: unscale in place and publish one per-block non-finite
+    flag.  Fusing removes the second full read of the tensor (the previous
+    split unscale/flag kernels were two separate elementwise launches) and
+    cuts one launch per tensor; on the launch-bound small/medium shapes this
+    is the dominant win.  Tail lanes load ``other=0.0`` (finite) so masked-out
+    lanes never raise the flag, and ``nf & mask`` guards stores of the flag.
+    """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     if NEED_MASK:
@@ -75,31 +85,15 @@ def _unscale_kernel(
         tl.store(x_ptr + offs, out, mask=mask)
     else:
         tl.store(x_ptr + offs, out)
-
-
-@triton.jit
-def _non_finite_flag_kernel(
-    x_ptr,
-    flag_ptr,
-    flag_base,
-    numel,
-    BLOCK: tl.constexpr,
-    NEED_MASK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    if NEED_MASK:
-        mask = offs < numel
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-    else:
-        x = tl.load(x_ptr + offs)
     # Non-finite detection via ordered range comparisons only: NaN is not
     # <= MAX nor >= -MAX, so it is caught as well; the unordered "x != x"
     # idiom is NOT selectable by this backend's LLVM for fp32 and must be
     # avoided. inf/nan survive unscaling unchanged, so testing the already
     # scaled in-place data is equivalent to testing the original values.
     nf = ~((x <= 3.4028235e38) & (x >= -3.4028235e38))
-    tl.store(flag_ptr + (flag_base + pid), tl.max(tl.where(nf, 1.0, 0.0)))
+    if NEED_MASK:
+        nf = nf & mask
+    tl.store(flag_ptr + pid, tl.max(tl.where(nf, 1.0, 0.0)))
 
 
 @triton.jit
@@ -131,30 +125,25 @@ def _amp_foreach_non_finite_check_and_unscale_(tensors, found_inf, inv_scale):
         else:
             small.append(tensor)
 
-    # Fast fused path: in-place unscale + per-block non-finite flags in two
-    # elementwise launches per tensor plus one tiny op-level reduce.
-    total_blocks = sum(triton.cdiv(t.numel(), _FLAG_BLOCK_SIZE) for t in small)
+    # Fast fused path: one in-place unscale + per-block non-finite flag pass
+    # per tensor (single kernel launch, single read+write), plus one tiny
+    # op-level reduce.  The old split (separate unscale and flag kernels)
+    # cost a second full read of every tensor; with both fused the small
+    # shapes become launch-bound, which is the dominant cost there.
+    total_blocks = sum(triton.cdiv(t.numel(), _BLOCK_SIZE) for t in small)
     if total_blocks > 0:
         flags = torch.empty(total_blocks, device=tensors[0].device, dtype=torch.float32)
         base = 0
         for tensor in small:
             n = tensor.numel()
-            nb = triton.cdiv(n, _FLAG_BLOCK_SIZE)
-            _unscale_kernel[(triton.cdiv(n, _BLOCK_SIZE),)](
+            nb = triton.cdiv(n, _BLOCK_SIZE)
+            _unscale_flag_kernel[(nb,)](
                 tensor,
                 inv_scale,
+                flags[base:],
                 n,
                 BLOCK=_BLOCK_SIZE,
                 NEED_MASK=n % _BLOCK_SIZE != 0,
-                num_warps=_NUM_WARPS,
-            )
-            _non_finite_flag_kernel[(nb,)](
-                tensor,
-                flags,
-                base,
-                n,
-                BLOCK=_FLAG_BLOCK_SIZE,
-                NEED_MASK=n % _FLAG_BLOCK_SIZE != 0,
                 num_warps=_NUM_WARPS,
             )
             base += nb
@@ -166,13 +155,16 @@ def _amp_foreach_non_finite_check_and_unscale_(tensors, found_inf, inv_scale):
         )
 
     # Huge-tensor path: the vendor-native pointwise engine beats elementwise
-    # Triton ALU once the tensors are large.
+    # Triton ALU once the tensors are large (~8x at 25M elements), and the
+    # non-finite check runs as `(~isfinite).any()`: the vendor `any` (91us at
+    # 16.7M) is ~4x faster than the vendor `all` (371us) for the same mask,
+    # which dominates the huge-tensor latency.
     if large:
         scale = inv_scale.item()
         has_non_finite = False
         for tensor in large:
             unscale_func(tensor, scale, out0=tensor)
-            if not torch.isfinite(tensor).all():
+            if torch.any(~torch.isfinite(tensor)):
                 has_non_finite = True
         if has_non_finite:
             found_inf.fill_(1.0)

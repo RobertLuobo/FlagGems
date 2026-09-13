@@ -120,7 +120,7 @@ def _fused_moe_routed_gemm_kernel(
         tl.store(
             c_ptr + token * stride_cm + offs_n * stride_cn,
             accumulator,
-            mask=offs_n < n_out,
+            mask=valid_route & (offs_n < n_out),
         )
 
 

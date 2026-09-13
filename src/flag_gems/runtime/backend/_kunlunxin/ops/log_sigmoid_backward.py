@@ -18,8 +18,11 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems.utils import pointwise_dynamic
 from flag_gems.utils import triton_lang_extension as ext
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+from ..utils.pointwise_dynamic import (
+    pointwise_dynamic as xpu_pointwise_dynamic,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,31 @@ logger = logging.getLogger(__name__)
 UNROLL_NUM = 2
 BUFFER_SIZE_LIMIT = 8192
 IS_CLOSE_MEMORY_ASYNC = False
+
+# Above this many elements the 12-CTA 1D-tile codegen measures faster than the
+# flat per-CTA kernels (see the module docstring, section 2).
+FLAT_MAX_NUMEL = 4 * 1024 * 1024
+
+# 12-CTA auto-grid 1D-tile codegen: same proven config as hardsigmoid_backward.
+config_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    buffer_size_limit=4096,
+    kunlunAutoGrid=True,
+    unroll_num=8,
+)
+
+
+@xpu_pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=config_)
+@triton.jit
+def log_sigmoid_backward_func(grad_output, self):
+    # 1 - sigmoid(self) == sigmoid(-self) == 1 / (1 + exp(self))
+    go = grad_output.to(tl.float32)
+    x = self.to(tl.float32)
+    return (go * tl.sigmoid(0.0 - x)).to(grad_output.dtype)
 
 
 def _pick_block(n_elements):
@@ -129,13 +157,14 @@ def log_sigmoid_backward_flat_kernel_unmasked(
     tl.store(grad_input_ptr + offsets, res.to(grad_input_ptr.dtype.element_ty))
 
 
-@pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, 1, "DEFAULT")])
-@triton.jit
-def log_sigmoid_backward_pointwise_kernel(grad_output, self):
-    # Strided / broadcast / mixed-dtype fallback with the same algebra as the
-    # flat kernel above (still a Triton kernel, no ATen redispatch).
-    derivative = 1.0 / (1.0 + tl.exp(self.to(tl.float32)))
-    return grad_output * derivative
+# NOTE: do not add a @pointwise_dynamic (flag_gems.utils) kernel here.  Its
+# ModuleGenerator re-emits this file's relative import
+# `from ..utils.pointwise_dynamic import ...` as an absolute
+# `from utils.pointwise_dynamic import ...` inside the generated module, which
+# cannot resolve from the code cache dir (ModuleNotFoundError: No module named
+# 'utils', seen in the non-contiguous .out test).  The xpu variant below has a
+# fixed-import codegen, accepts out0=, and handles strided / broadcast inputs,
+# so the non-flat fallback routes through it.
 
 
 def _can_use_flat_kernel(grad_output, self, grad_input=None):
@@ -193,12 +222,22 @@ def log_sigmoid_backward(grad_output, self, buffer):
     # `buffer` is intentionally unused: the vendor forward leaves it
     # uninitialized (see the module docstring above).
     if _can_use_flat_kernel(grad_output, self):
+        if self.numel() > FLAT_MAX_NUMEL:
+            return log_sigmoid_backward_func(grad_output, self)
         return _launch_flat_kernel(grad_output, self, torch.empty_like(self))
-    return log_sigmoid_backward_pointwise_kernel(grad_output, self)
+    return log_sigmoid_backward_func(grad_output, self)
 
 
 def log_sigmoid_backward_out(grad_output, self, buffer, *, grad_input):
     logger.debug("GEMS_KUNLUNXIN LOG_SIGMOID_BACKWARD OUT")
     if _can_use_flat_kernel(grad_output, self, grad_input):
+        # Same FLAT_MAX_NUMEL cutoff as the functional path: above ~4M elements
+        # the 12-CTA 1D-tile codegen measures about 2x faster than the flat
+        # per-CTA kernel for the same tensor (16.7M fp16: 0.244 ms vs 0.461 ms,
+        # benchmark/test_log_sigmoid_backward.py), and the xpu variant accepts
+        # out0= and writes in place, so the .out variant keeps the identity
+        # `result is grad_input`.
+        if self.numel() > FLAT_MAX_NUMEL:
+            return log_sigmoid_backward_func(grad_output, self, out0=grad_input)
         return _launch_flat_kernel(grad_output, self, grad_input)
-    return log_sigmoid_backward_pointwise_kernel(grad_output, self, out0=grad_input)
+    return log_sigmoid_backward_func(grad_output, self, out0=grad_input)

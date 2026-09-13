@@ -231,6 +231,293 @@ def _ormqr_out_kernel(
     tl.store(OUT_ptr + f, tl.load(X_ptr + xoff))
 
 
+# ---------------------------------------------------------------------------
+# Fast single-launch sweep (2026-09-11, XPU 6) - mirrors the design that was
+# validated end-to-end on this platform by
+# _kunlunxin/ops/linalg_householder_product.py (PASS, dtype-balanced 2.77x).
+#
+# The previous sweep here needed 3 staging launches (init VU, pack X, sweep)
+# plus the out gather.  The work rows are still independent (one row of C for
+# right mode / one column of C for left mode), but now ONE program owns CC
+# work rows, keeps them in registers for the whole reflector sequence and
+# rebuilds v_i / tau_i on the fly from the packed geqrf input - so no V/U
+# staging, no pack launch, no _set_diag copy.  The only reduction is the
+# 1-D -> scalar tl.sum on the contiguous tile axis, which a runtime-bound loop
+# may wrap.  Total launches: 2, independent of k.
+#
+# The compile envelope of a CC-wide sweep on this platform is NOT monotonic in
+# the pad width and only MP = 128 has been fully exercised (see
+# linalg_householder_product), so the fast sweep is taken for LENGTH <= 128
+# (the whole functional-test matrix and the small benchmark shapes); longer
+# reflector directions keep the staged sweep / per-reflector paths below that
+# are already validated on this platform.
+_SWEEP_FAST_MP = 128
+
+
+def _ormqr_pick_cc(nwork):
+    """Work rows per sweep program, by nwork (sibling-validated table).
+
+    Shared C/A/tau loads amortise over CC independent reductions, but the
+    squeezed trailing CC-1 programs and the extra register pressure make the
+    sweet spot grow only slowly with nwork; CC = 16 measured *worse* again on
+    the sibling op, so only CC in {1, 2, 4, 8} exist.
+    """
+    if nwork <= 5:
+        return 1
+    if nwork <= 16:
+        return 2
+    if nwork <= 32:
+        return 4
+    return 8
+
+
+@libentry()
+@triton.jit
+def _ormqr_sweep_fused_kernel(
+    C_ptr,
+    A_ptr,
+    T_ptr,
+    X_ptr,
+    K,
+    LENGTH,
+    NWORK,
+    s_cb,
+    s_cm,
+    s_cn,
+    a_bs,
+    a_rs,
+    a_cs,
+    t_bs,
+    t_cs,
+    XS: tl.constexpr,
+    LEFT: tl.constexpr,
+    REV: tl.constexpr,
+    MP: tl.constexpr,
+):
+    """Apply the whole reflector sequence to ONE work row, kept in registers.
+
+    The work row is a row of C (right mode) or a column of C fetched as a row
+    (left mode); the reflector vector v_i is rebuilt from the packed geqrf
+    input (v_i[i] = 1 implicit, v_i[r] = A[r, i] for r > i, 0 for r < i) and
+    tau_i is loaded as a scalar, so no staging buffer is needed.  Grid:
+    (batch, NWORK); every store is unmasked and 64-aligned by construction
+    (the X rows are MP wide and the padding lanes are written).
+    """
+    b = tl.program_id(0)
+    w = tl.program_id(1)
+    r = tl.arange(0, MP)
+    rc = tl.minimum(r, LENGTH - 1)
+    if LEFT:
+        x = tl.load(C_ptr + b * s_cb + rc * s_cm + w * s_cn)
+    else:
+        x = tl.load(C_ptr + b * s_cb + w * s_cm + rc * s_cn)
+    x = tl.where(r < LENGTH, x, 0.0)
+    for t in range(0, K):
+        if REV:
+            i = K - 1 - t
+        else:
+            i = t
+        av = tl.load(A_ptr + b * a_bs + rc * a_rs + i * a_cs)
+        tau = tl.load(T_ptr + b * t_bs + i * t_cs)
+        v = tl.where(r > i, av, tl.where(r == i, 1.0, 0.0))
+        v = tl.where(r < LENGTH, v, 0.0)
+        x = x - tl.sum(x * v) * (v * tau)
+    tl.store(X_ptr + b * (NWORK * XS) + w * XS + r, x)
+
+
+@libentry()
+@triton.jit
+def _ormqr_sweep_fused_cc2_kernel(
+    C_ptr,
+    A_ptr,
+    T_ptr,
+    X_ptr,
+    K,
+    LENGTH,
+    NWORK,
+    s_cb,
+    s_cm,
+    s_cn,
+    a_bs,
+    a_rs,
+    a_cs,
+    t_bs,
+    t_cs,
+    XS: tl.constexpr,
+    LEFT: tl.constexpr,
+    REV: tl.constexpr,
+    MP: tl.constexpr,
+):
+    b = tl.program_id(0)
+    w0 = tl.program_id(1) * 2
+    r = tl.arange(0, MP)
+    rc = tl.minimum(r, LENGTH - 1)
+    if LEFT:
+        x0 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 0) * s_cn)
+        x1 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 1) * s_cn)
+    else:
+        x0 = tl.load(C_ptr + b * s_cb + (w0 + 0) * s_cm + rc * s_cn)
+        x1 = tl.load(C_ptr + b * s_cb + (w0 + 1) * s_cm + rc * s_cn)
+    x0 = tl.where(r < LENGTH, x0, 0.0)
+    x1 = tl.where(r < LENGTH, x1, 0.0)
+    for t in range(0, K):
+        if REV:
+            i = K - 1 - t
+        else:
+            i = t
+        av = tl.load(A_ptr + b * a_bs + rc * a_rs + i * a_cs)
+        tau = tl.load(T_ptr + b * t_bs + i * t_cs)
+        v = tl.where(r > i, av, tl.where(r == i, 1.0, 0.0))
+        v = tl.where(r < LENGTH, v, 0.0)
+        u = v * tau
+        x0 = x0 - tl.sum(x0 * v) * u
+        x1 = x1 - tl.sum(x1 * v) * u
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 0) * XS + r, x0)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 1) * XS + r, x1)
+
+
+@libentry()
+@triton.jit
+def _ormqr_sweep_fused_cc4_kernel(
+    C_ptr,
+    A_ptr,
+    T_ptr,
+    X_ptr,
+    K,
+    LENGTH,
+    NWORK,
+    s_cb,
+    s_cm,
+    s_cn,
+    a_bs,
+    a_rs,
+    a_cs,
+    t_bs,
+    t_cs,
+    XS: tl.constexpr,
+    LEFT: tl.constexpr,
+    REV: tl.constexpr,
+    MP: tl.constexpr,
+):
+    b = tl.program_id(0)
+    w0 = tl.program_id(1) * 4
+    r = tl.arange(0, MP)
+    rc = tl.minimum(r, LENGTH - 1)
+    if LEFT:
+        x0 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 0) * s_cn)
+        x1 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 1) * s_cn)
+        x2 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 2) * s_cn)
+        x3 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 3) * s_cn)
+    else:
+        x0 = tl.load(C_ptr + b * s_cb + (w0 + 0) * s_cm + rc * s_cn)
+        x1 = tl.load(C_ptr + b * s_cb + (w0 + 1) * s_cm + rc * s_cn)
+        x2 = tl.load(C_ptr + b * s_cb + (w0 + 2) * s_cm + rc * s_cn)
+        x3 = tl.load(C_ptr + b * s_cb + (w0 + 3) * s_cm + rc * s_cn)
+    x0 = tl.where(r < LENGTH, x0, 0.0)
+    x1 = tl.where(r < LENGTH, x1, 0.0)
+    x2 = tl.where(r < LENGTH, x2, 0.0)
+    x3 = tl.where(r < LENGTH, x3, 0.0)
+    for t in range(0, K):
+        if REV:
+            i = K - 1 - t
+        else:
+            i = t
+        av = tl.load(A_ptr + b * a_bs + rc * a_rs + i * a_cs)
+        tau = tl.load(T_ptr + b * t_bs + i * t_cs)
+        v = tl.where(r > i, av, tl.where(r == i, 1.0, 0.0))
+        v = tl.where(r < LENGTH, v, 0.0)
+        u = v * tau
+        x0 = x0 - tl.sum(x0 * v) * u
+        x1 = x1 - tl.sum(x1 * v) * u
+        x2 = x2 - tl.sum(x2 * v) * u
+        x3 = x3 - tl.sum(x3 * v) * u
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 0) * XS + r, x0)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 1) * XS + r, x1)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 2) * XS + r, x2)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 3) * XS + r, x3)
+
+
+@libentry()
+@triton.jit
+def _ormqr_sweep_fused_cc8_kernel(
+    C_ptr,
+    A_ptr,
+    T_ptr,
+    X_ptr,
+    K,
+    LENGTH,
+    NWORK,
+    s_cb,
+    s_cm,
+    s_cn,
+    a_bs,
+    a_rs,
+    a_cs,
+    t_bs,
+    t_cs,
+    XS: tl.constexpr,
+    LEFT: tl.constexpr,
+    REV: tl.constexpr,
+    MP: tl.constexpr,
+):
+    b = tl.program_id(0)
+    w0 = tl.program_id(1) * 8
+    r = tl.arange(0, MP)
+    rc = tl.minimum(r, LENGTH - 1)
+    if LEFT:
+        x0 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 0) * s_cn)
+        x1 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 1) * s_cn)
+        x2 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 2) * s_cn)
+        x3 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 3) * s_cn)
+        x4 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 4) * s_cn)
+        x5 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 5) * s_cn)
+        x6 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 6) * s_cn)
+        x7 = tl.load(C_ptr + b * s_cb + rc * s_cm + (w0 + 7) * s_cn)
+    else:
+        x0 = tl.load(C_ptr + b * s_cb + (w0 + 0) * s_cm + rc * s_cn)
+        x1 = tl.load(C_ptr + b * s_cb + (w0 + 1) * s_cm + rc * s_cn)
+        x2 = tl.load(C_ptr + b * s_cb + (w0 + 2) * s_cm + rc * s_cn)
+        x3 = tl.load(C_ptr + b * s_cb + (w0 + 3) * s_cm + rc * s_cn)
+        x4 = tl.load(C_ptr + b * s_cb + (w0 + 4) * s_cm + rc * s_cn)
+        x5 = tl.load(C_ptr + b * s_cb + (w0 + 5) * s_cm + rc * s_cn)
+        x6 = tl.load(C_ptr + b * s_cb + (w0 + 6) * s_cm + rc * s_cn)
+        x7 = tl.load(C_ptr + b * s_cb + (w0 + 7) * s_cm + rc * s_cn)
+    x0 = tl.where(r < LENGTH, x0, 0.0)
+    x1 = tl.where(r < LENGTH, x1, 0.0)
+    x2 = tl.where(r < LENGTH, x2, 0.0)
+    x3 = tl.where(r < LENGTH, x3, 0.0)
+    x4 = tl.where(r < LENGTH, x4, 0.0)
+    x5 = tl.where(r < LENGTH, x5, 0.0)
+    x6 = tl.where(r < LENGTH, x6, 0.0)
+    x7 = tl.where(r < LENGTH, x7, 0.0)
+    for t in range(0, K):
+        if REV:
+            i = K - 1 - t
+        else:
+            i = t
+        av = tl.load(A_ptr + b * a_bs + rc * a_rs + i * a_cs)
+        tau = tl.load(T_ptr + b * t_bs + i * t_cs)
+        v = tl.where(r > i, av, tl.where(r == i, 1.0, 0.0))
+        v = tl.where(r < LENGTH, v, 0.0)
+        u = v * tau
+        x0 = x0 - tl.sum(x0 * v) * u
+        x1 = x1 - tl.sum(x1 * v) * u
+        x2 = x2 - tl.sum(x2 * v) * u
+        x3 = x3 - tl.sum(x3 * v) * u
+        x4 = x4 - tl.sum(x4 * v) * u
+        x5 = x5 - tl.sum(x5 * v) * u
+        x6 = x6 - tl.sum(x6 * v) * u
+        x7 = x7 - tl.sum(x7 * v) * u
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 0) * XS + r, x0)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 1) * XS + r, x1)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 2) * XS + r, x2)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 3) * XS + r, x3)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 4) * XS + r, x4)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 5) * XS + r, x5)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 6) * XS + r, x6)
+    tl.store(X_ptr + b * (NWORK * XS) + (w0 + 7) * XS + r, x7)
+
+
 def _sweep_width(length):
     """Smallest probe-verified sweep width that covers `length` (or None)."""
     for w in _SWEEP_WIDTHS:
@@ -285,6 +572,54 @@ def _ormqr_sweep(input, tau, other, left, transpose):
     rows = N if left else M
     in_rows = input.shape[-2]
     dev = other.device
+    rev = (not transpose) if left else transpose
+    total = B * M * N
+    # fast single-launch sweep (sibling-validated envelope: one program owns
+    # CC work rows, v_i/tau_i rebuilt on the fly; 2 launches total).
+    if length <= _SWEEP_FAST_MP:
+        cc = _ormqr_pick_cc(rows)
+        X = torch.empty(B * rows * _SWEEP_FAST_MP, dtype=torch.float32, device=dev)
+        grid = (B, triton.cdiv(rows, cc))
+        args = (
+            other,
+            input,
+            tau,
+            X,
+            k,
+            length,
+            rows,
+            s_cb,
+            other.stride(-2),
+            other.stride(-1),
+            s_ib,
+            input.stride(-2),
+            input.stride(-1),
+            s_tb,
+            tau.stride(-1),
+        )
+        ckw = dict(
+            XS=_SWEEP_FAST_MP, LEFT=bool(left), REV=rev, MP=_SWEEP_FAST_MP
+        )
+        if cc == 1:
+            _ormqr_sweep_fused_kernel[grid](*args, **ckw)
+        elif cc == 2:
+            _ormqr_sweep_fused_cc2_kernel[grid](*args, **ckw)
+        elif cc == 4:
+            _ormqr_sweep_fused_cc4_kernel[grid](*args, **ckw)
+        else:
+            _ormqr_sweep_fused_cc8_kernel[grid](*args, **ckw)
+        npad = ((total + 63) // 64) * 64
+        OUT = torch.empty(npad, dtype=torch.float32, device=dev)
+        _ormqr_out_kernel[(npad // 64,)](
+            OUT,
+            X,
+            M=M,
+            N=N,
+            TOTAL=total,
+            LEFT=bool(left),
+            LP=_SWEEP_FAST_MP,
+        )
+        return OUT[:total].view(*other.shape)
     # every element of V / U / X / OUT is written by the kernels below, so the
     # buffers are deliberately uninitialised (no gems `zeros` launch).
     V = torch.empty(B * k * LP, dtype=torch.float32, device=dev)
@@ -317,7 +652,6 @@ def _ormqr_sweep(input, tau, other, left, transpose):
         LP=LP,
     )
     # reflector order, identical to the per-reflector path below
-    rev = (not transpose) if left else transpose
     _ormqr_sweep_kernel[(B, rows)](
         X,
         V,
@@ -328,7 +662,6 @@ def _ormqr_sweep(input, tau, other, left, transpose):
         REV=rev,
         ACC64=LP <= _SWEEP_ACC64_MAX,
     )
-    total = B * M * N
     npad = ((total + 63) // 64) * 64
     OUT = torch.empty(npad, dtype=torch.float32, device=dev)
     _ormqr_out_kernel[(npad // 64,)](
