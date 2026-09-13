@@ -34,12 +34,19 @@ except ImportError:
     GEMS_OP = None
 
 
+class DregluBackwardBenchmark(base.TexGluBackwardBenchmark):
+    def set_more_shapes(self):
+        # base returns lists; Benchmark.init_user_config dedups the merged
+        # shapes with dict.fromkeys, which needs hashable entries.
+        return [tuple(shape) for shape in super().set_more_shapes()]
+
+
 @pytest.mark.dreglu
 @pytest.mark.skipif(not TE_AVAILABLE, reason="TransformerEngine not installed")
 @pytest.mark.skipif(TE_OP is None, reason="'dreglu' not found in TransformerEngine")
 @pytest.mark.skipif(GEMS_OP is None, reason="'dreglu' not found in FlagGems")
 def test_dreglu():
-    bench = base.TexGluBackwardBenchmark(
+    bench = DregluBackwardBenchmark(
         op_name="dreglu",
         torch_op=TE_OP,
         gems_op=GEMS_OP,

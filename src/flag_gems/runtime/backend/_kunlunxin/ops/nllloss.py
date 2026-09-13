@@ -145,6 +145,88 @@ def nll_loss_reduce_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Grid-parallel level-1 reduction for the 2d/nd reduced forward paths.
+#
+# `nll_loss_reduce_kernel` is a single program, so its unrolled body is
+# capped at `_NLL2D_REDUCE_MAX_TILES` (4) tiles - an unrolled NTILES=16
+# variant faults the device (see the comment above `_NLL2D_REDUCE_MAX_TILES`).
+# Sizes past that cap (e.g. the (4096, 4096, 4, 8) benchmark cell with
+# M = N*D = 131072 = 16*8192) therefore used to fall back to the staged host
+# tail (xpu_sum x2 + 0-d scalar ops), measured at ~150-220 us on that cell.
+# This kernel widens the *grid* while keeping the per-program body a
+# `tl.static_range(TPP)` unroll of fully unmasked tiles with TPP <= 4, i.e.
+# never past the validated fault cap.  Each program reduces its own
+# TPP-tile chunk of BOTH scratch buffers, splits it off the exact-divisor
+# `_nll2d_partial_config` (TPP | ntiles, so no tile is read twice and no
+# program walks past the end of the buffers) and writes two fp32 partials;
+# `nll_loss2d_finalize_kernel` then reduces the (<= 8192) partials into the
+# final scalar.  The reduced tail becomes 2 small launches instead of 2
+# `xpu_sum` calls plus the fp32 divide/casts.
+# ---------------------------------------------------------------------------
+_NLL2D_PARTIAL_PROG_TILES = 4
+
+
+def _nll2d_partial_config(ntiles):
+    """`(nprog, tpp)` with `tpp` the largest divisor of `ntiles` at most
+    `_NLL2D_PARTIAL_PROG_TILES` (so `nprog * tpp == ntiles` exactly): no
+    program body is unrolled past the 4-tile fault cap and no program ever
+    touches a tile outside `[0, ntiles)`."""
+    for tpp in (_NLL2D_PARTIAL_PROG_TILES, 2, 1):
+        if ntiles % tpp == 0:
+            return ntiles // tpp, tpp
+    raise RuntimeError("unreachable")
+
+
+@libentry()
+@triton.jit
+def nll_loss2d_partial_reduce_kernel(
+    out_ptr,
+    wgt_ptr,
+    pout_ptr,
+    pwgt_ptr,
+    TPP: tl.constexpr,
+    TL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_o = tl.zeros([], dtype=tl.float32)
+    total_w = tl.zeros([], dtype=tl.float32)
+    for j in tl.static_range(TPP):
+        off = (pid * TPP + j) * TL + tl.arange(0, TL)
+        o = tl.load(out_ptr + off).to(tl.float32)
+        w = tl.load(wgt_ptr + off).to(tl.float32)
+        total_o += tl.sum(o)
+        total_w += tl.sum(w)
+    tl.store(pout_ptr + pid, total_o)
+    tl.store(pwgt_ptr + pid, total_w)
+
+
+@libentry()
+@triton.jit
+def nll_loss2d_finalize_kernel(
+    pout_ptr,
+    pwgt_ptr,
+    total_out_ptr,
+    total_wgt_ptr,
+    MEAN: tl.constexpr,
+    NP: tl.constexpr,
+    nprog,
+):
+    # Single-shot masked tile over the (<= 8192) partials; `NP` lanes cover
+    # the buffer and lanes >= nprog are masked out (the two partial buffers
+    # are exactly nprog elements long, so the masked load stays in bounds).
+    off = tl.arange(0, NP)
+    mask = off < nprog
+    total_o = tl.sum(tl.load(pout_ptr + off, mask=mask, other=0).to(tl.float32))
+    total_w = tl.sum(tl.load(pwgt_ptr + off, mask=mask, other=0).to(tl.float32))
+    if MEAN:
+        res = total_o / total_w
+    else:
+        res = total_o
+    tl.store(total_out_ptr, res.to(total_out_ptr.dtype.element_ty))
+    tl.store(total_wgt_ptr, total_w.to(total_wgt_ptr.dtype.element_ty))
+
+
+# ---------------------------------------------------------------------------
 # Scalar `mean` finish for the *staged* (`xpu_sum`) reduced path.
 #
 # Takes the two already-reduced fp32 scalars and emits the two fp16/bf16/fp32
@@ -250,7 +332,12 @@ def nll_loss2d_forward_kernel(
     out_ptrs = out_ptr + offset_n * D + offset_d
     tl.store(out_ptrs, out, mask=mask_block)
 
-    if reduction == 1:
+    # Both reduced paths (mean *and* sum) need the per-element weight scratch
+    # for the reduction: ATen's `nll_loss2d_forward` returns `total_weight` =
+    # sum of the (non-ignored) weights for every reduction, matching
+    # `nll_loss_forward`'s fused path.  `reduction == 0` never reaches the
+    # reduction tail, so the pointer may stay `None` there.
+    if reduction != 0:
         ignore_wgt_tgt_ptrs = ignore_wgt_tgt_ptr + offset_n * D + offset_d
         tl.store(ignore_wgt_tgt_ptrs, wgt_tgt, mask=mask_block)
 
@@ -327,7 +414,9 @@ def nll_loss2d_forward_tiled_kernel(
     out = inp_tgt * wgt_tgt * -1
 
     tl.store(out_ptr + flat, out)
-    if reduction == 1:
+    # Both reduced paths need the weight scratch (mean and sum); see the
+    # comment at the same site in `nll_loss2d_forward_kernel`.
+    if reduction != 0:
         tl.store(ignore_wgt_tgt_ptr + flat, wgt_tgt)
 
 
@@ -429,7 +518,9 @@ def nll_loss2d_forward_flat_kernel(
     out = inp_tgt * wgt_tgt * -1
 
     tl.store(out_ptr + offset_nd, out)
-    if reduction == 1:
+    # Both reduced paths need the weight scratch (mean and sum); see the
+    # comment at the same site in `nll_loss2d_forward_kernel`.
+    if reduction != 0:
         tl.store(ignore_wgt_tgt_ptr + offset_nd, wgt_tgt)
 
 
@@ -503,16 +594,22 @@ def _nll2d_block_d(D):
 #     without, so it was reverted.
 # `sum` therefore keeps HEAD's path byte-for-byte.
 #
-# `_NLL2D_REDUCE_MAX_TILES` must stay at 2.  Raising it to 16 so that the
-# largest benchmark cell (`N*D = 131072`) could fuse too **faults the device**:
-# fp32 `(4096, 64, 4, 8)` mean raised `kl3ChannelCheckErrors ... status=719`,
-# `cluster[11] ... reason[26] sm rdwr conflict` and
-# `Xid (PCI:0000:da:00): KL_XID_KERNEL_EXCEPTION` inside
+# `_NLL2D_REDUCE_MAX_TILES` must stay at 4 or below.  Raising it to 16 so
+# that the largest benchmark cell (`N*D = 131072`) could fuse too
+# **faults the device**: fp32 `(4096, 64, 4, 8)` mean raised
+# `kl3ChannelCheckErrors ... status=719`, `cluster[11] ... reason[26] sm rdwr
+# conflict` and `Xid (PCI:0000:da:00): KL_XID_KERNEL_EXCEPTION` inside
 # `nll_loss_reduce_kernel` (dmesg kl3_dev7, 2026-08-30; the same config is
-# numerically correct in fp16).  Do not retry.
+# numerically correct in fp16).  Do not retry.  4 is the validated-safe
+# upper bound: `N*D = 32768` (the `(64, 512, 512)` benchmark cell) needs
+# exactly 4 x 8192-lane tiles.  Validated 2026-09-11 on XPU4: 1500+ fused
+# mean calls (fp32, weight and no-weight, ignore_index -100/1) with worst
+# abs diff 2.2e-8 against a CPU float64 oracle and no device fault.
+# (The unrolled 4-tile body measures ~11 us against ~72 us for the staged
+# xpu_sum + 0-d div/to/full tail, i.e. ~6x on the reduced mean path.)
 # ---------------------------------------------------------------------------
 _NLL2D_REDUCE_TILE = 8192
-_NLL2D_REDUCE_MAX_TILES = 2
+_NLL2D_REDUCE_MAX_TILES = 4
 
 
 def _nll2d_fused_reduce(M):
@@ -521,6 +618,28 @@ def _nll2d_fused_reduce(M):
     tl_width = min(_NLL2D_REDUCE_TILE, triton.next_power_of_2(M))
     ntiles = triton.cdiv(M, tl_width)
     if ntiles > _NLL2D_REDUCE_MAX_TILES or ntiles * tl_width != M:
+        return None
+    return ntiles, tl_width
+
+
+# Beyond the single-program cap above (`M > 4*8192`), sizes that still tile
+# exactly run the grid-parallel `nll_loss2d_partial_reduce_kernel`
+# (`TILES_PER_PROG` tiles per program) plus a one-program combine over the
+# partials - see the comment on the kernel above.  The cap keeps the combine
+# program far below 8192 lanes.
+_NLL2D_EXACT_TILE_CAP = 128
+
+
+def _nll2d_exact_tiles(M):
+    """Return `(ntiles, TL)` if `M` elements tile exactly (no padding), else
+    `None`.  This is `_nll2d_fused_reduce` without the single-program cap, so
+    the caller can choose between the one-program fused path (ntiles <=
+    `_NLL2D_REDUCE_MAX_TILES`), the grid-parallel path (ntiles <=
+    `_NLL2D_EXACT_TILE_CAP`) and keep the staged `xpu_sum` tail otherwise.
+    Both reduced paths require fully unmasked tiles, i.e. `M % TL == 0`."""
+    tl_width = min(_NLL2D_REDUCE_TILE, triton.next_power_of_2(M))
+    ntiles = triton.cdiv(M, tl_width)
+    if ntiles > _NLL2D_EXACT_TILE_CAP or ntiles * tl_width != M:
         return None
     return ntiles, tl_width
 
@@ -924,12 +1043,23 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
     weight = None if weight is None else weight.contiguous()
 
     out = torch.empty((N, D), dtype=self.dtype, device=self.device)
-    # `fused` replaces the host-side mean reduction tail (2 x xpu_sum + a 0-d
-    # gems div + 2 x .to()) with one extra launch.  Only reduction=mean takes
-    # it; see the comment on `_nll2d_fused_reduce`.
-    fused = _nll2d_fused_reduce(N * D) if reduction == 1 else None
+    # `exact` replaces the staged host-side reduction tail (xpu_sum x2 + a 0-d
+    # gems div + 2 x .to()) with one extra launch when `N*D` tiles exactly:
+    #   - ntiles <= `_NLL2D_REDUCE_MAX_TILES`: the one-program
+    #     `nll_loss_reduce_kernel` (mean and sum; see the comment on
+    #     `_nll2d_fused_reduce` for why the previous sum variant was reverted -
+    #     that measurement predates the `_NLL2D_REDUCE_MAX_TILES` 2 -> 4 fix
+    #     and the wider gather blocks below, so it is re-measured here);
+    #   - ntiles <= `_NLL2D_EXACT_TILE_CAP`: the grid-parallel partial reduce
+    #     plus a one-program combine (see
+    #     `nll_loss2d_partial_reduce_kernel`).
+    # Shapes whose `N*D` cannot be tiled exactly keep the staged path below.
+    exact = _nll2d_exact_tiles(N * D) if reduction != 0 else None
     ignore_weight_tgt = None
-    if reduction == 1:
+    if reduction != 0:
+        # Per-element weight scratch for the fused/grid reduction (mean and
+        # sum); see the comment in `nll_loss2d_forward_kernel` on why the sum
+        # reduction needs it too (`total_weight` is the sum of weights).
         ignore_weight_tgt = torch.empty((N, D), dtype=self.dtype, device=self.device)
 
     block_d = _nll2d_block_d(D)
@@ -985,20 +1115,55 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
         total_weight = torch.zeros([], dtype=self.dtype, device=self.device)
         return output, total_weight
 
-    if fused is not None:
-        ntiles, tl_width = fused
+    if exact is not None:
+        ntiles, tl_width = exact
         output = torch.empty([], dtype=self.dtype, device=self.device)
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
+        # The gather writes the per-element weight scratch for both mean and
+        # sum (see the comment in `nll_loss2d_forward_kernel`), so the
+        # reduction always has a real weight buffer: `total_weight` is the sum
+        # of (non-ignored) weights for every reduction, as in ATen.
+        wgt_buf = ignore_weight_tgt
         with torch_device_fn.device(self.device):
-            nll_loss_reduce_kernel[(1, 1, 1)](
-                out,
-                ignore_weight_tgt,
-                output,
-                total_weight,
-                True,
-                ntiles,
-                tl_width,
-            )
+            if ntiles <= _NLL2D_REDUCE_MAX_TILES:
+                nll_loss_reduce_kernel[(1, 1, 1)](
+                    out,
+                    wgt_buf,
+                    output,
+                    total_weight,
+                    reduction == 1,
+                    ntiles,
+                    tl_width,
+                )
+            else:
+                # Grid-parallel partial reduce: `tpp` tiles per program
+                # (`tpp | ntiles` exactly, so no OOB and no program body
+                # unrolled past the validated 4-tile fault cap), then a
+                # one-program masked combine over the fp32 partials.
+                nprog, tpp = _nll2d_partial_config(ntiles)
+                pout = torch.empty(
+                    (nprog,), dtype=torch.float32, device=self.device
+                )
+                pwgt = torch.empty(
+                    (nprog,), dtype=torch.float32, device=self.device
+                )
+                nll_loss2d_partial_reduce_kernel[(nprog, 1, 1)](
+                    out,
+                    wgt_buf,
+                    pout,
+                    pwgt,
+                    tpp,
+                    tl_width,
+                )
+                nll_loss2d_finalize_kernel[(1, 1, 1)](
+                    pout,
+                    pwgt,
+                    output,
+                    total_weight,
+                    reduction == 1,
+                    triton.next_power_of_2(nprog),
+                    nprog,
+                )
         return output, total_weight
 
     if reduction == 1:

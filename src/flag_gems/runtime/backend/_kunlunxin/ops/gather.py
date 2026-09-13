@@ -538,6 +538,303 @@ _gather_func_legacy = GatherFunctionLegacy()
 
 
 @triton.jit
+def _gather_backward_sum_kernel(
+    grad,
+    index,
+    output,
+    d0,
+    d1,
+    d2,
+    i_t0,
+    i_t1,
+    i_t2,
+    S,
+    total,
+    dim: tl.constexpr,
+    ndim: tl.constexpr,
+    BLOCK_OUTPUT: tl.constexpr,
+    BLOCK_INDEX: tl.constexpr,
+    LOOP: tl.constexpr,
+):
+    # Output-centric, atomic-free gather_backward: every output position is
+    # owned by exactly one lane, and the contribution of all index elements
+    # along the gather dim is accumulated in registers via a masked
+    # compare-select-sum.  Work is O(output.numel() * index.shape[dim]), which
+    # is why we only use it when index.shape[dim] is small (<= 512); the huge
+    # shapes go through the atomic scatter kernel instead.
+    #
+    # The index tensor is contiguous **int32** (the host converts it once;
+    # index values are < 2^31 by dispatch, and 4-byte loads halve the
+    # dominant load traffic).  Output position `oo` decomposes (row-major,
+    # d0/d1/d2 are the output shapes padded with 1) into per-axis
+    # coordinates x0..x2; the coordinate on `dim` is `n` and the other
+    # coordinates give the base offset of the corresponding "line" of index
+    # elements via i_t{0,1,2} (index strides, padded with 1).  The
+    # contributing index elements are at base + j * i_t{dim}.
+    pid = tl.program_id(0)
+    oo = pid * BLOCK_OUTPUT + tl.arange(0, BLOCK_OUTPUT)
+    ov = oo < total
+    # Clamp the ov-false lanes so every load offset stays in-bounds: the XPU
+    # backend hardware-faults on out-of-bounds masked reads (NOC exceptions).
+    # `total - 1` is safe because total >= 1 here (empty results return early).
+    cur = tl.minimum(oo, total - 1)
+    n = tl.zeros((BLOCK_OUTPUT,), dtype=tl.int32)
+    base = tl.zeros((BLOCK_OUTPUT,), dtype=tl.int32)
+    if ndim == 3:
+        x2 = cur % d2
+        cur = cur // d2
+        x1 = cur % d1
+        cur = cur // d1
+        x0 = cur
+        if dim == 0:
+            n = x0
+            base = x1 * i_t1 + x2 * i_t2
+            sdim = i_t0
+        elif dim == 1:
+            n = x1
+            base = x0 * i_t0 + x2 * i_t2
+            sdim = i_t1
+        else:
+            n = x2
+            base = x0 * i_t0 + x1 * i_t1
+            sdim = i_t2
+    else:
+        x1 = cur % d1
+        cur = cur // d1
+        x0 = cur
+        if dim == 0:
+            n = x0
+            base = x1 * i_t1
+            sdim = i_t0
+        else:
+            n = x1
+            base = x0 * i_t0
+            sdim = i_t1
+    acc = tl.zeros((BLOCK_OUTPUT,), dtype=tl.float32)
+    for jt in range(0, LOOP):
+        j = jt * BLOCK_INDEX + tl.arange(0, BLOCK_INDEX)
+        jm = j < S
+        # Clamp j for the jm-false lanes so all load offsets stay in-bounds
+        # (again: the XPU backend hardware-faults on OOB masked reads).
+        # Clamping the *scalar* j (not the 2D offset) keeps the affine
+        # offset decomposition intact, so contiguity/vectorization is
+        # preserved (a 2D tl.minimum on `off` costs ~2.3x).
+        jc = tl.minimum(j, S - 1)
+        m = ov[:, None] & jm[None, :]
+        off = base[:, None] + jc[None, :] * sdim
+        gi = tl.load(index + off, mask=m, other=0)
+        gv = tl.load(grad + off, mask=m, other=0.0).to(tl.float32)
+        # Explicit mask + tl.where before the sum (the XPU backend loses
+        # >8192-lane tree-reduction masks; see known public defect).
+        acc += tl.sum(tl.where(m & (gi == n[:, None]), gv, 0.0), axis=1)
+    tl.store(output + oo, acc, mask=ov)
+
+
+@triton.jit(do_not_specialize=[
+    "N", "SLICE", "index_dim_size", "stride_dim",
+    "i_s0", "i_s1", "i_s2", "o_s0", "o_s1", "o_s2",
+])
+def _gather_backward_scatter_kernel(
+    index,
+    grad,
+    output,
+    N,
+    SLICE,
+    index_dim_size,
+    stride_dim,
+    i_s0,
+    i_s1,
+    i_s2,
+    o_s0,
+    o_s1,
+    o_s2,
+    dim: tl.constexpr,
+    rank: tl.constexpr,
+    BLOCK: tl.constexpr,
+    LOOP: tl.constexpr,
+):
+    # Index-centric gather_backward: for every (contiguous) index element,
+    # scatter-add its grad onto the output position indexed by the value.
+    # Work is O(index.numel()) instead of O(output.numel() * index.shape[dim]).
+    #
+    # Duplicate index values can only alias inside one "slice" of
+    # prod(index.shape[dim:]) consecutive linear elements, so one program owns
+    # exactly one slice: every possible address conflict stays program-local
+    # (cross-program tl.atomic_add conflicts are silently dropped on this
+    # backend).  `iter_off` is the position within the slice and is what the
+    # mask must test; `offs` (the full flat position) feeds the axis
+    # decomposition so the outer coordinates are recovered.
+    base = tl.program_id(0).to(tl.int32) * SLICE
+    ar = tl.arange(0, BLOCK)
+    for i in tl.static_range(LOOP):
+        iter_off = i * BLOCK + ar
+        mask = iter_off < SLICE
+        offs = base + iter_off
+        v = tl.load(index + offs, mask=mask, other=0).to(tl.int32)
+        val = tl.load(grad + offs, mask=mask, other=0.0).to(tl.float32)
+        cur = offs
+        o = tl.zeros((BLOCK,), dtype=tl.int32)
+        if rank == 3:
+            mod = cur % i_s2
+            if dim != 2:
+                o += mod * o_s2
+            cur = cur // i_s2
+            mod = cur % i_s1
+            if dim != 1:
+                o += mod * o_s1
+            cur = cur // i_s1
+            mod = cur % i_s0
+            if dim != 0:
+                o += mod * o_s0
+        else:
+            mod = cur % i_s1
+            if dim != 1:
+                o += mod * o_s1
+            cur = cur // i_s1
+            mod = cur % i_s0
+            if dim != 0:
+                o += mod * o_s0
+        o += v * stride_dim
+        tl.atomic_add(output + o, val, mask=mask, sem="relaxed")
+
+
+def _gather_backward_scatter(grad, self, dim, index_contiguous, result):
+    # Linear-time fast path (offset sizes < 2^31); fp16/bf16 accumulate in
+    # fp32 (same precision as the legacy sum kernel).
+    ndim = self.ndim
+    index_shape = list(index_contiguous.shape)
+    N = index_contiguous.numel()
+
+    SLICE = 1
+    for s in index_shape[dim:]:
+        SLICE *= s
+    BLOCK = min(1024, max(1, triton.next_power_of_2(SLICE)))
+    while (SLICE + BLOCK - 1) // BLOCK > 32 and BLOCK < 32768:
+        BLOCK *= 2
+    LOOP = (SLICE + BLOCK - 1) // BLOCK
+
+    # output is freshly zero-allocated, so its strides are the row-major ones
+    o_s = [1] * 3
+    for k in range(ndim - 1, -1, -1):
+        o_s[k] = 1 if k == ndim - 1 else o_s[k + 1] * self.shape[k + 1]
+    pad = [1] * (3 - ndim)
+
+    if grad.dtype in (torch.float16, torch.bfloat16):
+        acc = torch.zeros(self.shape, dtype=torch.float32, device=self.device)
+        _gather_backward_scatter_kernel[(N // SLICE,)](
+            index_contiguous,
+            grad.contiguous(),
+            acc,
+            N,
+            SLICE,
+            index_shape[-1],
+            o_s[dim],
+            *(index_shape + pad),
+            *(o_s),
+            dim=dim,
+            rank=ndim,
+            BLOCK=BLOCK,
+            LOOP=LOOP,
+        )
+        return result.copy_(acc)
+    _gather_backward_scatter_kernel[(N // SLICE,)](
+        index_contiguous,
+        grad.contiguous(),
+        result,
+        N,
+        SLICE,
+        index_shape[-1],
+        o_s[dim],
+        *(index_shape + pad),
+        *(o_s),
+        dim=dim,
+        rank=ndim,
+        BLOCK=BLOCK,
+        LOOP=LOOP,
+    )
+    return result
+
+
+def gather_backward(grad, self, dim, index, sparse_grad):
+    logger.debug("GEMS_KUNLUNXIN GATHER_BACKWARD")
+    if sparse_grad:
+        raise RuntimeError("gather_backward with sparse_grad=True is not supported")
+
+    result = grad.new_zeros(self.shape)
+    if result.numel() == 0:
+        return result
+
+    dim = dim % self.ndim
+    index_contiguous = index.contiguous()
+    if index_contiguous.numel() == 0:
+        return result
+
+    if self.numel() >= 2**31 or index_contiguous.numel() >= 2**31:
+        # int64 legacy path: correct but O(output.numel() * index.shape[dim]);
+        # only reachable for gigantic (>= 2^31 elements) tensors.
+        return _gather_backward_legacy(grad, self, dim, index_contiguous, result)
+
+    # The generic legacy kernel handles any rank but is slow (int64 + tiny
+    # tiles).  The atomic scatter kernel (this backend's per-element
+    # tl.atomic_add is globally serialized at ~110ns) only wins when the
+    # gather dim is large.  Measured crossover of the atomic-free
+    # output-centric sum kernel vs the atomic scatter kernel is at
+    # index.shape[dim] ~= 700, so use the sum kernel for small dim sizes.
+    if index_contiguous.shape[dim] <= 512 and self.ndim <= 3:
+        return _gather_backward_sum(grad, self, dim, index_contiguous, result)
+
+    return _gather_backward_scatter(grad, self, dim, index_contiguous, result)
+
+
+def _gather_backward_sum(grad, self, dim, index_contiguous, result):
+    # Atomic-free output-centric path (index.shape[dim] <= 512, ndim <= 3).
+    ndim = self.ndim
+    index_shape = list(index_contiguous.shape)
+    index_strides = list(index_contiguous.stride())
+    S = index_shape[dim]
+    total = result.numel()
+    pad = [1] * (3 - ndim)
+
+    out_shapes = list(self.shape) + pad
+    idx_strides = index_strides + pad
+
+    # Single proven tile: (BO=64, BI=512, nw=4).  The earlier "small-S"
+    # config (BO=64, BI=256, nw=2) deterministically raises a hardware NOC
+    # idle-timeout (error 299) on fp16/bf16 inputs for every shape/dim
+    # tested (2D and 3D, 9/9 shapes), so it is unusable for a dtype-generic
+    # kernel; (64, 512, 4) is clean on the full test/benchmark matrix.
+    BO, BI, nw = 64, 512, 4
+    LOOP = (S + BI - 1) // BI
+
+    # int32 index: 4-byte loads halve the dominant load traffic; index
+    # values fit in int32 (numel < 2^31 by dispatch), and the expansion
+    # costs ~index.numel()*4B of one-time copy, negligible vs the kernel.
+    index32 = index_contiguous.to(torch.int32)
+
+    _gather_backward_sum_kernel[(triton.cdiv(total, BO),)](
+        grad.contiguous(),
+        index32,
+        result,
+        out_shapes[0],
+        out_shapes[1],
+        out_shapes[2],
+        idx_strides[0],
+        idx_strides[1],
+        idx_strides[2],
+        S,
+        total,
+        dim=dim,
+        ndim=ndim,
+        BLOCK_OUTPUT=BO,
+        BLOCK_INDEX=BI,
+        LOOP=LOOP,
+        num_warps=nw,
+        buffer_size_limit=2048,
+    )
+    return result
+
+
+@triton.jit
 def _gather_backward_kernel(
     grad,
     index,
@@ -587,17 +884,7 @@ def _gather_backward_kernel(
     tl.store(output + output_offsets_flat, result, mask=output_valid_flat)
 
 
-def gather_backward(grad, self, dim, index, sparse_grad):
-    logger.debug("GEMS_KUNLUNXIN GATHER_BACKWARD")
-    if sparse_grad:
-        raise RuntimeError("gather_backward with sparse_grad=True is not supported")
-
-    result = grad.new_zeros(self.shape)
-    if result.numel() == 0:
-        return result
-
-    dim = dim % self.ndim
-    index_contiguous = index.contiguous()
+def _gather_backward_legacy(grad, self, dim, index_contiguous, result):
     self_shape = _device_int_tensor(self.shape, torch.int64, self.device)
     index_shape = _device_int_tensor(index_contiguous.shape, torch.int64, self.device)
     index_strides = _device_int_tensor(

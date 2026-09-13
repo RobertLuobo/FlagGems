@@ -101,24 +101,51 @@ def _ebdb_count_kernel(
 
 @libentry()
 @triton.jit
-def _ebdb_tile_scan_kernel(
+def _ebdb_tile_total_kernel(
     tile_count_ptr,
-    prefix_ptr,
     counts_ptr,
-    n_tiles,
+    n_tiles_ptr,
     NWP: tl.constexpr,
     BW: tl.constexpr,
 ):
-    # Pure 1D kernel: exclusive scan of the per-sample-tile counts along the tile
-    # axis, plus the per-row total.  All accesses are contiguous BW-wide tiles.
+    # One program per row-block: per-row total of the per-sample-tile counts.
+    # Load-only dynamic loop (bound derived through tl.max of a tile) plus a
+    # single store: a scalar-loaded bound with a 128-lane body or an in-loop
+    # store fails TritonXPUUnrollControl on this backend (see the comments in
+    # _ebdb_gather_flat_kernel), so mirror the gather kernels' structure.
     rid = tl.program_id(0)
     rows = rid * BW + tl.arange(0, BW)
+    n_tiles = tl.max(tl.load(n_tiles_ptr + rows))
     acc = tl.zeros([BW], dtype=tl.int32)
-    for t in range(n_tiles):
-        c = tl.load(tile_count_ptr + t * NWP + rows)
-        tl.store(prefix_ptr + t * NWP + rows, acc)
-        acc += c
+    for u in range(n_tiles):
+        acc += tl.load(tile_count_ptr + u * NWP + rows)
     tl.store(counts_ptr + rows, acc)
+
+
+@libentry()
+@triton.jit
+def _ebdb_tile_prefix_kernel(
+    tile_count_ptr,
+    prefix_ptr,
+    n_tiles_ptr,
+    NWP: tl.constexpr,
+    BW: tl.constexpr,
+):
+    # One program per (sample-tile, row-block): exclusive-scan (along the tile
+    # axis) of the per-sample-tile counts.  Load-only dynamic loop (same
+    # tl.max-derived bound as _ebdb_tile_total_kernel) with a where-guarded
+    # accumulate plus a single store, matching the gather kernels that lower
+    # cleanly here.  Every load is in-bounds (u < n_tiles), so no clamping is
+    # needed; the guard only zeroes the contribution of later tiles.
+    tid = tl.program_id(0)
+    rid = tl.program_id(1)
+    rows = rid * BW + tl.arange(0, BW)
+    n_tiles = tl.max(tl.load(n_tiles_ptr + rows))
+    acc = tl.zeros([BW], dtype=tl.int32)
+    for u in range(n_tiles):
+        c = tl.load(tile_count_ptr + u * NWP + rows)
+        acc += tl.where(u < tid, c, 0)
+    tl.store(prefix_ptr + tid * NWP + rows, acc)
 
 
 @libentry()
@@ -193,28 +220,39 @@ def _ebdb_gather_row_kernel(
     D: tl.constexpr,
     BD: tl.constexpr,
 ):
+    # One program owns one output row: the columns are a plain tl.arange, so the
+    # out store is a full BD-lane write.  The per-row scalars (start, counts and
+    # the indirections through sorted_ptr / o2b_ptr) are carried as BD-wide
+    # vectors with a tl.where guard: a dynamic loop whose body contains scalar
+    # loads fails TritonXPUUnrollControl (see _ebdb_gather_flat_kernel), so all
+    # loop-carried state is replicated per lane exactly like the flat kernel.
     row = tl.program_id(0)
     blk = tl.program_id(1)
     cols = blk * BD + tl.arange(0, BD)
-    start = tl.load(start_ptr + row)
-    cnt = tl.load(counts_ptr + row)
-    freq = 1.0
+    r_v = tl.full([BD], row, tl.int32)
+    start_v = tl.load(start_ptr + r_v)
+    cnt_v = tl.load(counts_ptr + r_v)
+    k_max = tl.max(cnt_v)
+    freq = tl.full([BD], 1.0, tl.float32)
     if SGBF:
-        if cnt > 1:
-            freq = 1.0 / cnt.to(tl.float32)
+        denom = tl.where(cnt_v > 1, cnt_v.to(tl.float32), 1.0)
+        freq = 1.0 / denom
     acc = tl.zeros([BD], dtype=tl.float32)
-    for k in range(cnt):
-        sid = tl.load(sorted_ptr + start + k)
+    for k in range(k_max):
+        act = k < cnt_v
+        j = tl.where(act, start_v + k, 0)
+        sid = tl.load(sorted_ptr + j)
+        sid = tl.where(act, sid, 0)
         bag = tl.load(o2b_ptr + sid).to(tl.int32)
+        bag = tl.where(act, bag, 0)
         scale = freq
         if MODE_MEAN:
             bsz = tl.load(bag_ptr + bag).to(tl.float32)
-            if bsz != 0.0:
-                scale = scale / bsz
+            scale = scale / tl.where(bsz != 0.0, bsz, 1.0)
         if HAS_PSW:
             scale = scale * tl.load(psw_ptr + sid).to(tl.float32)
         g = tl.load(grad_ptr + bag * D + cols)
-        acc += g.to(tl.float32) * scale
+        acc += tl.where(act, g.to(tl.float32) * scale, 0.0)
     tl.store(out_ptr + row * D + cols, acc.to(out_ptr.dtype.element_ty))
 
 
@@ -386,11 +424,23 @@ def _build_csr(indices, n_samples, num_weights, padding_idx):
         BW=_ROWS_TILE,
         NS=_SAMP_TILE,
     )
-    _ebdb_tile_scan_kernel[(n_row_blocks,)](
+    # n_samp_tiles as a device tile: the scan loops derive their bounds through
+    # tl.max of a tile load (the scalar-arg bound fails TritonXPUUnrollControl
+    # once n_samp_tiles > 1, i.e. n_samples > 128).
+    n_tiles_buf = torch.full(
+        (n_rows_pad,), n_samp_tiles, dtype=torch.int32, device=device
+    )
+    _ebdb_tile_prefix_kernel[(n_samp_tiles, n_row_blocks)](
         tile_count,
         prefix,
+        n_tiles_buf,
+        NWP=n_rows_pad,
+        BW=_ROWS_TILE,
+    )
+    _ebdb_tile_total_kernel[(n_row_blocks,)](
+        tile_count,
         counts,
-        n_samp_tiles,
+        n_tiles_buf,
         NWP=n_rows_pad,
         BW=_ROWS_TILE,
     )

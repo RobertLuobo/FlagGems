@@ -25,6 +25,12 @@ from flag_gems.ops.ne_ import ne_ as _generic_ne_
 from flag_gems.ops.ne_ import ne_scalar_ as _generic_ne_scalar_
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
+# Single-pass vendor cluster-C comparison payload (ne_raw.xpu): torch.ne and
+# torch.not_equal are the same IEEE != compare, so ne_scalar reuses the
+# already-proven not_equal_scalar payload verbatim (same host-side wrapped
+# scalar promotion via `_scalar_bits`). Same crossover constant as the
+# sibling lt_scalar / greater_scalar family (_SMALL_SCALAR_LIMIT).
+from .not_equal import _SMALL_SCALAR_LIMIT, _raw_not_equal_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +84,19 @@ def ne_func_scalar(x, y):
 
 def ne_scalar(A, B):
     logger.debug("GEMS_KUNLUNXIN NE_SCALAR")
+    # Single-pass vendor cluster-C payload (ne_raw.xpu), the same x != s
+    # payload the sibling not_equal_scalar (ops/not_equal.py) uses: one read
+    # of A + one write of the 1-byte/elem bool output at the ATen memory
+    # footprint, with ATen's exact wrapped-scalar promotion (the scalar is
+    # converted to A.dtype on the host and compared in that dtype). The
+    # two-stage saturating-fp32 paths below move ~3.7x the bytes (fp32
+    # intermediate + vendor fp32->bool conversion) and cap at ~0.26-0.42x of
+    # torch on the big shapes; the payload wins from ~64K elements up (same
+    # payload / crossover as not_equal_scalar / lt_scalar: 65536).
+    if A.numel() >= _SMALL_SCALAR_LIMIT:
+        raw_out = _raw_not_equal_scalar(A, B)
+        if raw_out is not None:
+            return raw_out
     numel = A.numel()
     dtype = A.dtype
     if A.is_contiguous() and dtype in (torch.float16, torch.float32, torch.bfloat16):

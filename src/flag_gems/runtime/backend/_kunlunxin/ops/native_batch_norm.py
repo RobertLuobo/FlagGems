@@ -89,6 +89,32 @@ def make_3d_for_bn(input: Tensor) -> Tensor:
 # harness/probe/nbn_stage_probe.py), which is why the combine lives inside
 # stage 2 instead.
 # Tile widths are always >= 64: TritonXPU silently miscompiles <= 32-wide tiles.
+#
+# Fused fast path (added 2026-09-10).  The N*C-grid above is launch-bound:
+# every program costs ~0.2-0.3 us and the N*C launch itself is a fixed
+# ~13-20 us, so small/medium shapes pay far more for the launch+grid than for
+# the math.  For training with spatial_dim <= NBN_FUSED_S_MAX we use instead a
+# 2-launch grid=(C,) pair that reads the input exactly once per stage:
+#   native_batch_norm_fused_stats_kernel    (grid=C,     nested n x off loops,
+#                                            loop-carried accumulator) -- this
+#                                            one ONLY lowers at TILE_S <= 128;
+#                                            larger tiles die in
+#                                            TritonXPUUnrollControl (uni_sram,
+#                                            same family as the error above).
+#   native_batch_norm_fused_normalize_kernel (grid=C,     nested n x off loops,
+#                                            load/store only, so it lowers at
+#                                            any exact tile).
+# Measured 1.09-2.80x over the legacy path for every shape with
+# spatial_dim <= 1024 (and 1.25x at 1024), while shapes with a large spatial
+# run (>= 4098) REGRESS (0.20-0.55x) because a 128-wide stats tile has to
+# sweep the run 32+ times with only C programs -- hence the routing cut
+# (spatial_dim <= NBN_FUSED_S_MAX or batch_dim == 1).  The batch_dim == 1 arm
+# is not about speed: the legacy TRAINING path miscomputes single-batch
+# shapes with spatial_dim >= 128 (the batch-combine in the N*C-grid stage-2 is
+# nondeterministically wrong there), which the fused stats kernel does not
+# (one program per channel, no combine).  The legacy path is kept for
+# inference and for the large-spatial training shapes.
+# Tile widths are always >= 64: TritonXPU silently miscompiles <= 32-wide tiles.
 
 
 def _nbn_tile_s(spatial_dim):
@@ -111,6 +137,146 @@ def _nbn_tile_n(batch_dim):
     """1D tile policy for the batch (partial-combine) loop.  Never below 64."""
     tile = min(max(64, triton.next_power_of_2(max(batch_dim, 1))), 2048)
     return tile, (batch_dim % tile) != 0
+
+
+# Fused fast path is only a win while the spatial run is short enough that a
+# 128-wide stats tile does not have to sweep it many times (see the NOTE).
+NBN_FUSED_S_MAX = 2048
+
+
+def _nbn_fused_tile_s(spatial_dim):
+    """Tile for the fused stats kernel: loop-carried accumulators only lower at
+    TILE_S <= 128, and the masked variant needs TILE_S = 64 below 128 (a
+    128-wide mostly-false mask fails to lower, e.g. for S = 1)."""
+    if spatial_dim < 128:
+        return 64, (spatial_dim % 64) != 0
+    return 128, (spatial_dim % 128) != 0
+
+
+def _nbn_exact_tile(spatial_dim):
+    """Exact-fit tile for the fused normalize kernel (load/store only, so any
+    tile width lowers).  512/1024 for short runs, pow2-capped-4096 above."""
+    if spatial_dim <= 512:
+        return 512, (spatial_dim % 512) != 0
+    if spatial_dim <= 1024:
+        return 1024, (spatial_dim % 1024) != 0
+    tile = min(triton.next_power_of_2(spatial_dim), 4096)
+    return tile, (spatial_dim % tile) != 0
+
+
+@libentry()
+@triton.jit(do_not_specialize=["momentum", "eps", "var_correction"])
+def native_batch_norm_fused_stats_kernel(
+    input_pointer,  # [N, C, S] contiguous, flattened
+    mean_pointer,  # [C] f32 mean (for the normalize launch)
+    inv_std_pointer,  # [C] f32 1/sqrt(var + eps) (for the normalize launch)
+    save_mean_pointer,  # [C] input-dtype out
+    save_inv_std_pointer,  # [C] input-dtype out
+    running_mean_pointer,  # [C] in/out (or alias)
+    running_var_pointer,  # [C] in/out (or alias)
+    batch_dim,
+    feat_dim,
+    spatial_dim,
+    count,  # batch_dim * spatial_dim
+    momentum,
+    eps,
+    var_correction,  # count / (count - 1), 1.0 when count <= 1
+    HAS_RM: tl.constexpr,
+    HAS_RV: tl.constexpr,
+    TILE_S: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    c = tl.program_id(axis=0)
+    acc = tl.zeros([TILE_S], dtype=tl.float32)
+    acc_sq = tl.zeros([TILE_S], dtype=tl.float32)
+    for n in range(0, batch_dim):
+        base = (n * feat_dim + c) * spatial_dim
+        for off in range(0, spatial_dim, TILE_S):
+            idx = off + tl.arange(0, TILE_S)
+            if NEED_MASK:
+                m = idx < spatial_dim
+                x = tl.load(input_pointer + base + idx, mask=m, other=0.0).to(tl.float32)
+                # See the legacy stats kernel: `other=` alone is not enough on
+                # XPU, the masked tail must be predicated away explicitly.
+                x = tl.where(m, x, 0.0)
+                acc += x
+                acc_sq += x * x
+            else:
+                x = tl.load(input_pointer + base + idx).to(tl.float32)
+                acc += x
+                acc_sq += x * x
+    mean = tl.sum(acc) / count
+    var = tl.sum(acc_sq) / count - mean * mean
+    inv_std = rsqrt(var + eps)
+    tl.store(mean_pointer + c, mean)
+    tl.store(inv_std_pointer + c, inv_std)
+    tl.store(save_mean_pointer + c, mean.to(save_mean_pointer.dtype.element_ty))
+    tl.store(save_inv_std_pointer + c, inv_std.to(save_inv_std_pointer.dtype.element_ty))
+    if HAS_RM:
+        running_mean = tl.load(running_mean_pointer + c).to(tl.float32)
+        tl.store(
+            running_mean_pointer + c,
+            ((1.0 - momentum) * running_mean + momentum * mean).to(
+                running_mean_pointer.dtype.element_ty
+            ),
+        )
+    if HAS_RV:
+        running_var = tl.load(running_var_pointer + c).to(tl.float32)
+        # aten::native_batch_norm folds the UNBIASED batch variance into
+        # running_var (this is what the CPU reference does).
+        tl.store(
+            running_var_pointer + c,
+            (
+                (1.0 - momentum) * running_var + momentum * var * var_correction
+            ).to(running_var_pointer.dtype.element_ty),
+        )
+
+
+@libentry()
+@triton.jit
+def native_batch_norm_fused_normalize_kernel(
+    input_pointer,  # [N, C, S] contiguous, flattened
+    output_pointer,
+    mean_pointer,  # [C] f32
+    inv_std_pointer,  # [C] f32
+    weight_pointer,  # [C] or unused alias
+    bias_pointer,  # [C] or unused alias
+    batch_dim,
+    feat_dim,
+    spatial_dim,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    TILE_S: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    c = tl.program_id(axis=0)
+    mean = tl.load(mean_pointer + c).to(tl.float32)
+    inv_std = tl.load(inv_std_pointer + c).to(tl.float32)
+    if HAS_WEIGHT:
+        weight = tl.load(weight_pointer + c).to(tl.float32)
+    else:
+        weight = 1.0
+    if HAS_BIAS:
+        bias = tl.load(bias_pointer + c).to(tl.float32)
+    else:
+        bias = 0.0
+    for n in range(0, batch_dim):
+        base = (n * feat_dim + c) * spatial_dim
+        for off in range(0, spatial_dim, TILE_S):
+            idx = off + tl.arange(0, TILE_S)
+            if NEED_MASK:
+                m = idx < spatial_dim
+                x = tl.load(input_pointer + base + idx, mask=m).to(tl.float32)
+                y = weight * (x - mean) * inv_std + bias
+                tl.store(
+                    output_pointer + base + idx,
+                    y.to(output_pointer.dtype.element_ty),
+                    mask=m,
+                )
+            else:
+                x = tl.load(input_pointer + base + idx).to(tl.float32)
+                y = weight * (x - mean) * inv_std + bias
+                tl.store(output_pointer + base + idx, y.to(output_pointer.dtype.element_ty))
 
 
 @libentry()
@@ -326,6 +492,62 @@ def native_batch_norm(
     has_weight = weight is not None
     has_bias = bias is not None
     var_correction = (count / (count - 1)) if count > 1 else 1.0
+
+    if training and (spatial_dim <= NBN_FUSED_S_MAX or batch_dim <= 1) and feat_dim <= NBN_MAX_PROGRAMS:
+        # Fused fast path: 2 launches on a grid=(C,) grid with the running-stat
+        # update and save_mean / save_invstd written by the stats kernel (one
+        # program per channel, so no combine and no n == 0 race).  Routing is
+        # also taken for batch_dim == 1: the legacy N*C-grid stage-2 combine
+        # (a TILE_N-wide masked partial fold) is nondeterministically wrong for
+        # single-batch training at any spatial_dim >= 128, while the fused
+        # stats kernel has no combine at all.  See the NOTE above.
+        mean_f = torch.empty(feat_dim, device=input.device, dtype=torch.float32)
+        inv_f = torch.empty_like(mean_f)
+        fused_tile_s, fused_need_m = _nbn_fused_tile_s(spatial_dim)
+        exact_tile_s, exact_need_m = _nbn_exact_tile(spatial_dim)
+        with torch_device_fn.device(input.device):
+            native_batch_norm_fused_stats_kernel[(feat_dim,)](
+                input_flat,
+                mean_f,
+                inv_f,
+                save_mean,
+                save_inv_std,
+                running_mean if has_rm else save_mean,
+                running_var if has_rv else save_inv_std,
+                batch_dim,
+                feat_dim,
+                spatial_dim,
+                count,
+                momentum,
+                eps,
+                var_correction,
+                HAS_RM=has_rm,
+                HAS_RV=has_rv,
+                TILE_S=fused_tile_s,
+                NEED_MASK=fused_need_m,
+                num_warps=4,
+                isCloseVectorization=True,
+                buffer_size_limit=2048,
+            )
+            native_batch_norm_fused_normalize_kernel[(feat_dim,)](
+                input_flat,
+                output_flat,
+                mean_f,
+                inv_f,
+                weight if has_weight else input_flat,
+                bias if has_bias else input_flat,
+                batch_dim,
+                feat_dim,
+                spatial_dim,
+                HAS_WEIGHT=has_weight,
+                HAS_BIAS=has_bias,
+                TILE_S=exact_tile_s,
+                NEED_MASK=exact_need_m,
+                num_warps=4,
+                isCloseVectorization=True,
+                buffer_size_limit=2048,
+            )
+        return output.view_as(input), save_mean, save_inv_std
 
     if training:
         # Stage 1 writes every one of the N*C partial slots it is responsible

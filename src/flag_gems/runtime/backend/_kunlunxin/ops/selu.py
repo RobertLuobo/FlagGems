@@ -22,10 +22,23 @@ logger = logging.getLogger(__name__)
 # bf16-big keeps the pointwise kernel. Numerics identical in both kernels:
 # fp32 staging + min-clamped exp argument (no overflow on x>0) + quantized
 # store; masked tail only via NEED_MASK constexpr when not divisible.
+#
+# 2026-09-11 batch3 selu_ closure. The math above is written in the
+# tl.where(x>0, ...) form, which the XPU backend lowers to a slow select
+# sequence (~2x ALU-bound regression on mid/large N: fp16 16M 476us, fp32
+# 16M 520us). Rewriting the identical algebra as
+# scale * (max(0,x) + min(alpha*(exp(min(x,0))-1), 0)) lowers to fmin/fmax
+# (2x faster: fp16 16M -> 236us, fp32 16M -> 284us) while staying bit-identical
+# on randn inputs and exact on +-0 / +-inf (see harness/solution/selu_/).
+# With the fmin/fmax form the bf16 pack/unpack penalty disappears and the flat
+# path now beats the pointwise tile on bf16 big shapes too (16M: 330us vs
+# 582us), so the _BF16_BIG_NUMEL exception was removed and all contiguous
+# inputs use the flat kernel. The pointwise path is retained for
+# non-contiguous inputs only.
 _ALPHA = tl.constexpr(1.6732632423543772848170429916717)
 _SCALE = tl.constexpr(1.0507009873554804934193349852946)
 
-# ---- pointwise_dynamic path (non-contiguous and bf16-large) ----
+# ---- pointwise_dynamic path (non-contiguous only) ----
 config_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),
@@ -72,7 +85,12 @@ def selu_flat_kernel(
 
     x_f32 = x.to(tl.float32)
     x_neg = tl.minimum(x_f32, 0.0)  # clamp exp arg to avoid overflow on x>0
-    y = _SCALE * tl.where(x_f32 > 0.0, x_f32, _ALPHA * (tl.exp(x_neg) - 1.0))
+    # fmin/fmax form: ~2x faster than tl.where-select on XPU, bit-identical
+    # on randn and exact on +-0/+-inf (see header comment).
+    y = _SCALE * (
+        tl.maximum(x_f32, 0.0)
+        + tl.minimum(_ALPHA * (tl.exp(x_neg) - 1.0), 0.0)
+    )
 
     if NEED_MASK:
         tl.store(O + offsets, y.to(x.dtype), mask=mask)
@@ -87,15 +105,11 @@ def _pick_tier(numel):
     return 16384, 16
 
 
-_BF16_BIG_NUMEL = 8 * 1024 * 1024  # bf16 flat regresses above this
-
-
 def _use_flat(A):
-    if not A.is_contiguous():
-        return False
-    if A.dtype == torch.bfloat16 and A.numel() >= _BF16_BIG_NUMEL:
-        return False
-    return True
+    # 2026-09-11: with the fmin/fmax math the flat kernel wins on bf16 big
+    # shapes too (16M: 0.93x vs 0.53x pointwise), so all contiguous inputs
+    # use the flat kernel; the pointwise tile serves non-contiguous only.
+    return A.is_contiguous()
 
 
 def _launch_flat(A, out):

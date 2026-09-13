@@ -343,6 +343,20 @@ def igamma_(self, other):
     if other.device.type != flag_gems.device:
         raise ValueError(f"igamma_: other must be on {flag_gems.device}")
 
+    # ATen igamma_ is only defined for floating-point inputs (an integral
+    # `self` raises `igamma_cpu not implemented for 'Int'`).  Without this
+    # guard the kernel would compute the [0, 1] value in fp32 and store it
+    # back truncated to 0, silently corrupting the tensor.  `other` is
+    # promoted to `self.dtype` below, so only the output tensor needs the
+    # check.  fp16/bf16 are kept (the kernel computes in fp32 and the result
+    # is within 1 ulp of the fp32-accurate value); only integral dtypes are
+    # rejected.
+    if not self.dtype.is_floating_point:
+        raise TypeError(
+            f"igamma_: not implemented for '{self.dtype}' "
+            "(input must be a floating point type)"
+        )
+
     if self.numel() == 0:
         return self
 

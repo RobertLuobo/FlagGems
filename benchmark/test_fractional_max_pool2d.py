@@ -8,7 +8,7 @@ import flag_gems
 from . import base, consts, utils
 
 
-class FractionalMaxPool2dBenchmark(base.GenericBenchmark):
+class FractionalMaxPool2dBenchmark(base.GenericBenchmark4DOnly):
     def get_input_iter(self, dtype) -> Generator:
         for shape in self.shapes:
             yield from self.input_fn(shape, dtype, self.device)

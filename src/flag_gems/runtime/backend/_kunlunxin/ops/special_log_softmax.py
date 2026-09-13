@@ -542,6 +542,12 @@ def special_log_softmax(self, dim, dtype=None):
     for i in range(dim):
         M *= inp.shape[i]
     N = inp.shape[dim]
+
+    # Empty tensors: K = numel // M // N would divide by zero (M == 0 or
+    # N == 0) and the inner kernels have no work to do anyway; the reference
+    # returns an empty output of the (possibly cast) dtype.
+    if N == 0 or M == 0:
+        return torch.empty_like(inp)
     K = inp.numel() // M // N
 
     # dim not last -> reduce dim is strided; delegate to the tuned log_softmax.
@@ -549,8 +555,6 @@ def special_log_softmax(self, dim, dtype=None):
         return _log_softmax_kunlunxin(inp, dim)
 
     out = torch.empty_like(inp)
-    if N == 0 or M == 0:
-        return out
 
     with torch_device_fn.device(inp.device):
         if _fast_forward(out, inp, M, N):

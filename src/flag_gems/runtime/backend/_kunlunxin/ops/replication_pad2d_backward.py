@@ -60,11 +60,13 @@ logger = logging.getLogger(__name__)
 #   store auto-casts to the output dtype, so fp16/bf16 results round once
 #   from fp32, matching the reference opmath. There is no fp32 intermediate
 #   buffer and no extra cast pass.
-# - Performance note: address arithmetic must be written as a per-program
-#   `base` value (computed from temporary variables) added to the lane
-#   offset; fully inlined single-expression addresses compile 6x slower on
-#   the XPU backend. Unmasked stores are ~6x faster than masked ones, so the
-#   bulk block size is chosen to divide W when possible (NEED_MASK).
+# - Performance note: on the XPU backend the (row, col) decomposition of a
+#   per-lane flat offset is extremely slow (measured 10-20x), while a
+#   per-PROGRAM decomposition (only scalar integer ops) plus an affine lane
+#   offset is fast. This kernel therefore keeps ALL index arithmetic scalar
+#   except the final affine `iw = arange(BLOCK)` (1D blocks of 1024 lanes are
+#   ~10x faster per lane than 128-lane blocks). Unmasked stores are ~6x
+#   faster than masked ones, so the mask is dropped when W % BLOCK == 0.
 @triton.jit
 def _replication_pad2d_backward_bulk_kernel(
     go_ptr,
@@ -100,6 +102,36 @@ def _replication_pad2d_backward_bulk_kernel(
 
 
 @triton.jit
+def _replication_pad2d_backward_bulk_contig_kernel(
+    go_ptr,
+    gi_ptr,
+    OW,
+    W,
+    H_2,  # H - 2
+    pt,
+    pl,
+    OHW,  # OH * OW
+    HW,  # H * W
+    total,  # H_2 * W (per channel)
+    BLOCK: tl.constexpr,
+):
+    # grid = (NC, cdiv(H_2 * W, BLOCK)). The interior of every channel is a
+    # contiguous run of H_2 * W scalars in gi (rows 1..H-2), so the STORE is
+    # a pure affine `base + arange`; the (row, col) decomposition via
+    # per-lane division happens only on the (cheap) LOAD side. On the XPU
+    # backend a non-affine per-lane store index is ~20x slower, while a
+    # non-affine load index is nearly free.
+    nc = tl.program_id(0)
+    c = tl.program_id(1)
+    off = c * BLOCK + tl.arange(0, BLOCK)
+    mask = off < total
+    r = off // W
+    iw = off - r * W
+    v = tl.load(go_ptr + nc * OHW + (pt + 1 + r) * OW + pl + iw, mask=mask, other=0.0)
+    tl.store(gi_ptr + nc * HW + W + off, v, mask=mask)
+
+
+@triton.jit
 def _replication_pad2d_backward_row_edge_kernel(
     go_ptr,
     gi_ptr,
@@ -112,18 +144,17 @@ def _replication_pad2d_backward_row_edge_kernel(
     pb,
     OHW,
     HW,
-    total,  # NC * 2W
     MAXG: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    o = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = o < total
-
-    iw = o % W
-    rest = o // W
-    rid = rest % 2  # 0: row 0, 1: row H-1
-    nc = rest // 2
+    # grid = (NC, 2, cdiv(W, BLOCK)); rid 0 -> row 0, rid 1 -> row H-1.
+    # All index decomposition is scalar (per-program); only iw is a lane
+    # vector, so no per-lane integer division is emitted.
+    nc = tl.program_id(0)
+    rid = tl.program_id(1)
+    cg = tl.program_id(2)
+    iw = cg * BLOCK + tl.arange(0, BLOCK)
+    mask = iw < W
 
     ih = tl.where(rid == 0, 0, H - 1)
     lo_r = tl.where(rid == 0, 0, pt + H - 1)
@@ -161,24 +192,23 @@ def _replication_pad2d_backward_col_edge_kernel(
     gi_ptr,
     OW,
     W,
-    H,
+    H_2,  # H - 2
     pt,
     pl,
     pr,
     OHW,
     HW,
-    total,  # NC * 2 * (H-2)
     MAXG: tl.constexpr,
-    BLOCK: tl.constexpr,
+    P: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    o = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = o < total
-
-    rr = o % (2 * (H - 2))
-    nc = o // (2 * (H - 2))
-    ih = 1 + (rr // 2)
-    cid = rr % 2  # 0: col 0, 1: col W-1
+    # grid = (NC, 2, cdiv(H-2, P)); cid 0 -> col 0, cid 1 -> col W-1.
+    # Per-program scalar decomposition; lanes = interior rows (affine).
+    nc = tl.program_id(0)
+    cid = tl.program_id(1)
+    rg = tl.program_id(2)
+    rr = rg * P + tl.arange(0, P)
+    mask = rr < H_2
+    ih = 1 + rr
 
     lo_c_raw = tl.where(cid == 0, 0, pl + W - 1)
     lo_c = tl.minimum(tl.maximum(lo_c_raw, 0), OW - 1)
@@ -189,7 +219,7 @@ def _replication_pad2d_backward_col_edge_kernel(
     )
 
     out_base = nc * OHW + (pt + ih) * OW
-    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    acc = tl.zeros((P,), dtype=tl.float32)
     for c in tl.static_range(MAXG):
         cc = tl.minimum(c, tl.maximum(cnt_c - 1, 0))
         v = tl.load(go_ptr + out_base + lo_c + cc, mask=mask, other=0.0).to(tl.float32)
@@ -414,30 +444,55 @@ def _replication_pad2d_backward_impl(
         else:
             # Fast path: 1:1 bulk copy (unmasked when possible) + bounded
             # edge folds, single-writer cells.
+            #
+            # Blocks are fixed to 1024 lanes (the measured sweet spot on the
+            # XPU backend; 128-lane programs are ~10x slower per lane) and
+            # all index decomposition is scalar. For W <= 512 the interior
+            # rows of a channel are a contiguous run in gi, so the contig
+            # kernel keeps the STORE purely affine (per-lane division only on
+            # the cheap load side); measured ~4-13x faster than the row-wise
+            # kernel for W in [32, 256] and within noise for W >= 512, while
+            # the row-wise kernel wins for W >= 640 (no per-lane division).
+            # Edge kernels use a 3D grid (NC, 2, chunks) so the per-lane
+            # offset stays purely affine.
             maxg = max(pt + 1, pb + 1, pl + 1, pr + 1, 1)
-            BLOCK = 256
-            need_mask = True
-            for cand in (1024, 512, 256, 128, 64, 32):
-                if W % cand == 0:
-                    BLOCK, need_mask = cand, False
-                    break
-            cpw = triton.cdiv(W, BLOCK)
-            _replication_pad2d_backward_bulk_kernel[(NC * (H - 2) * cpw,)](
-                go,
-                gi,
-                OW,
-                W,
-                H - 2,
-                pt,
-                pl,
-                OHW,
-                HW,
-                CPW=cpw,
-                NEED_MASK=need_mask,
-                BLOCK=BLOCK,
-            )
-            n_row = NC * 2 * W
-            _replication_pad2d_backward_row_edge_kernel[(triton.cdiv(n_row, BLOCK),)](
+            BLOCK = 1024
+            h2 = H - 2
+            if W <= 512:
+                _replication_pad2d_backward_bulk_contig_kernel[
+                    (NC, triton.cdiv(h2 * W, BLOCK))
+                ](
+                    go,
+                    gi,
+                    OW,
+                    W,
+                    h2,
+                    pt,
+                    pl,
+                    OHW,
+                    HW,
+                    h2 * W,
+                    BLOCK=BLOCK,
+                )
+            else:
+                need_mask = (W % BLOCK) != 0
+                cpw = triton.cdiv(W, BLOCK)
+                _replication_pad2d_backward_bulk_kernel[(NC * h2 * cpw,)](
+                    go,
+                    gi,
+                    OW,
+                    W,
+                    h2,
+                    pt,
+                    pl,
+                    OHW,
+                    HW,
+                    CPW=cpw,
+                    NEED_MASK=need_mask,
+                    BLOCK=BLOCK,
+                )
+            cpw_e = triton.cdiv(W, BLOCK)
+            _replication_pad2d_backward_row_edge_kernel[(NC, 2, cpw_e)](
                 go,
                 gi,
                 OW,
@@ -449,26 +504,31 @@ def _replication_pad2d_backward_impl(
                 pb,
                 OHW,
                 HW,
-                n_row,
                 MAXG=maxg,
                 BLOCK=BLOCK,
             )
-            n_col = NC * 2 * (H - 2)
-            _replication_pad2d_backward_col_edge_kernel[(triton.cdiv(n_col, BLOCK),)](
-                go,
-                gi,
-                OW,
-                W,
-                H,
-                pt,
-                pl,
-                pr,
-                OHW,
-                HW,
-                n_col,
-                MAXG=maxg,
-                BLOCK=BLOCK,
-            )
+            n_col = NC * 2 * h2
+            if n_col > 0:
+                P = 1
+                while P < h2:
+                    P *= 2
+                P = min(max(P, 1), 1024)
+                _replication_pad2d_backward_col_edge_kernel[
+                    (NC, 2, triton.cdiv(h2, P))
+                ](
+                    go,
+                    gi,
+                    OW,
+                    W,
+                    h2,
+                    pt,
+                    pl,
+                    pr,
+                    OHW,
+                    HW,
+                    MAXG=maxg,
+                    P=P,
+                )
 
     res = gi.view(N, C, H, W)
 

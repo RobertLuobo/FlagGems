@@ -102,7 +102,14 @@ def im2col(input, kernel_size, dilation=1, padding=0, stride=1):
     total = output.numel()
     if total:
         x = x.contiguous()
-        block = 256
+        # The 1D flat gather kernel is launch-bound on the XPU backend:
+        # BLOCK=256 measures ~8.6ms on (4,32,128,128) while BLOCK=2048
+        # measures ~3.5ms (2.5x), and pure-copy probes show per-program
+        # overhead dominates below BLOCK~1024.  Large tensors prefer
+        # BLOCK=2048; tiny tensors (total < 4096) stay at 256 where the
+        # full-tensor tail is negligible and the smaller block avoids
+        # masked-lane waste (a small regression was measured otherwise).
+        block = 2048 if total >= 4096 else 256
         with torch_device_fn.device(input.device):
             _im2col_kernel[(triton.cdiv(total, block),)](
                 x,
