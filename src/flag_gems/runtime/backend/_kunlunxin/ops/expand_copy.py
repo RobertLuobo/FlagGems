@@ -104,8 +104,13 @@ def _launch_bcast(shape, strides, src, dst, n):
     )
 
 
-def expand_copy(x: torch.Tensor, size) -> torch.Tensor:
+def expand_copy(x: torch.Tensor, size, implicit: bool = False) -> torch.Tensor:
     """Kunlunxin override for aten::expand_copy.
+
+    Matches the full ATen schema ``expand_copy(Tensor self, SymInt[] size,
+    *, bool implicit=False)``: the ``implicit`` flag only marks an implicit
+    expand in autograd and does not affect the materialized value, so it is
+    accepted and ignored here (the result is always a fresh contiguous copy).
 
     The generic ``flag_gems.ops.expand_copy`` calls the triton ``copy_`` from
     ``flag_gems.ops.copy``, whose pointwise kernel (default KUNLUNXIN config:

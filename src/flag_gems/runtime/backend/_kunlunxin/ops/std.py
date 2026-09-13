@@ -167,10 +167,14 @@ def std(x, dim=None, *, correction=None, keepdim=False):
         # cancellation in fp32 for large N with non-zero mean (sum ~ N*2.5
         # has ULP ~ 0.5, destroying the ~1e-5 variance signal) and silently
         # returns std = 0. Grid is capped at 1024 programs; each program
-        # walks a contiguous CHUNK in BLOCK_N tiles.
-        GRID = min(triton.cdiv(N, 65536), 1024)
+        # walks a contiguous CHUNK in BLOCK_N tiles. Tuned on XPU:
+        # BLOCK_N=4096 (vs 1024) cuts the per-program loop trip count 4x and
+        # speeds up the 2^30-element global reduction ~2.5x (115ms -> 46ms
+        # for fp16); GRID=min(max(cdiv(N,16384),256),1024) keeps >= 256
+        # programs so even 1M-element reductions get enough parallelism.
+        GRID = min(max(triton.cdiv(N, 16384), 256), 1024)
         CHUNK = triton.cdiv(N, GRID)
-        BLOCK_N = 1024
+        BLOCK_N = 4096
         BLOCK_SIZE_REDUCE = 1024
         xc = x.contiguous()
         tmp = torch.empty((GRID,), dtype=torch.float32, device=x.device)

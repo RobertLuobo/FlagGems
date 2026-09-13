@@ -51,7 +51,11 @@ def _dequantize_kernel(
     # valid lanes. Lanes past n_elements read undefined bytes and land in
     # the padded tail of `out_ptr`, which the caller never exposes.
     raw = tl.load(x_ptr + offsets, mask=offsets < n_elements)
-    values = raw.to(tl.float32)
+    # i8 -> f32 via i32: the direct `arith.sitofp` on a vector of 64 x i8 is
+    # mis-lowered by TritonXPU's ConvertTritonXPUToLLVM ("size mismatch when
+    # packing elements for LLVM struct expected 8 but got 2"), so the sign
+    # extension is done in two 1:1 steps (i8 -> i32 -> f32).
+    values = raw.to(tl.int32).to(tl.float32)
     if UNSIGNED:
         values = tl.where(values < 0.0, values + 256.0, values)
     tl.store(out_ptr + offsets, (values - zero_point) * scale)

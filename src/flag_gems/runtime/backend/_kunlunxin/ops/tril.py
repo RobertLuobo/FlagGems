@@ -787,13 +787,25 @@ def _launch_v2_band(
     batch = input.numel() // (M * N)
     total = band_lo * N
     if _is_power_of_2(N):
+        if batch == 1:
+            if total > 0:
+                _launch_v2_pow2(input, out, diagonal, active_rows=band_lo)
+            if band_lo < M and input.data_ptr() != out.data_ptr():
+                _vendor_copy_from(input[band_lo:], out[band_lo:])
+            return out
+        # Batched (>1): the kept bottom rows of every matrix form a gap-bearing
+        # view (`input[..., band_lo:, :]` keeps a band_lo-row hole per matrix
+        # -> not contiguous) and the vendor strided copy of it is ~3.4x slower
+        # than a full contiguous-src copy (isolated, [100,65536,100] fp16:
+        # 4.74ms vs 1.40ms). Copy the full matrix first (no-op when out aliases
+        # input), then let the band kernel rewrite the [0, band_lo) prefix as
+        # the last writer: kept cells keep the copied input values, strict
+        # upper cells become 0. Correct because the band kernel runs after the
+        # copy, so it can never be overwritten.
+        if band_lo < M and input.data_ptr() != out.data_ptr():
+            _vendor_copy_from(input, out)
         if total > 0:
             _launch_v2_pow2(input, out, diagonal, active_rows=band_lo)
-        if band_lo < M:
-            if batch == 1:
-                _vendor_copy_from(input[band_lo:], out[band_lo:])
-            else:
-                _vendor_copy_from(input[..., band_lo:, :], out[..., band_lo:, :])
         return out
     if batch == 1:
         if total > 0:
@@ -801,16 +813,18 @@ def _launch_v2_band(
                 _launch_v2_rows(input, out, diagonal, num_rows=band_lo)
             else:
                 _launch_v2_flat(input, out, diagonal, total)
-        if band_lo < M:
+        if band_lo < M and input.data_ptr() != out.data_ptr():
             _vendor_copy_from(input[band_lo:], out[band_lo:])
         return out
-    # Batched: the kept bottom rows of every matrix form one regular strided
-    # view, so a single native `_copy_from` moves them all; only the (usually
-    # tiny) band prefix of each matrix goes through the tril kernel.
+    # Batched (>1): same as the power-of-two case above -- full vendor copy
+    # first (contiguous src, ~3.4x faster than the gap-bearing kept-rows view),
+    # then the band kernel rewrites the [0, band_lo) prefix of every matrix.
+    # The old gap-view `_copy_from(input[..., band_lo:, :], out[..., band_lo:, :])`
+    # measured 3.3-4.0x slower on [100,65536,100]/[1000,8192,100].
+    if band_lo < M and input.data_ptr() != out.data_ptr():
+        _vendor_copy_from(input, out)
     if total > 0:
         _launch_v2_band_batchgrid(input, out, diagonal, band_lo)
-    if band_lo < M:
-        _vendor_copy_from(input[..., band_lo:, :], out[..., band_lo:, :])
     return out
 
 
@@ -1020,6 +1034,13 @@ def _launch_exact_diag0_tile(
 
 
 _INPLACE_FLAT_BLOCK = 8192
+# Pow2 shift/mask only pays off once the band is large enough to amortize the
+# bigger blocks / different warp count of the shared `_launch_v2_pow2` path.
+# Below this (measured [10000,256] 65K elements, [64,64] 4K) the div kernel is
+# equal or better and the swap is within the launch-floor noise band; at/above
+# it every shape measured faster ([64,512,512] 262K: 1.6-1.9x, [4096,4096]
+# 16.7M: 1.6-1.8x). Must stay < 261632 (active of [64,512,512] at diag=0).
+_INPLACE_POW2_MIN_TOTAL = 1 << 17
 
 
 def _launch_tril_inplace_contiguous(
@@ -1039,6 +1060,19 @@ def _launch_tril_inplace_contiguous(
     active_rows = min(M, max(0, N - 1 - diagonal))
     if active_rows == 0:
         return input
+
+    if _is_power_of_2(N) and active_rows * N >= _INPLACE_POW2_MIN_TOTAL:
+        # Power-of-two N: share the proven `_tril_flat_pow2_kernel` (shift/mask
+        # row/col recovery) used by the out variants -- the XPU triton backend
+        # emits a real division for `offsets // N` even when N is a pow2
+        # constexpr, and that division dominates this memory-bound kernel
+        # (isolated [4096,4096] fp32: ~0.46ms -> ~0.29ms, [10000,65536] fp16:
+        # ~21.6ms -> ~12.8ms). In-place aliasing (in_ptr == out_ptr) is fine:
+        # kept cells are rewritten with their loaded values and strict-upper
+        # cells become 0; `active_rows` restricts the pass to the band.
+        return _launch_v2_pow2(
+            input, input, int(diagonal), active_rows=active_rows
+        )
 
     MN = M * N
     active_total = active_rows * N
@@ -1282,6 +1316,145 @@ def tril_(input: torch.Tensor, diagonal: int = 0):
     return _launch_tril_inplace_strided(input, diagonal)
 
 
+_ZC_BLOCK = 8192
+_ZC_RPC = 8
+# copy+zero fast path is beneficial when the matrix is large (the launch_tril
+# masked kernel is ~4-45x slower than a store-only zero pass there); small
+# batched matrices keep the legacy path (their zero pass is launch-bound).
+# Sliced layouts with M < 8 have only M rows -> a handful of stores -> fast.
+_ZC_MIN_TOTAL = 1 << 21
+_ZC_SLICE_M = 8
+
+
+def _tensors_may_overlap(a: torch.Tensor, b: torch.Tensor) -> bool:
+    if a.data_ptr() == b.data_ptr():
+        return True
+    try:
+        return bool(torch._C._overlaps(a, b))
+    except Exception:
+        a0, b0 = a.data_ptr(), b.data_ptr()
+        asz = a.numel() * a.element_size()
+        bsz = b.numel() * b.element_size()
+        return a0 < b0 + bsz and b0 < a0 + asz
+
+
+@triton.jit
+def _zc_zero_upper_storage_kernel(
+    ptr, M, N, diag, JOFF, B, NJ, BLOCK: tl.constexpr, RPC: tl.constexpr
+):
+    """Dense storage [B, N, M] (out.transpose(-2,-1) contiguous view): zero
+    [0, min(j - diag, M)) of storage row (b, j). Only rows j with j - diag > 0
+    are launched: j = JOFF + (row % NJ) with JOFF = diag + 1 (diag >= 0) or 0.
+    Single-compare lane mask (2-compare masks are ~900x slower on this XPU).
+    grid = (cdiv(M, BLOCK), cdiv(B * NJ, RPC))."""
+    i0 = tl.program_id(0) * BLOCK
+    g = tl.program_id(1)
+    for r in tl.static_range(RPC):
+        row = g * RPC + r
+        if row < B * NJ:
+            j = JOFF + (row % NJ)
+            end = tl.minimum(j - diag, M)
+            if end > i0:
+                m = tl.arange(0, BLOCK) < (end - i0)
+                tl.store(
+                    ptr + (row // NJ) * (N * M) + j * M + i0 + tl.arange(0, BLOCK),
+                    0.0,
+                    mask=m,
+                )
+
+
+@triton.jit
+def _zc_zero_upper_row_kernel(
+    ptr, M, N, diag, B, BATCH_STRIDE, ROW_STRIDE, NI, BLOCK: tl.constexpr, RPC: tl.constexpr
+):
+    """out [B, M, N] with unit col stride: zero [i + diag + 1, N) of logical row
+    (b, i). NI = min(M, N - diag - 1) = rows per batch with nonzero work.
+    Single-compare lane mask. grid = (cdiv(N, BLOCK), cdiv(B * NI, RPC))."""
+    j0 = tl.program_id(0) * BLOCK
+    g = tl.program_id(1)
+    for r in tl.static_range(RPC):
+        row = g * RPC + r
+        if row < B * NI:
+            i = row % NI
+            start = i + diag + 1
+            lo = tl.maximum(start, j0)
+            hi = tl.minimum(N, j0 + BLOCK)
+            if lo < hi:
+                m = tl.arange(0, BLOCK) < (hi - lo)
+                tl.store(
+                    ptr + (row // NI) * BATCH_STRIDE + i * ROW_STRIDE + lo + tl.arange(0, BLOCK),
+                    0.0,
+                    mask=m,
+                )
+
+
+def _launch_tril_out_copied_zero(input: torch.Tensor, out: torch.Tensor, diagonal: int) -> bool:
+    """Copy-first + store-only-zero-upper for non-contiguous tril_out.
+
+    Returns True if the fast path was taken. The vendor native strided copy
+    (`_vendor_copy_from`) fills the whole output, then a store-only kernel
+    (no load, no vselect) zeroes the strict-upper region; measured ~2-5x
+    faster than the legacy tmp+launch_tril+copy for large matrices
+    ([4096,4096] fp16: 172us vs 500us, [10000,65536] 5.4ms vs 14.4ms).
+    Keeps the legacy path for batched-small shapes (zero pass is launch-bound
+    there) and for any aliasing/irregular layout (safety first)."""
+    M, N = input.shape[-2:]
+    transposed = out.transpose(-2, -1).is_contiguous()  # dense storage [B, N, M]
+    if transposed:
+        dense = True
+    elif out.stride(-1) == 1:
+        dense = False
+    else:
+        return False
+
+    if M * N < _ZC_MIN_TOTAL and not (dense is False and M < _ZC_SLICE_M):
+        return False
+    if _tensors_may_overlap(input, out):
+        # input must be fully read before any write to out (legacy contract).
+        return False
+    total = input.numel()
+    if total >= (1 << 31):  # int32 offset safety in the kernels
+        return False
+
+    batch = total // (M * N)
+    if transposed:
+        # storage row (b, j) -> zero [0, min(j - diag, M)); rows j <= diag are
+        # all-kept (or nonexistent for diag < 0).
+        if diagonal >= 0:
+            nj = N - 1 - diagonal  # > 0 because diagonal < N - 1 here
+            joff = diagonal + 1
+        else:
+            nj = N
+            joff = 0
+        grid = (triton.cdiv(M, _ZC_BLOCK), triton.cdiv(batch * nj, _ZC_RPC))
+        with torch_device_fn.device(input.device):
+            _vendor_copy_from(input, out)
+            _zc_zero_upper_storage_kernel[grid](
+                out, M, N, diagonal, joff, batch, nj, _ZC_BLOCK, _ZC_RPC, num_warps=4
+            )
+    else:
+        ni = min(M, N - 1 - diagonal)
+        if ni <= 0:
+            return False
+        grid = (triton.cdiv(N, _ZC_BLOCK), triton.cdiv(batch * ni, _ZC_RPC))
+        with torch_device_fn.device(input.device):
+            _vendor_copy_from(input, out)
+            _zc_zero_upper_row_kernel[grid](
+                out,
+                M,
+                N,
+                diagonal,
+                batch,
+                out.stride(0) if out.dim() > 2 else 0,
+                out.stride(-2),
+                ni,
+                _ZC_BLOCK,
+                _ZC_RPC,
+                num_warps=4,
+            )
+    return True
+
+
 def tril_out(input: torch.Tensor, diagonal: int = 0, *, out: torch.Tensor = None):
     logger.debug("GEMS_KUNLUNXIN TRIL_OUT")
 
@@ -1311,6 +1484,15 @@ def tril_out(input: torch.Tensor, diagonal: int = 0, *, out: torch.Tensor = None
     if diagonal >= N - 1:
         if input.data_ptr() != out.data_ptr():
             _vendor_copy_from(input, out)
+        return out
+
+    # Copy-first + store-only-zero-upper fast path (see
+    # `_launch_tril_out_copied_zero`): vendor native strided copy fills the
+    # whole output, then a store-only kernel zeroes the strict-upper region.
+    # Only taken when it provably beats the legacy path and out/input do not
+    # overlap (aliasing goes through the tmp-based path, which reads input
+    # fully before any write to out).
+    if _launch_tril_out_copied_zero(input, out, int(diagonal)):
         return out
 
     # NOTE: the strided 2D-tile out kernel (`_launch_tril_strided_out`) is

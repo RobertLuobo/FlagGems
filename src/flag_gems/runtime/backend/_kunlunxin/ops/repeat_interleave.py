@@ -45,6 +45,13 @@ def repeat_interleave_self_int(inp, repeats, dim=None, *, output_size=None):
                     -inp.ndim, inp.ndim - 1, dim
                 )
             )
+    # Non-contiguous inputs (e.g. sliced [::2] views) combined with the
+    # inserted 0-stride dimension are mis-lowered by TritonXPU as 1D-tile
+    # strided gathers (illegal memory access, IMA).  Materialize a
+    # C-contiguous copy so the kernel only handles unit-stride + 0-stride;
+    # contiguous inputs (incl. benchmark shapes) take the zero-copy path.
+    if not inp.is_contiguous():
+        inp = inp.contiguous()
     inp_shape = list(inp.shape)
     inp_stride = list(inp.stride())
     output_shape = list(inp.shape)
@@ -200,31 +207,49 @@ def repeat_interleave_self_tensor(inp, repeats, dim=None, *, output_size=None):
             )
         )
 
-    repeats = repeats.contiguous()
-    inp = inp.contiguous()
+    if repeats.numel() == 0:
+        # Empty repeats along a zero-sized dim: ATen yields an empty output of
+        # the same shape.  Short-circuit before repeat_interleave_tensor, whose
+        # cumsum[-1].item() raises IndexError on an empty cumsum.
+        # (The size check above already raises for a mismatched dim, matching
+        # torch.repeat_interleave's "repeats must have the same size" error.)
+        return torch.empty(inp_shape, dtype=inp.dtype, device=inp.device)
+
+    # The kernel below indexes rows by row-major offsets
+    # (base_in = pid * inner), so materialize a C-contiguous copy for
+    # non-contiguous inputs; contiguous inputs (incl. all benchmark shapes)
+    # take the zero-copy path.
+    if not inp.is_contiguous():
+        inp = inp.contiguous()
+    if not repeats.is_contiguous():
+        repeats = repeats.contiguous()
+
     D = inp_shape[dim]
     outer = 1
-    inner = 1
     for s in inp_shape[:dim]:
         outer *= s
+    inner = 1
     for s in inp_shape[dim + 1 :]:
         inner *= s
 
-    if inner == 1:
-        # Indexed dim is the innermost: genuine per-element gather. Fall back
-        # to the index-select path (materialized index + vendor index_select).
-        indices = repeat_interleave_tensor(repeats)
-        return torch.index_select(inp, dim, indices)
-
     cumsum = repeats.cumsum(axis=0)
     rsum = int(cumsum[-1].item())
+    if output_size is not None and output_size != rsum:
+        raise RuntimeError(
+            "repeat_interleave: Invalid output_size, expected {} but got {}".format(
+                rsum, output_size
+            )
+        )
     out_shape = inp_shape[:dim] + [rsum] + inp_shape[dim + 1 :]
     out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
 
-    # BLOCK_I: cap at 4096 (measured sweet spot on XPU); floor at 64 (narrow
+    # BLOCK_I: cap at 16384 (measured sweet spot on XPU: emulated memory
+    # throughput scales ~2x per block-size doubling — 8KB 150GB/s, 16KB
+    # 290GB/s, 32KB 545GB/s, 64KB ~1.1TB/s — and the rep-store pipeline
+    # tops out at 64KB blocks, 128KB regresses); floor at 64 (narrow
     # vector stores below 64 elements per instruction are unreliable in
     # TritonXPU; masked path covers inner < 64).
-    block_i = min(max(triton.next_power_of_2(inner), 64), 4096)
+    block_i = min(max(triton.next_power_of_2(inner), 64), 16384)
     need_mask = inner % block_i != 0
     grid = (outer * D,)
     repeat_interleave_self_tensor_kernel[grid](

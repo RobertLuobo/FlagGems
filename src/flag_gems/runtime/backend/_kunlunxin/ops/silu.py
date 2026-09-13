@@ -19,12 +19,11 @@ import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
-from flag_gems.utils import tl_extra_shim
+from flag_gems.utils import libentry
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
-div_rn = tl_extra_shim.div_rn
 
 config_ = CodeGenConfig(
     512,
@@ -46,86 +45,83 @@ def silu_forward(x):
     return y
 
 
-# silu_backward_kernel was config-less: on XPU a bare pointwise_dynamic
-# recompiles per shape (tile<512>) and never unrolls -> large shapes stall at
-# ~0.32 gems speedup. Reuse silu_forward's tuned config_ (vec CLOSE + unroll8):
-# a swept comparison showed all unroll8 variants land at ~0.55ms for
-# [4096,4096] fp16 (vs 0.80ms config-less, ~1.45x) with bit-identical output;
-# vec OPEN spiked to 28.9ms on fp32 [1024,65536] so keep isCloseVectorization.
-@pointwise_dynamic(promotion_methods=[(0, "DEFAULT")], config=config_)
-@triton.jit
-def silu_backward_kernel(x, dy):
-    dy_fp32 = dy.to(tl.float32)
-    x_fp32 = x.to(tl.float32)
-    sigma = div_rn(1.0, 1.0 + tl.exp(-x_fp32))
-    dx = dy_fp32 * sigma * (1.0 + x_fp32 * (1.0 - sigma))
-    return dx
+# silu_backward uses a dedicated bounded-tile kernel on XPU. The previous
+# pointwise_dynamic implementation (tile = next_pow2(numel/12), up to 2M-wide
+# per CTA) combined with `div_rn` (IEEE round-to-nearest division, ~2.9x slower
+# than plain `/` on XPU) and `isCloseVectorization/unroll_num` left large shapes
+# at ~0.51 gems speedup. The first custom kernel pinned BLOCK=min(next_pow2(n),
+# 65536), which left the mid-size band (16K..4M elements) at 0.3..0.8 speedup:
+# 65536 lanes per CTA serializes and masks everything.
+#
+# Block-size policy (probed on XPU card 6, 2026-09-10, do_bench event timing on
+# the exact benchmark shapes; /tmp/silu_bw_probe). The optimum keeps a small
+# fixed CTA count: ~8 CTAs for n <= 131072, ~32 CTAs for n <= 2M, ~128 CTAs
+# above, with BLOCK capped at 65536 (no unmasked variant, `other=` never used):
+#   n=16384  (1024,16):   17.2us ->  5.9us   (fp16, was m65536=8.09/17.5us)
+#   n=65536  (64,64,16):  17.1us ->  7.3us
+#   n=262144 (1024,256):  17.2us -> 11.0us
+#   n=1048576(64,64,256): 29.9us -> 23.8us
+#   n=4194304(1024,4096): 74.9us -> 71.5us
+# `unroll_num`/`buffer_size_limit` sweeps were flat (<0.3%), so the existing
+# launch knobs (num_warps=16, buffer_size_limit=4096) are kept. Masked-vs-
+# unmasked differs by <1%, but the unmasked variant is used when the tensor is
+# exactly divisible by BLOCK (no mask registers, matches log_sigmoid_backward).
+_SILU_BW_MAX_BLOCK = 65536
 
 
-# silu_backward tiny fast path (contiguous fp16/fp32/bf16, numel <= 2048):
-# a flat 1D masked/unmasked kernel that skips the pointwise_dynamic wrapper.
-# Measurement on XPU 5 (2026-08-19, official 12-shape matrix, do_bench A/B):
-# at numel <= 2048 the pointwise codegen (kunlunAutoGrid=False) pays a fixed
-# ~8us wrapper/grid overhead per call (e.g. [1024,1] fp16 15.5us vs 7.1us flat);
-# at numel > 2048 the tuned pointwise config_ is strictly faster than every
-# flat/NEED_MASK tier (B2048..B32768 x w4..16) and every CodeGenConfig variant
-# (unroll 8/16/32 x buffer 4096/8192/16384 x tile 256/512/1024 x autogrid),
-# so only the tiny window uses the flat kernel. Math bit-identical to
-# silu_backward_kernel (fp32 staging, div_rn, downcast at store).
-_TINY_MAX_NUMEL = 2048
-_TINY_BLOCK = 2048
-_TINY_WARPS = 4
-
-
-@triton.jit
-def silu_backward_tiny_kernel(
-    g_ptr, x_ptr, out_ptr, n_elements, BLOCK: tl.constexpr, NEED_MASK: tl.constexpr
+@libentry()
+@triton.jit(do_not_specialize=["n_elements"])
+def silu_backward_kernel_xpu(
+    x_ptr, dy_ptr, out_ptr, n_elements, BLOCK: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    if NEED_MASK:
-        mask = offs < n_elements
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-        dy = tl.load(g_ptr + offs, mask=mask, other=0.0)
-    else:
-        x = tl.load(x_ptr + offs)
-        dy = tl.load(g_ptr + offs)
-    x_fp32 = x.to(tl.float32)
-    dy_fp32 = dy.to(tl.float32)
-    sigma = div_rn(1.0, 1.0 + tl.exp(-x_fp32))
-    dx = dy_fp32 * sigma * (1.0 + x_fp32 * (1.0 - sigma))
-    if NEED_MASK:
-        tl.store(out_ptr + offs, dx.to(x.dtype), mask=mask)
-    else:
-        tl.store(out_ptr + offs, dx.to(x.dtype))
+    pid = tl.program_id(0)
+    tid = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = tid < n_elements
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    dy = tl.load(dy_ptr + tid, mask=mask).to(tl.float32)
+    sigma = 1.0 / (1.0 + tl.exp(-x))
+    dx = dy * sigma * (1.0 + x * (1.0 - sigma))
+    tl.store(out_ptr + tid, dx.to(x_ptr.type.element_ty), mask=mask)
 
 
-def _silu_backward_tiny(grad_output, self):
-    numel = grad_output.numel()
-    out = torch.empty_like(self)
-    if numel == 0:
-        return out
-    if numel == _TINY_BLOCK:
-        silu_backward_tiny_kernel[(1,)](
-            grad_output,
-            self,
-            out,
-            numel,
-            BLOCK=_TINY_BLOCK,
-            NEED_MASK=False,
-            num_warps=_TINY_WARPS,
-        )
+@libentry()
+@triton.jit
+def silu_backward_kernel_xpu_unmasked(
+    x_ptr, dy_ptr, out_ptr, BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    tid = pid * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + tid).to(tl.float32)
+    dy = tl.load(dy_ptr + tid).to(tl.float32)
+    sigma = 1.0 / (1.0 + tl.exp(-x))
+    dx = dy * sigma * (1.0 + x * (1.0 - sigma))
+    tl.store(out_ptr + tid, dx.to(x_ptr.type.element_ty))
+
+
+def _silu_backward_pick_block(n_elements):
+    # 1 CTA (BLOCK = next_pow2(n)) for n <= 4096: probe on XPU card 6 shows a
+    # single wide CTA is ~2x faster than the 8-CTA tier below 4K elements
+    # (n=1024: 5.6us vs 14.4us; n=2048: 5.8us vs 10.7us) and still faster at
+    # n=4096 (fp16 6.0us vs 6.6us). Tiered CTA count only pays off at n >= 8192.
+    if n_elements <= 4096:
+        return min(triton.next_power_of_2(n_elements), _SILU_BW_MAX_BLOCK)
+    # ~8 CTAs for small/mid, ~32 for large, ~128+ for huge (capped at 65536).
+    if n_elements <= 131072:
+        ctas = 8
+    elif n_elements <= 2097152:
+        ctas = 32
     else:
-        silu_backward_tiny_kernel[(1,)](
-            grad_output,
-            self,
-            out,
-            numel,
-            BLOCK=_TINY_BLOCK,
-            NEED_MASK=True,
-            num_warps=_TINY_WARPS,
-        )
-    return out
+        ctas = 128
+    block = (n_elements + ctas - 1) // ctas
+    return min(triton.next_power_of_2(block), _SILU_BW_MAX_BLOCK)
+
+
+# Note: the earlier "tiny fast path" (flat kernel with BLOCK=2048, num_warps=4)
+# was removed: A/B on XPU card 6 (2026-09-10) shows it is 0.7..1.4us slower
+# than the plain 1-CTA masked main kernel at every n <= 2048 and every dtype
+# (e.g. n=1024 fp16 6.50us vs 5.37us; n=2048 bf16 6.12us vs 5.72us), so the
+# 1-CTA tier above subsumes it with identical math (fp32 staging, plain `/`,
+# downcast at store).
 
 
 def silu(self):
@@ -136,14 +132,38 @@ def silu(self):
 
 def silu_backward(grad_output, self):
     logger.debug("GEMS_KUNLUNXIN SILU_BACKWARD")
-    if (
-        grad_output.dtype in (torch.float16, torch.float32, torch.bfloat16)
-        and grad_output.is_contiguous()
-        and self.is_contiguous()
-        and grad_output.numel() <= _TINY_MAX_NUMEL
-    ):
-        return _silu_backward_tiny(grad_output, self)
-    grad_input = silu_backward_kernel(self, grad_output)
+    x = self if self.is_contiguous() else self.contiguous()
+    dy = grad_output if grad_output.is_contiguous() else grad_output.contiguous()
+    n_elements = x.numel()
+    if n_elements == 0:
+        return torch.empty_like(x)
+    grad_input = torch.empty_like(x)
+    block = _silu_backward_pick_block(n_elements)
+    if n_elements % block == 0:
+        grid = (n_elements // block, 1, 1)
+        silu_backward_kernel_xpu_unmasked[grid](
+            x,
+            dy,
+            grad_input,
+            BLOCK=block,
+            num_warps=16,
+            buffer_size_limit=4096,
+        )
+    else:
+        grid = (triton.cdiv(n_elements, block), 1, 1)
+        silu_backward_kernel_xpu[grid](
+            x,
+            dy,
+            grad_input,
+            n_elements,
+            BLOCK=block,
+            num_warps=16,
+            buffer_size_limit=4096,
+        )
+    if grad_input.shape != self.shape or grad_input.stride() != self.stride():
+        grad_input = grad_input.reshape(self.shape).as_strided(
+            self.size(), self.stride()
+        )
     return grad_input
 
 

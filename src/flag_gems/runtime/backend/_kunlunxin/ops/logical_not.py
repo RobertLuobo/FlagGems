@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 
 import triton
 import triton.language as tl
@@ -49,27 +50,31 @@ config_ = CodeGenConfig(
 @pointwise_dynamic(promotion_methods=[(0, "ALWAYS_BOOL")], config=config_)
 @triton.jit
 def logical_not_func(x):
-    # XPU has no fast per-element `x != 0` in fp: a floating-point compare (cmpf)
-    # lowered to i1 costs ~2x a plain icmp (measured on XPU 7, 2026-08-13:
-    # [4096,4096] fp16 ~0.49ms for `not x.to(tl.int1)` vs ~0.24ms for the
-    # bitcast-icmp body below; [1024,65536] 1.60ms vs 0.64ms; same ratio for
-    # fp32/bf16). `logical_not(x)` == `(x == 0)`.
-    #   u = bitcast(x, fp32)          -- value-exact upcast for every input
-    #                                    dtype (fp16/bf16/fp32/int16/32/64/bool)
-    #   (u & 0x7FFFFFFF) == 0         -- true only for 0x00000000/0x80000000
-    #                                    (+/-0.0); all other bit patterns,
-    #                                    incl. NaN/inf/subnormals and every
-    #                                    nonzero int, are non-zero after the
-    #                                    sign mask -> False.
-    # Result matches torch.logical_not bit-exactly for all float edge cases
-    # (NaN, +/-inf, -0.0, subnormals) verified on-device.
-    u = x.to(tl.float32).to(tl.int32, bitcast=True)
-    return (u & 0x7FFFFFFF) == 0
+    # `logical_not(x)` == `(x == 0)`: one icmp (int/bool) / cmpf (float)
+    # compare, no i16->f32 upcast. The previous sign-mask body
+    # `(x.to(tl.float32).to(tl.int32, bitcast=True) & 0x7FFFFFFF) == 0`
+    # lowered int16 inputs through `vsitofp`, which breaks the unrolled
+    # (buffer_size_limit=4096, unroll_num=16) 1d-tile path: the store value
+    # is 4096 bytes/2 = 2048 lanes while the pointer/mask tensors stay
+    # 4096-lane -> LLVM "size mismatch when packing elements ... expected 2
+    # but got 1" for every int16 shape with numel in [2048, 32768]
+    # (reproduced by the benchmark's own [64,64] int16 case). The sibling
+    # eq/ne/le/lt/ge/gt/less_equal/not_equal family uses the same plain
+    # compare under TRITONXPU_COMPARE_FUSION / TRITONXPU_FP16_FAST (set by
+    # the wrappers below), bit-identical to torch for NaN/+/-inf/-0.0/
+    # subnormals (NaN == 0 is False, -0.0 == 0 is True).
+    return x == 0
 
 
 def logical_not(A):
     logger.debug("GEMS_KUNLUNXIN LOGICAL_NOT")
-    return logical_not_func(A)
+    os.environ["TRITONXPU_COMPARE_FUSION"] = "1"
+    os.environ["TRITONXPU_FP16_FAST"] = "1"
+    try:
+        return logical_not_func(A)
+    finally:
+        del os.environ["TRITONXPU_COMPARE_FUSION"]
+        del os.environ["TRITONXPU_FP16_FAST"]
 
 
 def logical_not_(A):
@@ -79,5 +84,11 @@ def logical_not_(A):
     # large shapes, speedup ~0.001-0.005). Reuse the now-tuned logical_not_func
     # with out0=A (same recipe as bitwise_not_).
     logger.debug("GEMS_KUNLUNXIN LOGICAL_NOT_")
-    logical_not_func(A, out0=A)
+    os.environ["TRITONXPU_COMPARE_FUSION"] = "1"
+    os.environ["TRITONXPU_FP16_FAST"] = "1"
+    try:
+        logical_not_func(A, out0=A)
+    finally:
+        del os.environ["TRITONXPU_COMPARE_FUSION"]
+        del os.environ["TRITONXPU_FP16_FAST"]
     return A

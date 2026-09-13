@@ -502,6 +502,10 @@ def median_merge_select_chunk_kernel(
         rval = tl.where(has_nan, float("nan"), rval)
     else:
         rval = tl.load(inp + pid * N + ridx, mask=ridx < N, other=0)
+        # Mirror the float branch (has_nan is always 0 for integer inputs,
+        # so this select is a no-op).  Keeps the out_values store in the
+        # core-0-guarded region (see median_select_kernel).
+        rval = tl.where(has_nan, 0, rval)
     tl.store(out_values + pid, rval)
     tl.store(out_indices + pid, ridx.to(tl.int64))
 
@@ -579,6 +583,7 @@ def median_count_le_kernel(
 ):
     pid = ext.program_id(0)
     cols = tl.arange(0, BLOCK_N)
+    mask = cols < N
     keys_v = tl.load(keys + pid * BLOCK_N + cols)
     lo_v = tl.load(lo + pid)
     hi_v = tl.load(hi + pid)
@@ -701,6 +706,12 @@ def median_select_kernel(
         rval = tl.where(has_nan, float("nan"), rval)
     else:
         rval = tl.load(inp + pid * N + ridx, mask=ridx < N, other=0)
+        # Mirror the float branch (has_nan is always 0 for integer inputs,
+        # so this select is a no-op).  Without it the XPU backend sinks the
+        # direct load->store to the unguarded (all-64-core) region and the
+        # redundant concurrent out_values stores serialize; with it the
+        # store stays inside the core-0-guarded block like the float path.
+        rval = tl.where(has_nan, 0, rval)
     tl.store(out_values + pid, rval)
     tl.store(out_indices + pid, ridx.to(tl.int64))
 

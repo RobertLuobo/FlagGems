@@ -910,7 +910,19 @@ class WrapperGenerator:
             # max_grid_size0 = self.config.max_grid_size[0]
             # code.writeline(f"num_ctas = min({max_grid_size0}, num_tiles)")
             determine_num_ctas_and_tiles = [
-                "if sum(out0.shape) <= 2048*64:",
+                # Use the element count, not the sum of the dimensions: for a
+                # multi-dimensional output the dim-sum is a tiny fraction of
+                # numel, so `sum(out0.shape) <= 2048*64` used to select the
+                # single-tile branch for e.g. (16, 128, 64, 1280) and then
+                # emit `tile_size = next_power_of_2(numel)` = 2**28 lanes.
+                # The XPU compiler's make_ttxir pass is superlinear in the
+                # tile width (measured 57s/111s/218s at 2**24/2**25/2**26
+                # lanes) so that kernel never finished compiling
+                # (special_chebyshev_polynomial_w shape3 -> pytest-timeout).
+                # Bounding by num_tasks keeps every small tensor on the old
+                # single-tile path and moves only the huge-N shapes onto the
+                # verified 12-tile partition used by the fast path.
+                "if num_tasks <= 2048*64:",
                 "   num_ctas = 1 # XPU BLOCK_NUM",
                 "   num_tiles = 1 # XPU BLOCK_NUM",
                 "else:",
@@ -1030,7 +1042,10 @@ class WrapperGenerator:
                         code.writeline(f"tile_size{i}=tile_sizes[{i}],")
                     code.writeline("one_tile_per_cta=one_tile_per_cta,")
                 code.writeline("num_warps=num_warps,")
-                if self.config.is_cat:
+                if self.config.is_scatter_slice:
+                    code.writeline("buffer_size_limit=512,")
+                    code.writeline("isCloseOffsetAnalysis=True,")
+                elif self.config.is_cat:
                     code.writeline("buffer_size_limit=512,")
                 elif self.config.buffer_size_limit:
                     code.writeline(
@@ -1096,7 +1111,10 @@ class WrapperGenerator:
                     code.writeline("tile_size=tile_size,")
                     code.writeline("one_tile_per_cta=one_tile_per_cta,")
                 code.writeline("num_warps=num_warps,")
-                if self.config.is_cat:
+                if self.config.is_scatter_slice:
+                    code.writeline("buffer_size_limit=512,")
+                    code.writeline("isCloseOffsetAnalysis=True,")
+                elif self.config.is_cat:
                     code.writeline("buffer_size_limit=512,")
                 elif self.config.buffer_size_limit:
                     code.writeline(

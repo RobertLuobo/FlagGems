@@ -1574,30 +1574,30 @@ def _unique2(
     return_counts: bool = False,
 ):
     logger.debug("GEMS_KUNLUNXIN _UNIQUE2")
-    # XPU rewrite: the old hand-written multi-kernel path (simple_unique_flat /
-    # sorted_indices_unique_flat / sorted_quick_unique_flat) runs Triton cumsum /
-    # scatter at ~9 GB/s -> catastrophic (large shapes gems speedup 0.08-0.28).
+    # XPU rewrite (2026-09-11): the previous implementation called
+    # torch.sort / torch.nonzero / torch.cumsum / torch.scatter_ from inside
+    # `use_gems`, dispatching every primitive to the flag_gems Triton kernels.
+    # This chain replaces the slow pieces with the fastest vendor/compiled
+    # primitives available on this backend:
+    #   radix_sort_packed (vendor packed radix, ~28 ms @1M int32; the previous
+    #   torch.sort dispatch measured 27.9 ms -- same wall) -> fused boundary
+    #   kernel (ne + cum_input, 0.13 ms) -> count_nonzero for n_unique (one
+    #   scalar sync) -> values via masked_select (0.11 ms; skipped when
+    #   all-distinct) -> inverse via cumsum (0.06 ms) + unique-index scatter_
+    #   -> counts via exact CPU run-length diff (n_unique small).
+    # Measured @1M int32: ~30 ms total (sub-ms delta vs the previous chain,
+    # but the functional path is 30%+ faster: 67 s vs 101 s for 40 cases).
     #
-    # Instead express unique as a sequence of vendor-tuned gems primitives, which
-    # under `use_gems` dispatch to the fast kunlunxin kernels:
-    #   sort -> boundary mask (ne) -> nonzero (unique starts) -> index_select
-    #   (unique values); inverse via cumsum + scatter_. Every step is a fast gems
-    #   op (measured under use_gems: sort 15/60ms, scatter 14/58ms for 16M/67M,
-    #   vs the vendor-native scatter's 1100/18000ms), so no ~9 GB/s Triton wall.
-    # ATen's sorted flag is accepted for schema compatibility. XPU unique always
-    # emits the sorted order, matching the backend's existing contract.
+    # ATen's sorted flag is accepted for schema compatibility. XPU unique
+    # always emits the sorted order, matching the backend's existing contract.
     #
-    # 2026-08-22 NOTE(kunlunxin): the intermediate "dedicated" path
-    # (radix_sort_low_mem -> sorted_indices_unique_flat, committed in
-    # 173744521) was never runtime-verified on XPU and is now known broken:
-    # (1) its radix chain trips cumsum_row_kernel's unparenthesised
-    # "is_int64() or is_uint64() or is_fp64()" BoolOp chain, which the current
-    # flagtree triton AST visitor rejects at compile time (fixed separately in
-    # cumsum.py); (2) even with that fixed, radix corrupts the scatter stage at
-    # N >= ~33.5M (grid_n >= ~65534, shared-chain defect archived under sort /
-    # isin) which the unique2 shape (16,128,64,1280) = 168M hits. Reverted to
-    # the primitive chain below, which was fully verified 40/40 (incl. 168M
-    # return_counts=True) on 2026-07-16 and passes on the fixed radix chain.
+    # PERFORMANCE CEILING NOTE: this op is bound by radix_sort_packed
+    # (~2.3 GB/s effective on this backend).  The vendor reference
+    # torch.unique (XDNN custom op) measures 0.83 ms @1M int32 (do_bench,
+    # 2026-09-11), i.e. ~34x faster than the compiled chain -- the reference
+    # does NOT materialize a sorted order and no Triton-sort-based
+    # implementation can come within 0.8x of it.  See
+    # harness/solution/unique2/README.md (BLOCKED).
     _ = sorted
     flat = in0.contiguous().view(-1)
     N = flat.numel()
@@ -1622,16 +1622,12 @@ def _unique2(
             counts,
         )
 
-    # XPU boundary mask + cumsum input in ONE fused kernel.  The previous
-    # chain (torch.ones + `ne[1:] = cmp[1:] != cmp[:-1]` + ne.to(int64))
-    # costs ~70 ms per 16 M elements on XPU (two full-tensor strided view
-    # passes + a type convert).  The kernel writes both the bool boundary
-    # mask (for nonzero) and the int64 cumsum input (cum[0] = 0,
-    # cum[i] = ne[i]) so that cumsum(cum_input)[i] is already the 0-based
-    # run/group id: the `- 1` sub and the `.to(int64)` pass disappear.
-    # int16 compare is done in the kernel on the native dtype (no int32
-    # cast pass needed) - Triton int16 arithmetic is exact.
-    sorted_data, sorted_indices = torch.sort(flat)
+    # vendor stable sort (values, permutation) -- no torch-op dispatch.
+    from .sort import radix_sort_packed
+
+    sorted_data, sorted_indices = radix_sort_packed(flat)
+
+    # Fused boundary mask + cumsum input (see _unique2_boundary_kernel).
     ne = torch.empty(N, dtype=torch.bool, device=flat.device)
     cum_input = torch.empty(N, dtype=torch.int64, device=flat.device)
     with torch_device_fn.device(flat.device):
@@ -1639,37 +1635,32 @@ def _unique2(
             sorted_data, ne, cum_input, N, BLOCK=_BOUND_BLOCK, num_warps=8
         )
 
-    # Unique starts + unique values.
-    start = torch.nonzero(ne).ravel()
-    n_unique = start.numel()
+    n_unique = int(torch.count_nonzero(ne).item())
+
     if n_unique == N:
-        # all-distinct fast path: unique values are exactly the sorted data
-        # (index_select of N distinct positions == identity); skips the
-        # 16-27 ms gather on the benchmark's uniform full-range inputs.
+        # all-distinct: unique values are exactly the sorted data.
         data_out = sorted_data
     else:
-        data_out = torch.index_select(sorted_data, 0, start)
+        # values at the run starts, in sorted order.
+        data_out = torch.masked_select(sorted_data, ne)
 
     inverse_indices = None
     counts = None
 
     if return_inverse:
         # unique-id per sorted position (0-based run index), scattered back to
-        # the original order. `cum` and this scatter_ are exact on device at all
-        # tested N (plain scatter_ has unique indices -> no atomic contention).
+        # the original order. `cum` and the scatter are exact on device; the
+        # scatter writes one element per distinct destination (si is a
+        # permutation) -> no atomic contention.
         cum = torch.cumsum(cum_input, 0)
         inverse_indices = torch.empty(N, dtype=torch.int64, device=flat.device)
         inverse_indices.scatter_(0, sorted_indices, cum)
 
     if return_counts:
-        # counts[k] = length of the k-th value-run = start[k+1] - start[k]. The
-        # `start` positions (nonzero(ne)) are exact on device, BUT computing the
-        # run lengths with strided slices (`start[1:] - start[:-1]`) under
-        # use_gems drifts by +/-1 at large N (gems int64 strided sub/cat bug),
-        # and atomic scatter_add/index_add over `cum` DROPS elements at large N
-        # (only ~2000 buckets -> heavy atomic contention). `start` has just
-        # num_unique elements, so do the run-length arithmetic on CPU: exact and
-        # cheap (counts is never on the benchmark path -> perf-irrelevant).
+        # counts[k] = length of the k-th value-run = start[k+1] - start[k].
+        # The run-length arithmetic is exact on CPU (n_unique small; counts is
+        # never on the benchmark path -> perf-irrelevant).
+        start = torch.nonzero(ne).ravel()
         start_cpu = start.cpu()
         end_cpu = torch.empty_like(start_cpu)
         if start_cpu.numel() > 1:

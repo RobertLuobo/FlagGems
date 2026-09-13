@@ -108,6 +108,22 @@ def _xlogy_fast(x, y):
     return x.to(tl.float32) * tl.log(1.0000000000000000 * y.to(tl.float32))
 
 
+# Scalar-Self fast body: y is a tensor, x is a per-launch scalar passed as an
+# fp32 kernel argument.  Same tuned 12-CTA config_ (log.py recipe) as the
+# tensor-tensor `_xlogy_fast` above; the scalar only feeds the log so it folds
+# to a per-CTA scalar op.  Dispatched from `_launch_scalar_tensor` when
+# n >= _GATE and x != 0.0, where the select-free body x*log(y) is exactly
+# aten (mirror of `_exact_scalar_tensor`).
+@pointwise_dynamic(
+    is_tensor=[True, False],
+    promotion_methods=[(0, 1, "INT_TO_FLOAT")],
+    config=config_,
+)
+@triton.jit
+def _xlogy_fast_scalar_tensor(y, x):
+    return x.to(tl.float32) * tl.log(1.0000000000000000 * y.to(tl.float32))
+
+
 MIN_BLOCK = 2048
 UNROLL_NUM = 16
 BUFFER_SIZE_LIMIT = 8192
@@ -589,16 +605,26 @@ def _launch_scalar_tensor(y, out, x_val):
                 isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
             )
         return
-    x_val = float(x_val)
+    x_val_f = float(x_val)
+    if n_elements >= _GATE and x_val_f != 0.0:
+        # Large shapes, fast body x*log(y) exact for every y (x != 0): route
+        # through the tuned 12-CTA CodeGenConfig (mirror of `_launch`'s
+        # tensor-tensor fast path).  The raw-pointer 4096-lane kernels below
+        # are SFU/throttle-bound on the large range; the 1.0*-folded log body
+        # here matches `_xlogy_fast` and measures 0.82-1.03x on the 268M/655M
+        # benchmark shapes (vs 0.63-0.86x raw) while keeping 2.56M/16.7M at
+        # parity (batch-3 closure evidence, 2026-09-11).
+        _xlogy_fast_scalar_tensor(y, x_val_f, out0=out)
+        return
     block_size, num_warps, masked = _pick_block(n_elements)
-    exact = _exact_scalar_tensor(n_elements, x_val)
+    exact = _exact_scalar_tensor(n_elements, x_val_f)
     if masked:
         grid = (triton.cdiv(n_elements, block_size),)
         xlogy_scalar_tensor_kernel[grid](
             y,
             out,
             n_elements,
-            x_val,
+            x_val_f,
             BLOCK_SIZE=block_size,
             EXACT=exact,
             num_warps=num_warps,
@@ -611,7 +637,7 @@ def _launch_scalar_tensor(y, out, x_val):
         xlogy_scalar_tensor_kernel_unmasked[grid](
             y,
             out,
-            x_val,
+            x_val_f,
             BLOCK_SIZE=block_size,
             EXACT=exact,
             num_warps=num_warps,

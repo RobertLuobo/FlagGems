@@ -4,9 +4,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_KEYSET = torch._C.DispatchKeySet(
-    torch._C.DispatchKey.CompositeImplicitAutograd
-)
+# Composite-implicit dispatch keyset: redispatching with only this keyset skips
+# the composite wrapper and lands directly on the XPU/XDNN device kernel.
+_FALLBACK_KEYSET = torch._C.DispatchKeySet(torch._C.DispatchKey.CompositeImplicitAutograd)
 
 
 def _single(value):
@@ -24,13 +24,10 @@ def conv_transpose1d(
     dilation=1,
 ):
     logger.debug("GEMS_KUNLUNXIN CONV_TRANSPOSE1D")
-    output_dtype = input.dtype
-    needs_upcast = output_dtype in (torch.float16, torch.bfloat16)
-    if needs_upcast:
-        input = input.float()
-        weight = weight.float()
-        bias = None if bias is None else bias.float()
-
+    # Dispatch straight to the XDNN device kernel, bypassing the composite
+    # wrapper. Native dtypes are passed through untouched: the XDNN kernel
+    # supports fp16/bf16/fp32 directly, so no upcast (which would halve
+    # throughput on the XPU) is required.
     output = torch.ops.aten.conv_transpose1d.default.redispatch(
         _FALLBACK_KEYSET,
         input,
@@ -42,4 +39,4 @@ def conv_transpose1d(
         groups,
         _single(dilation),
     )
-    return output.to(output_dtype) if needs_upcast else output
+    return output

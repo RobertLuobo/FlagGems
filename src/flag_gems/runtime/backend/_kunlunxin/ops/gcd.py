@@ -49,6 +49,19 @@ _ITERS_32 = 48
 _ITERS_64 = 96
 _ITERS = {torch.int8: 24, torch.int16: 24, torch.int32: _ITERS_32}
 
+# Chunked no-mask fast path: each program handles NCHUNK * BLOCK lanes with
+# NO tail-mask (caller guarantees numel % (BLOCK*NCHUNK) == 0).  On this
+# backend the masked load/store path is measurably slower than the unmasked
+# one (~10-27% at >= 64K elements), and fewer programs reduce launch overhead.
+# Same math as the masked kernel (INT_MIN lanes keep their native value,
+# fixed-iteration Euclid).  Below _FAST_MIN_NUMEL the chunked kernel serializes
+# 8 chunks per program and loses to the 8x-more-parallel masked kernel
+# (measured: at 1K-16K elements fast is 1.05x-2.0x SLOWER), so the masked
+# kernel is kept for small tensors.
+_GCD_BLOCK = 128
+_GCD_NCHUNK = 8
+_GCD_FAST_MIN_NUMEL = 65536
+
 
 @triton.jit
 def gcd_kernel_32(
@@ -81,6 +94,35 @@ def gcd_kernel_32(
 
 
 @triton.jit
+def gcd_kernel_32_fast(
+    x_ptr,
+    y_ptr,
+    out_ptr,
+    ITERS: tl.constexpr,
+    MINV: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NCHUNK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    base = pid * (BLOCK * NCHUNK)
+    for c in tl.static_range(NCHUNK):
+        offsets = base + c * BLOCK + tl.arange(0, BLOCK)
+        x = tl.load(x_ptr + offsets)
+        y = tl.load(y_ptr + offsets)
+        xi = x.to(tl.int32)
+        yi = y.to(tl.int32)
+        a0 = tl.where(xi == MINV, xi, tl.abs(xi))
+        b0 = tl.where(yi == MINV, yi, tl.abs(yi))
+        for _ in range(ITERS):
+            nz = b0 != 0
+            bb = tl.where(nz, b0, 1)
+            r = a0 % bb
+            a0 = tl.where(nz, b0, a0)
+            b0 = tl.where(nz, r, b0)
+        tl.store(out_ptr + offsets, a0.to(out_ptr.type.element_ty))
+
+
+@triton.jit
 def gcd_kernel_64(
     x_ptr,
     y_ptr,
@@ -108,12 +150,46 @@ def gcd_kernel_64(
     tl.store(out_ptr + offsets, a0.to(out_ptr.type.element_ty), mask=mask)
 
 
+@triton.jit
+def gcd_kernel_64_fast(
+    x_ptr,
+    y_ptr,
+    out_ptr,
+    ITERS: tl.constexpr,
+    MINV: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NCHUNK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    base = pid * (BLOCK * NCHUNK)
+    for c in tl.static_range(NCHUNK):
+        offsets = base + c * BLOCK + tl.arange(0, BLOCK)
+        x = tl.load(x_ptr + offsets)
+        y = tl.load(y_ptr + offsets)
+        a0 = tl.where(x == MINV, x, tl.abs(x))
+        b0 = tl.where(y == MINV, y, tl.abs(y))
+        for _ in range(ITERS):
+            nz = b0 != 0
+            bb = tl.where(nz, b0, 1)
+            r = a0 % bb
+            a0 = tl.where(nz, b0, a0)
+            b0 = tl.where(nz, r, b0)
+        tl.store(out_ptr + offsets, a0.to(out_ptr.type.element_ty))
+
+
 def _kernel_meta(dtype):
     if dtype in (torch.int8, torch.int16, torch.int32):
         minv = -(1 << 31) if dtype == torch.int32 else torch.iinfo(dtype).min
-        return gcd_kernel_32, _ITERS[dtype], minv, 128, 8
+        return gcd_kernel_32, gcd_kernel_32_fast, _ITERS[dtype], minv, _GCD_BLOCK, 8
     if dtype == torch.int64:
-        return gcd_kernel_64, _ITERS_64, -(1 << 63), 128, 8
+        return (
+            gcd_kernel_64,
+            gcd_kernel_64_fast,
+            _ITERS_64,
+            -(1 << 63),
+            _GCD_BLOCK,
+            8,
+        )
     raise TypeError(f"unsupported dtype for gcd: {dtype}")
 
 
@@ -121,7 +197,26 @@ def _launch_gcd(lhs, rhs, out):
     numel = out.numel()
     if numel == 0:
         return out
-    kernel, iters, minv, block, num_warps = _kernel_meta(out.dtype)
+    kernel, fast_kernel, iters, minv, block, num_warps = _kernel_meta(out.dtype)
+    chunk = block * _GCD_NCHUNK
+    if numel >= _GCD_FAST_MIN_NUMEL and numel % chunk == 0:
+        # Unmasked chunked path: fewer programs + no tail-mask (measured
+        # faster on this backend for large numel).  Caller guarantees
+        # divisibility; _launch_gcd is the only entry, so in-place aliasing
+        # (A as both source and dest for gcd_) stays safe (each chunk is
+        # fully loaded before its store, chunks are disjoint).
+        grid = (triton.cdiv(numel, chunk),)
+        fast_kernel[grid](
+            lhs,
+            rhs,
+            out,
+            ITERS=iters,
+            MINV=minv,
+            BLOCK=block,
+            NCHUNK=_GCD_NCHUNK,
+            num_warps=num_warps,
+        )
+        return out
     grid = (triton.cdiv(numel, block),)
     kernel[grid](
         lhs,

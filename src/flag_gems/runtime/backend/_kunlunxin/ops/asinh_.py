@@ -40,6 +40,16 @@ config_ = CodeGenConfig(
 # (the naive x + sqrt(x^2+1) form evaluates to -inf + inf = NaN).
 # Uses float32 intermediate for numerical precision.
 #
+# Sign test is the sign bit (bitcast to int32, < 0), NOT the float
+# compare x < 0.0: (a) the float compare loses the -0.0 sign (ATen
+# asinh(-0.0) = -0.0, the fcmp would return +0.0); (b) measured
+# ~23% slower on every benchmark shape (e.g. (4096,4096) 924us ->
+# 712us, (1024,65536) 3598us -> 2765us, reproduced 3x) because the
+# XPU fcmp.olt lowering is far more expensive than the icmp.slt on the
+# sign bit.  The int sign test only differs from the float compare for
+# -0.0 (fixed) and the sign of NaN (sign flip, harmless under
+# equal_nan assertions).
+#
 # Large-|x| stability: for |x| > 1.84e19 the x*x term overflows float32
 # (max ~3.4e38) and log(|x| + sqrt(x^2+1)) silently returns inf for a
 # finite input; the asymptotically equal 2*|x| (i.e. log(2*|x|), exact
@@ -61,7 +71,7 @@ def asinh__func(x):
         abs_x + tl.sqrt(abs_x * abs_x + 1.0),
     )
     y = tl.log(r)
-    result = tl.where(x_fp32 < 0.0, -y, y)
+    result = tl.where(x_fp32.to(tl.int32, bitcast=True) < 0, -y, y)
     return result.to(x.dtype)
 
 

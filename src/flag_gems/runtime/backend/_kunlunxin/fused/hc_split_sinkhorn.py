@@ -39,11 +39,15 @@ Why this file exists (XPU, measured 2026-09-04):
 Strategy (no autotune, single config, exact tiles, no masks):
 - hc_mult in {2, 4} and device.type == "cuda" -> vectorized exact-tile
   kernel over BLOCK_N tokens with NO masks at all: the caller picks
-  BLOCK_N = 64 and, when ``num_tokens % 64 != 0``, pads the batch dim to the
-  next multiple of 64 (``torch.nn.functional.pad``) and slices the valid
-  rows back out (same guard pattern as ``_kunlunxin/fused/mhc_bwd.py``). For
-  every shape in the test/benchmark matrix (N in {128, 2048, 16384, 65536})
-  the padding is a no-op (all are multiples of 64).
+  BLOCK_N = 128 (64 for <= 128 tokens, see ``hc_split_sinkhorn`` below) and,
+  when ``num_tokens % BLOCK_N != 0``, pads the batch dim to the next multiple
+  of BLOCK_N (``torch.nn.functional.pad``) and slices the valid rows back out
+  (same guard pattern as ``_kunlunxin/fused/mhc_bwd.py``). For every shape in
+  the test/benchmark matrix (N in {128, 2048, 16384, 65536}) the padding is a
+  no-op (all are multiples of 64 and 128). BLOCK_N = 128 measured faster than
+  64 on XPU (2026-09-10, hc4 b256s256 7.45ms -> 4.80ms, hc2 b256s256 2.57ms ->
+  1.86ms); BLOCK_N = 256 aborts the XPU compiler (TritonXPUUnrollControl) so
+  128 is the largest safe exact-tile size.
 - All comb math stays in registers (no global read-back); the Sinkhorn
   iterations use a runtime ``range`` loop (``tl.static_range`` unroll of the
   Sinkhorn iterations is pathologically slow / hangs the XPU compiler,
@@ -64,7 +68,7 @@ from flag_gems.fused.mhc.hc_split_sinkhorn import (
 )
 
 _SUPPORTED_HC = (2, 4)
-_BLOCK_N = 64
+_BLOCK_N = 128
 
 
 @triton.jit
@@ -409,12 +413,19 @@ def hc_split_sinkhorn(
             comb.view(*outer_shape, hc_mult, hc_mult),
         )
 
-    pad = (-num_tokens) % _BLOCK_N
+    # Shape-fixed block size (no autotune): 128 lanes for the large-token
+    # shapes, 64 lanes for tiny token counts (<=128) where the 128-lane
+    # single-program launch measures slightly slower (launch-bound, measured
+    # 2026-09-10). Both are exact tiles with no masks; N % block_n == 0 holds
+    # for every shape in the test/benchmark matrix (N in {128, 2048, 16384,
+    # 65536}), and the pad guard below covers any other N.
+    block_n = 64 if num_tokens <= 128 else _BLOCK_N
+    pad = (-num_tokens) % block_n
     if pad:
         mixes_padded = torch.nn.functional.pad(mixes_flat, (0, 0, 0, pad))
     else:
         mixes_padded = mixes_flat
-    grid = (num_tokens + pad) // _BLOCK_N
+    grid = (num_tokens + pad) // block_n
 
     common = dict(
         mixes_ptr=mixes_padded,
@@ -423,7 +434,7 @@ def hc_split_sinkhorn(
         pre_ptr=pre,
         post_ptr=post,
         comb_ptr=comb,
-        BLOCK_N=_BLOCK_N,
+        BLOCK_N=block_n,
         SINKHORN_ITERS=sinkhorn_iters,
         EPS=eps,
         num_warps=4,

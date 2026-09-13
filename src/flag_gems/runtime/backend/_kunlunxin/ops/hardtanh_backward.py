@@ -80,14 +80,14 @@ def hardtanh_backward_func(grad_output, self, min_val, max_val):
     # hardtanh: y = clamp(x, min_val, max_val)
     # gradient: 1 when min_val < x < max_val (strict, matches ATen
     # hardtanh_backward), 0 on/outside the bounds.
-    grad_output_fp32 = grad_output.to(tl.float32)
     self_fp32 = self.to(tl.float32)
     # 0.0 if x <= min_val, +inf (-> 1.0) if x > min_val; mirrored for max_val.
     p = tl.maximum(0.0, (self_fp32 - min_val) * 1.0e30)
     q = tl.maximum(0.0, (max_val - self_fp32) * 1.0e30)
-    in_range = tl.minimum(1.0, p) * tl.minimum(1.0, q)
-    result = grad_output_fp32 * in_range
-    return result.to(grad_output.dtype)
+    # min(1, min(p, q)) is domain-safe (p, q >= 0, so no inf*0 NaN that
+    # min(1, p*q) has) and needs one fewer cvt than min(1,p)*min(1,q) in fp16.
+    in_range = tl.minimum(1.0, tl.minimum(p, q)).to(self.dtype)
+    return grad_output * in_range
 
 
 def hardtanh_backward(grad_output, self, min_val, max_val):

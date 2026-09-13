@@ -193,7 +193,6 @@ def _roll_gather(
             params.extend((src.size(dim), strides[dim], effective[dim]))
         else:
             params.extend((1, 1, 0))
-    need_mask = numel % _TRITON_BLOCK != 0
     grid = (triton.cdiv(numel, _TRITON_BLOCK),)
     _roll_gather_kernel[grid](
         src.reshape(-1),
@@ -203,7 +202,6 @@ def _roll_gather(
         *params,
         NWRAP=len(wrap_dims),
         BLOCK=_TRITON_BLOCK,
-        NEED_MASK=need_mask,
     )
     return out
 
@@ -229,8 +227,16 @@ def _roll_gather_kernel(
     shift3,
     NWRAP: tl.constexpr,
     BLOCK: tl.constexpr,
-    NEED_MASK: tl.constexpr,
 ):
+    # NOTE: the load/store must stay masked.  On this XPU triton backend a
+    # fully unmasked ``store(load(in_ptr + src))`` (the ``numel % BLOCK == 0``
+    # case) is miscompiled when ``src`` is produced by the ``tl.where`` chain
+    # below: the address select is dropped, so some lanes load
+    # ``in[src + size*stride]`` instead of ``in[src]`` (observed for e.g.
+    # (64, 8) and (64, 64) with shifts (1, 2) / dims (0, 1)).  The masked
+    # variant with the explicit clamp compiles correctly; the store mask also
+    # discards the tail lanes, and the clamp keeps the load in bounds since
+    # XPU ignores ``other=`` on some paths.
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     source = offsets - delta
     if NWRAP >= 1:
@@ -242,13 +248,8 @@ def _roll_gather_kernel(
     if NWRAP >= 4:
         source += tl.where((offsets // stride3) % size3 < shift3, size3 * stride3, 0)
     source = tl.where(source < 0, source + numel, source)
-    if NEED_MASK:
-        # Clamp instead of relying on masked loads: XPU ignores `other=` on
-        # some paths, and the store mask already discards the tail lanes.
-        source = tl.minimum(tl.maximum(source, 0), numel - 1)
-        tl.store(out_ptr + offsets, tl.load(in_ptr + source), mask=offsets < numel)
-    else:
-        tl.store(out_ptr + offsets, tl.load(in_ptr + source))
+    source = tl.minimum(tl.maximum(source, 0), numel - 1)
+    tl.store(out_ptr + offsets, tl.load(in_ptr + source), mask=offsets < numel)
 
 
 def _contiguous(inp: torch.Tensor) -> torch.Tensor:

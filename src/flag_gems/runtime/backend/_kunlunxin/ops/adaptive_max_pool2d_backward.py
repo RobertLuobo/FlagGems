@@ -173,12 +173,12 @@ def adaptive_max_pool2d_backward(
     in_n, in_c, in_h, in_w = self.shape
     out_h, out_w = grad_output.shape[2], grad_output.shape[3]
 
-    # ATen semantics: grad_input is zero everywhere except at the argmax
-    # positions of each output (unwritten positions must be 0, never garbage).
-    grad_input = torch.zeros_like(self)
-
-    n_in = grad_input.numel()
+    n_in = in_n * in_c * in_h * in_w
     if n_in == 0 or grad_output.numel() == 0:
+        # ATen semantics: grad_input is zero everywhere except at the argmax
+        # positions of each output (unwritten positions must be 0, never
+        # garbage); with no work the zeroes are the whole content.
+        grad_input = torch.zeros_like(self)
         return grad_input.squeeze(0) if input_is_3d else grad_input
 
     # Exact division on both dims: each input position belongs to exactly one
@@ -187,6 +187,9 @@ def adaptive_max_pool2d_backward(
 
     with torch_device_fn.device(self.device):
         if exact:
+            # The scatter kernel writes only the n_out argmax positions, so
+            # every other input position must still read 0 (ATen semantics).
+            grad_input = torch.zeros_like(self)
             # Fast path: exact division -> each output's argmax is a distinct
             # input position, one lane per output, no atomics, no races.
             n_out = grad_output.numel()
@@ -205,6 +208,12 @@ def adaptive_max_pool2d_backward(
                 isCloseVectorization=True,
             )
         else:
+            # The gather kernel writes every input position (one lane per
+            # input element, single masked store covering [0, n_in)), so no
+            # pre-zeroing is needed: empty_like skips an allocation plus the
+            # vendor zeros-kernel launch (~10% of op time on the gather
+            # shapes; bitwise-identical output).
+            grad_input = torch.empty_like(self)
             # Exact upper bounds for the per-dim candidate counts (see gather
             # kernel comment): at most 1 when in is a multiple of out, at most
             # floor(out / in) + 2 otherwise.

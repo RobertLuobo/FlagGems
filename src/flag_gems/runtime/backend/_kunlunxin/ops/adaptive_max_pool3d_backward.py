@@ -26,97 +26,42 @@ logger = logging.getLogger(__name__)
 
 @libentry()
 @triton.jit
-def _adaptive_max_pool3d_backward_recompute_indices_kernel(
-    input_ptr,
-    index_out_ptr,
-    n_elems,  # in_n * in_c * out_d * out_h * out_w
-    in_d,
-    in_h,
-    in_w,
-    out_d,
-    out_h,
-    out_w,
-    WIN_D: tl.constexpr,
-    WIN_H: tl.constexpr,
-    WIN_W: tl.constexpr,
+def _adaptive_max_pool3d_backward_scatter_kernel(
+    grad_output_ptr,
+    indices_ptr,
+    grad_input_ptr,
+    n_out,
+    out_per_nc,
+    in_spatial,
     BLOCK: tl.constexpr,
 ):
-    """Recompute the adaptive-max-pool3d argmax indices (forward semantics).
+    """Scatter-based adaptive max pool 3d backward (Kunlunxin/XPU).
 
-    One lane per output position.  Each adaptive window
-    [start, end) = [floor(o * in / out), ceil((o + 1) * in / out)) is scanned
-    in row-major (d, h, w) order with the same tie-break as the ATen reference
-    (first tap attaining the strict max; NaNs win over any value).  The
-    recomputed indices are what the CPU reference tolerates: on this XPU stack
-    the vendor ``adaptive_max_pool3d`` forward returns uninitialized index
-    memory, so a backward whose output depended on the caller-supplied
-    ``indices`` would either fault or disagree with the reference.
-
-    Windows are provably non-empty and all loads below stay in the (n, c)
-    plane: candidate positions are clamped to the window start when the
-    predicate is dropped (the XPU backend treats compound i1 masked loads as a
-    slow path and ``other=`` is unreliable there).
+    One lane per output position; valid only when ``in % out == 0`` on all
+    three spatial dims (each input position belongs to exactly one adaptive
+    window, hence the argmax positions of the disjoint windows are distinct
+    input positions and the plain non-atomic stores can never race).  The
+    Gems forward (see ``_patch_adaptive_max_pool3d_aten``) produces ATen-exact
+    per-plane flat indices``d * in_hw + h * in_w + w``, so the upstream
+    gradient is stored directly at ``nc * in_spatial + idx``.
     """
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = offsets < n_elems
-    safe_offsets = tl.where(mask, offsets, 0)
-
-    out_per_nc = out_d * out_h * out_w
-    nc = safe_offsets // out_per_nc
-    rem = safe_offsets % out_per_nc
-    od = rem // (out_h * out_w)
-    rem2 = rem % (out_h * out_w)
-    oh = rem2 // out_w
-    ow = rem2 % out_w
-
-    # Adaptive window: start = floor(o * in / out), end = ceil((o + 1) * in / out).
-    d_start = (od * in_d) // out_d
-    d_end = tl.minimum(((od + 1) * in_d + out_d - 1) // out_d, in_d)
-    h_start = (oh * in_h) // out_h
-    h_end = tl.minimum(((oh + 1) * in_h + out_h - 1) // out_h, in_h)
-    w_start = (ow * in_w) // out_w
-    w_end = tl.minimum(((ow + 1) * in_w + out_w - 1) // out_w, in_w)
-
-    plane_base = input_ptr + nc * (in_d * in_h * in_w)
-    in_hw = in_h * in_w
-
-    acc_val = tl.full((BLOCK,), float("-inf"), dtype=tl.float32)
-    acc_idx = tl.full((BLOCK,), -1, dtype=tl.int32)
-
-    # Rolled loops (compile-time constant bounds) instead of tl.static_range:
-    # the XPU unroll control pass (TritonXPUUnrollControl) fails with uni_sram
-    # OOR when the window scan is fully unrolled for large ratios
-    # (e.g. in=8/out=1 gives 9^3 = 729 bodies).
-    for kd in range(0, WIN_D):
-        d = d_start + kd
-        d_ok = d < d_end
-        d_safe = tl.where(d_ok, d, d_start)
-        for kh in range(0, WIN_H):
-            h = h_start + kh
-            h_ok = h < h_end
-            h_safe = tl.where(h_ok, h, h_start)
-            for kw in range(0, WIN_W):
-                w = w_start + kw
-                w_ok = w < w_end
-                w_safe = tl.where(w_ok, w, w_start)
-                value = tl.load(
-                    plane_base + d_safe * in_hw + h_safe * in_w + w_safe
-                ).to(tl.float32)
-                active = d_ok & h_ok & w_ok
-                is_new = active & (
-                    (value > acc_val) | (value != value) | (acc_idx < 0)
-                )
-                acc_val = tl.where(is_new, value, acc_val)
-                acc_idx = tl.where(is_new, d * in_hw + h * in_w + w, acc_idx)
-
-    tl.store(index_out_ptr + offsets, acc_idx, mask=mask)
+    mask = offsets < n_out
+    idx = tl.load(indices_ptr + offsets).to(tl.int32)
+    val = tl.load(grad_output_ptr + offsets).to(tl.float32)
+    nc = offsets // out_per_nc
+    tl.store(
+        grad_input_ptr + nc * in_spatial + idx,
+        val.to(grad_input_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 @libentry()
 @triton.jit
 def _adaptive_max_pool3d_backward_gather_kernel(
     grad_output_ptr,
-    indices_ptr,  # recomputed int32 indices, layout (n, c, out_d, out_h, out_w)
+    indices_ptr,  # Gems-forward int64 indices, layout (n, c, out_d, out_h, out_w)
     grad_input_ptr,
     n_elems,  # in_n * in_c * in_d * in_h * in_w
     in_d,
@@ -136,15 +81,17 @@ def _adaptive_max_pool3d_backward_gather_kernel(
     may contain this input element form the small box
     ``[d_min, d_max) x [h_min, h_max) x [w_min, w_max)`` with
     ``d_min = floor(d * out / in)``, ``d_max = ceil((d + 1) * out / in)``.
-    For each candidate we load its (recomputed) argmax index and the upstream
-    gradient, and accumulate the gradient whose index equals this position.
+    For each candidate we load the argmax index produced by the Gems forward
+    and the upstream gradient, and accumulate the gradient whose index equals
+    this position.
 
     This is the same exact, deterministic, race-free pattern as the
     Kunlunxin ``max_pool3d_backward``: ``tl.atomic_add`` scatter loses updates
     on this backend (~1e-5 per op, seed-dependent), so every output element's
     contribution is accumulated in registers and written with a single
     masked store.  The candidate box is bounded by the constexpr
-    ``MAX_* = (out + in - 1) // in + 1``, and candidate addresses are clamped
+    ``MAX_* = (out + in - 1) // in + 1``-style bound (1 when in is a multiple
+    of out, ``out // in + 2`` otherwise), and candidate addresses are clamped
     so the (unmasked) loads can never go out of the (n, c) plane.
     """
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -177,8 +124,7 @@ def _adaptive_max_pool3d_backward_gather_kernel(
     # Small static bounds (MAX_* <= 2 whenever out <= in, the only legal
     # adaptive-pool configuration): fully unrolled bodies let the compiler
     # issue all candidate loads up front (ILP), matching the proven
-    # Kunlunxin ``max_pool3d_backward_flat_kernel`` pattern.  The recompute
-    # kernel above stays rolled because its window bound can reach 9^3 bodies.
+    # Kunlunxin ``max_pool3d_backward_flat_kernel`` pattern.
     for od in tl.static_range(0, MAX_D):
         o_d = d_min + od
         d_ok = o_d < d_max
@@ -211,96 +157,90 @@ def adaptive_max_pool3d_backward(
 ):
     """Gradient of adaptive_max_pool3d (Kunlunxin/XPU implementation).
 
-    Recomputes the forward argmax indices inside the (n, c) planes (see the
-    recompute kernel) and then accumulates the gradient with the deterministic
-    gather pattern.  The caller-supplied ``indices`` argument is accepted for
-    ATen schema compatibility but not trusted: on this XPU stack the vendor
-    ``adaptive_max_pool3d`` forward writes uninitialized index memory, so a
-    backward honoring those indices would either fault on out-of-bounds
-    addresses or disagree with the reference.  When the caller's indices come
-    from a correct forward, the recomputed indices coincide with them (same
-    window math, same tie-break) and the result is identical.
+    Built on the ATen-exact indices produced by the Gems ``adaptive_max_pool3d``
+    forward (see ``_patch_adaptive_max_pool3d_aten`` and
+    ``_patch_adaptive_max_pool3d_functional``; on this XPU stack the vendor
+    XDNN wrapper rejects bfloat16 and returns uninitialized index memory for
+    float16/float32, so a backward consuming XDNN indices would either fault
+    or disagree with ATen).  Two exact, deterministic, atomics-free paths:
+
+    * exact division (``in % out == 0`` on all three spatial dims): one lane
+      per output position, non-atomic scatter (the argmax positions of
+      disjoint adaptive windows are distinct input positions, so stores never
+      race) -- O(n_out);
+    * otherwise: one lane per input position, the gradient is accumulated in
+      registers from the candidate output box and written with a single
+      masked store -- O(n_in).
     """
     logger.debug("GEMS_KUNLUNXIN ADAPTIVE_MAX_POOL3D_BACKWARD")
 
     grad_output = grad_output.contiguous()
     self = self.contiguous()
+    indices = indices.contiguous()
     in_n, in_c, in_d, in_h, in_w = self.shape
     out_d, out_h, out_w = grad_output.shape[-3:]
 
-    grad_input = torch.empty_like(self)
+    # ATen semantics: grad_input is zero everywhere except at the argmax
+    # positions of each output (unwritten positions must be 0, never garbage).
+    grad_input = torch.zeros_like(self)
 
     n_in = grad_input.numel()
     if n_in == 0 or grad_output.numel() == 0:
         return grad_input
 
-    n_out = in_n * in_c * out_d * out_h * out_w
-    # Exact upper bounds for the per-dim iteration counts (see kernel
-    # comments).  For the adaptive windows with r = in / out >= 1 the
-    # recompute-scan length is exactly r when r is an integer and at most
-    # floor(r) + 2 otherwise, so the naive ``(in + out - 1) // out + 1``
-    # bound spends (3/2)^3 = 3.4x of the loop bodies on the common
-    # integer-ratio shapes (in = 2 * out); the gather candidate count is 1
-    # whenever out divides in, and at most 2 otherwise.
-    win_d = in_d // out_d + (0 if in_d % out_d == 0 else 2)
-    win_h = in_h // out_h + (0 if in_h % out_h == 0 else 2)
-    win_w = in_w // out_w + (0 if in_w % out_w == 0 else 2)
-    max_d = 1 if in_d % out_d == 0 else (out_d // in_d + 2)
-    max_h = 1 if in_h % out_h == 0 else (out_h // in_h + 2)
-    max_w = 1 if in_w % out_w == 0 else (out_w // in_w + 2)
+    # Exact division on all three dims: each input position belongs to exactly
+    # one adaptive window, so the scatter fast path below is race-free.
+    exact = (
+        (in_d % out_d == 0) and (in_h % out_h == 0) and (in_w % out_w == 0)
+    )
 
-    indices_tmp = torch.empty((n_out,), dtype=torch.int32, device=self.device)
-
-    # Two launch shapes tuned on Kunlunxin XL (2026-09-05), re-measured shape
-    # by shape against the enabled-vendor baseline:
-    # - recompute scan: 64-lane tiles / num_warps=1 keep the rolled window
-    #   scan within the TritonXPUUnrollControl vrf-budget / uni_sram limits
-    #   for every ratio (BLOCK=128 with a WIN=8 scan overruns uni_sram);
-    #   when the window is at most 2 per dim (the common out = in / 2
-    #   shapes) the scan fits 128-lane tiles / num_warps=2 as well.
-    # - gather: the candidate box is at most 2 elements per dim and fully
-    #   statically unrolled, so 128-lane tiles / num_warps=2 fit and roughly
-    #   halve its latency.  BLOCK=256 / num_warps=4 overrun uni_sram even on
-    #   these small bodies; do not raise without re-measuring every shape.
-    recompute_block = 128 if max(win_d, win_h, win_w) <= 2 else 64
-    recompute_warps = 2 if recompute_block == 128 else 1
     with torch_device_fn.device(self.device):
-        _adaptive_max_pool3d_backward_recompute_indices_kernel[(triton.cdiv(n_out, recompute_block),)](
-            self,
-            indices_tmp,
-            n_out,
-            in_d,
-            in_h,
-            in_w,
-            out_d,
-            out_h,
-            out_w,
-            WIN_D=win_d,
-            WIN_H=win_h,
-            WIN_W=win_w,
-            BLOCK=recompute_block,
-            num_warps=recompute_warps,
-            buffer_size_limit=2048,
-            isCloseVectorization=True,
-        )
-        _adaptive_max_pool3d_backward_gather_kernel[(triton.cdiv(n_in, 128),)](
-            grad_output,
-            indices_tmp,
-            grad_input,
-            n_in,
-            in_d,
-            in_h,
-            in_w,
-            out_d,
-            out_h,
-            out_w,
-            MAX_D=max_d,
-            MAX_H=max_h,
-            MAX_W=max_w,
-            BLOCK=128,
-            num_warps=2,
-            buffer_size_limit=2048,
-            isCloseVectorization=True,
-        )
+        if exact:
+            # Fast path: exact division -> each output's argmax is a distinct
+            # input position, one lane per output, no atomics, no races.
+            n_out = grad_output.numel()
+            _adaptive_max_pool3d_backward_scatter_kernel[
+                (triton.cdiv(n_out, 256),)
+            ](
+                grad_output,
+                indices,
+                grad_input,
+                n_out,
+                out_d * out_h * out_w,
+                in_d * in_h * in_w,
+                BLOCK=256,
+                num_warps=4,
+                buffer_size_limit=2048,
+                isCloseVectorization=True,
+            )
+        else:
+            # Exact upper bounds for the per-dim candidate counts (see gather
+            # kernel comment): at most 1 when in is a multiple of out, at most
+            # floor(out / in) + 2 otherwise.
+            max_d = 1 if in_d % out_d == 0 else (out_d // in_d + 2)
+            max_h = 1 if in_h % out_h == 0 else (out_h // in_h + 2)
+            max_w = 1 if in_w % out_w == 0 else (out_w // in_w + 2)
+            # 128 lanes / num_warps=2: the candidate box is at most 2 elements
+            # per dim and fully statically unrolled; larger tiles overrun
+            # uni_sram on this backend, do not raise without re-measuring.
+            _adaptive_max_pool3d_backward_gather_kernel[(triton.cdiv(n_in, 128),)](
+                grad_output,
+                indices,
+                grad_input,
+                n_in,
+                in_d,
+                in_h,
+                in_w,
+                out_d,
+                out_h,
+                out_w,
+                MAX_D=max_d,
+                MAX_H=max_h,
+                MAX_W=max_w,
+                BLOCK=128,
+                num_warps=2,
+                buffer_size_limit=2048,
+                isCloseVectorization=True,
+            )
 
     return grad_input

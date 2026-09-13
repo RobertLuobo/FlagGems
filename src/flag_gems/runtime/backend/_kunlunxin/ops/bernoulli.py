@@ -166,19 +166,24 @@ def bernoulli(self, *, generator=None):
     with torch_device_fn.device(device):
         block_elems = BLOCK * UNROLL
         nmain = N // block_elems
-        if N % block_elems == 0:
-            # all blocks fully in-bounds -> branchless kernel
-            bernoulli_kernel[(nmain,)](
-                out,
-                self,
-                N,
-                philox_seed,
-                philox_offset,
-                BLOCK=BLOCK,
-                ROUNDS=PHILOX_ROUNDS,
-                num_warps=NUM_WARPS,
-            )
-        else:
+        # XPU codegen defect (XRE status 719, "A kernel exception has
+        # occurred"): the phase-2 branchless kernel below, at fp32, is
+        # compiled with all four 16-element (64-byte) lm2gm stores sharing
+        # ONE local staging buffer (LLIR: 4x `lm2gm_v3(..., %66, 0, 64)`
+        # with only mfence between a store into %66 and the next). The
+        # async lm2gm copy races with the next store into the reused buffer
+        # and the device raises a kernel exception on EVERY fp32 launch
+        # with N % (BLOCK*UNROLL) == 0 (reproduced from N=4096 to
+        # N=655,360,000; fp16/bf16 use 32-byte transfers, allocate 4
+        # separate buffers and are unaffected). The single-launch
+        # bernoulli_kernel_with_tail below wraps the identical main path in
+        # `if pid < NMAIN`, which lets the allocator use 4 separate staging
+        # buffers (verified in the same LLIR dump) and is the
+        # production-proven path for fp32 (every non-exact N already goes
+        # through it and passes clean). Route fp32 through it as well; for
+        # exact multiples the last program degenerates to a fully-masked
+        # no-op tail.
+        if self.dtype == torch.float32 or N % block_elems != 0:
             # branchless full blocks + in-kernel per-element masked tail
             bernoulli_kernel_with_tail[(nmain + 1,)](
                 out,
@@ -187,6 +192,18 @@ def bernoulli(self, *, generator=None):
                 philox_seed,
                 philox_offset,
                 NMAIN=nmain,
+                BLOCK=BLOCK,
+                ROUNDS=PHILOX_ROUNDS,
+                num_warps=NUM_WARPS,
+            )
+        else:
+            # all blocks fully in-bounds -> branchless kernel
+            bernoulli_kernel[(nmain,)](
+                out,
+                self,
+                N,
+                philox_seed,
+                philox_offset,
                 BLOCK=BLOCK,
                 ROUNDS=PHILOX_ROUNDS,
                 num_warps=NUM_WARPS,

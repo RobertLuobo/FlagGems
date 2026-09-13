@@ -1,6 +1,7 @@
 import logging
 
 import torch
+import triton
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,18 @@ logger = logging.getLogger(__name__)
 _SMALL_NUMEL = 200000  # below this the single-pass reversed flip beats two-pass
 
 
+def _flip0_fast(rows: int, cols: int) -> bool:
+    """Whether the vendor ``flip`` kernel handles ``flip(0)`` of a contiguous
+    (rows, cols) tensor on its fast (block, clamp-free) path: the inner run is
+    a power of two >= 256 and the lane grid exactly covers the tensor
+    (``numel % next_power_of_2(numel / 12) == 0``)."""
+    if cols < 256 or (cols & (cols - 1)) != 0:
+        return False
+    numel = rows * cols
+    tile = triton.next_power_of_2(triton.cdiv(numel, 12))
+    return numel % tile == 0
+
+
 def rot90(input, k=1, dims=[0, 1]):
     logger.debug("GEMS_KUNLUNXIN ROT90")
     x = input
@@ -55,11 +68,25 @@ def rot90(input, k=1, dims=[0, 1]):
     if k_norm == 1:
         if x.numel() <= _SMALL_NUMEL:
             return x.flip([dim1]).transpose(dim0, dim1)
+        # Vendor flip(0) on (rows, cols) is ~7x faster than the reversed single
+        # flip when the inner run is a power of two and the grid covers the
+        # tensor exactly (see flip.py's `_partition`); use copy + flip there.
         out_shape = list(x.shape)
         out_shape[dim0], out_shape[dim1] = out_shape[dim1], out_shape[dim0]
-        out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
-        torch.ops.aten._copy_from(x.transpose(dim0, dim1), out, False)
-        return out.flip([dim0])
+        if _flip0_fast(out_shape[dim0], out_shape[dim1]):
+            out = torch.empty(out_shape, device=x.device, dtype=x.dtype)
+            torch.ops.aten._copy_from(x.transpose(dim0, dim1), out, False)
+            return out.flip([dim0])
+        # Rectangular shapes ((400, 800) etc.) miss the vendor flip(0) fast
+        # zone (non-pow2 inner run, or lane grid not exactly covering the
+        # tensor).  There the two-kernel copy + flip(0) composition is SLOWER
+        # than one reversed inner flip + free transpose view: 86us vs 51us at
+        # (400, 800) fp16 (1.69x), 89us vs 59us fp32.  (The vendor
+        # index_select is not an option either: its slice path faults with a
+        # device kernel exception whenever it has to materialise the
+        # transposed view via `contiguous()`, and even after pre-materialising
+        # with `_copy_from` it measures ~2x slower than the plain flip.)
+        return x.flip([dim1]).transpose(dim0, dim1)
     if k_norm == 2:
         return x.flip([dim0, dim1])
     return x.flip([dim0]).transpose(dim0, dim1)

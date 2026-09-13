@@ -15,136 +15,21 @@ import triton.language as tl
 logger = logging.getLogger(__name__)
 
 
-@triton.jit
-def _fused_recurrent_gated_delta_rule_fwd_kernel(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    o,
-    h0,
-    ht,
-    cu_seqlens,
-    ssm_state_indices,
-    scale,
-    T,  # number of tokens (runtime), used only when cu_seqlens is None
-    stride_q_t,
-    stride_q_h,
-    stride_q_k,
-    stride_k_t,
-    stride_k_h,
-    stride_k_k,
-    stride_v_t,
-    stride_v_hv,
-    stride_v_v,
-    stride_o_t,
-    stride_o_hv,
-    stride_o_v,
-    stride_g_t,
-    stride_g_hv,
-    stride_beta_t,
-    stride_beta_hv,
-    stride_cu,
-    stride_ssm,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    H0_STRIDE_S: tl.constexpr,
-    H0_STRIDE_HV: tl.constexpr,
-    HT_STRIDE_S: tl.constexpr,
-    HT_STRIDE_HV: tl.constexpr,
-    USE_CU: tl.constexpr,  # cu_seqlens is not None
-    USE_SSM: tl.constexpr,  # ssm_state_indices is not None
-    INPLACE: tl.constexpr,  # inplace_final_state
-    USE_L2: tl.constexpr,  # use_qk_l2norm_in_kernel
-    LAST_SEQ: tl.constexpr,  # N-1: only the last sequence writes final state
-):
-    i_seq, i_hv, i_v = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    if USE_CU:
-        t0 = tl.load(cu_seqlens + i_seq * stride_cu).to(tl.int64)
-        t1 = tl.load(cu_seqlens + (i_seq + 1) * stride_cu).to(tl.int64)
-    else:
-        t0 = i_seq.to(tl.int64) * T
-        t1 = t0 + T
-
-    if t1 == t0:
-        return
-
-    i_h = i_hv // (HV // H)
-    offs = tl.arange(0, BK)
-
-    p_q = q + t0 * stride_q_t + i_h * stride_q_h + offs * stride_q_k
-    p_k = k + t0 * stride_k_t + i_h * stride_k_h + offs * stride_k_k
-    p_v = v + t0 * stride_v_t + i_hv * stride_v_hv + i_v * stride_v_v
-    p_g = g + t0 * stride_g_t + i_hv * stride_g_hv
-    p_beta = beta + t0 * stride_beta_t + i_hv * stride_beta_hv
-    p_o = o + t0 * stride_o_t + i_hv * stride_o_hv + i_v * stride_o_v
-
-    if USE_SSM:
-        s0 = tl.load(ssm_state_indices + t0 * stride_ssm).to(tl.int64)
-    else:
-        s0 = i_seq.to(tl.int64)
-
-    p_h = h0 + s0 * H0_STRIDE_S + i_hv * H0_STRIDE_HV + offs * V + i_v
-    h = tl.load(p_h).to(tl.float32)
-
-    for it in range(0, t1 - t0):
-        bq = tl.load(p_q).to(tl.float32)
-        bk = tl.load(p_k).to(tl.float32)
-        bv = tl.load(p_v).to(tl.float32)
-        bg = tl.load(p_g).to(tl.float32)
-        bb = tl.load(p_beta).to(tl.float32)
-
-        if USE_L2:
-            bq = bq * tl.rsqrt(tl.sum(bq * bq) + 1e-6)
-            bk = bk * tl.rsqrt(tl.sum(bk * bk) + 1e-6)
-        bq = bq * scale
-
-        h = h * tl.exp(bg)
-        acc = tl.sum(h * bk)  # scalar: sum_k h[k, :] * k[k]  (per output column)
-        bv = (bv - acc) * bb
-        h = h + bk * bv
-        bo = tl.sum(h * bq)
-        tl.store(p_o, bo.to(p_o.dtype.element_ty))
-
-        p_q += stride_q_t
-        p_k += stride_k_t
-        p_v += stride_v_t
-        p_g += stride_g_t
-        p_beta += stride_beta_t
-        p_o += stride_o_t
-
-    # single store after the loop via SCALAR stores (vector stores are broken
-    # on this backend): extract each lane with a where+sum and store as scalar.
-    # Only the last sequence writes: with a constant ssm index the reference
-    # last-write-wins semantics end at the final token of the last sequence.
-    if i_seq == LAST_SEQ or not INPLACE:
-        for kk in tl.static_range(0, BK):
-            h_kk = tl.sum(tl.where(offs == kk, h, 0.0))
-            if INPLACE:
-                p_ht = ht + s0 * HT_STRIDE_S + i_hv * HT_STRIDE_HV + i_v * K + kk
-            else:
-                p_ht = ht + (t1 - 1) * HT_STRIDE_S + i_hv * HT_STRIDE_HV + i_v * K + kk
-            tl.store(p_ht, h_kk.to(ht.dtype.element_ty))
-
-
 def _fused_recurrent_gated_delta_rule_fwd_python(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    scale,
-    initial_state,
-    inplace_final_state,
-    cu_seqlens,
-    ssm_state_indices,
-    use_qk_l2norm_in_kernel,
-):
-    """Pure PyTorch sequential implementation (fallback path)."""
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    inplace_final_state: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    logger.debug("GEMS_KUNLUNXIN FUSED RECURRENT GATED DELTA RULE FWD (PYTHON)")
     batch, seq_len, heads, _ = q.shape
     value_heads = v.shape[2]
     output = torch.zeros_like(v)
@@ -203,6 +88,131 @@ def _fused_recurrent_gated_delta_rule_fwd_python(
                     final_state[position, value_head] = state.to(final_state.dtype)
 
     return output, final_state
+
+
+@triton.jit
+def _fused_recurrent_gated_delta_rule_fwd_kernel(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    o,
+    h0,
+    ht,
+    cu_seqlens,
+    ssm_state_indices,
+    scale,
+    T,  # sequence length (runtime), used only when cu_seqlens is None
+    stride_q_t,
+    stride_q_h,
+    stride_q_k,
+    stride_k_t,
+    stride_k_h,
+    stride_k_k,
+    stride_v_t,
+    stride_v_hv,
+    stride_v_v,
+    stride_o_t,
+    stride_o_hv,
+    stride_o_v,
+    stride_g_t,
+    stride_g_hv,
+    stride_beta_t,
+    stride_beta_hv,
+    stride_cu,
+    stride_ssm,
+    H: tl.constexpr,  # number of q/k heads (Hg)
+    HV: tl.constexpr,  # number of v heads
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    H0_STRIDE_S: tl.constexpr,
+    H0_STRIDE_HV: tl.constexpr,
+    HT_STRIDE_S: tl.constexpr,
+    HT_STRIDE_HV: tl.constexpr,
+    USE_CU: tl.constexpr,  # cu_seqlens is not None
+    USE_SSM: tl.constexpr,  # ssm_state_indices is not None
+    LAST_SEQ: tl.constexpr,  # last sequence index (N - 1)
+    INPLACE: tl.constexpr,  # inplace_final_state (state is written back in-place)
+    USE_L2: tl.constexpr,  # l2-normalize q/k inside the kernel
+):
+    # One program per (sequence, value head, value column); the K-vector state is
+    # kept in registers and the per-token recurrence is unrolled sequentially.
+    i_seq, i_hv, i_v = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if USE_CU:
+        t0 = tl.load(cu_seqlens + i_seq * stride_cu).to(tl.int64)
+        t1 = tl.load(cu_seqlens + (i_seq + 1) * stride_cu).to(tl.int64)
+    else:
+        t0 = i_seq.to(tl.int64) * T
+        t1 = t0 + T
+
+    # q/k head of this value-head group (grouped heads: H divides HV)
+    i_h = i_hv // (HV // H)
+    offs = tl.arange(0, BK)
+
+    # initial state slot: ssm_state_indices[sequence start] (or the sequence id)
+    if USE_SSM:
+        s0 = tl.load(ssm_state_indices + t0 * stride_ssm).to(tl.int64)
+        s1 = tl.load(ssm_state_indices + (t1 - 1) * stride_ssm).to(tl.int64)
+    else:
+        s0 = i_seq.to(tl.int64)
+        s1 = s0
+
+    p_q = q + t0 * stride_q_t + i_h * stride_q_h + offs * stride_q_k
+    p_k = k + t0 * stride_k_t + i_h * stride_k_h + offs * stride_k_k
+    p_v = v + t0 * stride_v_t + i_hv * stride_v_hv + i_v * stride_v_v
+    p_g = g + t0 * stride_g_t + i_hv * stride_g_hv
+    p_beta = beta + t0 * stride_beta_t + i_hv * stride_beta_hv
+    p_o = o + t0 * stride_o_t + i_hv * stride_o_hv + i_v * stride_o_v
+
+    p_h = (
+        h0
+        + (s0 * H0_STRIDE_S + i_hv * H0_STRIDE_HV).to(tl.int64)
+        + offs * V
+        + i_v
+    )
+    h = tl.load(p_h).to(tl.float32)
+
+    # S_t = exp(g_t) * S_{t-1} + beta_t * k_t^T (v_t - k_t @ S_{t-1})
+    # o_t = q_t @ S_t * scale
+    for it in range(0, t1 - t0):
+        bq = tl.load(p_q).to(tl.float32)
+        bk = tl.load(p_k).to(tl.float32)
+        bv = tl.load(p_v).to(tl.float32)
+        bg = tl.load(p_g).to(tl.float32)
+        bb = tl.load(p_beta).to(tl.float32)
+
+        if USE_L2:
+            bq = bq / tl.sqrt(tl.sum(bq * bq) + 1e-6)
+            bk = bk / tl.sqrt(tl.sum(bk * bk) + 1e-6)
+        bq = bq * scale
+
+        h = h * tl.exp(bg)
+        acc = tl.sum(h * bk)  # (v_t - k_t @ S) component
+        bv = (bv - acc) * bb
+        h = h + bk * bv
+        bo = tl.sum(h * bq)
+        tl.store(p_o, bo.to(o.dtype.element_ty))
+
+        p_q += stride_q_t
+        p_k += stride_k_t
+        p_v += stride_v_t
+        p_g += stride_g_t
+        p_beta += stride_beta_t
+        p_o += stride_o_t
+
+    # Final-state write-back.  With a constant ssm index all sequences race on
+    # the same slot, so only the last sequence stores (last-write-wins order of
+    # the sequential reference); without ssm each sequence owns its own slot.
+    if (i_seq == LAST_SEQ) or (not USE_SSM):
+        p_ht = (
+            ht
+            + (s1 * HT_STRIDE_S + i_hv * HT_STRIDE_HV).to(tl.int64)
+            + i_v * K
+            + offs
+        )
+        tl.store(p_ht, h.to(ht.dtype.element_ty))
 
 
 def fused_recurrent_gated_delta_rule_fwd(

@@ -11,6 +11,13 @@ from . import base
 class OrmqrBenchmark(base.GenericBenchmark2DOnly):
     # Override default shapes to include representative sizes for Householder application:
     # small matrices (fused kernel path) and medium/large matrices (tiled path)
+    # NOTE (Kunlunxin, 2026-09-11): (4096, 4096) and (1024, 65536) are excluded on
+    # this backend - their reflector directions blow up to O(k * rows/64) sequential
+    # kernel launches (k > 2048 per-reflector path, e.g. 2k=8192 launches/call at
+    # k=4096), i.e. tens of minutes per single do_bench call, so neither baseline
+    # nor the fixed implementation can complete a full run. Both the baseline and
+    # the post-fix measurements use this reduced set (same convention as the
+    # kunlunxin core_shapes comment "Big Shape Will Cause Timeout").
     DEFAULT_SHAPES = [
         (32, 32),
         (48, 48),
@@ -19,8 +26,6 @@ class OrmqrBenchmark(base.GenericBenchmark2DOnly):
         (128, 128),
         (256, 256),
         (1024, 1024),
-        (4096, 4096),
-        (1024, 65536),
     ]
 
     def set_shapes(self, shape_file_path=None):

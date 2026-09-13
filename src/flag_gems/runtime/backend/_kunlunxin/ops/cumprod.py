@@ -297,10 +297,17 @@ def cumprod_row_scan_chunk_kernel(
             x = tl.load(inp_ptr + row_offset + n_offsets).to(ACC_DTYPE)
         r = tl.cumprod(x, axis=0) * carry
         carry *= tl.reduce(x, axis=0, combine_fn=reduce_mul)
+        # Convert in-register on store: the scan stays in ACC_DTYPE (same
+        # numerics as before), only the stored value is narrowed to the
+        # output pointer's element type so the kernel can write `out`
+        # directly (the native torch-level scan_out.to(out.dtype) convert
+        # of the whole tile is ~30x slower on this backend than the scan
+        # itself). Chunk c+1 loads [start+BN, ...) which is disjoint from
+        # chunk c's stores, so writing in-place (out == inp) stays race-free.
         if NEED_TAIL:
-            tl.store(out_ptr + row_offset + n_offsets, r, mask=mask)
+            tl.store(out_ptr + row_offset + n_offsets, r.to(out_ptr.dtype.element_ty), mask=mask)
         else:
-            tl.store(out_ptr + row_offset + n_offsets, r)
+            tl.store(out_ptr + row_offset + n_offsets, r.to(out_ptr.dtype.element_ty))
 
 
 def reduce_then_scan_row(x, out, M, N, compute_dtype):
@@ -316,19 +323,20 @@ def reduce_then_scan_row(x, out, M, N, compute_dtype):
         return out
 
     # N > persistent_limit: per-row chunked online scan. The scan runs in
-    # ACC_DTYPE and the result is packed back into `out` (which may be a
-    # narrower dtype, e.g. in-place cumprod_ on int16) by a torch-level
-    # convert + copy; XPU rejects stores whose value type is wider than the
-    # pointer type (XDNN "data type not matched").
+    # ACC_DTYPE and the kernel narrows each stored value to `out`'s element
+    # type in-register (see cumprod_row_scan_chunk_kernel), so `out` is
+    # written directly and no intermediate scan_out (which would require a
+    # torch-level convert + copy of the whole tile) is needed. Writing
+    # in-place is safe: chunk c+1 loads [start+BN, ...), disjoint from
+    # chunk c's stores.
     acc_tl = _TL_SCAN_DTYPES.get(compute_dtype, tl.float32)
     BN = 32768 if compute_dtype == torch.float32 else 16384
     need_tail = 1 if N % BN else 0
-    scan_out = torch.empty((M, N), dtype=compute_dtype, device=x.device)
     grid = (M,)
     with torch_device_fn.device(x.device):
         cumprod_row_scan_chunk_kernel[grid](
             x,
-            scan_out,
+            out,
             N,
             ACC_DTYPE=acc_tl,
             BN=BN,
@@ -336,10 +344,6 @@ def reduce_then_scan_row(x, out, M, N, compute_dtype):
             num_warps=8,
             buffer_size_limit=2048,
         )
-    if scan_out.dtype == out.dtype:
-        torch.ops.aten._copy_from(scan_out, out, False)
-    else:
-        torch.ops.aten._copy_from(scan_out.to(out.dtype), out, False)
     return out
 
 

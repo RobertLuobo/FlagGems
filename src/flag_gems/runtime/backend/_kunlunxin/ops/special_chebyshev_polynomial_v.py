@@ -14,7 +14,12 @@ import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
-from flag_gems.utils import pointwise_dynamic
+# Must use the vendor (XPU) pointwise_dynamic codegen: the generic
+# flag_gems.utils.pointwise_dynamic instantiates with
+# `self.config.balance_grid`, an attribute the _kunlunxin CodeGenConfig does
+# not define, so every case died at JIT-instantiation time (same fix as
+# igammac_ / lgamma / smooth_l1_loss).
+from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 

@@ -100,13 +100,22 @@ def nonzero_dense_flat_kernel(
     # FALLBACK kernel for ndim > 8 (per-lane metadata loads); the default dense
     # path uses nonzero_dense_flat_args_kernel which keeps shape/strides in
     # kernel arguments (no global loads, no masked loads).
+    #
+    # The metadata loads are deliberately UNMASKED: d = j % ndim always indexes
+    # [0, ndim), and strides/shape have exactly ndim elements, so every lane is
+    # in-bounds by construction.  Masking them (mask = j < n_out) is what
+    # triggers the backend's unreliable masked-load path here -- the trailing
+    # lanes of the last program come out as garbage (reproduced: a dense
+    # (2,2,2,2,2,2,2,2,3) wrote 3/INT64_MAX for the last output row while the
+    # unmasked form is exact).  The STORE keeps its mask (out has n_out
+    # elements; j >= n_out must not write).
     pid = ext.program_id(0)
     j = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = j < n_out
     i = j // ndim
     d = j % ndim
-    stride_d = tl.load(strides + d, mask=mask)
-    shape_d = tl.load(shape + d, mask=mask)
+    stride_d = tl.load(strides + d)
+    shape_d = tl.load(shape + d)
     coord = (i // stride_d) % shape_d
     tl.store(out + j, coord, mask=mask)
 

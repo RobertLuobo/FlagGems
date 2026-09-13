@@ -64,7 +64,14 @@ logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
 @triton.jit
 def _prelu_kernel_backward_scalar_func(grad_output, x, weight):
     # weight is a Python float; fast path (all tensor args same shape).
-    pos = (x > 0).to(x.dtype)
+    # pos = (x > 0) as 1.0/0.0, computed with saturating fp arithmetic only:
+    # the compared form (x > 0) lowers to the per-lane slow path on this
+    # backend (~5 ms per compare on a 16.7M-lane 12-CTA tile vs 0.4 ms for
+    # the equivalent min/max chain).  min/max saturation is exact for every
+    # value outside the fp32-subnormal band (0, 1e-30) and NaN resolves to
+    # 0.0 through the backend's min/max non-NaN preference, matching the
+    # ATen reference (x=NaN -> grad_input=grad_output*weight, grad_weight=0).
+    pos = tl.minimum(1.0, tl.maximum(0.0, x.to(tl.float32) * 1.0e30)).to(x.dtype)
     x_neg = tl.minimum(x, 0.0)
     grad_input = grad_output * (pos + (1.0 - pos) * weight)
     grad_weight = grad_output * x_neg * (1.0 - pos)
@@ -79,7 +86,8 @@ def _prelu_kernel_backward_scalar_func(grad_output, x, weight):
 @triton.jit
 def _prelu_kernel_backward_channel_func(grad_output, x, weight):
     # weight is a last-dim broadcastable tensor [1, ..., 1, C].
-    pos = (x > 0).to(x.dtype)
+    # Same saturating pos as the scalar variant (see above).
+    pos = tl.minimum(1.0, tl.maximum(0.0, x.to(tl.float32) * 1.0e30)).to(x.dtype)
     x_neg = tl.minimum(x, 0.0)
     grad_input = grad_output * (pos + (1.0 - pos) * weight)
     grad_weight = grad_output * x_neg * (1.0 - pos)

@@ -296,10 +296,22 @@ def _install():
     import (``from flag_gems.fused.DSA.bin_topk import bucket_sort_topk``) in
     tests/test_DSA/test_bin_topk.py, so the SpecOpRegistrar namespace swap
     cannot reach it; the attribute of the already-imported module (loaded
-    during ``import flag_gems``) is patched here instead."""
+    during ``import flag_gems``) is patched here instead.
+
+    ``gmod.HAS_TLE`` is also set to True: the kunlunxin VendorDescriptor keeps
+    ``tle_enabled=False`` (the generic TLE kernel does not lower on the
+    Triton-XPU backend), so the module-level ``HAS_TLE`` guard in
+    tests/test_DSA/test_bin_topk.py would otherwise skip the whole
+    ``bucket_sort_topk`` matrix even though the vendor replacement above is a
+    complete, functional implementation of the operator. The only other
+    readers of ``flag_gems.fused.DSA.bin_topk.HAS_TLE`` are
+    ``tle_bucket_sort_topk`` / ``_should_use_tle_bucket_sort_topk``, which are
+    only reachable through the (now replaced) generic ``bucket_sort_topk``
+    entrypoint, so no TLE code path is activated on XPU."""
     gmod = sys.modules.get("flag_gems.fused.DSA.bin_topk")
     if gmod is not None:
         gmod.bucket_sort_topk = bucket_sort_topk_xpu
+        gmod.HAS_TLE = True
 
 
 _install()

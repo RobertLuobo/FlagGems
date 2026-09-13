@@ -114,15 +114,24 @@ def copy_tensor_kernel(in_ptr, out_ptr, total, BLOCK: tl.constexpr):
 # the interior is copied by the native `_copy_from` engine, only these
 # B*(pad_top+pad_bottom)*W_out border elements use a Triton gather.
 #
-# IMPORTANT (XPU backend hazard, same as pad1d_side_kernel in reflection_pad1d):
-# every lane's addresses MUST stay in-bounds. The flat index is clamped
-# (oc = min(o, total_h-1)) BEFORE decoding, so every lane decodes a valid
-# (b, r, w) and both load and store addresses are in-bounds by construction.
-# Masked-off lanes therefore re-read/re-write the last valid element
-# (idempotent), which prevents the XPU masked-tail corruption of neighboring
-# memory seen with unclamped pad kernels.
+# OPTIMIZATION (2026-09-11, reflection_pad2d_out task): the previous
+# pad2d_hside_kernel used a flat 1D index `o` over all B*R*W_out border elements
+# and clamped it (oc = min(o, total_h-1)) before decoding. On KunlunXin XPU the
+# clamp (a runtime min) defeats the compiler's contiguity proof, so the store
+# `out + f(oc)` degraded to the discrete per-element path: measured 2.16ns/el
+# (4606us for the 2.13M border elements of (32,64,128,256) pad(0,4,0,4)). This
+# row-per-program variant assigns ONE program per border row (b, r); the store
+# offset is a per-program scalar base + pure arange(w), so it is provably
+# stride-1 and lowers to block DMA. The load side is an unavoidable gather
+# (reflected row + reflected column), but the whole border pass drops to
+# 0.40ns/el (851us, 5.4x faster). The mask `w < W_out` only ever masks the
+# tail lanes of the LAST row (the flat kernel uses the identical masked-tail
+# pattern and is verified clean); loads are always in-bounds (reflection is a
+# total map into [0, H_in) x [0, W_in)). Validated: canary-guarded output
+# buffers + full reference comparison across the whole test/benchmark shape
+# matrix, maxerr = 0.0.
 @triton.jit
-def pad2d_hside_kernel(
+def pad2d_hside_rows_kernel(
     in_ptr,
     out_ptr,
     H_in: tl.constexpr,
@@ -133,23 +142,12 @@ def pad2d_hside_kernel(
     W_out: tl.constexpr,
     HW_out: tl.constexpr,
     HW_in: tl.constexpr,
-    total_h,
-    BLOCK: tl.constexpr,
+    W_BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    o = pid * BLOCK + tl.arange(0, BLOCK)
-    m = o < total_h
-    oc = tl.minimum(o, total_h - 1)
-
     R = pad_top + pad_bottom
-    RW = R * W_out
-    # All divisors below are constexpr -> compile-time magic-number division
-    # (a runtime divisor on XPU costs ~30 instructions: the flat kernel's
-    # measured soft-div is the dominant cost of the gather path).
-    b = oc // RW
-    rem = oc - b * RW
-    r = rem // W_out
-    w = rem - r * W_out
+    b = pid // R
+    r = pid - b * R
 
     # Output row: top region rows [0, pad_top), bottom region rows
     # [H_in+pad_top, H_out).
@@ -163,6 +161,8 @@ def pad2d_hside_kernel(
     ih = tl.where(t_h < H_in, t_h, pH - t_h)
 
     # Reflected width index (same single-reflection argument for pad_left/right).
+    w = tl.arange(0, W_BLOCK)
+    m = w < W_out
     x = w - pad_left
     t_w = tl.abs(x)
     pW = 2 * (W_in - 1)
@@ -212,6 +212,53 @@ def pad2d_wside_kernel(
     tl.store(out_ptr + b * HW_out + (pad_top + y) * W_out + w_out, vals, mask=m)
 
 
+# Left/right pad columns of the INTERIOR (non-padded-height) rows, big total_w
+# variant: gather into a CONTIGUOUS scratch of B*H_in*P elements, then let the
+# vendor `_copy_from` engine write the two strided column segments (the same
+# native-engine trick as the interior). The in-place pad2d_wside_kernel above
+# keeps the small-total_w cases, where its single launch beats scratch + 2
+# copies (measured crossover ~2^18; at 65536 the in-place kernel is 116-141us
+# vs 221us for scratch+copy, at 1048576 scratch+copy is 574us vs 1592us).
+#
+# On KunlunXin XPU a runtime min/clamp defeats the compiler's contiguity proof
+# (see the hside rows kernel above), so the STORE uses the unclamped `o` and
+# only the LOAD decodes from the clamped `oc` (in-bounds for every lane, even
+# the masked tail) — the load is a data-dependent gather anyway, so the clamp is
+# free there. The masked tail lanes' stores (`o >= total_w`) are suppressed by
+# `m` (same masked-tail pattern as the flat kernel, verified clean) and the host
+# allocates BLOCK slots of slack, so even a hypothetical un-suppressed store
+# cannot corrupt neighboring memory.
+@triton.jit
+def pad2d_wside_scratch_kernel(
+    in_ptr,
+    scratch_ptr,
+    H_in: tl.constexpr,
+    W_in: tl.constexpr,
+    pad_left: tl.constexpr,
+    pad_right: tl.constexpr,
+    P: tl.constexpr,
+    HW_in: tl.constexpr,
+    total_w,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    o = pid * BLOCK + tl.arange(0, BLOCK)
+    m = o < total_w
+    oc = tl.minimum(o, total_w - 1)
+
+    row = oc // P
+    j = oc - row * P
+    b = row // H_in
+    y = row - b * H_in
+
+    # source column: left segment reversed (pad_l-j: [pad_l .. 1]); right
+    # segment reversed (W_in-2-(j-pad_l): [W_in-2 .. W_in-1-pad_r]). Exact
+    # (single period) because pad_left/pad_right < W_in is host-validated.
+    src = tl.where(j < pad_left, pad_left - j, W_in - 2 - (j - pad_left))
+    v = tl.load(in_ptr + b * HW_in + y * W_in + src)
+    tl.store(scratch_ptr + o, v, mask=m)
+
+
 def _launch_reflection_pad2d_split(
     x, out, pad_left, pad_right, pad_top, pad_bottom, H_in, W_in, H_out, W_out, B
 ):
@@ -223,14 +270,17 @@ def _launch_reflection_pad2d_split(
     HW_out = H_out * W_out
     HW_in = H_in * W_in
     with torch_device_fn.device(x.device):
-        # 1. Interior block: native strided copy.
-        mid = torch.ops.aten.slice(out, -2, pad_top, pad_top + H_in)
-        mid = torch.ops.aten.slice(mid, -1, pad_left, pad_left + W_in)
+        # 1. Interior block: native strided copy. `narrow` is gems-registered and
+        # is a zero-copy as_strided view (no kernel, no 4-arg slice step), so
+        # this is both safe and dispatch-cheap.
+        mid = torch.ops.aten.narrow(out, -2, pad_top, H_in)
+        mid = torch.ops.aten.narrow(mid, -1, pad_left, W_in)
         torch.ops.aten._copy_from(x, mid, False)
-        # 2. Top/bottom rows.
+        # 2. Top/bottom rows: one program per border row (contiguous store).
         if pad_top > 0 or pad_bottom > 0:
-            total_h = B * (pad_top + pad_bottom) * W_out
-            pad2d_hside_kernel[(triton.cdiv(total_h, 4096),)](
+            R = pad_top + pad_bottom
+            W_BLOCK = triton.next_power_of_2(W_out)
+            pad2d_hside_rows_kernel[(B * R,)](
                 x,
                 out,
                 H_in,
@@ -241,26 +291,60 @@ def _launch_reflection_pad2d_split(
                 W_out,
                 HW_out,
                 HW_in,
-                total_h,
-                BLOCK=4096,
+                W_BLOCK=W_BLOCK,
             )
         # 3. Interior rows' left/right columns.
         if pad_left > 0 or pad_right > 0:
-            total_w = B * H_in * (pad_left + pad_right)
-            pad2d_wside_kernel[(triton.cdiv(total_w, 4096),)](
-                x,
-                out,
-                H_in,
-                W_in,
-                pad_left,
-                pad_right,
-                pad_top,
-                W_out,
-                HW_out,
-                HW_in,
-                total_w,
-                BLOCK=4096,
-            )
+            P = pad_left + pad_right
+            total_w = B * H_in * P
+            if total_w >= 262144:
+                # Big W-side: contiguous scratch + 2 vendor strided copies.
+                BLOCK_W = 1024
+                scratch = torch.empty(
+                    total_w + BLOCK_W, device=x.device, dtype=x.dtype
+                )
+                pad2d_wside_scratch_kernel[(triton.cdiv(total_w, BLOCK_W),)](
+                    x,
+                    scratch,
+                    H_in,
+                    W_in,
+                    pad_left,
+                    pad_right,
+                    P,
+                    HW_in,
+                    total_w,
+                    BLOCK=BLOCK_W,
+                )
+                s3 = torch.ops.aten.narrow(scratch, 0, 0, total_w).view(B, H_in, P)
+                o3 = out.view(B, H_out, W_out)
+                i3 = torch.ops.aten.narrow(o3, 1, pad_top, H_in)
+                if pad_left > 0:
+                    torch.ops.aten._copy_from(
+                        torch.ops.aten.narrow(s3, 2, 0, pad_left),
+                        torch.ops.aten.narrow(i3, 2, 0, pad_left),
+                        False,
+                    )
+                if pad_right > 0:
+                    torch.ops.aten._copy_from(
+                        torch.ops.aten.narrow(s3, 2, pad_left, pad_right),
+                        torch.ops.aten.narrow(i3, 2, pad_left + W_in, pad_right),
+                        False,
+                    )
+            else:
+                pad2d_wside_kernel[(triton.cdiv(total_w, 4096),)](
+                    x,
+                    out,
+                    H_in,
+                    W_in,
+                    pad_left,
+                    pad_right,
+                    pad_top,
+                    W_out,
+                    HW_out,
+                    HW_in,
+                    total_w,
+                    BLOCK=4096,
+                )
     return out
 
 
