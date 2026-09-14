@@ -11,28 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Kunlunxin (XPU) vendor add_rms_norm.
-#
-# Why a vendor override exists: the generic `flag_gems.fused.add_rms_norm`
-# dispatches N > 4096 to `add_rms_norm_loop_kernel`, an `@triton.autotune`
-# kernel with no `add_rms_norm_loop` entry in this vendor's tune configs. On
-# XPU autotune + a large TILE_N drives `tl.sum` past its 8192-lane correctness
-# ceiling (see HARNESS_SUMMARY 2.5), producing NaN / 100% mismatch on
-# N = 40999 for all three dtypes (measured 2026-09-02, [200, 40999]).
-#
-# The kernels below mirror the XPU-validated `_kunlunxin/ops/rms_norm.py`
-# (R1/R2: 2D row-tile to amortize launch, constexpr-N contiguous block DMA,
-# NEED_MASK unmasked fast path, 8192-lane tl.sum) to the x = x1 + x2 inputs:
-#   * N >  8192          -> per-row looped kernel, BLOCK=8192 (tl.sum-safe),
-#                           two-pass (var then normalize) with fp32 accumulation
-#   * N == 1             -> flat elementwise kernel (each element is its own row)
-#   * M % TILE_M == 0    -> unmasked 2D multi-row tile (fastest: block DMA)
-#   * N <= 256, M >= 4096-> masked 2D multi-row tile (launch-bound corner)
-#   * otherwise          -> per-row kernel (constexpr-N, NEED_MASK fast path)
-#
-# No CPU/ATen/native/composite fallback is used.
-
 import builtins
 import logging
 import math
@@ -171,13 +149,7 @@ def add_rms_norm_tile2d_kernel(
     eps: tl.constexpr,
     TILE_M: tl.constexpr,  # rows per program (M % TILE_M == 0 guaranteed)
     N: tl.constexpr,  # number of columns (normalized dim), used as tile width
-):
-    # Unmasked 2D multi-row tile: each program owns TILE_M consecutive rows and
-    # the whole normalized dim as ONE contiguous column block, reducing along
-    # axis=1, so the launch count drops from M to M // TILE_M. Strictly
-    # unmasked: any mask on the 2D row-tile makes XPU OffsetAnalysis give up on
-    # block-DMA (measured rms_norm: unmasked ~292us vs masked ~2.4ms on
-    # [10000, 256]). Only launch when M % TILE_M == 0 (no out-of-range rows).
+): 
     pid = ext.program_id(0)
 
     n_off = tl.arange(0, N)
@@ -208,11 +180,7 @@ def add_rms_norm_multirow_kernel(
     eps: tl.constexpr,
     TILE_M: tl.constexpr,
     N: tl.constexpr,  # number of columns (normalized dim), used as tile width
-):
-    # Masked 2D multi-row tile: the launch-bound fallback for M not divisible by
-    # any TILE_M candidate. Only rows are masked; out-of-range rows load garbage
-    # (XPU ignores `other=`) but their axis=1 reduce is per-row independent and
-    # their store is masked out, so valid rows are unaffected.
+): 
     pid = ext.program_id(0)
 
     n_off = tl.arange(0, N)
@@ -243,11 +211,7 @@ def add_rms_norm_flat_kernel(
     xnumel,  # number of elements (== M * N == M)
     eps,
     BLOCK: tl.constexpr,
-):
-    # N == 1 fast path: every "row" is a single element, so add_rms_norm is
-    # elementwise: y = (x1 + x2) / sqrt((x1 + x2)^2 + eps) * w[0]. A flat
-    # BLOCK-lane kernel avoids the per-row launch-bound cost of one program per
-    # element (rms_norm [10000, 1]: ~236us per-row vs ~7-8us flat, all dtypes).
+): 
     pid = ext.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < xnumel
@@ -313,12 +277,7 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
 
     x1 = x1.contiguous()
     x2 = x2.contiguous()
-    weight = weight.contiguous()
-    # NOTE (kunlunxin/XPU): allocate via native empty_strided instead of
-    # torch.empty_like. `empty` is intercepted by the gems empty op and the XPU
-    # triton JIT bakes the launch grid into the compile key, causing ~95-100ms
-    # per-call recompiles (see rms_norm_perf_fix). empty_strided is not
-    # intercepted, so it allocates natively.
+    weight = weight.contiguous() 
     y = torch.empty_strided(x1.size(), x1.stride(), dtype=x1.dtype, device=x1.device)
 
     with torch_device_fn.device(x1.device):

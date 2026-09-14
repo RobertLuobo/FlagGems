@@ -12,44 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-HC head fused kernel (kunlunxin / XPU specialized).
-
-Why a specialized file (XPU, measured 2026-09-04):
-- The general implementation in ``flag_gems/fused/mhc/hc_head_fused_kernel.py``
-  launches a single per-token Triton kernel whose inner loads are masked with
-  ``h_mask = h_off < H`` (``other=0.0``). On XPU the masked tail of the last
-  row of the last token reads out of the tensor allocation (mask/other is not
-  enforced at the load level, same family of defect as documented for
-  ``mhc_bwd``/``mhc_pre``), which raises a device kernel exception
-  (``torch.AcceleratorError: CUDA error: unspecified launch failure``,
-  ``cuapi_xpu_wait ... status=719``) and wedges the device for all subsequent
-  launches: functional baseline ``-m hc_head_fused_kernel --ref cpu`` gives
-  15 failed / 1 passed / 16 skipped (of the 16 non-skipped cases only the
-  smallest ``n1_h1280_hc4`` survives; every following case dies at a plain
-  ``torch.manual_seed`` in the test harness).
-- The general kernel also carries ``@triton.autotune`` (5 configs keyed on
-  (H, HC)); the mhc family convention on XPU is a single fixed config.
-
-Design (mirrors the proven ``_kunlunxin/fused/mhc_pre.py`` 3-kernel pattern,
-all single-shot, no internal loops, no reduction over masked lanes):
-  1. ``_sqrsum_partials_kernel``  grid (N, T): exact unmasked tiles
-     (K % B == 0 for the full test/benchmark matrix) -> (N, T) partials.
-  2. ``torch.mm`` (vendor engine, f32, numerically identical to the reference
-     ``torch.matmul``) -> (N, HC) mixes.
-  3. ``_head_mix_kernel``        grid (N,): rsqrt + sigmoid -> pre_mix, all
-     scalar loads, no vector reductions.
-  4. ``_weighted_row_kernel``    grid (N,): weighted sum, masked loads clamped
-     to an in-bounds index, masked store (mhc_pre-proven safe pattern).
-
-Key points:
-- NO ``@triton.autotune``; single config, num_stages=1 (mhc convention).
-- H, HC, B are ``tl.constexpr``; any K not divisible by B is zero-padded in
-  the wrapper (padded lanes contribute 0 to sqrsum and mixes, and the rsqrt
-  denominator keeps the original ``K = HC * H``), so arbitrary shapes stay
-  correct instead of faulting.
-"""
-
 import logging
 import os
 
