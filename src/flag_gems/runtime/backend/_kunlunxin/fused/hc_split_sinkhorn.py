@@ -12,46 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-hc_split_sinkhorn (kunlunxin / XPU specialized).
-
-Why this file exists (XPU, measured 2026-09-04):
-- The general implementation in ``flag_gems/fused/mhc/hc_split_sinkhorn.py``
-  uses the vectorized ``mhc_split_sinkhorn_kernel_hcmult_4`` with per-lane
-  masks (``mask = offs < num_tokens``) on every load/store and
-  ``mhc_split_sinkhorn_kernel_generic`` (HC != 4) which keeps comb in global
-  memory and re-reads it inside the same program (store -> load read-back).
-- On XPU the masked loads of the vectorized kernel are not reliable at the
-  large-token boundary (same family of defect as documented in the harness
-  for reduction tails) and a kernel exception wedges the device for
-  subsequent launches: the full matrix run passes the two small configs
-  (N in {128, 2048}) and then faults with
-  ``kl3ChannelCheckFailed ... A kernel exception has occurred`` (status 299,
-  ``wait for noc idle timeout``) at the N=16384 config, after which every
-  subsequent case fails at ``torch.manual_seed`` and the card hangs until
-  reset.
-- The generic (HC != 4) kernel additionally performs scalar store -> load to
-  the same global address inside one program, which on XPU does NOT see the
-  updated value (documented defect, see ``_kunlunxin/fused/mhc_pre.py``);
-  for hc_mult=2 this produces silently wrong comb values (~88% mismatched
-  elements in the mhc_pre equivalent).
-
-Strategy (no autotune, single config, exact tiles, no masks):
-- hc_mult in {2, 4} and device.type == "cuda" -> vectorized exact-tile
-  kernel over BLOCK_N tokens with NO masks at all: the caller picks
-  BLOCK_N = 64 and, when ``num_tokens % 64 != 0``, pads the batch dim to the
-  next multiple of 64 (``torch.nn.functional.pad``) and slices the valid
-  rows back out (same guard pattern as ``_kunlunxin/fused/mhc_bwd.py``). For
-  every shape in the test/benchmark matrix (N in {128, 2048, 16384, 65536})
-  the padding is a no-op (all are multiples of 64).
-- All comb math stays in registers (no global read-back); the Sinkhorn
-  iterations use a runtime ``range`` loop (``tl.static_range`` unroll of the
-  Sinkhorn iterations is pathologically slow / hangs the XPU compiler,
-  measured in mhc_pre).
-- Any other hc_mult, non-cuda device or numel() == 0 is routed to the
-  general implementation to preserve upstream behavior.
-"""
-
 import sys
 
 import torch
@@ -62,6 +22,7 @@ import flag_gems.fused.mhc.hc_split_sinkhorn as _general_module
 from flag_gems.fused.mhc.hc_split_sinkhorn import (
     hc_split_sinkhorn as _general_hc_split_sinkhorn,
 )
+from flag_gems.ops import empty as _gems_empty
 
 _SUPPORTED_HC = (2, 4)
 _BLOCK_N = 64
@@ -396,10 +357,10 @@ def hc_split_sinkhorn(
     num_tokens = mixes_flat.shape[0]
     device = mixes.device
 
-    pre = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)
-    post = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)
-    comb = torch.empty(
-        num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=device
+    pre = _gems_empty((num_tokens, hc_mult), dtype=torch.float32, device=device)
+    post = _gems_empty((num_tokens, hc_mult), dtype=torch.float32, device=device)
+    comb = _gems_empty(
+        (num_tokens, hc_mult * hc_mult), dtype=torch.float32, device=device
     )
 
     if num_tokens == 0:
