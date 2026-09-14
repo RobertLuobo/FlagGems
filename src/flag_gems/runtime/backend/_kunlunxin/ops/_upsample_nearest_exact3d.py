@@ -25,19 +25,6 @@ from flag_gems.runtime import device, torch_device_fn
 logger = logging.getLogger(__name__)
 device = device.name
 
-
-# NOTE (kunlunxin/XPU): flat 1D grid over ALL output elements (decode nc/od/oh/ow
-# from the flat index, no per-plane loop) exposes full program-level parallelism.
-# Follows the vendor upsample_nearest3d precedent: geometry (OD/OH/OW/ID/IH/IW)
-# is tl.constexpr so the per-lane div/mod chain is strength-reduced to constant
-# arithmetic; nc is clamped to NC-1 and the nearest-exact source indices are
-# clamped to the source extent before use so every load is in-bounds for ANY
-# decoded lane and the loads drop the mask (masked-memory path is penalized on
-# XPU); the tail store is guarded by a NEED_MASK constexpr only when total_out
-# does not divide BLOCK_SIZE.  The nearest-exact source mapping is
-#   src = min(floor((dst + 0.5) / scale), in - 1)
-# where scale = out / in (reciprocal_scale = in / out, or 1 / scale when the
-# scale factor was given directly).
 @triton.jit
 def _upsample_nearest_exact3d_kernel(
     ptr_o,

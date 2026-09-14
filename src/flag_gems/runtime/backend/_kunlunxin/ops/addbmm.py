@@ -24,22 +24,6 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-
-# Fused batch-GEMM + bias/alpha/beta epilogue for addbmm / addbmm_
-# (out = beta * bias + alpha * sum_b(batch1[b] @ batch2[b]), bias is a 2D
-# [M, N] tensor shared across the batch, unlike baddbmm's 3D bias).
-#
-# XPU (kunlunxin) closure 2026-09-03: the previous path used the generic
-# src/flag_gems/ops/addbmm.py kernel, which is @triton.autotune'd on the addmm
-# config set. On this backend autotune (a) re-tunes per shape and dumps
-# multi-hundred-MB IR on the big BlasBenchmark shapes, and (b) the autotune
-# envelope is known-unsound for masked tiles (see _kunlunxin/ops/addmm.py
-# closure notes; 31 of 336 generated configs return wrong values), and it also
-# *selects by timing*. We now use a single fused kernel styled after the
-# addmm/baddbmm XPU closure kernels (always-masked loads other=0.0, GROUP_M L2
-# swizzle, dtype-dependent reduction tile, no @autotune): the batch dimension
-# is folded into the accumulation loop, so addbmm is one kernel launch with a
-# 2D [M, N] output.
 def heur_tile_m(args):
     M = args["M"]
     if M <= 512:

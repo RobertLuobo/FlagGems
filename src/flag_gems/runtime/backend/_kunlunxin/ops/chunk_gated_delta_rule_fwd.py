@@ -5,36 +5,6 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-
-"""Kunlunxin (XPU) vendor implementation of chunk_gated_delta_rule_fwd.
-
-Rationale
----------
-The generic FLA chunked implementation (`flag_gems/fused/FLA/chunk.py`) never
-compiles on TritonXPU: its KKT / solve_tril kernels are built around 16x16
-``tl.dot`` tiles and hit ``TritonSDNNCombineBefore`` pass failures in the SDK
-pipeline (and then ``uni_sram`` OOM under the libtuner sweep).  Reproducing the
-chunked algorithm (cumsum + KKT + 16x16 blocked trich-solve + WY transform)
-without tl.dot is not feasible, so this override computes the same recurrence
-token-by-token with the column-parallel kernel proven by the sibling op
-``fused_recurrent_gated_delta_rule_fwd`` (one program per (sequence, value
-head, value column), state = a K-vector kept in registers, no tl.dot at all).
-
-The chunked algorithm is mathematically equivalent to the per-token gated
-delta rule recurrence, which is exactly what the accuracy tests compare
-against (a naive per-token reference), so the outputs (``o``, ``final_state``)
-are exact to fp32 accumulation semantics.
-
-Known limitations (documented, not tested by the suite):
-- ``g_out`` (tuple slot 0) is the within-chunk cumsum of ``g`` and ``A``
-  (slot 2, the chunk transition inverse) is returned as a zero tensor of the
-  generic shape: they are only consumed when ``GDN_RECOMPUTE_SUPPRESS_LEVEL
-  >= 3`` (w/h/v_new path), which this override does not support (returns
-  ``None`` for slots 4-6 like the generic default does).
-- Requires power-of-two head dim ``K`` (matches the vector of the test
-  matrix; same constraint as the sibling vendor kernel).
-"""
-
 import logging
 
 import torch

@@ -11,26 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Kunlunxin (TritonXPU) specialization of chunk.
-#
-# Why this override exists (2026-09-05, XPU 6)
-# --------------------------------------------
-# The general implementation in src/flag_gems/ops/chunk.py materializes each
-# chunk with ``A[tuple(slices)]``, which lowers to ``aten::slice.Tensor``.
-# Under ``use_gems()`` the registered ``slice.Tensor`` python impl is invoked
-# with 4 positional arguments (self, dim, start, end -- ``step`` is omitted),
-# so any *non-full* slice raises::
-#
-#     TypeError: slice() missing 1 required positional argument: 'step'
-#
-# -> tests/test_chunk.py: 0 passed / 72 failed
-# -> benchmark/test_chunk.py aborts on the first Gems measurement.
-#
-# This override re-implements the same chunking math (ceiling division, and at
-# most one smaller final chunk; returns fewer than ``chunks`` entries when
-# ``ceil(size/chunks) * chunks > size``) through ``torch.narrow``, a zero-copy
-# view equivalent to slicing that is safe inside ``use_gems()``.
 
 import logging
 from typing import List
@@ -84,7 +64,13 @@ def chunk(A: torch.Tensor, chunks: int, dim: int = 0) -> List[torch.Tensor]:
         end = min(start + chunk_size, dim_size)
         # ``A[a:b, ...]`` would dispatch to the registered ``slice.Tensor``
         # python impl (missing the 'step' argument) under ``use_gems()``;
-        # ``torch.narrow`` is the zero-copy view equivalent.
-        result.append(torch.narrow(A, dim, start, end - start))
+        # ``torch.narrow`` falls back to an ATen kernel on XPU (forbidden),
+        # so build the zero-copy view via ``torch.as_strided`` (metadata-only,
+        # not registered -> no re-dispatch/recursion).
+        size = list(A.shape)
+        size[dim] = end - start
+        stride = list(A.stride())
+        storage_offset = A.storage_offset() + start * A.stride(dim)
+        result.append(torch.as_strided(A, size, stride, storage_offset))
 
     return result

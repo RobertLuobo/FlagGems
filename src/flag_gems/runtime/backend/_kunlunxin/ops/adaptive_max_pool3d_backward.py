@@ -40,23 +40,7 @@ def _adaptive_max_pool3d_backward_recompute_indices_kernel(
     WIN_H: tl.constexpr,
     WIN_W: tl.constexpr,
     BLOCK: tl.constexpr,
-):
-    """Recompute the adaptive-max-pool3d argmax indices (forward semantics).
-
-    One lane per output position.  Each adaptive window
-    [start, end) = [floor(o * in / out), ceil((o + 1) * in / out)) is scanned
-    in row-major (d, h, w) order with the same tie-break as the ATen reference
-    (first tap attaining the strict max; NaNs win over any value).  The
-    recomputed indices are what the CPU reference tolerates: on this XPU stack
-    the vendor ``adaptive_max_pool3d`` forward returns uninitialized index
-    memory, so a backward whose output depended on the caller-supplied
-    ``indices`` would either fault or disagree with the reference.
-
-    Windows are provably non-empty and all loads below stay in the (n, c)
-    plane: candidate positions are clamped to the window start when the
-    predicate is dropped (the XPU backend treats compound i1 masked loads as a
-    slow path and ``other=`` is unreliable there).
-    """
+): 
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n_elems
     safe_offsets = tl.where(mask, offsets, 0)
@@ -129,24 +113,7 @@ def _adaptive_max_pool3d_backward_gather_kernel(
     MAX_H: tl.constexpr,
     MAX_W: tl.constexpr,
     BLOCK: tl.constexpr,
-):
-    """Gather-based adaptive max pool 3d backward (Kunlunxin/XPU).
-
-    One lane per input position.  The output positions whose adaptive window
-    may contain this input element form the small box
-    ``[d_min, d_max) x [h_min, h_max) x [w_min, w_max)`` with
-    ``d_min = floor(d * out / in)``, ``d_max = ceil((d + 1) * out / in)``.
-    For each candidate we load its (recomputed) argmax index and the upstream
-    gradient, and accumulate the gradient whose index equals this position.
-
-    This is the same exact, deterministic, race-free pattern as the
-    Kunlunxin ``max_pool3d_backward``: ``tl.atomic_add`` scatter loses updates
-    on this backend (~1e-5 per op, seed-dependent), so every output element's
-    contribution is accumulated in registers and written with a single
-    masked store.  The candidate box is bounded by the constexpr
-    ``MAX_* = (out + in - 1) // in + 1``, and candidate addresses are clamped
-    so the (unmasked) loads can never go out of the (n, c) plane.
-    """
+): 
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n_elems
     safe_offsets = tl.where(mask, offsets, 0)
@@ -208,19 +175,7 @@ def adaptive_max_pool3d_backward(
     grad_output: torch.Tensor,
     self: torch.Tensor,
     indices: torch.Tensor,
-):
-    """Gradient of adaptive_max_pool3d (Kunlunxin/XPU implementation).
-
-    Recomputes the forward argmax indices inside the (n, c) planes (see the
-    recompute kernel) and then accumulates the gradient with the deterministic
-    gather pattern.  The caller-supplied ``indices`` argument is accepted for
-    ATen schema compatibility but not trusted: on this XPU stack the vendor
-    ``adaptive_max_pool3d`` forward writes uninitialized index memory, so a
-    backward honoring those indices would either fault on out-of-bounds
-    addresses or disagree with the reference.  When the caller's indices come
-    from a correct forward, the recomputed indices coincide with them (same
-    window math, same tie-break) and the result is identical.
-    """
+): 
     logger.debug("GEMS_KUNLUNXIN ADAPTIVE_MAX_POOL3D_BACKWARD")
 
     grad_output = grad_output.contiguous()
@@ -234,14 +189,8 @@ def adaptive_max_pool3d_backward(
     if n_in == 0 or grad_output.numel() == 0:
         return grad_input
 
-    n_out = in_n * in_c * out_d * out_h * out_w
-    # Exact upper bounds for the per-dim iteration counts (see kernel
-    # comments).  For the adaptive windows with r = in / out >= 1 the
-    # recompute-scan length is exactly r when r is an integer and at most
-    # floor(r) + 2 otherwise, so the naive ``(in + out - 1) // out + 1``
-    # bound spends (3/2)^3 = 3.4x of the loop bodies on the common
-    # integer-ratio shapes (in = 2 * out); the gather candidate count is 1
-    # whenever out divides in, and at most 2 otherwise.
+    n_out = in_n * in_c * out_d * out_h * out_w 
+    
     win_d = in_d // out_d + (0 if in_d % out_d == 0 else 2)
     win_h = in_h // out_h + (0 if in_h % out_h == 0 else 2)
     win_w = in_w // out_w + (0 if in_w % out_w == 0 else 2)
@@ -250,18 +199,7 @@ def adaptive_max_pool3d_backward(
     max_w = 1 if in_w % out_w == 0 else (out_w // in_w + 2)
 
     indices_tmp = torch.empty((n_out,), dtype=torch.int32, device=self.device)
-
-    # Two launch shapes tuned on Kunlunxin XL (2026-09-05), re-measured shape
-    # by shape against the enabled-vendor baseline:
-    # - recompute scan: 64-lane tiles / num_warps=1 keep the rolled window
-    #   scan within the TritonXPUUnrollControl vrf-budget / uni_sram limits
-    #   for every ratio (BLOCK=128 with a WIN=8 scan overruns uni_sram);
-    #   when the window is at most 2 per dim (the common out = in / 2
-    #   shapes) the scan fits 128-lane tiles / num_warps=2 as well.
-    # - gather: the candidate box is at most 2 elements per dim and fully
-    #   statically unrolled, so 128-lane tiles / num_warps=2 fit and roughly
-    #   halve its latency.  BLOCK=256 / num_warps=4 overrun uni_sram even on
-    #   these small bodies; do not raise without re-measuring every shape.
+ 
     recompute_block = 128 if max(win_d, win_h, win_w) <= 2 else 64
     recompute_warps = 2 if recompute_block == 128 else 1
     with torch_device_fn.device(self.device):

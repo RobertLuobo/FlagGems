@@ -11,46 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kunlunxin (TritonXPU) specialization of ``triton_sparse_mla_fwd_interface``.
-
-The generic implementation in ``flag_gems/fused/DSA/sparse_mla.py`` runs one
-fused kernel that mixes ``tl.dot`` with a data-dependent gather through
-``indices`` and with ``tl.max``/``tl.math.exp2`` softmax reductions.  On this
-backend that combination is broken (see ``flashmla_sparse.py`` for the same
-finding on the sibling op):
-
-* ``tl.dot`` + data-dependent gather in the same kernel: hard compile failure.
-* ``tl.dot`` + ``tl.max``/``tl.math.exp`` in the same kernel: compiles but
-  silently returns wrong values.
-* the untyped ``qk`` accumulator (fp16 initial value, fp32 redefinition after
-  ``* log_scale``) is rejected by the XPU frontend type unification:
-  ``initial value for `qk` is of type fp16[...], but the then block redefines
-  it as fp32[...]``.
-
-So the op is split into four kernels, none of which mixes ``tl.dot`` with a
-data-dependent address or a transcendental/reduction:
-
-  A ``_spmla_gather_dt``/``_spmla_gather_td``: gather (no ``tl.dot``)
-  B ``_spmla_qk``   : dense ``tl.dot`` only                    -> logits
-  C ``_spmla_softmax``: reductions/exp (no ``tl.dot``)         -> probs, lse
-  D ``_spmla_pv``   : dense ``tl.dot`` only                    -> output
-
-The causal mask (keys ``n <= query``) is applied once, in the softmax kernel.
-All (b, sq, g) groups of the same ``indices`` gather into the same dense KV
-buffers.  All intermediate buffers are over-allocated to whole tile
-boundaries (``TP = cdiv(topk, 64) * 64`` topk, ``AH`` head blocks, exact
-``BD``/``BDV`` dividers) so that every store is unmasked (masked stores are
-known to write past tight allocations on this backend).  When a head block
-overruns ``H`` (possible only for the tiny ``G < 16`` edge shapes), the output
-is written into a padded buffer and the interface returns a slimmed view of
-it.
-"""
-
 import logging
 
 import torch
 import triton
 import triton.language as tl
+
+from flag_gems.ops import empty as _gems_empty
+from flag_gems.ops import full as _gems_full
 
 logger = logging.getLogger(__name__)
 
@@ -359,15 +327,15 @@ def triton_sparse_mla_fwd_interface(
     NDV = triton.cdiv(D, BDV)
     SQC = B * SQ
 
-    lse = torch.full(
+    lse = _gems_full(
         (B, SQ, H), float("-inf"), device=q.device, dtype=torch.bfloat16
     )
 
-    gkv_dt = torch.empty((B, SQ, VG, DT, TP), device=q.device, dtype=q.dtype)
-    gkv_td = torch.empty((B, SQ, VG, TP, DT), device=q.device, dtype=q.dtype)
-    logits = torch.empty((B, SQ, AH, TP), device=q.device, dtype=torch.float32)
-    probs = torch.empty((B, SQ, AH, TP), device=q.device, dtype=q.dtype)
-    padded_out = torch.empty((B, SQ, AH, D), device=q.device, dtype=q.dtype)
+    gkv_dt = _gems_empty((B, SQ, VG, DT, TP), device=q.device, dtype=q.dtype)
+    gkv_td = _gems_empty((B, SQ, VG, TP, DT), device=q.device, dtype=q.dtype)
+    logits = _gems_empty((B, SQ, AH, TP), device=q.device, dtype=torch.float32)
+    probs = _gems_empty((B, SQ, AH, TP), device=q.device, dtype=q.dtype)
+    padded_out = _gems_empty((B, SQ, AH, D), device=q.device, dtype=q.dtype)
 
     grid_gather = (SQC, VG, (TP // BT) * ND)
     _spmla_gather_dt[grid_gather](

@@ -39,30 +39,6 @@ def _adaptive_max_pool2d_backward_gather_kernel(
     MAX_W: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Gather-based adaptive max pool 2d backward (Kunlunxin/XPU).
-
-    One lane per input position.  The output positions whose adaptive window
-    may contain this input element form the small box
-    ``[h_min, h_max) x [w_min, w_max)`` with
-    ``h_min = floor(h * out / in)``, ``h_max = ceil((h + 1) * out / in)``.
-    For each candidate we load its argmax index and the upstream gradient and
-    accumulate the gradient whose index equals this position.
-
-    This is the same exact, deterministic, race-free pattern as the proven
-    Kunlunxin ``adaptive_max_pool3d_backward`` gather kernel:
-    ``tl.atomic_add`` scatter loses updates on this backend (~1e-5 per op,
-    seed-dependent), so every output element's contribution is accumulated in
-    registers and written with a single masked store.  The candidate box is
-    bounded by the constexpr ``MAX_* = (out + in - 1) // in + 1``-style bound
-    (1 when in is a multiple of out, ``out // in + 2`` otherwise), and
-    candidate addresses are clamped so the (unmasked) loads can never leave
-    the (n, c) plane (the XPU backend treats compound i1 masked loads as a
-    slow path and ``other=`` is unreliable there).
-
-    The caller-supplied ``indices`` are the ones produced by the Gems
-    ``adaptive_max_pool2d`` forward (ATen-exact flat spatial index
-    ``h * W + w``); see ``_patch_adaptive_max_pool2d_aten``.
-    """
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n_elems
     safe_offsets = tl.where(mask, offsets, 0)
@@ -119,16 +95,7 @@ def _adaptive_max_pool2d_backward_scatter_kernel(
     out_per_nc,
     in_hw,
     BLOCK: tl.constexpr,
-):
-    """Scatter-based adaptive max pool 2d backward (Kunlunxin/XPU).
-
-    One lane per output position; valid only when ``in_h % out_h == 0`` and
-    ``in_w % out_w == 0`` (each input position belongs to exactly one adaptive
-    window, hence every output's argmax index is a distinct input position and
-    the plain (non-atomic) stores can never race).  The Gems forward produces
-    ATen-exact per-plane flat indices ``h * in_w + w``, so the incoming
-    gradient is stored directly at ``nc * in_hw + idx``.
-    """
+): 
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n_out
     idx = tl.load(indices_ptr + offsets).to(tl.int32)
@@ -145,19 +112,7 @@ def adaptive_max_pool2d_backward(
     grad_output: torch.Tensor,
     self: torch.Tensor,
     indices: torch.Tensor,
-) -> torch.Tensor:
-    """Gradient of adaptive_max_pool2d (Kunlunxin/XPU implementation).
-
-    Two exact, deterministic, atomics-free paths, both built on the
-    ATen-exact indices produced by the Gems forward (see
-    ``_patch_adaptive_max_pool2d_aten``):
-
-    * exact division (``in_h % out_h == 0`` and ``in_w % out_w == 0``):
-      one lane per output position, non-atomic scatter (the argmax positions
-      of disjoint windows are distinct, so stores never race) -- O(n_out);
-    * otherwise: one lane per input position, gradient accumulated in
-      registers from the candidate output box, single masked store -- O(n_in).
-    """
+) -> torch.Tensor: 
     logger.debug("GEMS_KUNLUNXIN ADAPTIVE_MAX_POOL2D_BACKWARD")
 
     input_is_3d = self.dim() == 3

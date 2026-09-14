@@ -18,6 +18,8 @@ import torch
 import triton
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
+from flag_gems.ops import scalar_tensor as _gems_scalar_tensor
+
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
@@ -65,7 +67,7 @@ def __irshift__(self, other):
 
     # Handle scalar other
     if not torch.is_tensor(other):
-        other = torch.tensor(other, dtype=self.dtype, device=self.device)
+        other = _gems_scalar_tensor(other, dtype=self.dtype, device=self.device)
 
     # In-place: store result back in self
     if self.numel() > 4096:

@@ -10,38 +10,7 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Kunlunxin (TritonXPU) specialization of _chunk_cat.
-#
-# Why this override exists (2026-09-05, XPU 7)
-# --------------------------------------------
-# flag_gems.use_gems() registers a Python "slice.Tensor" implementation on the
-# ATen dispatcher, and on this torch build that Python impl is called with
-# 4 positional arguments (self, dim, start, stop) instead of the declared
-# (self, dim, start, end, step). As a result any NON-FULL slice executed
-# inside a use_gems() context raises
-#     TypeError: slice() missing 1 required positional argument: 'step'
-# The generic implementation in src/flag_gems/ops/_chunk_cat.py hits that
-# defect in its multi-tensor path:
-#   - dst_flat[dst_start : dst_start + len(src_flat)] = src_flat   (dim == 0)
-#   - output[tuple(output_idx)] = chunk_data  (dim > 0, contains partial
-#     slices too)
-# so every multi-tensor call died with TypeError (functional baseline:
-# 3 failed / 9 passed, all of test_chunk_cat_multiple_tensors).
-#
-# This file re-implements the multi-tensor path with slice-free construction
-# only (chunk / cat / stack / reshape / zeros -- all of which dispatch to
-# native or known-good implementations) and reuses the proven generic
-# single-tensor Triton kernels unchanged, so the benchmarked single-tensor
-# path does not move.
-#
-# Reference layout (verified empirically against the CPU ATen reference):
-#   chunk_size      = ceil(dim_size / num_chunks)
-#   interleaved[i]  = cat([tensor.chunk(i) for tensor in tensors], dim=dim)
-#   out             = stack([x.reshape(shape[:dim] + [-1])
-#                            for x in interleaved], dim=dim)
-
+# limitations under the License. 
 import logging
 from typing import List
 

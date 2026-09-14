@@ -140,6 +140,7 @@ from .ceil import ceil, ceil_, ceil_out
 from .celu import celu, celu_
 from .cholesky_inverse import cholesky_inverse
 from .cholesky_solve import cholesky_solve, cholesky_solve_out
+from .chunk import chunk
 from .clamp import (
     clamp,
     clamp_,
@@ -737,6 +738,7 @@ __all__ = [
     "cholesky_inverse",
     "cholesky_solve",
     "cholesky_solve_out",
+    "chunk",
     "clamp",
     "clamp_",
     "clamp_max",

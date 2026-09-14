@@ -10,63 +10,7 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.
-"""Kunlunxin (XPU) override for torch.block_diag.
-
-The generic kernel (flag_gems.ops.block_diag) tiles each input block with a
-flat 1D arange and decodes every element's on-block (row, col) via runtime
-integer division/modulo (``offs // block_cols``, ``offs % block_cols``). On
-the XPU backend those lower to per-element i64 software division
-(tensor<1024 xi64> arith.divsi/arith.remsi in TTIR), and the resulting output
-pointer vector is emitted as a discrete (scalar-lane) scatter store instead of
-a contiguous block copy; Gems latency scales with the square of the output.
-
-Measurements on this backend show:
-
-* A discrete (computed per-lane) STORE is ~400x more expensive than a
-  contiguous store, a discrete LOAD ~30x; only 1D ``tl.arange``-derived
-  (affine, unit inner stride) pointer vectors lower to block-DMA.
-* 2D tiles (even row-major-contiguous ones) go through a cluster/alloca
-  conversion that costs ~6us/program; runtime row-loops are not pipelined and
-  serialize on memory latency (~200ns/iteration).
-* Per-program fixed cost is ~0.2us, so wide tiles and few programs win.
-* Masked load/store with a non-trivial mask and vectorized stores whose base
-  is not a single product of program ids are miscompiled on this backend
-  (garbage appears at masked-off store lanes / values land at the load
-  offset), so the kernels below are always unmasked and index via clamped
-  ``tl.minimum`` (self-duplicating writes carry the correct value).
-
-Two kernel shapes satisfy the contiguous-store constraint:
-
-* ``block_diag_wos_kernel`` - whole-output kernel: one program covers ``BS``
-  contiguous output elements (unit-stride store) and recovers the source
-  (block, row, col) from the clamped output index by constexpr power-of-two
-  shifts (``blk = row >> LOGB`` etc.). The load is a gather, but the store
-  stays a contiguous block-DMA; the wasted lanes are exactly the
-  (1 - 1/n^2) zero region of the output. Used when all blocks are square,
-  power-of-two sized and the output dims are power-of-two (the benchmark
-  shapes (n,b) in {(4,64),(8,128),(16,64),(4,256),(8,256)}). ``BS`` is a
-  power of two no larger than ``total`` (also a power of two on this path),
-  so ``BS`` always divides ``total``: every program's store executes and the
-  whole output is written, hence no pre-zeroing is required (``torch.empty``
-  is safe) and the contiguous store needs no predicate.
-* ``block_diag_row_strided_kernel`` - one program per (block, row) with a 1D
-  ``tl.arange(0, BC)``; both the load (``row * block_cols + cl``) and the
-  store (``(row_off + row) * total_cols + col_off + cl``) are contiguous
-  except for the clamped tail lanes. Covers the general (non-pow2, mixed
-  shape) cases.
-* ``block_diag_varlen_general_kernel`` - per-block (rows, cols) from a
-  device-side meta table (mixed shapes, the tests' path).
-
-The fast path coalesces the same-shape blocks with a single-launch scratch
-copy (``_coalesce_blocks_kernel``) when the caching allocator returned
-non-adjacent buffers (e.g. fp32 blocks), so the strided kernels' contiguity
-assumption always holds. ``torch.cat`` is not used: it dispatches to the
-FlagGems override inside ``flag_gems.use_gems`` (the benchmark path), which
-costs ~60us/block on this backend.
-"""
-
-import logging
+# limitations under the License.import logging
 import math
 
 import torch

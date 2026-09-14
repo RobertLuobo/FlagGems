@@ -12,38 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU) override of dist.
-#
-# Why a vendor override exists: the generic implementation
-# (src/flag_gems/ops/dist.py) is numerically unreliable on XPU:
-#   * masked loads (mask=..., other=0.0) do not honour `other`: false lanes may
-#     read out-of-bounds memory and the garbage participates in tl.sum. The
-#     generic two-stage path (N > 16384) uses one 4096-lane masked block per
-#     chunk, so every N that is not a multiple of 4096 (e.g. 65537, 1000000)
-#     produces a wrong tail partial (measured: 7983.1 instead of 1.02 for the
-#     single-lane tail of N=65537; rel. error ~3e-2..1e-1 for (65537,)/(1,1e6)).
-#     N that are exact multiples of 4096 (e.g. 32768, 524288) are unaffected,
-#     which is why only the non-divisible shapes fail.
-#   * Per-kernel live tiles must stay within the uni_sram budget
-#     (~2048-4096 fp32 lanes total; 4096-lane tiles plus a second live tile
-#     can blow the budget, cf. cdist_backward).
-#
-# This override only uses exact in-bounds UNMASKED loads, 1D reductions and
-# scalar (0-d) accumulation:
-#   * N <= 2048: one program; the range is decomposed into up to 8 uniform
-#     power-of-two "pieces" (S = 512/256/.../1) plus a short scalar loop for
-#     the remainder (never touching a masked-memory path).
-#   * N > 2048: a chunk kernel (grid (N // 2048,), one 2048-lane unmasked tile
-#     per program) writes fp32 per-chunk partials; a tail kernel (grid (1,))
-#     reduces the %-remainder with the piece decomposition into one extra
-#     partial; the partial buffer is pre-filled with the MODE identity (0.0 /
-#     -inf / +inf) so the unmasked mid/final reductions stay correct; a
-#     mid-reduce kernel re-reduces groups of 2048 while the partial count
-#     exceeds 2048; a final kernel reduces the (identity-padded) partial buffer
-#     and applies the p-norm finalization.
-#   * All accumulation is fp32 (XPU has no fp64; fp16/bf16 inputs are exactly
-#     upcast, so p == 0 counts and all comparisons are exact).
-
 import logging
 import math
 
