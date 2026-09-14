@@ -133,96 +133,65 @@ def true_div_func_u16(x, y):
     return x / y
 
 
-def div_complex_real(ar, ai, br, bi):
-    # Smith's method: divide by the larger denominator component to avoid
-    # intermediate overflow/underflow (mirrors the common op complex kernel).
-    # Computed in fp32: fp16/bf16 components would lose precision and the
-    # fp16 division path is less robust in the XPU backend.
-    arf = ar.to(tl.float32)
-    aif = ai.to(tl.float32)
-    brf = br.to(tl.float32)
-    bif = bi.to(tl.float32)
-    abs_br = tl.abs(brf)
-    abs_bi = tl.abs(bif)
-    use_br = abs_br >= abs_bi
+def _true_div_complex_tt(A, B):
+    """Complex true division decomposed into real-lane kernels.
 
-    # When |br| >= |bi|: ratio = bi/br, denom = br + bi*ratio
-    ratio1 = tl.where(brf == 0, 0.0, bif / brf)
-    denom1 = brf + bif * ratio1
-    real1 = (arf + aif * ratio1) / denom1
-    imag1 = (aif - arf * ratio1) / denom1
+    The vendor Triton runtime has no complex pointer dtype support (its
+    argument canonicalization rejects complex64/complex32), so -- like every
+    other complex-capable Kunlunxin op (see add.py) -- split the operands
+    into interleaved real/imag lanes and apply Smith's algorithm with
+    real-valued kernels. The formula mirrors the generic CROSS kernel
+    div_complex_kernel in flag_gems/ops/div.py.
+    """
 
-    # When |bi| > |br|: ratio = br/bi, denom = bi + br*ratio
-    ratio2 = tl.where(bif == 0, 0.0, brf / bif)
-    denom2 = bif + brf * ratio2
-    real2 = (arf * ratio2 + aif) / denom2
-    imag2 = (aif * ratio2 - arf) / denom2
+    def _real_lanes(T):
+        # (real, imag) lanes of a tensor or a python scalar. The lanes are made
+        # contiguous: `view_as_real(...).unbind(-1)` yields stride-2 views, and
+        # feeding those to the gems pointwise kernels this function's arithmetic
+        # dispatches to faults the device (XPUW dump, then the context is dead).
+        if isinstance(T, torch.Tensor):
+            if T.is_complex():
+                re, im = torch.view_as_real(T).unbind(-1)
+                return re.contiguous(), im.contiguous()
+            return T.contiguous(), torch.zeros_like(T)
+        if isinstance(T, complex):
+            return T.real, T.imag
+        return float(T), 0.0
 
-    return tl.where(use_br, real1, real2)
+    ar, ai = _real_lanes(A)
+    br, bi = _real_lanes(B)
 
+    # Promote all lanes to a single real dtype: the component dtype of the
+    # complex result (fp32 for complex64, fp16 for complex32).
+    tensor_dtypes = [t.dtype for t in (ar, ai, br, bi) if isinstance(t, torch.Tensor)]
+    common = tensor_dtypes[0]
+    for dt in tensor_dtypes[1:]:
+        common = torch.promote_types(common, dt)
+    if not common.is_floating_point:
+        common = torch.get_default_dtype()
 
-@pointwise_dynamic(
-    is_tensor=[True, True, True, True],
-    promotion_methods=[(0, 1, 2, 3, "INT_TO_FLOAT")],
-)
-@triton.jit
-def div_complex_imag(ar, ai, br, bi):
-    arf = ar.to(tl.float32)
-    aif = ai.to(tl.float32)
-    brf = br.to(tl.float32)
-    bif = bi.to(tl.float32)
-    abs_br = tl.abs(brf)
-    abs_bi = tl.abs(bif)
-    use_br = abs_br >= abs_bi
+    def _cast(x):
+        if isinstance(x, torch.Tensor):
+            return x.to(common)
+        return torch.tensor(x, dtype=common)
 
-    ratio1 = tl.where(brf == 0, 0.0, bif / brf)
-    denom1 = brf + bif * ratio1
-    imag1 = (aif - arf * ratio1) / denom1
+    ar, ai, br, bi = _cast(ar), _cast(ai), _cast(br), _cast(bi)
 
-    ratio2 = tl.where(bif == 0, 0.0, brf / bif)
-    denom2 = bif + brf * ratio2
-    imag2 = (aif * ratio2 - arf) / denom2
-
-    return tl.where(use_br, imag1, imag2)
-
-
-def _true_divide_complex(A, B):
-    # Kunlunxin pointwise codegen cannot lower complex pointers
-    # (canonicalize_ptr_dtype KeyError), so compute Smith's method on
-    # real/imag components with two plain pointwise kernels and reassemble.
-    if not A.is_complex():
-        # real ÷ complex: promote A to B's precision, imag = 0
-        a = torch.stack((A.to(B.dtype), torch.zeros_like(A, dtype=B.dtype)), dim=-1)
-    else:
-        a = torch.view_as_real(A.resolve_conj().resolve_neg())
-    if isinstance(B, torch.Tensor):
-        if B.is_complex():
-            b = torch.view_as_real(B.resolve_conj().resolve_neg())
-        else:
-            b = torch.stack(
-                (B.to(a.dtype), torch.zeros_like(B, dtype=a.dtype)), dim=-1
-            )
-    else:
-        if isinstance(B, complex):
-            b = torch.tensor(
-                [B.real, B.imag], dtype=a.dtype, device=a.device
-            ).unsqueeze(0).expand(*a.shape[:-1], 2)
-        else:
-            b = torch.stack(
-                (
-                    torch.full(a.shape[:-1], B, dtype=a.dtype, device=a.device),
-                    torch.zeros(a.shape[:-1], dtype=a.dtype, device=a.device),
-                ),
-                dim=-1,
-            )
-    a = a.contiguous()
-    b = b.contiguous()
-    ar, ai = a.select(-1, 0), a.select(-1, 1)
-    br, bi = b.select(-1, 0), b.select(-1, 1)
-    real = div_complex_real(ar, ai, br, bi)
-    imag = div_complex_imag(ar, ai, br, bi)
-    output = torch.stack((real, imag), dim=-1)
-    return torch.view_as_complex(output)
+    # Smith's method: divide by the larger component to avoid overflow,
+    # same expressions as the generic div_complex_kernel.
+    use_br = br.abs() >= bi.abs()
+    ratio1 = torch.where(br == 0, torch.zeros_like(br), bi / br)
+    denom1 = br + bi * ratio1
+    real1 = (ar + ai * ratio1) / denom1
+    imag1 = (ai - ar * ratio1) / denom1
+    ratio2 = torch.where(bi == 0, torch.zeros_like(bi), br / bi)
+    denom2 = bi + br * ratio2
+    real2 = (ar * ratio2 + ai) / denom2
+    imag2 = (ai * ratio2 - ar) / denom2
+    real = torch.where(use_br, real1, real2)
+    imag = torch.where(use_br, imag1, imag2)
+    out = torch.view_as_complex(torch.stack((real, imag), dim=-1))
+    return out.to(torch.result_type(A, B))
 
 
 def divide(A, B):
@@ -241,31 +210,13 @@ def divide(A, B):
     return true_divide(A, B)
 
 
-def true_divide_tensor_(A, B):
-    # Vendor entry for aten.true_divide_.Tensor. Tensor.true_divide_ dispatches
-    # here even for scalar others, so without a function named
-    # `true_divide_tensor_` exported from this package, SpecOpRegistrar keeps
-    # the generic flag_gems.ops.true_divide_.true_divide_tensor_ (which imports
-    # the generic true_divide_ by value), and the untuned generic kernel runs
-    # ~300x slower than the tuned kunlunxin kernel.
-    #
-    # tests/test_true_divide.py pins the legacy dispatch log contract
-    # ("GEMS TRUE_DIVIDE_" via logger "flag_gems.ops.true_divide_") to prove the
-    # call is intercepted by a flag_gems override rather than native aten. Emit
-    # the same message through that logger so the contract holds while the
-    # actual computation runs on the tuned kunlunxin kernel below.
-    logging.getLogger("flag_gems.ops.true_divide_").debug("GEMS TRUE_DIVIDE_")
-    logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_TENSOR_")
-    return true_divide_(A, B)
-
-
 def true_divide(A, B):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE")
-    if isinstance(A, torch.Tensor) and A.is_complex():
-        return _true_divide_complex(A, B)
-    if isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor) and B.is_complex():
-        return _true_divide_complex(A, B)
     if isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor):
+        if A.is_complex() or B.is_complex():
+            # The pointwise code generator has no complex dtype mapping.
+            # Decompose into real/imag lanes (see _true_div_complex_tt).
+            return _true_div_complex_tt(A, B)
         if (
             A.dtype in (torch.float16, torch.float32)
             and A.numel() >= DIV_TENSOR_U16_MIN_NUMEL
@@ -273,16 +224,14 @@ def true_divide(A, B):
             return true_div_func_u16(A, B)
         return true_div_func(A, B)
     elif isinstance(A, torch.Tensor):
-        if A.is_complex():
-            # The pointwise code generator has no complex scalar dtype mapping.
-            # Divide interleaved real/imag lanes with the existing Triton kernel.
-            return torch.view_as_complex(
-                true_div_func_tensor_scalar(torch.view_as_real(A), B)
-            )
+        if A.is_complex() or (isinstance(B, complex)):
+            return _true_div_complex_tt(A, B)
         if A.numel() >= DIV_SCALAR_CFG_THRESHOLD:
             return true_div_func_tensor_scalar_cfg(A, B)
         return true_div_func_tensor_scalar(A, B)
     elif isinstance(B, torch.Tensor):
+        if B.is_complex():
+            return _true_div_complex_tt(A, B)
         if B.numel() >= DIV_SCALAR_CFG_THRESHOLD:
             return true_div_func_scalar_tensor_cfg(A, B)
         return true_div_func_scalar_tensor(A, B)
@@ -308,9 +257,29 @@ def true_divide_tensor(A, B):
     return true_divide(A, B)
 
 
+def true_divide_tensor_(A, B):
+    # Vendor entry for aten.true_divide_.Tensor. Tensor.true_divide_ dispatches
+    # here even for scalar others, so without a function named
+    # `true_divide_tensor_` exported from this package, SpecOpRegistrar keeps
+    # the generic flag_gems.ops.true_divide_.true_divide_tensor_ (which imports
+    # the generic true_divide_ by value), and the untuned generic kernel runs
+    # ~300x slower than the tuned kunlunxin kernel.
+    #
+    # tests/test_true_divide.py pins the legacy dispatch log contract
+    # ("GEMS TRUE_DIVIDE_" via logger "flag_gems.ops.true_divide_") to prove the
+    # call is intercepted by a flag_gems override rather than native aten. Emit
+    # the same message through that logger so the contract holds while the
+    # actual computation runs on the tuned kunlunxin kernel below.
+    logging.getLogger("flag_gems.ops.true_divide_").debug("GEMS TRUE_DIVIDE_")
+    logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_TENSOR_")
+    return true_divide_(A, B)
+
+
 def true_divide_out(A, B, out):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_OUT")
     if isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor):
+        if A.is_complex() or B.is_complex():
+            return out.copy_(_true_div_complex_tt(A, B))
         if (
             A.dtype in (torch.float16, torch.float32)
             and A.numel() >= DIV_TENSOR_U16_MIN_NUMEL
@@ -318,6 +287,8 @@ def true_divide_out(A, B, out):
             return true_div_func_u16(A, B, out0=out)
         return true_div_func(A, B, out0=out)
     elif isinstance(A, torch.Tensor):
+        if A.is_complex():
+            return out.copy_(_true_div_complex_tt(A, B))
         if A.numel() >= DIV_SCALAR_CFG_THRESHOLD:
             return true_div_func_tensor_scalar_cfg(A, B, out0=out)
         return true_div_func_tensor_scalar(A, B, out0=out)
@@ -340,6 +311,8 @@ def true_divide_(A, B):
             return true_div_func_u16(A, B, out0=A)
         return true_div_func(A, B, out0=A)
     else:
+        if A.is_complex() or isinstance(B, complex):
+            return A.copy_(_true_div_complex_tt(A, B))
         if A.numel() >= DIV_SCALAR_CFG_THRESHOLD:
             if A.dtype == torch.float32:
                 return true_div_func_tensor_scalar_cfg16(A, B, out0=A)
