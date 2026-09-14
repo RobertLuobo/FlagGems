@@ -5,17 +5,12 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
-VENDOR = flag_gems.vendor_name
-# torch_npu.npu_gru only support fp16
-if VENDOR == "ascend":
-    DTYPES = [torch.float16]
-else:
-    # torch.nn.GRU has precision issues when using fp16 or bf16 on CPU and GPU.
-    DTYPES = [
-        torch.float32,
-    ]
-    if flag_gems.runtime.device.support_fp64:
-        DTYPES.append(torch.float64)
+# torch.nn.GRU has precision issues when using fp16 or bf16 on CPU and GPU.
+DTYPES = [
+    torch.float32,
+]
+if flag_gems.runtime.device.support_fp64:
+    DTYPES.append(torch.float64)
 
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -106,10 +101,8 @@ def test_gru(
         batch_first,
     )
 
-    # torch_npu.npu_gru has precision issues when using fp16 on CPU and NPU.
-    atol = 1e-2 if dtype is torch.float16 else 1e-4
-    utils.gems_assert_close(res_out, ref_out, dtype, atol=atol)
-    utils.gems_assert_close(res_hn, ref_hn, dtype, atol=atol)
+    utils.gems_assert_close(res_out, ref_out, dtype)
+    utils.gems_assert_close(res_hn, ref_hn, dtype)
 
 
 _GRU_DATA_CASES = [
@@ -207,7 +200,5 @@ def test_gru_data(
         bidirectional,
     )
 
-    # torch_npu.npu_gru has precision issues when using fp16 on CPU and NPU.
-    atol = 1e-2 if dtype is torch.float16 else 1e-4
-    utils.gems_assert_close(res_out, ref_out, dtype, atol=atol)
-    utils.gems_assert_close(res_hn, ref_hn, dtype, atol=atol)
+    utils.gems_assert_close(res_out, ref_out, dtype)
+    utils.gems_assert_close(res_hn, ref_hn, dtype)
