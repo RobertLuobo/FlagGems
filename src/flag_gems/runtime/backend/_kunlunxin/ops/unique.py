@@ -1567,6 +1567,20 @@ def _unique2_boundary_kernel(
     tl.store(cum_ptr + offs, tl.where(offs == 0, 0, is_b.to(tl.int64)), mask=mask)
 
 
+# NOTE(kunlunxin, 2026-09-14): this module is intentionally NOT registered in
+# flag_gems' _FULL_CONFIG anymore. The chain below (triton radix sort ->
+# boundary kernel -> nonzero -> index_select -> cumsum -> scatter_) measured
+# 1116 ms @16M / 17.7 s @67M vs the native ATen `_unique2`'s 10.6 ms / 40.2 ms
+# (105x / 440x slower, card 5): the vendor radix sort alone is 520 ms @16M
+# (122x the native 4.2 ms, see _kunlunxin/ops/sort.py -- its own comment
+# records 590 ms @16M as the tuned floor), and the C++ kernel never takes the
+# slow Python `scatter_` path (1308 ms native) this chain was built around.
+# Keeping it unregistered makes `torch.unique` fall through to the native
+# kernel (1.0x, functional parity verified vs CPU torch.unique). The chain is
+# kept as reference; re-register only after the radix sort and the
+# nonzero/index_select vendor kernels reach ~1x of native.
+
+
 def _unique2(
     in0: torch.Tensor,
     sorted: bool = True,
