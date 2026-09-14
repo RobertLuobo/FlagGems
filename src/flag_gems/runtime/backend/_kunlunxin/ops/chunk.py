@@ -47,9 +47,16 @@ def chunk(A: torch.Tensor, chunks: int, dim: int = 0) -> List[torch.Tensor]:
     if dim < 0:
         dim = dim + A.ndim
 
-    # Calculate the size of each chunk (ceiling division)
-    dim_size = A.size(dim)
+    # Hoist metadata lookups out of the loop: the Python-visible access cost of
+    # shape/stride/storage_offset per chunk (not ``as_strided`` itself, which
+    # is a metadata-only view primitive with no re-dispatch) dominates the
+    # per-chunk time at large chunk counts.
+    shape = A.shape
+    dim_size = shape[dim]
     chunk_size = (dim_size + chunks - 1) // chunks
+    stride = A.stride()
+    storage_offset = A.storage_offset()
+    dim_stride = stride[dim]
 
     # Create list to hold chunks
     result = []
@@ -67,10 +74,10 @@ def chunk(A: torch.Tensor, chunks: int, dim: int = 0) -> List[torch.Tensor]:
         # ``torch.narrow`` falls back to an ATen kernel on XPU (forbidden),
         # so build the zero-copy view via ``torch.as_strided`` (metadata-only,
         # not registered -> no re-dispatch/recursion).
-        size = list(A.shape)
+        size = list(shape)
         size[dim] = end - start
-        stride = list(A.stride())
-        storage_offset = A.storage_offset() + start * A.stride(dim)
-        result.append(torch.as_strided(A, size, stride, storage_offset))
+        result.append(
+            torch.as_strided(A, size, stride, storage_offset + start * dim_stride)
+        )
 
     return result

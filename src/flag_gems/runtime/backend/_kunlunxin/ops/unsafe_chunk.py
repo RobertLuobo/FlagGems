@@ -17,6 +17,8 @@ from typing import List
 
 import torch
 
+from .narrow import narrow as _gems_narrow
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +54,7 @@ def unsafe_chunk(A: torch.Tensor, chunks: int, dim: int = 0) -> List[torch.Tenso
     # Match torch.unsafe_chunk: a zero-sized dim yields exactly `chunks`
     # empty views (narrow of length 0), not an empty list.
     if dim_size == 0:
-        return [torch.narrow(A, dim, 0, 0) for _ in range(chunks)]
+        return [_gems_narrow(A, dim, 0, 0) for _ in range(chunks)]
 
     # Calculate the size of each chunk (ceiling division)
     chunk_size = (dim_size + chunks - 1) // chunks
@@ -69,8 +71,8 @@ def unsafe_chunk(A: torch.Tensor, chunks: int, dim: int = 0) -> List[torch.Tenso
 
         end = min(start + chunk_size, dim_size)
         # ``A[a:b, ...]`` would dispatch to the registered ``slice.Tensor``
-        # python impl under ``use_gems()``; ``torch.narrow`` is the zero-copy
-        # view equivalent.
-        result.append(torch.narrow(A, dim, start, end - start))
+        # python impl under ``use_gems()``; the gems ``narrow`` (a zero-copy
+        # ``torch.as_strided`` view) is the equivalent.
+        result.append(_gems_narrow(A, dim, start, end - start))
 
     return result

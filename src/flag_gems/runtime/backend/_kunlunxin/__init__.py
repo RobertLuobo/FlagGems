@@ -27,20 +27,16 @@ CUSTOMIZED_UNUSED_OPS = (
     "randperm",
     "topk",
     "unique",
-    # flag_gems' generic Python "slice.Tensor" impl (src/flag_gems/ops/slice.py)
-    # is incompatible with this torch_xmlir-XPU build: the ATen dispatcher
-    # invokes the registered Python kernel with 4 positional arguments
-    # (self, dim, start, stop), omitting the defaulted `step`, so ANY slice
-    # inside a use_gems() context raises
-    #     TypeError: slice() missing 1 required positional argument: 'step'
-    # (see e.g. tests/test_fill.py::test_fill_scalar_sliced_view /
-    # test_fill_sliced_view_tensor, and the _kunlunxin/ops/*.py workarounds).
-    # Additionally that generic impl materialises a COPY (torch.empty + copy_)
-    # instead of a view, so it can never satisfy the aliasing semantics of
-    # Tensor.__setitem__'s slice fast path (view = x.slice(...); view.fill_(v))
-    # even when called with an explicit step. Use the native torch_xmlir
-    # slice.Tensor (which is a correct zero-copy view) for this vendor.
     "slice",
+    # The 097c718a (batch 20260914) vendor conv_transpose1d.py was only an
+    # fp16/bf16-upcast wrapper around
+    #   aten::conv_transpose1d.default.redispatch(CompositeImplicitAutograd, ...)
+    # and was never imported by _kunlunxin/ops/__init__.py (dead code). The
+    # generic flag_gems.ops.conv_transpose1d (triton autotune + tl.dot) has no
+    # kunlunxin tune_configs.yaml entry and the conv family is unsupported on
+    # this stack (cf. op_black_list.yaml: conv1d "All dtypes failed"), so
+    # exclude it from use_gems() registration and keep the native ATen path.
+    "conv_transpose1d",
 )
 
 

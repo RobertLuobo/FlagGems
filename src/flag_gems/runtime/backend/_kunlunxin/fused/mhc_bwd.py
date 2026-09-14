@@ -15,7 +15,6 @@
 import torch
 
 from flag_gems.fused.mhc.mhc_bwd import mhc_bwd as _general_mhc_bwd
-from flag_gems import empty as _gems_empty
 from flag_gems.ops import pad as _gems_pad
 
 _BLOCK_S = 64  # must match BLOCK_S in the general _mhc_bwd_kernel_n4
@@ -32,7 +31,7 @@ def mhc_bwd(
     delegates to the general implementation for shapes that are safe on XPU.
     """
     if out.numel() == 0:
-        return _gems_empty(out.shape, dtype=torch.float32, device=out.device)
+        return torch.empty(out.shape, dtype=torch.float32, device=out.device)
 
     seqlen = out.shape[0]
     if seqlen % _BLOCK_S != 0:

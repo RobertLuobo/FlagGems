@@ -22,20 +22,20 @@ import flag_gems.fused.mhc.hc_split_sinkhorn as _general_module
 from flag_gems.fused.mhc.hc_split_sinkhorn import (
     hc_split_sinkhorn as _general_hc_split_sinkhorn,
 )
-from flag_gems import empty as _gems_empty
 
 _SUPPORTED_HC = (2, 4)
 _BLOCK_N = 64
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _hc_split_sinkhorn_kernel_hc4(
-    mixes_ptr,  # (N, 24) f32, N % BLOCK_N == 0
+    mixes_ptr,  # (N, 24) f32, N = 真实行数（无需 BLOCK 对齐）
     hc_scale_ptr,  # (3,) f32
     hc_base_ptr,  # (24,) f32
-    pre_ptr,  # (N, 4) f32
-    post_ptr,  # (N, 4) f32
-    comb_ptr,  # (N, 16) f32
+    pre_ptr,  # (N_pad, 4) f32, N_pad % BLOCK_N == 0
+    post_ptr,  # (N_pad, 4) f32
+    comb_ptr,  # (N_pad, 16) f32
+    num_tokens,  # 真实行数；[num_tokens, N_pad) 为冗余行（输入读被 clamp）
     BLOCK_N: tl.constexpr,
     SINKHORN_ITERS: tl.constexpr,
     EPS: tl.constexpr,
@@ -43,7 +43,11 @@ def _hc_split_sinkhorn_kernel_hc4(
     """Vectorized split + 4x4 Sinkhorn, exact tiles, no masks."""
     pid = tl.program_id(0)
     offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-    base = offs * 24
+    # Pad 行 (offs >= num_tokens) 的输入读被 clamp 到最后一行，输出落在
+    # pre/post/comb 尾部、由主机侧截断丢弃。免去对 mixes 做全量 pad 拷贝
+    # (ATen constant_pad_nd)，同时消除输出缓冲越界写。
+    offs_r = tl.minimum(offs, num_tokens - 1)
+    base = offs_r * 24
 
     scale_0 = tl.load(hc_scale_ptr + 0)
     scale_1 = tl.load(hc_scale_ptr + 1)
@@ -239,14 +243,15 @@ def _hc_split_sinkhorn_kernel_hc4(
     tl.store(comb_ptr + co + 15, cm_33)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _hc_split_sinkhorn_kernel_hc2(
-    mixes_ptr,  # (N, 8) f32, N % BLOCK_N == 0
+    mixes_ptr,  # (N, 8) f32, N = 真实行数（无需 BLOCK 对齐）
     hc_scale_ptr,  # (3,) f32
     hc_base_ptr,  # (8,) f32
-    pre_ptr,  # (N, 2) f32
-    post_ptr,  # (N, 2) f32
-    comb_ptr,  # (N, 4) f32
+    pre_ptr,  # (N_pad, 2) f32, N_pad % BLOCK_N == 0
+    post_ptr,  # (N_pad, 2) f32
+    comb_ptr,  # (N_pad, 4) f32
+    num_tokens,  # 真实行数；[num_tokens, N_pad) 为冗余行（输入读被 clamp）
     BLOCK_N: tl.constexpr,
     SINKHORN_ITERS: tl.constexpr,
     EPS: tl.constexpr,
@@ -254,7 +259,8 @@ def _hc_split_sinkhorn_kernel_hc2(
     """Vectorized split + 2x2 Sinkhorn, exact tiles, no masks."""
     pid = tl.program_id(0)
     offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-    base = offs * 8
+    offs_r = tl.minimum(offs, num_tokens - 1)
+    base = offs_r * 8
 
     scale_0 = tl.load(hc_scale_ptr + 0)
     scale_1 = tl.load(hc_scale_ptr + 1)
@@ -357,10 +363,17 @@ def hc_split_sinkhorn(
     num_tokens = mixes_flat.shape[0]
     device = mixes.device
 
-    pre = _gems_empty((num_tokens, hc_mult), dtype=torch.float32, device=device)
-    post = _gems_empty((num_tokens, hc_mult), dtype=torch.float32, device=device)
-    comb = _gems_empty(
-        (num_tokens, hc_mult * hc_mult), dtype=torch.float32, device=device
+    # 输出缓冲按 _BLOCK_N 对齐的完整行数分配：exact-tile 内核按整个 grid
+    # 无 mask 写满，[num_tokens, n_pad) 的冗余行在返回前被截断丢弃。
+    # 输入 mixes_flat 不做任何 pad 拷贝（F.pad 在 XPU 上 fallback 到 ATen
+    # constant_pad_nd，且旧实现输出缓冲只按 num_tokens 分配会越界写）。
+    pad = (-num_tokens) % _BLOCK_N
+    n_pad = num_tokens + pad
+
+    pre = torch.empty((n_pad, hc_mult), dtype=torch.float32, device=device)
+    post = torch.empty((n_pad, hc_mult), dtype=torch.float32, device=device)
+    comb = torch.empty(
+        (n_pad, hc_mult * hc_mult), dtype=torch.float32, device=device
     )
 
     if num_tokens == 0:
@@ -370,20 +383,16 @@ def hc_split_sinkhorn(
             comb.view(*outer_shape, hc_mult, hc_mult),
         )
 
-    pad = (-num_tokens) % _BLOCK_N
-    if pad:
-        mixes_padded = torch.nn.functional.pad(mixes_flat, (0, 0, 0, pad))
-    else:
-        mixes_padded = mixes_flat
-    grid = (num_tokens + pad) // _BLOCK_N
+    grid = n_pad // _BLOCK_N
 
     common = dict(
-        mixes_ptr=mixes_padded,
+        mixes_ptr=mixes_flat,
         hc_scale_ptr=hc_scale,
         hc_base_ptr=hc_base,
         pre_ptr=pre,
         post_ptr=post,
         comb_ptr=comb,
+        num_tokens=num_tokens,
         BLOCK_N=_BLOCK_N,
         SINKHORN_ITERS=sinkhorn_iters,
         EPS=eps,
@@ -395,10 +404,9 @@ def hc_split_sinkhorn(
     else:
         _hc_split_sinkhorn_kernel_hc2[(grid,)](**common)
 
-    if pad:
-        pre = pre[:num_tokens]
-        post = post[:num_tokens]
-        comb = comb[:num_tokens]
+    pre = pre[:num_tokens]
+    post = post[:num_tokens]
+    comb = comb[:num_tokens]
 
     return (
         pre.view(*outer_shape, hc_mult),

@@ -362,6 +362,7 @@ from .mvlgamma_ import mvlgamma_
 from .nan_to_num import nan_to_num
 from .nanmedian import nanmedian, nanmedian_dim, nanmedian_dim_values, nanmedian_out
 from .nansum import nansum, nansum_out
+from .narrow import narrow
 from .narrow_copy import narrow_copy
 from .native_batch_norm import native_batch_norm
 from .native_group_norm import native_group_norm
@@ -568,6 +569,7 @@ from .uniform import uniform_
 from .unique import _unique2
 from .unique_consecutive import unique_consecutive
 from .unique_dim import unique_dim
+from .unsafe_chunk import unsafe_chunk  # noqa: F401
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
 from .upsample_bicubic2d_aa_backward import _upsample_bicubic2d_aa_backward
 from .upsample_linear1d import upsample_linear1d

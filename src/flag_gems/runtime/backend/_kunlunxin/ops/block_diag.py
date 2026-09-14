@@ -10,7 +10,8 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.import logging
+# limitations under the License.
+import logging
 import math
 
 import torch
@@ -314,13 +315,8 @@ def block_diag(*tensors):
         block_numel = block_rows * block_cols
         total_rows = n * block_rows
         total_cols = n * block_cols
-        device = t0.device
-
-        # Should the output buffer be pre-zeroed? Only the whole-output kernel
-        # writes every output cell (``BS`` divides the power-of-two ``total``,
-        # so no tail program skips its store); the row kernels only write the
-        # block footprints and therefore need a pre-zeroed buffer for the
-        # off-block region.
+        device = t0.device 
+        
         use_wos = (
             block_rows == block_cols
             and _is_pow2(block_cols)
@@ -340,13 +336,7 @@ def block_diag(*tensors):
                     == i * block_numel
                     for i in range(2, n)
                 )
-            )
-        # The whole-output kernel writes every output cell (the off-block
-        # region is written with its 0.0 value by the ``tl.where``), so a
-        # ``torch.empty`` buffer is safe whenever ``use_wos`` holds, even when
-        # the source blocks are not contiguous (the scratch buffer is separate
-        # and the kernels are ordered on the same stream). Only the per-row
-        # kernels (which write just the block footprints) need pre-zeroing.
+            ) 
         use_empty = use_wos
         out = (
             torch.empty((total_rows, total_cols), dtype=dtype0, device=device)
@@ -356,38 +346,14 @@ def block_diag(*tensors):
 
         if block_numel == 0:
             return out
-
-        # Coalesce the blocks when the allocator did not lay them out
-        # contiguously, so the strided kernels always see a contiguous source
-        # of n * block_numel elements. A per-block base pointer loaded from a
-        # device table (the varlen kernel's pattern) does NOT lower to
-        # block-DMA on this backend and is 2-3x slower, so any kernel that
-        # needs the strided ``blk * input_stride`` load form gets its input
-        # first copied into a scratch buffer by the single-launch
-        # ``_coalesce16_kernel`` (n <= 16; otherwise ``_coalesce_blocks_kernel``
-        # with a device table). ``torch.cat`` is deliberately avoided: it
-        # dispatches to the FlagGems override when this runs inside
-        # ``flag_gems.use_gems`` (the benchmark path), costing ~60us/block.
+ 
         if n == 1:
             src = t0
             input_stride = block_numel
         elif contiguous:
             src = t0
             input_stride = block_numel
-        else:
-            # Copy the blocks into a contiguous scratch, then let the
-            # wos/row kernel read it with its strided ``blk * input_stride``
-            # load form (a per-block base pointer loaded from a device table
-            # does NOT lower to block-DMA on this backend and is 2-3x slower).
-            # For up to 16 blocks the bases are passed as scalar kernel
-            # arguments (``_coalesce16_kernel``): building a device-side
-            # pointer table costs a synchronous host-to-device copy of the
-            # pointer list (~0.1-0.7ms on this backend), which would dominate
-            # the whole call. The launches are ordered on the current stream,
-            # so no explicit synchronization is required before the wos/row
-            # kernel reads the scratch. ``torch.cat`` is deliberately avoided:
-            # it dispatches to the FlagGems override when this runs inside
-            # ``flag_gems.use_gems`` (the benchmark path), costing ~60us/block.
+        else: 
             src = torch.empty((n, block_numel), dtype=dtype0, device=device)
             if n <= 16:
                 bases = [t.data_ptr() for t in tensors] + [0] * (16 - n)

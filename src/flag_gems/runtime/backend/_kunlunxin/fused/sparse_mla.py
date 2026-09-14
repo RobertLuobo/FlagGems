@@ -17,7 +17,6 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems import empty as _gems_empty
 from flag_gems import full as _gems_full
 
 logger = logging.getLogger(__name__)
@@ -331,11 +330,11 @@ def triton_sparse_mla_fwd_interface(
         (B, SQ, H), float("-inf"), device=q.device, dtype=torch.bfloat16
     )
 
-    gkv_dt = _gems_empty((B, SQ, VG, DT, TP), device=q.device, dtype=q.dtype)
-    gkv_td = _gems_empty((B, SQ, VG, TP, DT), device=q.device, dtype=q.dtype)
-    logits = _gems_empty((B, SQ, AH, TP), device=q.device, dtype=torch.float32)
-    probs = _gems_empty((B, SQ, AH, TP), device=q.device, dtype=q.dtype)
-    padded_out = _gems_empty((B, SQ, AH, D), device=q.device, dtype=q.dtype)
+    gkv_dt = torch.empty((B, SQ, VG, DT, TP), device=q.device, dtype=q.dtype)
+    gkv_td = torch.empty((B, SQ, VG, TP, DT), device=q.device, dtype=q.dtype)
+    logits = torch.empty((B, SQ, AH, TP), device=q.device, dtype=torch.float32)
+    probs = torch.empty((B, SQ, AH, TP), device=q.device, dtype=q.dtype)
+    padded_out = torch.empty((B, SQ, AH, D), device=q.device, dtype=q.dtype)
 
     grid_gather = (SQC, VG, (TP // BT) * ND)
     _spmla_gather_dt[grid_gather](
