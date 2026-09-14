@@ -24,9 +24,10 @@ Why a vendor override:
   matrix: 16.7ms vs 0.26ms native).
 
 Design (kept to constructs proven reliable on the TritonXPU backend):
-  - Output is pre-filled natively with ``torch.full(..., padding_value)`` and
-    the kernel only writes the real (non-padding) elements, so **every output
-    element is written exactly once** (no double write of the padding region).
+  - Output is pre-filled with ``flag_gems.ops.full(..., padding_value)`` (the
+    gems full kernel) and the kernel only writes the real (non-padding)
+    elements, so **every output element is written exactly once** (no double
+    write of the padding region).
   - One program handles ``ROWS_PER_PROG`` rows sequentially; the row loop and
     the column loop both have ``constexpr`` bounds (statically unrolled), so
     there is no data-dependent loop bound.
@@ -46,6 +47,9 @@ import triton.language as tl
 
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
+
+# Use the gems implementations for allocation/fill instead of raw torch calls.
+import flag_gems.ops as _general_ops
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +99,7 @@ def _jagged_to_padded_dense_forward_kernel(
                 src = tl.minimum(seq_start + col, total_length - 1)
                 val = tl.load(values + src, mask=col < seq_len, other=padding_value)
                 # Store only the real region: padded lanes are never written
-                # (they already hold padding_value from torch.full).
+                # (they already hold padding_value from the pre-fill).
                 tl.store(
                     output + row * max_length + col,
                     val,
@@ -126,13 +130,13 @@ def _jagged_to_padded_dense_forward(values, offsets, max_lengths, padding_value=
     max_length = int(max_lengths[0])
 
     if batch_size <= 0 or max_length <= 0:
-        return torch.empty(
+        return _general_ops.empty(
             (max(batch_size, 0), max(max_length, 0)),
             dtype=values.dtype,
             device=values.device,
         )
 
-    output = torch.full(
+    output = _general_ops.full(
         (batch_size, max_length), padding_value, dtype=values.dtype, device=values.device
     )
 
