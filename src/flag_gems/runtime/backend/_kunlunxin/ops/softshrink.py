@@ -24,20 +24,6 @@ from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
 
-# Hybrid two-path recipe (expected value: big shapes ~2x faster than the
-# previous single hand-written kernel, no shape regressions; verified on
-# XPU 7):
-#   * numel >= _BIG_PATH_MIN_ELEMS: pointwise_dynamic + the CodeGenConfig
-#     sweet spot of the memory-bound scalar/pointwise family (gt / greater /
-#     lt_ / ge_): unroll_num=8, 1d-tile + kunlunAutoGrid, ~2x faster than
-#     the old hand-written 1024-block kernel on [1024,65536]/[4096,4096]/
-#     [64,512,512] (fp32 7.56->3.59 ms, 1.90->0.91 ms).
-#   * numel < _BIG_PATH_MIN_ELEMS: the previous hand-written 1024-block
-#     kernel. A fresh-compile sweep showed the pointwise_dynamic codegen
-#     regresses 16K-65K element shapes 2-3.5x (its tile/grid strategy),
-#     while the 1024-block kernel keeps them at launch floor.
-# Kernel bodies / algorithm / numerics are unchanged in both paths (the
-# math is x-lambd if x>lambd, x+lambd if x<-lambd, else 0, with NaN kept).
 _BIG_PATH_MIN_ELEMS = 131072
 
 _config_ = CodeGenConfig(

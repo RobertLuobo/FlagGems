@@ -12,20 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Kunlunxin (XPU) override of `empty_permuted`.
-#
-# `empty_permuted` returns *uninitialized* memory: the only contract is the
-# permuted (but dense, non-overlapping) layout. The generic implementation
-# additionally launches a Triton kernel that writes 0.0 over the whole buffer
-# ("touches" the storage), which on XPU costs 3+ orders of magnitude versus a
-# pure allocation for large tensors (measured: 1 GiB fp32 -> ~6-110 ms vs
-# ~0.016 ms native). Writing zeros is not part of the op contract, so the
-# Kunlunxin override performs the allocation only and skips the waste pass.
-#
-# The logger keeps the `flag_gems.ops.empty_permuted` name on purpose:
-# tests/test_empty.py asserts the "GEMS EMPTY_PERMUTED" debug record through
-# `caplog.at_level("DEBUG", logger="flag_gems.ops.empty_permuted")`, and the
-# log identity is the op, not the file that implements it.
 import logging
 
 import torch

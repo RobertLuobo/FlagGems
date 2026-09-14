@@ -12,35 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU) override of logit_backward.
-#
-# The generic `flag_gems.ops.logit_backward` (KernelGen-generated, hand-rolled
-# 1024-lane kernel) computes the non-eps path as
-#     grad_input = grad_out.to(f32) / (self_f32 * (1.0 - self_f32))
-#   followed by a direct masked store of the division result. On this backend
-# that codegen shape is UNRELIABLE for fp32: with masked loads (`other=0`)
-# the fp32 division result is silently zeroed at lanes == 0 (mod 16) — e.g.
-# `(1024,1024)` fp32 loses every 16th element (measured 2026-09-06, repeatable
-# standalone) — so all 6 fp32 non-eps test cases fail with `res=0` at the
-# first element. fp16/bf16 are unaffected (the .to(f32)/.to(fp16) casts inhibit
-# the bad lowering), which is why only fp32 fails.
-#
-# The eps branch of the generic kernel — clamp to [lo, hi] + `tl.where(in_range,
-# g/(c*(1-c)), 0.0)` — compiles to a provably correct kernel on this backend
-# (all 54 eps test cases pass, including the scalar and tail shapes), where the
-# fp32 division result is only ever consumed through a select.
-#
-# Fix (backend-local, no generic-file change): ALWAYS take the eps-style
-# structure. `eps=None` maps to lo=0.0, hi=1.0, so for x in (0, 1) — the whole
-# tested/valid domain — the kernel is numerically identical to ATen's
-# `grad / (x * (1 - x))` (clamp is a no-op, in_range is all-true) while using
-# exactly the codegen shape proven correct for fp32. `eps=0.0` is rejected by
-# the harness's eps range check (0.0 <= eps); eps values hit the same path with
-# lo=eps as before.
-#
-# Note: this is a correctness fix; performance is unchanged from the generic
-# 1024-lane masked kernel (the benchmark exercises the eps=1e-6 path, which
-# already used this exact structure).
 import logging
 
 import torch

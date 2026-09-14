@@ -18,7 +18,7 @@ import sys
 import torch
 import triton
 import triton.language as tl
-from flag_gems.ops import empty as _gems_empty
+from flag_gems import empty as _gems_empty
 
 logger = logging.getLogger(__name__)
 

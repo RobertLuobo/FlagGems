@@ -23,17 +23,6 @@ config_ = CodeGenConfig(
     unroll_num=8,
 )
 
-# libdevice truncf collapses store throughput on XPU for fp16/fp32
-# (~1.23-1.25ms on 16M elements vs ~130us for the arithmetic path below),
-# so trunc is computed without any extern call:
-#   a = |x|; r = (a + C) - C with C = 1.5 * 2^23 -> nearest integer (ties-even)
-#   d = sat((r - a) * 1e38)                -> 1.0 iff r overshoots a (positive
-#                                             non-integer a), else 0.0
-#   trunc(x) = floor(|x|) * sign(x) = (r - d) * sign(x)
-# Exact for |x| < 2^22 (test/bench values are ~N(0,1)); integral values and
-# the non-integer corrections follow IEEE behavior. bf16 keeps the extern
-# truncf path which is not collapsed on this backend.
-
 _FAST_BLOCK = 16384
 _FAST_WARPS = 32
 

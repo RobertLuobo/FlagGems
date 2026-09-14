@@ -24,30 +24,7 @@ from flag_gems.utils import libentry, tl_extra_shim
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
-rsqrt = tl_extra_shim.rsqrt
-
-
-# Forward is split into TWO @libentry kernels, one program per (n, group):
-#
-#   1) group_norm_reduce_kernel  -> flat 1D contiguous reduction => Mean/Rstd
-#   2) group_norm_normalize_kernel -> per-channel affine write => Y
-#
-# WHY split + per-channel: the previous single kernel combined the reduction
-# with a normalize pass that recovered each element's channel via a PER-ELEMENT
-# gather `ch = ch_base + idx // HW` + masked `tl.load(W + ch)`. On the XPU triton
-# fork that integer-div + gather in the pointwise store loop was pathologically
-# slow (measured 9.5ms vs 0.16ms for a scalar-per-channel write on
-# [16,8,128,128] group=4), and fusing it with the reduce loop tripped the XPU
-# codegen into the same slow path even after removing the giant 2D tile.
-#
-# A group is `group_size` channels x HW CONTIGUOUS elements. The reduction is a
-# flat 1D inner reduction over a BOUNDED BLOCK (loops), killing the old
-# tensor<2x16384> giant-tile IR explosion (449K lines / 891 modules in
-# ir-group_norm-dev3.log). The normalize walks the group ONE CHANNEL AT A TIME
-# (`GROUP_SIZE` is a constexpr so the channel loop statically unrolls), loading
-# a SCALAR weight/bias per channel and doing a contiguous HW block DMA -> no
-# per-element div/gather. This is ~40x faster than the fused gather kernel.
-
+rsqrt = tl_extra_shim.rsqrt 
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])

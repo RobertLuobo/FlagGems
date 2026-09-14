@@ -25,6 +25,8 @@ from ._batch_norm_no_update import _batch_norm_no_update
 from ._dyn_quant_pack_4bit_weight import _dyn_quant_pack_4bit_weight
 from ._embedding_bag_dense_backward import _embedding_bag_dense_backward
 from ._euclidean_dist import _euclidean_dist
+from .empty import empty  # noqa: F401
+from .empty_permuted import empty_permuted  # noqa: F401
 from ._functional_sym_constrain_range import _functional_sym_constrain_range
 from ._functional_sym_constrain_range_for_size import (
     _functional_sym_constrain_range_for_size,

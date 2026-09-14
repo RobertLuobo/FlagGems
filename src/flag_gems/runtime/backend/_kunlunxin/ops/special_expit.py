@@ -12,37 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU) special_expit(x) = 1 / (1 + exp(-x)).
-#
-# The generic flag_gems/ops/special_expit.py routes expit through
-# tl_extra_shim.exp2 -> extern `_ZN3xpu5exp2fEf` (XPU software libdevice-style
-# implementation, the same slow-extern family as the erfc/erf/lgamma fixes;
-# baseline measures 79ms vs 0.21ms torch on (4096,4096) fp16, Gems Speedup
-# ~0.0026x).  This override computes expit with the core triton math op
-# tl.exp (math::ExpOp -> LLVM::Exp2Op, the fast native path already used by
-# _kunlunxin/ops/sigmoid.py), so there is no extern call at all:
-#   y = 1 / (1 + exp(-x))         computed in fp32, downcast at store.
-# Accuracy vs a CPU fp64 reference (randn over all test shapes):
-#   fp16 max abs err 2.44e-4  (0.22x of tolerance atol 1e-4 + rtol 1e-3*|ref|)
-#   fp32 max abs err 5.96e-8  (0.0006x of atol 1e-4 + rtol 1.3e-6*|ref|)
-#   bf16 max abs err 1.95e-3  (0.12x  of atol 1e-4 + rtol 0.016*|ref|)
-# NaN/Inf semantics match torch: NaN propagates; +Inf -> 1.0; -Inf -> 0.0;
-# +-0 -> 0.5.
-#
-# Tile buckets sweep-measured on XPU for this kernel (12 benchmark shapes x
-# fp16/fp32/bf16, triton.testing.do_bench A/B in a single process, see
-# harness/solution/performance/special_expit_perf.md); num_warps measures as a
-# no-op on this backend, so buckets are chosen on tile width and dtype:
-#   fp16: 16384/8 (>=1M), 4096/4 (262K), 8192/4 (65K), 2048/4 (below)
-#   fp32: 65536/16 (>=4M), 16384/8 (1M-4M), 8192/4 (262K), 4096/4 (65K)  [vec]
-#   bf16: 131072/32 (>=4M), 32768/8 (1M-4M), 16384/8 (262K), 8192/4 (65K) [vec]
-# The "vec" variants set isCloseVectorization=True (skips the normalize/
-# vectorize rewriter, the config used by the sibling _kunlunxin/ops/sigmoid.py
-# kernel, which measures 20-35% faster than the default pass on bf16/fp32
-# large tiles).  Unmasked runs when the shape divides the tile exactly
-# (masked memory path on XPU costs ~2x); every benchmark shape divides its
-# bucket, and non-dividing shapes fall back to the same tile with a mask.
-
 import logging
 
 import torch

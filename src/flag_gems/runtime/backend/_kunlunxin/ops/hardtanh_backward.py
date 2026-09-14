@@ -12,42 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU) override of hardtanh_backward.
-#
-# hardtanh_backward is a pure elementwise mask op (grad * [min_val < x < max_val]).
-# The generic `flag_gems.ops.hardtanh_backward` runs a flat BLOCK=1024 always-masked
-# kernel with the default CodeGenConfig; on XPU that lowers to the slow masked
-# memory path (measured 2026-09-04 on 16.7M elements: 2.03 ms fp16 / 1.95 ms fp32,
-# ~0.06x / ~0.08x vs the 0.073 ms / 0.123 ms vendor native kernel).
-#
-# This override reuses the proven hardsigmoid_backward recipe (same op shape:
-# masked pointwise backward), which measured 0.108 ms fp16 / 0.141 ms fp32 /
-# 0.108 ms bf16 on the same 16.7M shapes (18.8x / 13.8x / 18.8x vs the generic):
-#   1. pointwise_dynamic codegen with prefer_1d_tile=True + kunlunAutoGrid=True
-#      (12-CTA grid, pow2 tile) is the established fast grid on XPU.
-#   2. unroll_num=4 is the sweet spot for this op (sweep 4/8/16 x buffer_size_limit
-#      2048..16384: unroll 8 is 6-11% slower, unroll 16 is 17-27% slower;
-#      buffer_size_limit is a no-op in 2048..16384).
-#   3. The derivative is written with saturating fp arithmetic only, exactly like
-#      the proven lt_/less_/hardsigmoid_backward recipe (the i1-compare form
-#      `(x > min) & (x < max)` multiplied into a float lowers to the per-lane
-#      slow path, 0.68 ms vs 0.11 ms here):
-#        p = max(0, (x-min)*1e30), q = max(0, (max-x)*1e30)
-#      1e30 saturates every fp16/bf16/fp32 gap around the bounds (min gap
-#      1.2e-7 -> 1.2e23), so min(1,p)*min(1,q) is exactly 1.0 on (min,max) and
-#      0.0 at/outside the bounds (strict at the boundary, matching the CPU
-#      reference: hardtanh_backward(g, -1.0, -1, 1) == 0).  NaN inputs resolve
-#      to 0.0 through the backend's min/max non-NaN preference, matching the
-#      CPU reference.  maxabsdiff vs torch CPU reference: 0.0 on all checked
-#      fp16/fp32/bf16 random and boundary inputs.
-#   4. isCloseDtypeConvert=True and isCloseVectorization=True must stay at
-#      their defaults (False): the former crashes the bf16 lowering with a
-#      VTruncFOpConversion assertion, the latter regresses 60x (see
-#      hardsigmoid_backward).
-#
-# Bedrock check: `_FULL_CONFIG["hardtanh_backward"].__module__` must become
-# `_kunlunxin.ops.hardtanh_backward` once `_kunlunxin/ops/__init__.py` imports
-# this module (registration is applied by the harness main agent).
 import logging
 
 import triton

@@ -41,14 +41,7 @@ config_ = CodeGenConfig(
     is_tensor=[True, False, False], promotion_methods=[(0, "DEFAULT")], config=config_
 )
 @triton.jit
-def threshold_kernel(self, threshold, value):
-    # `tl.where(self > threshold, self, value)` lowers `arith.cmpf` (fp compare
-    # -> i1) to a slow per-lane path on XPU (4096^2 fp16 ~0.70-0.76ms vs ~0.10ms
-    # memory floor). Saturating-arithmetic select keeps the vectorized fast
-    # path: m = saturate((x - t) * 1e30) lands exactly on {0, 1}; the two-term
-    # blend x*m + v*(1-m) is then exact. Note 1e30 (finite in fp32) saturates in
-    # f32; for fp16 the same constant overflows to inf, so the whole
-    # computation stays in the native dtype (f16<->f32 converts are slow here).
+def threshold_kernel(self, threshold, value): 
     if self.dtype == tl.float16:
         big = tl.full((), 1.0e30, dtype=self.dtype)
         d = (self - threshold) * big
@@ -66,28 +59,9 @@ def threshold_kernel(self, threshold, value):
     is_tensor=[True, True, False], promotion_methods=[(0, 1, "DEFAULT")], config=config_
 )
 @triton.jit
-def threshold_backward_kernel(grad_output, self, threshold):
-    # grad_input = grad_output where self > threshold else 0.
-    # The old form `tl.where(self > threshold, grad_output, 0)` compiles a
-    # data-dependent select-against-a-zero-constant on XPU that pins gems latency
-    # far above the memory floor: 4096^2 fp16 0.46ms / fp32 0.40ms / bf16 0.48ms
-    # (fp16 SLOWER than fp32 -> not memory-bound). A plain add/mul of the two
-    # tensors runs at the memory floor (~0.10ms fp16), so the select-with-zero is
-    # the cost, not the compare or the memory traffic. Rewriting the select as a
-    # multiply by the boolean mask keeps the tensor-op fast path: 4096^2 fp16
-    # 0.46->0.32, fp32 0.40->0.28, bf16 0.48->0.43 (avg gems speedup 0.172->0.221).
+def threshold_backward_kernel(grad_output, self, threshold): 
     return grad_output * (self > threshold)
 
-
-# XPU background (4096^2 fp16, tl.mul ~0.50ms): any fp compare kernel
-# (x * (y > t), tl.where, sub-then-compare) lands at ~0.70-0.76ms — the XPU
-# backend lowers `arith.cmpf` to a slow scalar path. An equivalent UINT32
-# bit-pattern test (`arith.cmpi`) plus a magnitude bound (`0x7F800000` clears
-# negatives/inf/NaN) keeps the vectorized int fast path. This candidate is
-# strictly better than the pointwise kernel on every case of the
-# comprehensive benchmark (do_bench, dtype-equal gems speed ~0.29x -> ~0.36x,
-# still < 1.0x gate). Restricted to non-negative fp32 thresholds (host check);
-# everything else falls back to the pointwise kernel above.
 _THRESHOLD_BWD_BLOCK = 16384
 _THRESHOLD_BWD_BLOCK_SMALL = 8192
 _THRESHOLD_BWD_WARPS = 1

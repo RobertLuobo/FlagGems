@@ -18,21 +18,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def resize(inp: torch.Tensor, size, memory_format=None):
-    """Out-of-place resize (kunlunxin / XPU).
-
-    The generic implementation copies the data with a Triton kernel
-    (``_resize_kernel``). On XPU that contiguous copy is ~22x slower than the
-    vendor's native copy engine (e.g. [4096, 4096] fp16: 0.88ms vs 0.04ms),
-    which makes every ``resize`` call pure overhead (native resize copies the
-    preserved elements with the DMA engine and is essentially free).
-
-    Fix: allocate the output and copy the preserved ``min(old, new)`` elements
-    through the ATen ``_copy_from`` primitive. gems overrides ``copy_``/``copy``
-    but never ``_copy_from``, so this reaches the native strided-copy engine and
-    runs at native speed even while use_gems is active. Result matches native
-    ``aten.resize`` exactly (output is a fresh tensor, not an alias).
-    """
+def resize(inp: torch.Tensor, size, memory_format=None): 
     logger.debug("GEMS RESIZE")
 
     if not isinstance(size, tuple):

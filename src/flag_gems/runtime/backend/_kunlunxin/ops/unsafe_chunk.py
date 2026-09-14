@@ -11,27 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Kunlunxin (TritonXPU) specialization of unsafe_chunk.
-#
-# Why this override exists (2026-09-05, XPU 6)
-# --------------------------------------------
-# The general implementation in src/flag_gems/ops/unsafe_chunk.py materializes
-# each chunk with ``A[tuple(slices)]``, which lowers to ``aten::slice.Tensor``
-# and is only correct here because the vendor ``CUSTOMIZED_UNUSED_OPS``
-# excludes ``"slice"`` (native torch_xmlir zero-copy view).  It also has two
-# deviations from ``torch.unsafe_chunk`` reference semantics:
-#
-#   * ``chunks <= 0`` raises ``ZeroDivisionError`` (``(size + chunks - 1) // 0``)
-#     instead of torch's ``RuntimeError("chunk expects `chunks` to be greater
-#     than 0, got: ...")``;
-#   * a zero-sized ``dim`` (e.g. ``torch.empty(0)``) returns ``[]`` whereas
-#     ``torch.unsafe_chunk`` returns exactly ``chunks`` empty views.
-#
-# This override re-implements ``torch.unsafe_chunk`` semantics (ceiling
-# division, at most one smaller final chunk, returns fewer than ``chunks``
-# entries when ``chunks > dim_size``) through ``torch.narrow``, a zero-copy
-# view equivalent to slicing that is safe inside ``use_gems()``.
 
 import logging
 from typing import List

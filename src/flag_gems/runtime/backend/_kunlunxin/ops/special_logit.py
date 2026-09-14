@@ -11,19 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kunlunxin (XPU) special_logit / special_logit.out.
-
-The generic src/flag_gems/ops/special_logit.py kernel guards the eps-clamp
-with `tl.where(x_f32 != x_f32, ...)` to keep NaN inputs as NaN.  On the
-Triton-XPU backend that unordered float compare lowers to an LLVM `setuo`
-(`setcc ... setuo`) on v16f32, which the xdnn/xpu backend cannot select and
-`make_elf` aborts the whole process (only the fp32/bf16 case is hit after the
-fp16 variant was compiled; fp16 also crashes with more than one block).
-The vendor kernel below replaces the unordered compare with two ordered
-comparisons (`x < lo` / `x > hi`): for NaN both predicates are false, so the
-value passes through unchanged and NaN is preserved, and the ordered
-predicates are selectable on XPU.
-"""
 import logging
 
 import torch

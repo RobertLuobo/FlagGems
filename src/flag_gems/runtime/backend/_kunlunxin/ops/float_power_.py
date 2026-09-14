@@ -11,36 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Kunlunxin(XPU) float_power / float_power_ vendor implementation.
-#
-# Why a vendor override is required (xpu3 libdevice, 2026-09-04):
-#   * `triton.language.extra.xpu.libdevice.pow` maps (fp64, fp64) to
-#     ("Unsupported", fp64) and fp64 exp2/log2 are "Unsupported" as well, so
-#     the generic implementation (`_pow(x.to(tl.float64), e.to(tl.float64))`)
-#     fails to link with `ld.lld: undefined symbol: Unsupported` on XPU.
-#   * The generic in-place variants already cast to tl.float32 before pow
-#     (lowering to the supported `_ZN3xpu3powEff`); the functional
-#     `float_power.{Tensor_Tensor,Tensor_Scalar,Scalar}` (float64 out)
-#     variants do not, so the benchmark's `torch.float_power(...)` call under
-#     use_gems fails to compile end-to-end on XPU.
-#   * Additionally, this TorchXPU build remaps every device-side float64
-#     allocation to float32 (no fp64 hardware), so `torch.empty(..., float64)`
-#     is a float32 tensor here; the functional variants' f64 output is
-#     therefore float32 on the device.
-#
-# Implementation:
-#   * Fast path (contiguous, equal-shape inputs): 1D big-tile kernel on the
-#     SFU chain `r = exp2(e * log2(|x|))` (on this backend tl.exp2/tl.log2
-#     are e^x / ln(x) numerically, so r == |x|^e), with in-kernel corner-case
-#     handling (negative base x integer exponent => sign * |x|^e; negative
-#     base x non-integer exponent => NaN; e == 0 => 1; x = 0 / +/-inf / NaN
-#     fall out of the SFU chain). Mirrors the approach validated for
-#     `_kunlunxin/ops/pow.py` (2026-08-15/19 probes) and the 2026-08-17
-#     float_power_ candidate.
-#   * Fallback: pointwise_dynamic fp32 pow (same math as the generic
-#     in-place implementation) for broadcast / non-contiguous inputs.
-
 import logging
 
 import torch

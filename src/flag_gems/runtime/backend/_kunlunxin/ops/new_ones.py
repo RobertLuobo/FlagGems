@@ -1,25 +1,3 @@
-# Kunlunxin (XPU) override of new_ones.
-#
-# The generic new_ones launches the pure-write `ones_kernel` with a hard-coded
-# BLOCK_SIZE=1024 -> grid = cdiv(N, 1024). For large N this is millions of tiny
-# programs, so the fill is LAUNCH-BOUND (~10-20 GB/s) regardless of size.
-#
-# Fix (committed): size-banded BLOCK_SIZE / num_warps so each program writes a
-# wide contiguous block DMA and the grid stays small.
-#
-# Native-dtype store trap (this rewrite's finding): on this XPU triton backend
-# an fp16/bf16/fp32 `tl.store` materialises a SLOW (narrowly-vectorised) store
-# (~1.16-1.40 TB/s measured) while the SAME bytes through an INT view are a
-# fast block DMA at ~2.25-2.30 TB/s (int16 for bf16, int32 for fp16/fp32; the
-# earlier commit already used this trick for bf16). This rewrite generalises
-# the trick:
-#   - fp16/bf16/fp32: fill through an int32 view with the bit pattern of 1.0
-#     (fp16 0x3C003C00, bf16 0x3F803F80, fp32 0x3F800000) -> ~2.25 TB/s,
-#     BEATING the torch native fill (~2.05 TB/s) on large sizes.
-#   - exact (n % BLOCK == 0) grids use an unmasked kernel; otherwise the masked
-#     variant.  Odd N for 16-bit dtypes falls back to the int16-view path.
-#   - int64-view stores are much SLOWER (only ~0.85 TB/s) -> never use 8-byte.
-# Pure write -> zero correctness risk; all values are the exact 1.0 bit pattern.
 import logging
 
 import torch

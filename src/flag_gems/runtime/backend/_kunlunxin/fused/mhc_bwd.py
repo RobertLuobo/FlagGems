@@ -15,7 +15,7 @@
 import torch
 
 from flag_gems.fused.mhc.mhc_bwd import mhc_bwd as _general_mhc_bwd
-from flag_gems.ops import empty as _gems_empty
+from flag_gems import empty as _gems_empty
 from flag_gems.ops import pad as _gems_pad
 
 _BLOCK_S = 64  # must match BLOCK_S in the general _mhc_bwd_kernel_n4

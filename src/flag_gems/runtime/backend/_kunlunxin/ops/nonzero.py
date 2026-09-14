@@ -28,23 +28,11 @@ from .cumsum import cumsum
 logger = logging.getLogger(__name__)
 
 
-def nonzero_kernel_heur_block_size(args):
-    # NOTE(kunlunxin): the unbounded next_pow2(cdiv(n, 12)) tile is an IR bomb:
-    # at 16 M elements it lowers a 2 M-lane tile (compile minutes + giant LLVM
-    # expansion, see HARNESS_SUMMARY 2.1).  The kernel is linear (3 memory ops
-    # + an ndim-loop), so any tile >= 64 is semantics-identical; cap at 4096
-    # (the largest tile qualified for linear kernels on this backend; the
-    # grid becomes cdiv(n, 4096) programs either way).
+def nonzero_kernel_heur_block_size(args): 
     return min(triton.next_power_of_2(triton.cdiv(args["n_elements"], 12)), 4096)
 
 
-@libentry()
-# @triton.autotune(
-#     configs=runtime.get_tuned_config("nonzero"),
-#     key=[
-#         "n_elements",
-#     ],
-# )
+@libentry() 
 @triton.heuristics(
     values={
         "BLOCK_SIZE": nonzero_kernel_heur_block_size,
@@ -94,12 +82,7 @@ def nonzero_dense_flat_kernel(
     shape,
     ndim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-):
-    # DENSE (no zeros): row-major output [N, ndim]. One lane per OUTPUT element,
-    # j = i*ndim + d, coord = (i // stride[d]) % shape[d]. Fully contiguous store.
-    # FALLBACK kernel for ndim > 8 (per-lane metadata loads); the default dense
-    # path uses nonzero_dense_flat_args_kernel which keeps shape/strides in
-    # kernel arguments (no global loads, no masked loads).
+): 
     pid = ext.program_id(0)
     j = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = j < n_out
@@ -339,6 +322,20 @@ def _is_dense(inp):
     return inp, inp_bool, prefix_sum, num_nonzeros
 
 
+def _unbind_views(out):
+    """``unbind(out, dim=1)`` as zero-copy ``as_strided`` views.
+
+    ``unbind`` has no device kernel on XPU and falls back to the ATen
+    composite implementation (forbidden); ``torch.as_strided`` is metadata-only
+    and unregistered, so it never re-dispatches. ``out`` is row-major
+    [N, ndim], so column i is the view shape (N,), stride (ndim,), offset i.
+    """
+    n, ndim = out.shape
+    return [
+        torch.as_strided(out, (n,), (ndim,), storage_offset=i) for i in range(ndim)
+    ]
+
+
 def nonzero(inp, *, as_tuple=False):
     logger.debug("GEMS_KUNLUNXIN NONZERO")
 
@@ -351,7 +348,7 @@ def nonzero(inp, *, as_tuple=False):
             (0, inp_ndim) if inp_ndim else (0, 0), dtype=torch.int64, device=inp.device
         )
         if as_tuple:
-            return torch.unbind(out, dim=1) if inp_ndim else ()
+            return _unbind_views(out) if inp_ndim else ()
         return out
 
     inp = inp.contiguous()
@@ -392,7 +389,7 @@ def nonzero(inp, *, as_tuple=False):
                     is_use_mask_zero=True,
                 )
         if as_tuple:
-            return torch.unbind(out, dim=1)
+            return _unbind_views(out)
         return out
 
     # SPARSE path: data-dependent scatter via prefix sum.
@@ -413,7 +410,7 @@ def nonzero(inp, *, as_tuple=False):
         )
 
     if as_tuple:
-        return torch.unbind(out, dim=1)
+        return _unbind_views(out)
     else:
         return out
 
@@ -458,7 +455,7 @@ def _dense_result(inp, num_nonzeros, as_tuple):
                     is_use_mask_zero=True,
                 )
     if as_tuple:
-        return torch.unbind(out, dim=1)
+        return _unbind_views(out)
     return out
 
 
@@ -485,7 +482,7 @@ def _sparse_result(inp, inp_ndim, n_elements, num_nonzeros, as_tuple):
             is_use_mask_zero=True,
         )
     if as_tuple:
-        return torch.unbind(out, dim=1)
+        return _unbind_views(out)
     return out
 
 

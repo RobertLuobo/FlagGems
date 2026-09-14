@@ -22,7 +22,7 @@ import flag_gems.fused.mhc.hc_split_sinkhorn as _general_module
 from flag_gems.fused.mhc.hc_split_sinkhorn import (
     hc_split_sinkhorn as _general_hc_split_sinkhorn,
 )
-from flag_gems.ops import empty as _gems_empty
+from flag_gems import empty as _gems_empty
 
 _SUPPORTED_HC = (2, 4)
 _BLOCK_N = 64

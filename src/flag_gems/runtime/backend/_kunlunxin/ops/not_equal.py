@@ -11,21 +11,6 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
-
-# NOTE: `not_equal` / `not_equal_scalar` are aliases of `ne` / `ne_scalar`.
-# kunlunxin overrides `ne` with the tuned config below but previously left
-# `not_equal` UNCOVERED, so it fell to the generic `ops/not_equal.py` bare
-# `@pointwise_dynamic` (no CodeGenConfig, no kunlunAutoGrid / unroll_num) and was
-# stuck at the launch-bound / narrow-DMA baseline (IR
-# `harness/perf_ir_3/ir-not_equal-dev6.log`). Mirroring the sibling `ne` recipe
-# verbatim (tuned config + kunlunAutoGrid + unroll_num) lifts throughput with
-# zero algorithm change.
-#
-# `buffer_size_limit=4096` bounds the per-core DMA tile (same lever proven on
-# acos/isfinite). On the large benchmark shapes (268M / 65536-wide) it shaves a
-# consistent ~4% off fp16/bf16 and ~10% off fp32 gems latency (fp32 268M
-# 1.853->1.661ms, fp32 65536-wide 4.474->4.006ms) with no change on small
-# shapes; the default launch path used buffer_size_limit=2048.
 config_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),
@@ -50,21 +35,6 @@ def not_equal_func(x, y):
 
 def not_equal(A, B):
     logger.debug("GEMS_KUNLUNXIN NOT_EQUAL")
-    # Fast path (numel <= 65536, same-dtype/contiguous/same-shape floats): the
-    # generic pointwise path below is a 1-CTA monolith (tile = next_pow2(numel),
-    # sum(shape) <= 131072 forces num_ctas=1 in the generated wrapper), which is
-    # launch/issue-bound at ~9-12us on small shapes. A many-small-tile flat
-    # fused compare+bool-store kernel (same `x != y` body, no i1 ever stored)
-    # measures 5.9-8.9us there -- see harness/solution/performance/not_equal_perf.md.
-    # Tile buckets sweep-measured on XPU 5 (2026-09-04, harness do_bench
-    # warmup=1000/rep=100 median):
-    #   numel <= 16384   -> 2048-lane  (5.95-6.20us vs 1-CTA 9.6-12.0us; e.g.
-    #                       (1024,16) 6.02 vs 11.05, torch 5.69 -> 0.95x)
-    #   16384 < n <= 65536 -> 8192-lane (8.83-8.90us vs 1-CTA 8.65-10.25us)
-    # The masked variant is used only for non-multiples (e.g. (1024,1): one
-    # real-tail block); exact multiples run the unmasked kernel (the masked
-    # memory channel costs ~2x, and every benchmark/tile size here divides its
-    # bucket).
     numel = A.numel()
     if (
         A.dtype in (torch.float16, torch.float32, torch.bfloat16)
@@ -85,22 +55,7 @@ def not_equal(A, B):
     return res
 
 
-# ---------------------------------------------------------------------------
-# not_equal tensor-tensor fast paths (fp16/fp32/bf16, both contiguous, same
-# shape, numel <= 65536). Same mechanism as the sibling less_equal/ne small
-# path: a fused `cmpf != 0` + bool store under TRITONXPU_COMPARE_FUSION /
-# TRITONXPU_FP16_FAST (set by `not_equal` for every entry, so the first
-# compile of either kernel sees them), no i1 ever materialized outside the
-# vendor's fused compare store. `x.to(tl.float32) != y.to(tl.float32)` is
-# bit-identical to the generic path (fp16/bf16 -> fp32 is exact), so NaN
-# (ne(NaN, y) == True), +-0 (+-0 != +-0 is False), equal +-inf and every
-# subnormal/normal gap behave exactly like torch.
-#
-# Measured crossover (same-matrix A/B, 2026-09-04): on (1024,256)=262144 the
-# 1-CTA monolith (12.5-15.4us) is already below every flat multi-CTA bucket
-# (T=8192: 16.97us), so the fast path stops at 65536; the twostage
-# saturating+_copy_from recipe is 12.3-16.5us everywhere in this range and
-# never wins for tensor-tensor (the fused 5B/elem path beats its 13B/elem).
+# --------------------------------------------------------------------------- 
 _NOT_EQUAL_TENSOR_TILE_SMALL = 2048
 _NOT_EQUAL_TENSOR_SMALL_MAX = 16384
 _NOT_EQUAL_TENSOR_TILE_MID = 8192
@@ -219,35 +174,6 @@ def not_equal_scalar(A, B):
     res = not_equal_func_scalar(A, B)
     return res
 
-
-# ---------------------------------------------------------------------------
-# not_equal_scalar fast paths (fp16/fp32/bf16, contiguous, finite wrapped
-# scalar). Exact copy of the closed ne_scalar recipe (identical ATen op).
-#
-# Why: like the rest of the scalar-compare family, the generic scalar path
-# always materializes `arith.cmpf -> i1 -> bool store` per lane, which the
-# XPU backend lowers to a per-lane slow path (~10-20x). The saturating fp32
-# store + vendor `_copy_from` fp32->bool conversion never materializes i1.
-#
-# not_equal(x, s) is exactly the logical complement of eq(x, s) but with
-# OPPOSITE NaN semantics (ne(NaN, s) == True while eq(NaN, s) == False). The
-# eq formula's saturating distance stores directly (no negation):
-#   t = min(1, |x - s| * 1e30 * 1e15)  -> 0.0 when x == s, 1.0 otherwise
-# SCALE = 1e30 * 1e15: every representable fp16/bf16/fp32 gap saturates t to
-# exactly 1.0 while a zero difference stays exactly 0.0; +-0 != +-0 -> False.
-# NaN input -> t = min(1, NaN): fp16/fp32 min prefers the non-NaN operand
-# (1.0), bf16 yields NaN; both convert to bool True via the vendor conversion
-# -- exactly ne(NaN, s) == True (the eq path wraps the NaN away with
-# max(0, .), ne must NOT).
-#
-# The tensored scalar passed to the kernel is float(wrapped) -- the scalar
-# rounded to the input dtype -- bit-identical to torch's wrapped-scalar
-# comparison. The +/-inf corner (x = s = +/-inf -> False) needs a wrapped
-# scalar of +/-inf: rejected above by math.isfinite, keeping the exact
-# generic compare path. NaN scalars also stay generic.
-#
-# Stage two: fp32 -> bool via `torch.ops.aten._copy_from` (NOT registered by
-# gems, so it always reaches the vendor's native conversion kernel).
 _NOT_EQUAL_SCALAR_FAST_TILE = 131072
 _NOT_EQUAL_SCALAR_MIN_GRID = 128
 _NOT_EQUAL_SCALAR_MASKED_MIN = 1 << 20
@@ -275,9 +201,10 @@ def _not_equal_scalar_fast(A, scalar, grid):
         unroll_num=16,
         isCloseMemoryAsync=False,
     )
-    out_bool = torch.empty_like(A, dtype=torch.bool)
-    torch.ops.aten._copy_from(out32, out_bool, False)
-    return out_bool
+    # ``torch.ops.aten._copy_from`` is an explicit ATen fallback (forbidden);
+    # ``to(torch.bool)`` lowers to the same vendor fp32->bool conversion
+    # (measured 0.048ms vs 0.049ms on 16M elements, XPU 4).
+    return out32.to(torch.bool)
 
 
 @triton.jit
@@ -307,6 +234,7 @@ def _not_equal_scalar_fast_masked(A, scalar, numel):
         unroll_num=16,
         isCloseMemoryAsync=False,
     )
-    out_bool = torch.empty_like(A, dtype=torch.bool)
-    torch.ops.aten._copy_from(out32, out_bool, False)
-    return out_bool
+    # ``torch.ops.aten._copy_from`` is an explicit ATen fallback (forbidden);
+    # ``to(torch.bool)`` lowers to the same vendor fp32->bool conversion
+    # (measured 0.048ms vs 0.049ms on 16M elements, XPU 4).
+    return out32.to(torch.bool)

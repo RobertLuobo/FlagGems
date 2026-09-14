@@ -12,27 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin( XPU ) erfc(x) = 1 - erf(x).
-#
-# The generic flag_gems/ops/special_erfc.py routes erfc through
-# tl_extra_shim.erfc -> extern `_ZN3xpu4erfcEf` (XPU software libdevice-style
-# implementation), which measures ~76x slower than torch-native on 16.7M+
-# element tiles (baseline Gems Speedup ~= 0.013x on (4096, 4096) fp32,
-# 40.9ms vs 0.563ms).  This override reuses the exact odd polynomial
-# x*P(x^2) already validated in _kunlunxin/ops/erf.py (LSQ fit on
-# t in [0, 9], deg-12 in t, fp32 Horner max abs err 3.7e-5 on [0, 3.0] and
-# hard saturation at |x| > 3) and computes erfc = 1 - erf:
-#   x >  3 : 1 -  1.0 = 0.0   (ref erfc(3.5)=7.4e-7, |diff| < atol 1e-4)
-#   x < -3 : 1 - -1.0 = 2.0   (ref erfc(-3.5)=1.9999993, |diff| < atol 1e-4)
-#   else   : 1 - x*P(x^2)     (abs err <= 3.7e-5, same margin as erf itself;
-#                              dense-grid check vs torch.erfc: max |diff|
-#                              3.45e-5, 0.345x of the test tolerance
-#                              atol 1e-4 + rtol 1.3e-6*|ref|)
-# There is no transcendental at all (no exp), only FMA/dp2a-friendly Horner,
-# matching the design that made the erf kernel ~2.9x faster than torch-native.
-# NaN/Inf semantics: comparisons are false for NaN so the polynomial
-# propagates NaN; +/-Inf saturate to 0.0 / 2.0 exactly like torch.
-
 import logging
 
 import torch
