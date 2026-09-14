@@ -184,7 +184,6 @@ from flag_gems.ops.adaptive_avg_pool3d_backward import (
 )
 from flag_gems.ops.adaptive_max_pool2d import adaptive_max_pool2d
 from flag_gems.ops.adaptive_max_pool2d_backward import adaptive_max_pool2d_backward
-from flag_gems.ops.adaptive_max_pool3d import adaptive_max_pool3d
 from flag_gems.ops.adaptive_max_pool3d_backward import adaptive_max_pool3d_backward
 from flag_gems.ops.add import add, add_
 from flag_gems.ops.addbmm import addbmm, addbmm_
@@ -326,10 +325,6 @@ from flag_gems.ops.conv_tbc_backward import conv_tbc_backward
 from flag_gems.ops.conv_transpose1d import conv_transpose1d
 from flag_gems.ops.conv_transpose2d import conv_transpose2d
 from flag_gems.ops.conv_transpose3d import conv_transpose3d
-from flag_gems.ops.convolution_overrideable import (
-    convolution_overrideable,
-    convolution_overrideable_out,
-)
 from flag_gems.ops.copy import copy, copy_
 from flag_gems.ops.copysign import copysign, copysign_out
 from flag_gems.ops.copysign_ import copysign_
@@ -479,6 +474,7 @@ from flag_gems.ops.greater import (
 )
 from flag_gems.ops.greater_equal import greater_equal_
 from flag_gems.ops.grid_sample import grid_sample
+from flag_gems.ops.grid_sampler_3d import grid_sampler_3d
 from flag_gems.ops.grid_sampler_3d_backward import grid_sampler_3d_backward
 from flag_gems.ops.group_gemm import group_mm
 from flag_gems.ops.groupnorm import group_norm, group_norm_backward
@@ -1152,7 +1148,6 @@ __all__ = [
     "adaptive_avg_pool3d_backward_grad_input",
     "adaptive_max_pool2d",
     "adaptive_max_pool2d_backward",
-    "adaptive_max_pool3d",
     "adaptive_max_pool3d_backward",
     "add",
     "add_",
@@ -1323,8 +1318,6 @@ __all__ = [
     "conv_transpose1d",
     "conv_transpose2d",
     "conv_transpose3d",
-    "convolution_overrideable",
-    "convolution_overrideable_out",
     "copy",
     "copy_",
     "copysign",
@@ -1493,6 +1486,7 @@ __all__ = [
     "greater_scalar",
     "greater_scalar_out",
     "grid_sample",
+    "grid_sampler_3d",
     "grid_sampler_3d_backward",
     "group_mm",
     "group_norm",
