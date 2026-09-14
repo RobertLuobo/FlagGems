@@ -90,7 +90,7 @@ from .asin import asin, asin_
 from .assert_async import _assert_async
 from .atan import atan, atan_
 from .atan2 import atan2, atan2_, atan2_out
-from .atanh import atanh, atanh_  # noqa: F401
+from .atanh import atanh, atanh_, atanh_out  # noqa: F401
 from .attention import (  # noqa: F401
     ScaleDotProductAttention,
     flash_attention_forward,
@@ -703,6 +703,9 @@ __all__ = [
     "arcsin",
     "arcsin_",
     "arcsin_out",
+    "arcsinh",
+    "arcsinh_",
+    "arcsinh_out",
     "arctan",
     "arctan2",
     "arctan2_",
@@ -720,6 +723,9 @@ __all__ = [
     "atan2_",
     "atan2_out",
     "atan_",
+    "atanh",
+    "atanh_",
+    "atanh_out",
     "avg_pool2d",
     "avg_pool2d_backward",
     "avg_pool3d",
@@ -795,6 +801,9 @@ __all__ = [
     "copysign_out",
     "cos",
     "cos_",
+    "cosh",
+    "cosh_",
+    "cosh_out",
     "count_nonzero",
     "cummax",
     "cummin",
