@@ -23,6 +23,7 @@ from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
 
+
 @triton.jit
 def reflection_pad1d_kernel(
     in_ptr,

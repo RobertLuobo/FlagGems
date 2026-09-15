@@ -28,7 +28,7 @@ def _t_copy_pw(src):
     return src
 
 
-def _launch_t_copy_kernel(inp: torch.Tensor, out: torch.Tensor): 
+def _launch_t_copy_kernel(inp: torch.Tensor, out: torch.Tensor):
     if inp.device.type != flag_gems.device or out.device.type != flag_gems.device:
         raise ValueError(f"t_copy kernels require {flag_gems.device} tensors")
     assert inp.dtype == out.dtype, "dtype mismatch between input and output"

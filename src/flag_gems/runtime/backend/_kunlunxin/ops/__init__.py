@@ -25,7 +25,7 @@ from ._batch_norm_no_update import _batch_norm_no_update
 from ._dyn_quant_pack_4bit_weight import _dyn_quant_pack_4bit_weight
 from ._embedding_bag_dense_backward import _embedding_bag_dense_backward
 from ._embedding_bag_per_sample_weights_backward import (
-    _embedding_bag_per_sample_weights_backward,
+    _embedding_bag_per_sample_weights_backward,  # noqa: F401
 )
 from ._euclidean_dist import _euclidean_dist
 from ._functional_sym_constrain_range import _functional_sym_constrain_range
@@ -35,7 +35,7 @@ from ._functional_sym_constrain_range_for_size import (
 from ._fused_adam import _fused_adam, _fused_adam_
 from ._fused_rms_norm import _fused_rms_norm  # noqa: F401
 from ._is_all_true import _is_all_true
-from ._jagged_to_padded_dense_forward import _jagged_to_padded_dense_forward
+from ._jagged_to_padded_dense_forward import _jagged_to_padded_dense_forward  # noqa: F401
 from ._native_batch_norm_legit_functional import _native_batch_norm_legit_functional
 from ._native_batch_norm_legit_no_training import _native_batch_norm_legit_no_training
 from ._nested_view_from_buffer_copy import _nested_view_from_buffer_copy
@@ -134,7 +134,7 @@ from .bitwise_xor import (
     xor_scalar_,
     xor_scalar_tensor,
 )
-from .block_diag import block_diag
+from .block_diag import block_diag  # noqa: F401
 from .bmm import bmm, bmm_out
 from .broadcast_tensors import broadcast_tensors
 from .broadcast_to import broadcast_to

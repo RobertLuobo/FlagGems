@@ -55,7 +55,7 @@ def bitwise_and_tensor_(A, B):
     return bitwise_and_func(A, B, out0=A)
 
 
-# Scalar (tensor-vs-scalar) path. 
+# Scalar (tensor-vs-scalar) path.
 @pointwise_dynamic(
     is_tensor=[True, False], promotion_methods=[(0, 1, "DEFAULT")], config=config_
 )
@@ -100,7 +100,7 @@ def bitwise_and_scalar_(A, B):
 
 
 def bitwise_and_scalar_tensor(A, B):
-    logger.debug("GEMS_KUNLUNXIN BITWISE_AND_SCALAR_TENSOR") 
+    logger.debug("GEMS_KUNLUNXIN BITWISE_AND_SCALAR_TENSOR")
     if (
         B.dtype in (torch.bool, torch.int16)
         and B.is_contiguous()

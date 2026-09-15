@@ -187,7 +187,7 @@ def any_kernel_1(
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offset < n_elements
-    val = tl.load(inp + offset, mask=mask, other=0) 
+    val = tl.load(inp + offset, mask=mask, other=0)
     nz = tl.where(mask, val != 0, False)
     any_val = tl.reduce(nz, axis=0, combine_fn=reduce_any)
     tl.store(mid + pid, any_val)
@@ -203,7 +203,7 @@ def any_kernel_dim_v2(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NEED_MASK: tl.constexpr,
-): 
+):
     pid = ext.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     inp = inp + rows * N
@@ -234,6 +234,7 @@ def any_kernel_2(mid, out, MID_SIZE, BLOCK_MID: tl.constexpr):
     nz = tl.where(mask, val != 0, False)
     any_val = tl.reduce(nz, axis=0, combine_fn=reduce_any)
     tl.store(out, any_val)
+
 
 @libentry()
 @triton.jit
@@ -329,7 +330,7 @@ def any(inp):
     return out
 
 
-def _move_dim_last_contig(inp, dim): 
+def _move_dim_last_contig(inp, dim):
     if dim == inp.ndim - 1 and inp.is_contiguous():
         return inp
     order = [i for i in range(inp.ndim) if i != dim] + [dim]
@@ -374,7 +375,7 @@ def any_dim(inp, dim=None, keepdim=False):
             inpc = _move_dim_last_contig(inp, dim)
         M = inpc.numel() // N
 
-        if inp.dtype == torch.bool: 
+        if inp.dtype == torch.bool:
             if N <= 512:
                 block_m, block_n = 64, triton.next_power_of_2(N)
             elif N <= 4096:
@@ -395,20 +396,16 @@ def any_dim(inp, dim=None, keepdim=False):
                     NEED_MASK=need_mask,
                     buffer_size_limit=2048,
                 )
-        elif N >= vector_size * vector_size: 
-            outf = torch.empty(shape, dtype=torch.float, device=inp.device) 
-            block_m = triton.next_power_of_2(
-                min(triton.cdiv(M, cluster_num), core_num)
-            )
+        elif N >= vector_size * vector_size:
+            outf = torch.empty(shape, dtype=torch.float, device=inp.device)
+            block_m = triton.next_power_of_2(min(triton.cdiv(M, cluster_num), core_num))
             grid = (triton.cdiv(M, block_m),)
             with torch_device_fn.device(inp.device):
                 max_kernel_dim[grid](inpc, outf, M, N, buffer_size_limit=2048)
             out = outf.to(torch.bool)
         else:
             out = torch.empty(shape, dtype=torch.bool, device=inp.device)
-            block_m = triton.next_power_of_2(
-                min(triton.cdiv(M, cluster_num), core_num)
-            )
+            block_m = triton.next_power_of_2(min(triton.cdiv(M, cluster_num), core_num))
             grid = (triton.cdiv(M, block_m),)
             with torch_device_fn.device(inp.device):
                 any_kernel_dim[grid](inpc, out, M, N, buffer_size_limit=2048)
@@ -434,7 +431,7 @@ def any_dims(inp, dim=None, keepdim=False):
         shape[i] = 1
     M = inp.numel() // N
 
-    if M == 1: 
+    if M == 1:
         res = any(inp)
         out = res.reshape(shape)
     else:

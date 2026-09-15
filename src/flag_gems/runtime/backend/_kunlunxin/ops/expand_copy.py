@@ -89,8 +89,8 @@ def _expand_bcast_kernel(
 
 def _launch_bcast(shape, strides, src, dst, n):
     ndim = len(shape)
-    shapes = (tuple(shape) + (1,) * (6 - ndim))
-    strided = (tuple(strides) + (0,) * (6 - ndim))
+    shapes = tuple(shape) + (1,) * (6 - ndim)
+    strided = tuple(strides) + (0,) * (6 - ndim)
     grid = (triton.cdiv(n, _BCAST_BLOCK),)
     _expand_bcast_kernel[grid](
         src,

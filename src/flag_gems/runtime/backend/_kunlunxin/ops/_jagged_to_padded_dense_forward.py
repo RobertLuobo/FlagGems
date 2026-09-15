@@ -13,15 +13,13 @@
 # limitations under the License.
 import logging
 
-import torch
 import triton
 import triton.language as tl
 
-from flag_gems.utils import libentry
-from flag_gems.utils import triton_lang_extension as ext
-
 # Use the gems implementations for allocation/fill instead of raw torch calls.
 import flag_gems.ops as _general_ops
+from flag_gems.utils import libentry
+from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +107,10 @@ def _jagged_to_padded_dense_forward(values, offsets, max_lengths, padding_value=
         )
 
     output = _general_ops.full(
-        (batch_size, max_length), padding_value, dtype=values.dtype, device=values.device
+        (batch_size, max_length),
+        padding_value,
+        dtype=values.dtype,
+        device=values.device,
     )
 
     total_length = int(values.numel())

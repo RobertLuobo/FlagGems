@@ -79,7 +79,10 @@ def _embedding_bag_per_sample_weights_backward(
         raise RuntimeError(
             "embedding_bag_backward: per_sample_weights only supported for mode='sum'"
         )
-    assert indices.dtype in (torch.int32, torch.int64), "Indices must be int32 or int64."
+    assert indices.dtype in (
+        torch.int32,
+        torch.int64,
+    ), "Indices must be int32 or int64."
     assert (
         grad.device == weight.device == indices.device == offset2bag.device
     ), "All inputs must be on the same device."

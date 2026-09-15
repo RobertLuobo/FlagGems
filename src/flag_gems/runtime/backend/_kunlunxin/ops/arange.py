@@ -66,7 +66,7 @@ def arange_func_float(
     step,
     size,
     BLOCK_SIZE: tl.constexpr,
-): 
+):
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE
     cols = tl.arange(0, BLOCK_SIZE)
@@ -80,7 +80,7 @@ def arange_start(
     start, end, step=1, *, dtype=None, layout=None, device=None, pin_memory=None
 ):
     logger.debug("GEMS_KUNLUNXIN ARANGE")
-    if dtype is None: 
+    if dtype is None:
         if all(_is_integral_scalar(x) for x in (start, end, step)):
             dtype = torch.int64
         else:

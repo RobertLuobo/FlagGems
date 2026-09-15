@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
-def _std_partial_sum_kernel(X, Tmp, N, CHUNK, BLOCK_N: tl.constexpr): 
+def _std_partial_sum_kernel(X, Tmp, N, CHUNK, BLOCK_N: tl.constexpr):
     pid = tl.program_id(0)
     start = pid * CHUNK
     end = tl.minimum(start + CHUNK, N)
@@ -26,7 +26,7 @@ def _std_partial_sum_kernel(X, Tmp, N, CHUNK, BLOCK_N: tl.constexpr):
 
 
 @triton.jit
-def _std_partial_sq_kernel(X, Tmp, N, Mean, CHUNK, BLOCK_N: tl.constexpr): 
+def _std_partial_sq_kernel(X, Tmp, N, Mean, CHUNK, BLOCK_N: tl.constexpr):
     pid = tl.program_id(0)
     start = pid * CHUNK
     end = tl.minimum(start + CHUNK, N)
@@ -132,7 +132,7 @@ def std(x, dim=None, *, correction=None, keepdim=False):
         if N == 1 and effective_correction == 0.0:
             out = torch.zeros([], device=x.device, dtype=x.dtype)
             return out.view([1] * input_ndim) if keepdim else out
- 
+
         GRID = min(triton.cdiv(N, 65536), 1024)
         CHUNK = triton.cdiv(N, GRID)
         BLOCK_N = 1024
@@ -157,7 +157,7 @@ def std(x, dim=None, *, correction=None, keepdim=False):
     else:
         dim_list = list(dim)
     dim_list_normalized = [d % input_ndim for d in dim_list]
- 
+
     x_view = dim_compress(x, dim_list_normalized)
     N = 1
     for d in dim_list_normalized:

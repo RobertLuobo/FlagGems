@@ -25,6 +25,7 @@ from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
+
 @triton.jit
 def reflection_pad2d_kernel(
     in_ptr,
@@ -76,6 +77,7 @@ def copy_tensor_kernel(in_ptr, out_ptr, total, BLOCK: tl.constexpr):
     vals = tl.load(in_ptr + o, mask=mask)
     tl.store(out_ptr + o, vals, mask=mask)
 
+
 @triton.jit
 def pad2d_hside_kernel(
     in_ptr,
@@ -125,7 +127,7 @@ def pad2d_hside_kernel(
 
     vals = tl.load(in_ptr + b * HW_in + ih * W_in + iw)
     tl.store(out_ptr + b * HW_out + h_out * W_out + w, vals, mask=m)
- 
+
 
 @triton.jit
 def pad2d_wside_kernel(
@@ -331,7 +333,7 @@ def launch_reflection_pad2d(input: torch.Tensor, padding, out: torch.Tensor = No
     HW_out = H_out * W_out
     HW_in = H_in * W_in
     total_out = B * HW_out
- 
+
     if total_out >= 1048576:
         return _launch_reflection_pad2d_split(
             x,

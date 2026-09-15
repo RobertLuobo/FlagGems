@@ -4,7 +4,7 @@ import math
 import torch
 
 logger = logging.getLogger(__name__)
- 
+
 _FAST_PATH_MAX_RANK = 64
 
 

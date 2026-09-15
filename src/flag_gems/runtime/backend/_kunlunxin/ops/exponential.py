@@ -25,7 +25,7 @@ from flag_gems.utils.random_utils import (
 )
 
 logger = logging.getLogger(__name__)
- 
+
 PHILOX_ROUNDS = tl.constexpr(5)
 
 

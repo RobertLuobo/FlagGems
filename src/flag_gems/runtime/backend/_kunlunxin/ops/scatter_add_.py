@@ -17,7 +17,7 @@ from ..utils.tle_copy import tle_copy
 logger = logging.getLogger(__name__)
 
 
-def span_for_slice(slice_n: int, block: int) -> int: 
+def span_for_slice(slice_n: int, block: int) -> int:
     if slice_n <= 0:
         return block
     if slice_n >= block:

@@ -377,9 +377,7 @@ def tle_dma_available():
         elif os.environ.get("TRITON_ENABLE_XCN_BACKEND"):
             _TLE_DMA_AVAILABLE = False
         else:
-            _TLE_DMA_AVAILABLE = (
-                os.environ.get("TRITON_XPU_ARCH", "3") == "3"
-            )
+            _TLE_DMA_AVAILABLE = os.environ.get("TRITON_XPU_ARCH", "3") == "3"
     return _TLE_DMA_AVAILABLE
 
 
@@ -475,6 +473,7 @@ def _dsa_tile(rows: int, cols: int, element_size: int):
         max(DSA_TILE_BYTES // (cols_block * element_size), 1),
     )
     return rows_block, cols_block
+
 
 _TRANS_PLAN_CACHE = {}
 
