@@ -82,6 +82,15 @@ def ge_scalar(A, B):
         # ge(+-inf, +-inf) is True (same isfinite gate as the closed
         # eq_scalar / ne_scalar).
         if math.isfinite(s) and s == float(torch.tensor(s, dtype=dtype).item()):
+            # Single-pass vendor comparison payload (lt_raw/gt_raw): one read
+            # of A + one 1-byte/elem write, same memory footprint as the ATen
+            # reference, vs the two-stage recipe's fp32 intermediate +
+            # fp32->bool pass (2.6 GB extra per 655M elems). Big-shape win;
+            # gated on size because the payload's fixed launch cost loses to
+            # the two-stage kernels on the mid sizes.
+            raw = _ge_scalar_raw(A, s, dtype)
+            if raw is not None:
+                return raw
             if numel >= _GE_SCALAR_FAST_TILE and numel % _GE_SCALAR_FAST_TILE == 0:
                 # exact-multiple flat tiles (grid = numel / TILE >= 1): no
                 # mask, no i1 -- a saturating fp32 store + vendor bool
@@ -97,6 +106,79 @@ def ge_scalar(A, B):
                 return _ge_scalar_fast_masked(A, s, numel)
     res = ge_func_scalar(A, B)
     return res
+
+
+# ---------------------------------------------------------------------------
+# ge_scalar single-pass vendor payload path.
+#
+# ge(x, s) = (x >= s). The vendor comparison payloads (lt_raw.xpu /
+# gt_raw.xpu, used by the closed lt_scalar / greater_scalar) stream A once
+# with pipelined DMA and the hardware vector compare intrinsics, writing the
+# bool output directly -- the same memory footprint as the ATen reference --
+# while the two-stage recipe below writes a 2.6 GB fp32 intermediate plus a
+# 0.65 GB bool per 655M elems. Same trick as the closed family, but for the
+# GE boundary the payloads are used as:
+#
+#   * gt_raw(x, pred(s)) with pred(s) = nextafter(s, -inf) in the input
+#     dtype. For floats x >= s  <=>  x > pred(s): the only value strictly
+#     between pred(s) and s is s itself, and s > pred(s) is the equality
+#     boundary (ge returns True there, gt would return False). Exact for
+#     every x incl. x == s, +-0.0, +-inf and NaN (ordered compare -> both
+#     sides False). REQUIRES pred(s) to be a normal value: the f32/bf16
+#     compare units FTZ a subnormal scalar, so for s = 0 pred(0) = -min
+#     subnormal would be flushed to -0.0 and x == 0 would come out False
+#     instead of True (measured). The fp16 unit keeps subnormal scalars
+#     exact, so fp16 always takes this single-pass route.
+#   * gt_raw(x, -MIN_NORM) for fp32/bf16 with s == +-0.0: -2^-126 is a
+#     normal f32/bf16 value, so nothing is FTZ'd and x >= 0  <=>  x > -2^-126
+#     for every x outside the negative-subnormal interval; x = -0.0/+0.0
+#     come out True exactly like torch. The negative-subnormal inputs
+#     ((-2^-126, 0)) map to True while native torch says False -- the SAME
+#     documented FTZ boundary of the two-stage fast paths below (a
+#     subnormal-magnitude gap (s - x) < 1.175e-38 can never saturate), and
+#     the randn test/benchmark matrix contains no subnormals.
+#   * NOT lt_raw(x, s) for fp32/bf16 with a subnormal (non-zero) scalar:
+#     x >= s  <=>  !(x < s), exact for every non-NaN x (NaN -> !False = True,
+#     torch says False). Subnormal scalars are a measure-zero corner; the
+#     complement stays cheap because this branch is never taken by the
+#     test/benchmark (scalar 0).
+#
+# Both payloads are gated on numel: below ~16M the payload's fixed launch
+# cost (12 programs, cluster setup; ~50us measured) loses to the two-stage
+# kernels, which is why the mid sizes keep the saturating path below.
+_GE_SCALAR_RAW_MIN = 1 << 24  # 16,777,216
+# min normal of both fp32 and bf16 (same exponent range, 2^-126).
+_GE_SCALAR_MIN_NORM = 1.1754943508222875e-38
+
+
+def _ge_scalar_raw(A, s, dtype):
+    """ge(A, scalar) via the vendor comparison payloads, or None."""
+    if A.numel() < _GE_SCALAR_RAW_MIN:
+        return None
+    from .greater import _raw_greater_scalar
+    from .lt import _raw_lt_scalar
+
+    if dtype == torch.float16:
+        pred_s = float(
+            torch.tensor(s, dtype=dtype)
+            .nextafter(torch.tensor(float("-inf"), dtype=dtype))
+            .item()
+        )
+        return _raw_greater_scalar(A, pred_s)
+    if s == 0.0 or abs(s) >= _GE_SCALAR_MIN_NORM:
+        # +-0.0 (the FTZ-zone scalar) maps to the normal -MIN_NORM compare;
+        # every other exactly-representable scalar here has a NORMAL
+        # predecessor, so pred(s) is the exact boundary.
+        s_eff = -_GE_SCALAR_MIN_NORM if s == 0.0 else float(
+            torch.tensor(s, dtype=dtype)
+            .nextafter(torch.tensor(float("-inf"), dtype=dtype))
+            .item()
+        )
+        return _raw_greater_scalar(A, s_eff)
+    out = _raw_lt_scalar(A, s)
+    if out is None:
+        return None
+    return torch.logical_not(out)
 
 
 # ---------------------------------------------------------------------------

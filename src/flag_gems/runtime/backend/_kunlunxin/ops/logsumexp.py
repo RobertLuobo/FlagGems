@@ -38,8 +38,16 @@ _FALLBACK_KEYSET = torch._C.DispatchKeySet(
 #    wide-row `tl.max` serial chain (~25x slower than `tl.sum`) into a fast
 #    integer reduction (~4x).
 #  - N >  _MULTIROW_MAX_N:   two-kernel chunk-split (single data read, single
-#    exp per element): partials (m_c, z_c) per [TILE_R, BN] chunk tile, then a
-#    tiny per-row combine over C partials.
+#    exp per element): fast partials z_c = sum(exp(a)) per [TILE_R, BN] chunk
+#    tile (no max, no max-shift -- avoids the expensive [TILE_R, BN] subtract
+#    tile that spills on this XPU), then a tiny per-row combine
+#    out = log(sum_c z_c). The max-shift is free to skip for ordinary inputs
+#    (|x| <= ~80), so the slow (m, z) kernels below are kept as the guarded
+#    fallback: after the fast kernels, any row with an out-of-range element
+#    shows up as +-inf and is recomputed by the exact path. The host guard
+#    costs one device sync, which is an amortized no-op on the multi-ms
+#    big-N path it guards (the N <= 4096 multirow path stays exact so the
+#    guard never hurts the launch-bound small shapes).
 _MULTIROW_MAX_N = 4096
 _CHUNK_BN = 4096
 
@@ -171,6 +179,52 @@ def logsumexp_kernel_combine(
 
 @libentry()
 @triton.jit
+def logsumexp_kernel_fast_partial(
+    zrow_ptr,
+    input_ptr,
+    R,
+    BN: tl.constexpr,
+    TILE_R: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    """Fast per-chunk partial z_c = sum(exp(a)) for a big innermost dim.
+
+    Unlike ``logsumexp_kernel_partial`` there is no max and no max-shift: the
+    subtract on a [TILE_R, BN] tile is what spills registers on this XPU, and
+    for |x| <= ~80 the unshifted sum cannot overflow (a [TILE_R, BN] chunk has
+    at most BN=4096 elements, so z_c < 4096 * e^80 < 3.4e38). Out-of-range
+    rows are caught by the host-side guard in ``_reduce_inner`` and rerun
+    through the exact (m, z) path. -inf rows give z_c = 0 and +inf rows give
+    z_c = +inf, both of which stay exact through the combine's log.
+    """
+    pid = ext.program_id(0)
+    r_offsets = pid * TILE_R + tl.arange(0, TILE_R)
+    r_mask = r_offsets < R
+    n_offsets = tl.arange(0, BN)
+    offsets = r_offsets[:, None] * BN + n_offsets[None, :]
+    if NEED_MASK:
+        a = tl.load(input_ptr + offsets, mask=r_mask[:, None], other=-float("inf")).to(
+            tl.float32
+        )
+    else:
+        a = tl.load(input_ptr + offsets).to(tl.float32)
+    z = tl.sum(tl.exp(a), axis=1)
+    tl.store(zrow_ptr + r_offsets, z, mask=r_mask)
+
+
+@libentry()
+@triton.jit
+def logsumexp_kernel_fast_combine(output_ptr, zrow_ptr, M, TILE_C: tl.constexpr):
+    """Fast per-row combine: out = log(sum_c z_c). The zrow buffer is padded
+    with 0 slots (pad slots contribute 0 to the sum)."""
+    row = ext.program_id(0)
+    c_offsets = tl.arange(0, TILE_C)
+    zc = tl.load(zrow_ptr + row * TILE_C + c_offsets)
+    tl.store(output_ptr + row, tl.log(tl.sum(zc, axis=0)))
+
+
+@libentry()
+@triton.jit
 def logsumexp_kernel_tail_partials(
     mrow_ptr,
     zrow_ptr,
@@ -213,15 +267,17 @@ def logsumexp_kernel_tail_partials(
 
 
 def _reduce_inner_small(inp, rows, N, out):
-    """Single-tile multirow kernel for N <= _MULTIROW_MAX_N."""
+    """Single-tile multirow kernel for N <= _MULTIROW_MAX_N (exact).
+
+    TILE_M=32 for N > 64: the [32, N] tile is the measured sweet spot on this
+    XPU (16.3us vs 18.2us/14.1us for 64/16 on [256,256] f32; ~-2% on
+    [1024,1024]; ~+2% on [4096,4096]) -- the previous 64/16 split was tuned
+    for the N<=64 launch-bound tier only. The N <= 64 tier keeps 16 (a single
+    small tile per program; 32 would waste partial rows)."""
     if N <= 64:
         TILE_M = 16
-    elif N <= 256:
-        TILE_M = 64
-    elif N <= 1024:
-        TILE_M = 32
     else:
-        TILE_M = 8
+        TILE_M = 32
     need_mask = 1 if rows % TILE_M else 0
     grid = (triton.cdiv(rows, TILE_M), 1, 1)
     logsumexp_kernel_multirow[grid](
@@ -231,7 +287,7 @@ def _reduce_inner_small(inp, rows, N, out):
         N=N,
         TILE_M=TILE_M,
         NEED_MASK=need_mask,
-        num_warps=4,
+        num_warps=8,
         buffer_size_limit=2048,
     )
 
@@ -254,83 +310,135 @@ def _reduce_tail_partials(mrow, zrow, inp, rows, row_stride, tail_n):
     )
 
 
+def _reduce_inner_chunk_slow(inp, rows, N):
+    """Exact chunk-split path (single data read, single exp per element):
+    per-chunk (m_c, z_c) partials via the tile kernel, then a tiny per-row
+    combine. Any tail (N % 4096 != 0) is reduced by the per-row online kernel
+    over a tail-slice view (masked-tail reductions miscompute on this
+    backend). Used as-is for N % 4096 != 0 and as the guarded fallback of the
+    fast path below."""
+    out = torch.empty((rows,), dtype=torch.float32, device=inp.device)
+    BN = _CHUNK_BN
+    C_full = N // BN
+    TAIL = N - C_full * BN
+    TILE_C = max(1, triton.next_power_of_2(C_full + (1 if TAIL else 0)))
+    # partials compact per chunk; then per-row padded to TILE_C with
+    # (-inf, 0) pad slots so the combine kernel reads mask-free.
+    mrow = torch.empty((rows * C_full,), dtype=torch.float32, device=inp.device)
+    zrow = torch.empty_like(mrow)
+    if C_full:
+        R = rows * C_full
+        TILE_R = 32
+        need_mask = 1 if R % TILE_R else 0
+        full_view = torch.ops.aten.slice(inp, 1, 0, C_full * BN)
+        # reshape may copy only when the slice is non-contiguous (tail
+        # cases with N % BN != 0); the aligned path is a null-op view.
+        flat = torch.ops.aten.reshape(full_view, (R, BN))
+        grid = (triton.cdiv(R, TILE_R), 1, 1)
+        logsumexp_kernel_partial[grid](
+            mrow,
+            zrow,
+            flat,
+            R,
+            BN=BN,
+            TILE_R=TILE_R,
+            NEED_MASK=need_mask,
+            num_warps=4,
+            buffer_size_limit=2048,
+        )
+    if C_full and TILE_C != C_full:
+        mrow = mrow.view(rows, C_full)
+        zrow = zrow.view(rows, C_full)
+        mp = torch.full(
+            (rows, TILE_C), -float("inf"), dtype=torch.float32, device=inp.device
+        )
+        zp = torch.zeros((rows, TILE_C), dtype=torch.float32, device=inp.device)
+        mp[:, :C_full] = mrow
+        zp[:, :C_full] = zrow
+        mrow = mp
+        zrow = zp
+    elif not C_full:
+        mrow = torch.full(
+            (rows, TILE_C), -float("inf"), dtype=torch.float32, device=inp.device
+        )
+        zrow = torch.zeros((rows, TILE_C), dtype=torch.float32, device=inp.device)
+    if TAIL:
+        # tail slice view: [rows, TAIL] strided by N (no copy)
+        tail_view = torch.ops.aten.slice(inp, 1, C_full * BN, N)
+        mtail = torch.empty((rows,), dtype=torch.float32, device=inp.device)
+        ztail = torch.empty_like(mtail)
+        _reduce_tail_partials(mtail, ztail, tail_view, rows, N, TAIL)
+    else:
+        # unused sentinel pointer for the HAS_TAIL=0 build
+        mtail = torch.empty((1,), dtype=torch.float32, device=inp.device)
+        ztail = torch.empty_like(mtail)
+    logsumexp_kernel_combine[(rows, 1, 1)](
+        out,
+        mrow,
+        zrow,
+        mtail,
+        ztail,
+        rows,
+        C_FULL=C_full,
+        HAS_TAIL=1 if TAIL else 0,
+        TILE_C=TILE_C,
+        num_warps=4,
+        buffer_size_limit=2048,
+    )
+    return out
+
+
+def _reduce_inner_chunk_fast(inp, rows, N):
+    """Fast chunk-split path for N % _CHUNK_BN == 0: unshifted per-chunk
+    partials z_c = sum(exp(a)) + out = log(sum_c z_c). No per-element subtract
+    tile (it spills on this XPU) and no per-element max. Exact for |x| <= ~80
+    (a [TILE_R, BN] partial cannot overflow: z_c < BN * e^80 < 3.4e38) and for
+    the +-inf/NaN specials; out-of-range rows surface as +-inf and are
+    corrected by the host guard in ``_reduce_inner``."""
+    BN = _CHUNK_BN
+    C_full = N // BN
+    TILE_C = max(1, triton.next_power_of_2(C_full))
+    R = rows * C_full
+    zrow = torch.empty((R,), dtype=torch.float32, device=inp.device)
+    TILE_R = 4
+    need_mask = 1 if R % TILE_R else 0
+    flat = torch.ops.aten.reshape(inp, (R, BN))
+    grid = (triton.cdiv(R, TILE_R), 1, 1)
+    logsumexp_kernel_fast_partial[grid](
+        zrow,
+        flat,
+        R,
+        BN=BN,
+        TILE_R=TILE_R,
+        NEED_MASK=need_mask,
+        num_warps=4,
+        buffer_size_limit=2048,
+    )
+    # pad to TILE_C with 0 slots (they contribute 0 to the combine sum)
+    zrow_p = torch.zeros((rows, TILE_C), dtype=torch.float32, device=inp.device)
+    zrow_p[:, :C_full] = zrow.view(rows, C_full)
+    out = torch.empty((rows,), dtype=torch.float32, device=inp.device)
+    logsumexp_kernel_fast_combine[(rows, 1, 1)](
+        out, zrow_p, rows, TILE_C=TILE_C, num_warps=4, buffer_size_limit=2048
+    )
+    return out
+
+
 def _reduce_inner(inp, rows, N):
     """logsumexp over the innermost dim N of a contiguous [rows, N] tensor."""
     out = torch.empty((rows,), dtype=inp.dtype, device=inp.device)
     if N <= _MULTIROW_MAX_N:
         _reduce_inner_small(inp, rows, N, out)
+    elif N % _CHUNK_BN == 0:
+        # Fast aligned chunk path (no max-shift). The host guard costs one
+        # device sync, amortized over the multi-ms big-N read; on overflow or
+        # underflow (|x| > ~80) it reroutes to the exact path below.
+        fast = _reduce_inner_chunk_fast(inp, rows, N)
+        if torch.any(torch.isinf(fast)):
+            fast.copy_(_reduce_inner_chunk_slow(inp, rows, N))
+        out.copy_(fast)
     else:
-        # Chunk-split path: single data read, single exp per element. Full
-        # 4096-chunks go through the tile kernel; any tail (N % 4096 != 0) is
-        # reduced by the multirow kernel over a tail-slice view (masked-tail
-        # reductions miscompute on this backend).
-        BN = _CHUNK_BN
-        C_full = N // BN
-        TAIL = N - C_full * BN
-        TILE_C = max(1, triton.next_power_of_2(C_full + (1 if TAIL else 0)))
-        # partials compact per chunk; then per-row padded to TILE_C with
-        # (-inf, 0) pad slots so the combine kernel reads mask-free.
-        mrow = torch.empty((rows * C_full,), dtype=torch.float32, device=inp.device)
-        zrow = torch.empty_like(mrow)
-        if C_full:
-            R = rows * C_full
-            TILE_R = 32
-            need_mask = 1 if R % TILE_R else 0
-            full_view = torch.ops.aten.slice(inp, 1, 0, C_full * BN)
-            # reshape may copy only when the slice is non-contiguous (tail
-            # cases with N % BN != 0); the aligned path is a null-op view.
-            flat = torch.ops.aten.reshape(full_view, (R, BN))
-            grid = (triton.cdiv(R, TILE_R), 1, 1)
-            logsumexp_kernel_partial[grid](
-                mrow,
-                zrow,
-                flat,
-                R,
-                BN=BN,
-                TILE_R=TILE_R,
-                NEED_MASK=need_mask,
-                num_warps=4,
-                buffer_size_limit=2048,
-            )
-        if C_full and TILE_C != C_full:
-            mrow = mrow.view(rows, C_full)
-            zrow = zrow.view(rows, C_full)
-            mp = torch.full(
-                (rows, TILE_C), -float("inf"), dtype=torch.float32, device=inp.device
-            )
-            zp = torch.zeros((rows, TILE_C), dtype=torch.float32, device=inp.device)
-            mp[:, :C_full] = mrow
-            zp[:, :C_full] = zrow
-            mrow = mp
-            zrow = zp
-        elif not C_full:
-            mrow = torch.full(
-                (rows, TILE_C), -float("inf"), dtype=torch.float32, device=inp.device
-            )
-            zrow = torch.zeros((rows, TILE_C), dtype=torch.float32, device=inp.device)
-        if TAIL:
-            # tail slice view: [rows, TAIL] strided by N (no copy)
-            tail_view = torch.ops.aten.slice(inp, 1, C_full * BN, N)
-            mtail = torch.empty((rows,), dtype=torch.float32, device=inp.device)
-            ztail = torch.empty_like(mtail)
-            _reduce_tail_partials(mtail, ztail, tail_view, rows, N, TAIL)
-        else:
-            # unused sentinel pointer for the HAS_TAIL=0 build
-            mtail = torch.empty((1,), dtype=torch.float32, device=inp.device)
-            ztail = torch.empty_like(mtail)
-        logsumexp_kernel_combine[(rows, 1, 1)](
-            out,
-            mrow,
-            zrow,
-            mtail,
-            ztail,
-            rows,
-            C_FULL=C_full,
-            HAS_TAIL=1 if TAIL else 0,
-            TILE_C=TILE_C,
-            num_warps=4,
-            buffer_size_limit=2048,
-        )
+        out.copy_(_reduce_inner_chunk_slow(inp, rows, N))
     return out
 
 

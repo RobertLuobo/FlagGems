@@ -13,9 +13,7 @@
 # limitations under the License.
 
 import logging
-import struct
 
-import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
@@ -42,7 +40,24 @@ config_ = CodeGenConfig(
 )
 @triton.jit
 def threshold_kernel(self, threshold, value):
-    return tl.where(self > threshold, self, value)
+    # `tl.where(self > threshold, self, value)` lowers `arith.cmpf` (fp compare
+    # -> i1) to a slow per-lane path on XPU (4096^2 fp16 ~0.70-0.76ms vs ~0.10ms
+    # memory floor). Saturating-arithmetic select keeps the vectorized fast
+    # path: m = saturate((x - t) * 1e30) lands exactly on {0, 1}; the two-term
+    # blend x*m + v*(1-m) is then exact. Note 1e30 (finite in fp32) saturates in
+    # f32; for fp16 the same constant overflows to inf, so the whole
+    # computation stays in the native dtype (f16<->f32 converts are slow here).
+    if self.dtype == tl.float16:
+        big = tl.full((), 1.0e30, dtype=self.dtype)
+        d = (self - threshold) * big
+        m = tl.minimum(1.0, tl.maximum(0.0, d))
+        return self * m + value * (1.0 - m)
+    # f32 fma form v + (x - v)*m: one extra rounding on the m==1 path
+    # (|err| <= 6e-8 in f32, far inside RESOLUTION), but measurably faster
+    # than the two-term form on fp32/bf16.
+    d = (self - threshold) * 1.0e30
+    m = tl.minimum(1.0, tl.maximum(0.0, d))
+    return value + (self - value) * m
 
 
 @pointwise_dynamic(
@@ -51,56 +66,23 @@ def threshold_kernel(self, threshold, value):
 @triton.jit
 def threshold_backward_kernel(grad_output, self, threshold):
     # grad_input = grad_output where self > threshold else 0.
-    # The old form `tl.where(self > threshold, grad_output, 0)` compiles a
-    # data-dependent select-against-a-zero-constant on XPU that pins gems latency
-    # far above the memory floor: 4096^2 fp16 0.46ms / fp32 0.40ms / bf16 0.48ms
-    # (fp16 SLOWER than fp32 -> not memory-bound). A plain add/mul of the two
-    # tensors runs at the memory floor (~0.10ms fp16), so the select-with-zero is
-    # the cost, not the compare or the memory traffic. Rewriting the select as a
-    # multiply by the boolean mask keeps the tensor-op fast path: 4096^2 fp16
-    # 0.46->0.32, fp32 0.40->0.28, bf16 0.48->0.43 (avg gems speedup 0.172->0.221).
-    return grad_output * (self > threshold)
-
-
-# XPU background (4096^2 fp16, tl.mul ~0.50ms): any fp compare kernel
-# (x * (y > t), tl.where, sub-then-compare) lands at ~0.70-0.76ms — the XPU
-# backend lowers `arith.cmpf` to a slow scalar path. An equivalent UINT32
-# bit-pattern test (`arith.cmpi`) plus a magnitude bound (`0x7F800000` clears
-# negatives/inf/NaN) keeps the vectorized int fast path. This candidate is
-# strictly better than the pointwise kernel on every case of the
-# comprehensive benchmark (do_bench, dtype-equal gems speed ~0.29x -> ~0.36x,
-# still < 1.0x gate). Restricted to non-negative fp32 thresholds (host check);
-# everything else falls back to the pointwise kernel above.
-_THRESHOLD_BWD_BLOCK = 16384
-_THRESHOLD_BWD_BLOCK_SMALL = 8192
-_THRESHOLD_BWD_WARPS = 1
-
-
-@triton.jit
-def _threshold_backward_bits_kernel(
-    grad,
-    self,
-    out,
-    n_elements,
-    threshold_bits,
-    BLOCK: tl.constexpr,
-    NEED_MASK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    if NEED_MASK:
-        m = offs < n_elements
-        x = tl.load(grad + offs, mask=m)
-        y = tl.load(self + offs, mask=m)
-        yb = y.to(tl.float32).to(tl.uint32, bitcast=True)
-        keep = (yb > threshold_bits) & (yb < 0x7F800000)
-        tl.store(out + offs, x * keep.to(x.dtype), mask=m)
-    else:
-        x = tl.load(grad + offs)
-        y = tl.load(self + offs)
-        yb = y.to(tl.float32).to(tl.uint32, bitcast=True)
-        keep = (yb > threshold_bits) & (yb < 0x7F800000)
-        tl.store(out + offs, x * keep.to(x.dtype))
+    #
+    # Every compare-based formulation is slow on XPU: `tl.where(self > t, g, 0)`
+    # and `g * (self > t)` lower `arith.cmpf` to a per-lane path (~0.60ms for
+    # 4096^2 fp16, 0.09x), and even the integer bit-pattern compare
+    # (`yb > tbits & yb <= 0x7F800000`, 0.46ms) stays ~3x above the memory
+    # floor because the f32->u32 bitcast + i-cmps keep CoreTiling from
+    # vectorizing the blob. The proven fast form (same recipe as the
+    # `threshold` forward above and hardsigmoid_backward) is saturating
+    # arithmetic with no compare at all: m = min(1, max(0, (x - t) * 1e30))
+    # lands exactly on {0, 1} for any positive gap (1e30 saturates every
+    # representable gap >= 2^-149 in f32; in fp16/bf16 1e30 is +inf and
+    # saturates all gaps incl. subnormals), so `g * m` is exact and the
+    # compiler keeps the vectorized tensor-op path. Measured (do_bench, 16.7M
+    # fp16 on 4096^2): 0.46ms -> 0.061ms (fp16 0.117x -> 1.02x vs ATen).
+    d = (self - threshold) * 1.0e30
+    m = tl.minimum(1.0, tl.maximum(0.0, d))
+    return grad_output * m
 
 
 def threshold(self, threshold, value):
@@ -117,37 +99,5 @@ def threshold_(self, threshold, value):
 
 def threshold_backward(grad_output, self, threshold):
     logger.debug("GEMS_KUNLUNXIN THRESHOLD_BACKWARD")
-    use_bits = (
-        grad_output.is_contiguous()
-        and self.is_contiguous()
-        and grad_output.dtype == self.dtype
-        and grad_output.dtype in (torch.float16, torch.float32, torch.bfloat16)
-        and grad_output.numel() >= 8192
-    )
-    if use_bits:
-        tbits = struct.unpack("I", struct.pack("f", float(threshold)))[0]
-        if tbits < 0x80000000:  # non-negative fp32 threshold keeps the bit test exact
-            n = grad_output.numel()
-            out = torch.empty_like(grad_output)
-            if n == 0:
-                return out
-            block = (
-                _THRESHOLD_BWD_BLOCK
-                if n >= _THRESHOLD_BWD_BLOCK
-                else _THRESHOLD_BWD_BLOCK_SMALL
-            )
-            need_mask = (n % block) != 0
-            grid = (triton.cdiv(n, block),)
-            _threshold_backward_bits_kernel[grid](
-                grad_output,
-                self,
-                out,
-                n,
-                tbits,
-                BLOCK=block,
-                NEED_MASK=need_mask,
-                num_warps=_THRESHOLD_BWD_WARPS,
-            )
-            return out
     grad_input = threshold_backward_kernel(grad_output, self, threshold)
     return grad_input

@@ -134,11 +134,11 @@ def max_pool2d_forward_flat_kernel(
     input_ptr,
     output_ptr,
     indices_ptr,
-    total,
-    in_h,
-    in_w,
-    out_h,
-    out_w,
+    total: tl.constexpr,
+    in_h: tl.constexpr,
+    in_w: tl.constexpr,
+    out_h: tl.constexpr,
+    out_w: tl.constexpr,
     kernel_h: tl.constexpr,
     kernel_w: tl.constexpr,
     stride_h: tl.constexpr,
@@ -149,9 +149,12 @@ def max_pool2d_forward_flat_kernel(
     dilation_w: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    # Geometry as constexpr: the block-index decompositions (// and % on
+    # out_hw / out_w) compile to ALU (no runtime sdiv/srem), and the probe
+    # shows the loads then vectorize onto the xpu.gm2lm_v3 block-DMA path.
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     output_mask = offsets < total
-    out_hw = out_h * out_w
+    out_hw: tl.constexpr = out_h * out_w
     nc_idx = offsets // out_hw
     rem = offsets % out_hw
     oh = rem // out_w
@@ -167,12 +170,95 @@ def max_pool2d_forward_flat_kernel(
             valid = output_mask & (ih >= 0) & (ih < in_h) & (iw >= 0) & (iw < in_w)
             ih_safe = tl.where(valid, ih, 0)
             iw_safe = tl.where(valid, iw, 0)
+            # Unconditional load: the clamped indices always form a valid
+            # in-bounds address, so no i1-masked load (XPU slow path) is
+            # needed; the invalid-lane value is discarded below.
             input_offset = nc_safe * (in_h * in_w) + ih_safe * in_w + iw_safe
-            value = tl.load(input_ptr + input_offset, mask=valid, other=float("-inf"))
+            value = tl.load(input_ptr + input_offset)
             value = tl.where(valid, value.to(tl.float32), float("-inf"))
             is_new_max = valid & (value > max_val)
             max_val = tl.where(is_new_max, value, max_val)
             max_idx = tl.where(is_new_max, ih_safe * in_w + iw_safe, max_idx)
+
+    tl.store(output_ptr + offsets, max_val, mask=output_mask)
+    tl.store(indices_ptr + offsets, max_idx, mask=output_mask)
+
+
+@triton.jit
+def _extract32_wide(raw, sub):
+    # sub: constexpr 0/1; raw: int64 with 2x fp32 packed (little-endian)
+    return (((raw >> (32 * sub)) & 0xFFFFFFFF).to(tl.uint32)).to(
+        tl.float32, bitcast=True
+    )
+
+
+@libentry()
+@triton.jit
+def max_pool2d_forward_wide_kernel(
+    input_ptr,
+    output_ptr,
+    indices_ptr,
+    total,
+    total64,  # n*c*IH*IW // 2 (max i64 index + 1)
+    in_h,
+    in_w,
+    out_h,
+    out_w,
+    kernel_h: tl.constexpr,
+    kernel_w: tl.constexpr,
+    stride_h: tl.constexpr,
+    stride_w: tl.constexpr,
+    padding_h: tl.constexpr,
+    padding_w: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # fp32 wide-load fast path: dilation_w == 1 (consecutive w-taps) and
+    # stride_w even and in_w even. For one output (oh, ow) and tap row kh the
+    # KW w-taps form the contiguous span [ow*SW - PW, ow*SW - PW + KW - 1].
+    # With IW even the element index e0 = row*IW + ow*SW - PW has fixed parity
+    # (e0 & 1 == PW & 1), so the span is fetched as NLOAD = ceil((KW + MIS)/2)
+    # int64 (8B) loads covering 2x fp32 per load; the per-slot (block, sub)
+    # positions are constexpr. This halves the load-op count vs one scalar load
+    # per tap (measured ~1.4-2.1x faster on the k3 s2 p1 matrix).
+    MIS: tl.constexpr = padding_w % 2
+    NLOAD: tl.constexpr = (kernel_w + MIS + 1) // 2
+
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    output_mask = offsets < total
+    out_hw = out_h * out_w
+    nc_idx = offsets // out_hw
+    rem = offsets % out_hw
+    oh = rem // out_w
+    ow = rem % out_w
+    nc_safe = tl.where(output_mask, nc_idx, 0)
+    p64 = input_ptr.to(tl.pointer_type(tl.int64))
+
+    max_val = tl.full((BLOCK,), float("-inf"), tl.float32)
+    max_idx = tl.full((BLOCK,), -1, tl.int64)
+    ow_base = ow * stride_w - padding_w
+
+    for kh in tl.static_range(kernel_h):
+        ih = oh * stride_h - padding_h + kh
+        h_ok = (ih >= 0) & (ih < in_h)
+        ih_safe = tl.where(h_ok, ih, 0)
+        # e0 = element index of the first slot (ow*SW - PW within the row);
+        # b0 is its i64-block (floor division; b0 == -1 only for ow == 0 with
+        # PW == 1 whose sole slot is out-of-bounds and discarded below).
+        e0 = (nc_safe * in_h + ih_safe) * in_w + ow_base
+        b0 = e0 >> 1
+        for k in tl.static_range(NLOAD):
+            bk = tl.minimum(tl.maximum(b0 + k, 0), total64 - 1)
+            raw = tl.load(p64 + bk)
+            for s in tl.static_range(kernel_w):
+                if (s + MIS) // 2 != k:
+                    pass
+                else:
+                    v = _extract32_wide(raw, (s + MIS) % 2)
+                    e = ow_base + s
+                    valid = output_mask & h_ok & (e >= 0) & (e < in_w)
+                    is_new = valid & (v > max_val)
+                    max_val = tl.where(is_new, v, max_val)
+                    max_idx = tl.where(is_new, ih_safe * in_w + e, max_idx)
 
     tl.store(output_ptr + offsets, max_val, mask=output_mask)
     tl.store(indices_ptr + offsets, max_idx, mask=output_mask)
@@ -184,11 +270,11 @@ def max_pool2d_backward_flat_kernel(
     grad_output_ptr,
     indices_ptr,
     grad_input_ptr,
-    total,
-    in_h,
-    in_w,
-    out_h,
-    out_w,
+    total: tl.constexpr,
+    in_h: tl.constexpr,
+    in_w: tl.constexpr,
+    out_h: tl.constexpr,
+    out_w: tl.constexpr,
     kernel_h: tl.constexpr,
     kernel_w: tl.constexpr,
     stride_h: tl.constexpr,
@@ -199,9 +285,14 @@ def max_pool2d_backward_flat_kernel(
     dilation_w: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    # Geometry as constexpr (same trick as the forward flat kernel): the // and
+    # % decompositions compile to ALU multiply-shift instead of runtime
+    # sdiv/srem sequences, and the compiler can prove lane-affine addresses so
+    # the (clamped) loads go through the xpu.gm2lm_v3 block-DMA path.
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     input_mask = offsets < total
-    in_hw = in_h * in_w
+    in_hw: tl.constexpr = in_h * in_w
+    out_hw: tl.constexpr = out_h * out_w
     nc_idx = offsets // in_hw
     rem = offsets % in_hw
     ih = rem // in_w
@@ -233,12 +324,18 @@ def max_pool2d_backward_flat_kernel(
             )
             oh_safe = tl.where(valid, oh, 0)
             ow_safe = tl.where(valid, ow, 0)
-            out_offset = nc_safe * (out_h * out_w) + oh_safe * out_w + ow_safe
-            index_value = tl.load(indices_ptr + out_offset, mask=valid, other=-1)
-            index_value = tl.where(valid, index_value, -1)
+            out_offset = nc_safe * out_hw + oh_safe * out_w + ow_safe
+            # Unconditional load on the clamped (in-bounds) address; the
+            # masked-load path is a known slow path on this backend and the
+            # invalid-lane value is discarded by the value-level where.
+            # NOTE: the gradient is upcast to fp32 by the host (below) --
+            # measured: 16-bit loads (fp16/bf16) are ~3-17% slower than the
+            # native 32-bit word on this backend, so an on-the-fly cvt in the
+            # kernel loses more than the saved conversion pass.
+            index_value = tl.load(indices_ptr + out_offset)
             match = valid & (index_value == input_flat_idx)
-            grad_value = tl.load(grad_output_ptr + out_offset, mask=valid, other=0.0)
-            grad_acc += tl.where(match, grad_value.to(tl.float32), 0.0)
+            grad_value = tl.load(grad_output_ptr + out_offset)
+            grad_acc += tl.where(match, grad_value, 0.0)
 
     tl.store(grad_input_ptr + offsets, grad_acc, mask=input_mask)
 
@@ -408,6 +505,40 @@ def max_pool2d_with_indices(
     block = 1024
     grid = (triton.cdiv(total, block),)
 
+    # Wide-i64 fast path (fp32, dilation_w == 1, even stride_w, even in_w):
+    # the KW consecutive w-taps of one output row are fetched as 2x-fp32 int64
+    # loads (constexpr slot mapping), halving the load-op count (~1.4-2.1x
+    # faster on the k3 s2 p1 matrix). Anything else uses the flat kernel.
+    if (
+        input.dtype == torch.float32
+        and dilation_w == 1
+        and stride_w % 2 == 0
+        and in_w % 2 == 0
+    ):
+        with torch_device_fn.device(input.device):
+            max_pool2d_forward_wide_kernel[grid](
+                input,
+                output,
+                indices,
+                total,
+                input.numel() // 2,  # = n*c*in_h*in_w // 2 (max i64 index + 1)
+                in_h,
+                in_w,
+                out_h,
+                out_w,
+                kernel_h,
+                kernel_w,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                block,
+                num_warps=1,
+                buffer_size_limit=2048,
+                isCloseVectorization=True,
+            )
+        return output, indices
+
     with torch_device_fn.device(input.device):
         max_pool2d_forward_flat_kernel[grid](
             input,
@@ -435,6 +566,92 @@ def max_pool2d_with_indices(
     return output, indices
 
 
+@libentry()
+@triton.jit
+def max_pool2d_backward_residue_kernel(
+    grad_output_ptr,
+    indices_ptr,
+    grad_input_ptr,
+    n_count,  # number of iw values in this residue class (cdiv(in_w - R_W, S_W))
+    in_hw,  # in_h * in_w
+    out_hw,  # out_h * out_w
+    R_H: tl.constexpr,
+    R_W: tl.constexpr,
+    S_H: tl.constexpr,
+    S_W: tl.constexpr,
+    P_H: tl.constexpr,
+    P_W: tl.constexpr,
+    D_H: tl.constexpr,
+    D_W: tl.constexpr,
+    K_H: tl.constexpr,
+    K_W: tl.constexpr,
+    IN_W: tl.constexpr,
+    OUT_H: tl.constexpr,
+    OUT_W: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Residue-compressed gather backward (Kunlunxin/XPU).
+
+    Grid: (cdiv(n_count, BLOCK), m_count, n_c); one program per (m, nc) row
+    of the n_count output positions in this residue class.  Every input
+    position belongs to exactly one residue class (R_H, R_W) =
+    (ih % S_H, iw % S_W).  For a fixed (R_H, R_W) the kernel offset (kh, kw)
+    can only be valid when ``(R_H + P_H - kh * D_H) % S_H == 0`` (and
+    symmetrically for w); the condition is constexpr per launch, so the
+    impossible taps are pruned at trace time (avg 2.25 of 9 taps for s = 2).
+    For the surviving taps the load addresses are affine in the lane index
+    (``n + c_w``), which is exactly the block-DMA-friendly pattern of the
+    proven forward flat kernel; the generic per-input gather cannot express
+    this (data-dependent clamps defeat the vectorizer and unmasked
+    non-affine loads raise a device exception on this backend).
+
+    Correctness: the argmax of output (oh, ow) is at input flat index
+    ``h * in_w + w`` (identical to the ATen/XDNN convention and to the Gems
+    forward), so the input-gradient contribution of ``(oh, ow)`` equals
+    ``grad_output[oh, ow]`` when ``indices[oh, ow] == flat`` and 0 otherwise;
+    summing over the (at most) K_H x K_W output positions of the residue class
+    yields exactly the ATen backward semantics (an input that is the argmax of
+    several windows accumulates all of them).  Boundary lanes (n + c_w out of
+    [0, OUT_W)) contribute 0 through the value-level ``tl.where``; the loads
+    are unconditional on clamped, provably in-bounds offsets (the pattern of
+    the proven forward flat kernel -- no i1-masked load slow path).
+    """
+    n = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = tl.program_id(1)
+    nc = tl.program_id(2)
+    n_mask = n < n_count
+    ih = R_H + m * S_H
+    iw = R_W + n * S_W
+    input_flat_idx = ih * IN_W + iw
+
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for kh in tl.static_range(K_H):
+        if (R_H + P_H - kh * D_H) % S_H == 0:
+            c_h = (R_H + P_H - kh * D_H) // S_H
+            oh = m + c_h
+            oh_c = tl.minimum(tl.maximum(oh, 0), OUT_H - 1)
+            h_ok = (oh >= 0) & (oh < OUT_H)
+            for kw in tl.static_range(K_W):
+                if (R_W + P_W - kw * D_W) % S_W == 0:
+                    c_w = (R_W + P_W - kw * D_W) // S_W
+                    valid = n_mask & h_ok & (n + c_w >= 0) & (n + c_w < OUT_W)
+                    # Unconditional load: the clamped offsets always form an
+                    # in-bounds address (same pattern as the proven forward
+                    # flat kernel); invalid-lane values are discarded below.
+                    n_safe = tl.where(valid, n, -c_w)
+                    out_offset = nc * out_hw + oh_c * OUT_W + n_safe + c_w
+                    index_value = tl.load(indices_ptr + out_offset)
+                    match = valid & (index_value == input_flat_idx)
+                    grad_value = tl.load(grad_output_ptr + out_offset)
+                    acc += tl.where(match, grad_value, 0.0)
+
+    tl.store(
+        grad_input_ptr + nc * in_hw + ih * IN_W + iw,
+        acc,
+        mask=n_mask,
+    )
+
+
 def max_pool2d_backward(
     grad_output: torch.Tensor,
     input: torch.Tensor,
@@ -447,6 +664,11 @@ def max_pool2d_backward(
 ):
     logger.debug("GEMS_KUNLUNXIN MAX_POOL2D_BACKWARD")
     original_dtype = grad_output.dtype
+    # The residue/flat kernels run in fp32 (the native 32-bit word on this
+    # backend): 16-bit loads are measurably slower (see the flat kernel
+    # comment), so the grad is upcast once here and the fp32 result converted
+    # back once at the end (two small passes, cheaper than the 3-17% slower
+    # 16-bit inner loop).
     grad_output = grad_output.to(torch.float32).contiguous()
     indices = indices.to(torch.int32).contiguous()
 
@@ -465,38 +687,145 @@ def max_pool2d_backward(
     in_n, in_c, in_h, in_w = input.shape
     out_h, out_w = grad_output.shape[2], grad_output.shape[3]
 
-    grad_input = torch.zeros_like(input, dtype=torch.float32)
+    # The residue kernel writes every input position in [0, total) exactly
+    # once (each input belongs to exactly one residue class (ih % s_h,
+    # iw % s_w) and is stored by a single lane with a masked store covering
+    # the class tail), so no pre-zeroing is needed: empty_like skips an
+    # allocation plus a vendor zeros-fill kernel launch vs zeros_like (see
+    # adaptive_max_pool2d_backward for the same pattern; output is
+    # bit-identical).
+    grad_input = torch.empty_like(input, dtype=torch.float32)
 
     if grad_input.numel() == 0:
         return grad_input.to(original_dtype)
 
-    total = grad_input.numel()
-    block = 1024
-    grid = (triton.cdiv(total, block),)
+    n_c = in_n * in_c
+    in_hw = in_h * in_w
+    out_hw = out_h * out_w
 
     with torch_device_fn.device(grad_input.device):
-        max_pool2d_backward_flat_kernel[grid](
-            grad_output,
-            indices,
-            grad_input,
-            total,
-            in_h,
-            in_w,
-            out_h,
-            out_w,
-            kernel_h,
-            kernel_w,
-            stride_h,
-            stride_w,
-            padding_h,
-            padding_w,
-            dilation_h,
-            dilation_w,
-            block,
-            num_warps=1,
-            buffer_size_limit=2048,
-            isCloseVectorization=True,
-        )
+        # Two kernels: the dense flat gather (one lane per input, the
+        # generic pattern) and the residue-compressed gather (below).  The
+        # residue kernel is competitive when a residue class has enough
+        # rows/columns (measured on the full benchmark matrix): it wins
+        # 3.3-10x on the 224x224-family shapes, 1.6x on the (3,5)s(2,1)
+        # 56x56/28x28 shapes (m=28/14, n=2m), and loses 1.4-8.7x on the
+        # small-spatial (m<8 or n<2m) shapes; the second condition (m>=64)
+        # covers the large k3s2p1/ceil shapes where n == m but both are big.
+        if stride_h == 1 and stride_w == 1:
+            # No residue-class tap pruning possible (every tap survives); the
+            # dense flat layout with 1D blocks is at least as fast (measured
+            # 1.0-1.4x on the k3 s1 d2 matrix) and needs no per-class loop.
+            total = grad_input.numel()
+            block = 1024
+            grid = (triton.cdiv(total, block),)
+            max_pool2d_backward_flat_kernel[grid](
+                grad_output,
+                indices,
+                grad_input,
+                total,
+                in_h,
+                in_w,
+                out_h,
+                out_w,
+                kernel_h,
+                kernel_w,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                dilation_h,
+                dilation_w,
+                block,
+                num_warps=1,
+                buffer_size_limit=2048,
+                isCloseVectorization=True,
+            )
+        else:
+            # One launch per large residue class; impossible taps are pruned
+            # at trace time by the constexpr divisibility checks inside the
+            # kernel.  The grid is (w-blocks, m, n*c): for the surviving taps
+            # the load offsets are affine in the lane index (contiguous),
+            # which the generic per-input gather cannot express (data-
+            # dependent clamps there keep every load on the masked slow
+            # path).  The block width is sized to the class's n_count so no
+            # lane is wasted.
+            residue_classes = []
+            for r_h in range(stride_h):
+                if r_h >= in_h:
+                    continue
+                m_count = (in_h - r_h + stride_h - 1) // stride_h
+                for r_w in range(stride_w):
+                    if r_w >= in_w:
+                        continue
+                    n_count = (in_w - r_w + stride_w - 1) // stride_w
+                    if n_count == 0 or m_count == 0:
+                        continue
+                    # Measured routing rule (see comment above): the residue
+                    # kernel wins when the class is either wide (n >= 2m,
+                    # e.g. the (3,5)s(2,1) 56x56/28x28 shapes) or large
+                    # (m >= 64, e.g. the 224x224 k3s2p1/ceil shapes).
+                    if (m_count >= 8 and n_count >= 2 * m_count) or m_count >= 64:
+                        residue_classes.append((r_h, r_w, m_count, n_count))
+            if residue_classes:
+                for (r_h, r_w, m_count, n_count) in residue_classes:
+                    block = min(max(1 << (n_count - 1).bit_length(), 4), 256)
+                    max_pool2d_backward_residue_kernel[
+                        (triton.cdiv(n_count, block), m_count, n_c)
+                    ](
+                        grad_output,
+                        indices,
+                        grad_input,
+                        n_count,
+                        in_hw,
+                        out_hw,
+                        R_H=r_h,
+                        R_W=r_w,
+                        S_H=stride_h,
+                        S_W=stride_w,
+                        P_H=padding_h,
+                        P_W=padding_w,
+                        D_H=dilation_h,
+                        D_W=dilation_w,
+                        K_H=kernel_h,
+                        K_W=kernel_w,
+                        IN_W=in_w,
+                        OUT_H=out_h,
+                        OUT_W=out_w,
+                        BLOCK=block,
+                        num_warps=1,
+                        buffer_size_limit=2048,
+                        isCloseVectorization=True,
+                    )
+            else:
+                # Small classes: the dense flat kernel beats the per-class
+                # launches (fewer, wider programs; measured on the 14x14 /
+                # 7x7 / 28x28 shapes).
+                total = grad_input.numel()
+                block = 1024
+                grid = (triton.cdiv(total, block),)
+                max_pool2d_backward_flat_kernel[grid](
+                    grad_output,
+                    indices,
+                    grad_input,
+                    total,
+                    in_h,
+                    in_w,
+                    out_h,
+                    out_w,
+                    kernel_h,
+                    kernel_w,
+                    stride_h,
+                    stride_w,
+                    padding_h,
+                    padding_w,
+                    dilation_h,
+                    dilation_w,
+                    block,
+                    num_warps=1,
+                    buffer_size_limit=2048,
+                    isCloseVectorization=True,
+                )
 
     return grad_input.to(original_dtype)
 

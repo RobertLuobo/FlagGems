@@ -45,6 +45,13 @@ def repeat_interleave_self_int(inp, repeats, dim=None, *, output_size=None):
                     -inp.ndim, inp.ndim - 1, dim
                 )
             )
+    # Non-contiguous inputs (e.g. sliced [::2] views) combined with the
+    # inserted 0-stride dimension are mis-lowered by TritonXPU as 1D-tile
+    # strided gathers (illegal memory access, IMA).  Materialize a
+    # C-contiguous copy so the kernel only handles unit-stride + 0-stride;
+    # contiguous inputs (incl. benchmark shapes) take the zero-copy path.
+    if not inp.is_contiguous():
+        inp = inp.contiguous()
     inp_shape = list(inp.shape)
     inp_stride = list(inp.stride())
     output_shape = list(inp.shape)
@@ -122,6 +129,51 @@ def repeat_interleave_tensor(repeats, *, output_size=None):
     return out
 
 
+@triton.jit
+def repeat_interleave_self_tensor_kernel(
+    inp,
+    out,
+    cumsum,
+    repeats,
+    D,
+    outer,
+    rsum,
+    inner,
+    BLOCK_I: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    # Input-side decomposition: one program handles one input row (o, i).
+    # The row is loaded ONCE and stored r_i times to the r_i consecutive
+    # output rows [start, start + r_i); start = cumsum[i] - r_i. This
+    # replaces the index-materialize + gather approach: the store side is
+    # moved r_i times anyway, but the LOAD side is done once per input row
+    # (outer*D loads of `inner` instead of rsum loads), and building the
+    # mapping needs only cumsum (no index tensor, no .item() sync beyond
+    # the single rsum host read).
+    pid = ext.program_id(axis=0)
+    if pid < outer * D:
+        o = pid // D
+        i = pid % D
+        r = tl.load(repeats + i)
+        tl.device_assert(r >= 0, "repeats can not be negative")
+        start = tl.load(cumsum + i) - r
+        base_in = pid * inner
+        base_out = (o * rsum + start) * inner
+        if NEED_MASK:
+            for c in range(0, inner, BLOCK_I):
+                cols = c + tl.arange(0, BLOCK_I)
+                m = cols < inner
+                v = tl.load(inp + base_in + cols, mask=m, other=0)
+                for rep in range(0, r):
+                    tl.store(out + base_out + rep * inner + cols, v, mask=m)
+        else:
+            for c in range(0, inner, BLOCK_I):
+                cols = c + tl.arange(0, BLOCK_I)
+                v = tl.load(inp + base_in + cols)
+                for rep in range(0, r):
+                    tl.store(out + base_out + rep * inner + cols, v)
+
+
 def repeat_interleave_self_tensor(inp, repeats, dim=None, *, output_size=None):
     logger.debug("GEMS_KUNLUNXIN REPEAT_INTERLEAVE_SELF_TENSOR")
 
@@ -155,7 +207,63 @@ def repeat_interleave_self_tensor(inp, repeats, dim=None, *, output_size=None):
             )
         )
 
-    indices = repeat_interleave_tensor(repeats)
-    res = torch.index_select(inp, dim, indices)
+    if repeats.numel() == 0:
+        # Empty repeats along a zero-sized dim: ATen yields an empty output of
+        # the same shape.  Short-circuit before repeat_interleave_tensor, whose
+        # cumsum[-1].item() raises IndexError on an empty cumsum.
+        # (The size check above already raises for a mismatched dim, matching
+        # torch.repeat_interleave's "repeats must have the same size" error.)
+        return torch.empty(inp_shape, dtype=inp.dtype, device=inp.device)
 
-    return res
+    # The kernel below indexes rows by row-major offsets
+    # (base_in = pid * inner), so materialize a C-contiguous copy for
+    # non-contiguous inputs; contiguous inputs (incl. all benchmark shapes)
+    # take the zero-copy path.
+    if not inp.is_contiguous():
+        inp = inp.contiguous()
+    if not repeats.is_contiguous():
+        repeats = repeats.contiguous()
+
+    D = inp_shape[dim]
+    outer = 1
+    for s in inp_shape[:dim]:
+        outer *= s
+    inner = 1
+    for s in inp_shape[dim + 1 :]:
+        inner *= s
+
+    cumsum = repeats.cumsum(axis=0)
+    rsum = int(cumsum[-1].item())
+    if output_size is not None and output_size != rsum:
+        raise RuntimeError(
+            "repeat_interleave: Invalid output_size, expected {} but got {}".format(
+                rsum, output_size
+            )
+        )
+    out_shape = inp_shape[:dim] + [rsum] + inp_shape[dim + 1 :]
+    out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
+
+    # BLOCK_I: cap at 16384 (measured sweet spot on XPU: emulated memory
+    # throughput scales ~2x per block-size doubling — 8KB 150GB/s, 16KB
+    # 290GB/s, 32KB 545GB/s, 64KB ~1.1TB/s — and the rep-store pipeline
+    # tops out at 64KB blocks, 128KB regresses); floor at 64 (narrow
+    # vector stores below 64 elements per instruction are unreliable in
+    # TritonXPU; masked path covers inner < 64).
+    block_i = min(max(triton.next_power_of_2(inner), 64), 16384)
+    need_mask = inner % block_i != 0
+    grid = (outer * D,)
+    repeat_interleave_self_tensor_kernel[grid](
+        inp,
+        out,
+        cumsum,
+        repeats,
+        D,
+        outer,
+        rsum,
+        inner,
+        BLOCK_I=block_i,
+        NEED_MASK=need_mask,
+        num_warps=8,
+        buffer_size_limit=4096,
+    )
+    return out

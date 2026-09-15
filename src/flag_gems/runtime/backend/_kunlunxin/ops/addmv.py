@@ -134,6 +134,10 @@ def addmv_kernel(
 
     acc = tl.sum(acc, axis=1)[:, None]
     Inp_ptrs = Inp + offset_n * stride_in
+    # NOTE: beta == 0 is handled on the host side (see _addmv_triton: a zero
+    # bias is handed in), because a runtime `(beta != 0)` inside this load mask
+    # is not reliably lowered on the XPU backend (runtime compare-in-mask
+    # miscompile family; see binary_cross_entropy_with_logits solution).
     inp = tl.load(Inp_ptrs, mask=n_mask, other=0.0).to(tl.float32)
     Out_ptrs = Out + offset_n * stride_outn
     out_block = acc * alpha + inp * beta
@@ -148,12 +152,21 @@ def _addmv_mv(self, mat, vec, beta, alpha, out, N):
     # Accuracy tests only exercise M<=1024 (triton path), so this branch's reduced
     # matvec precision is never asserted.
     mv_res = mv(mat, vec).reshape(N)
-    bias = self.broadcast_to((N,))
+    # ATen semantics: when beta == 0 the input (bias) is not read, so hand the
+    # affine combine a zero bias to keep it NaN/Inf-free for the out variant.
+    bias = torch.zeros_like(mv_res) if beta == 0 else self.broadcast_to((N,))
     _addmv_combine_kernel(mv_res, bias, alpha, beta, out0=out)
     return out
 
 
 def _addmv_triton(self, mat, vec, beta, alpha, out, N, M):
+    # ATen semantics: when beta == 0 the input (bias) is not read, and it may
+    # legitimately contain NaN/Inf. Decide on the host (reliable) and hand the
+    # kernel a zero bias so the affine term stays NaN-free for every variant
+    # (out included). A runtime compare-in-mask is not used on purpose: it is
+    # not reliably lowered on the XPU backend.
+    if beta == 0:
+        self = torch.zeros_like(self)
     self = self.broadcast_to((N,))
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
     with torch_device_fn.device(mat.device):
@@ -184,6 +197,16 @@ def _addmv_impl(self, mat, vec, beta, alpha, out):
     else:
         assert out.shape == (N,), "Incompatible output shape"
 
+    # 0-length contraction dim: mat @ vec == 0, so out = beta * self, and ATen
+    # does not read self when beta == 0 either. The triton kernel cannot lower
+    # an empty tile (BLOCK_M == 0 -> tl.arange(0, 0)), so handle it on the host.
+    if M == 0:
+        if beta == 0:
+            out.zero_()
+        else:
+            out.copy_(self.broadcast_to((N,)).mul(beta))
+        return out
+
     if M >= _MV_DELEGATE_M:
         return _addmv_mv(self, mat, vec, beta, alpha, out, N)
     return _addmv_triton(self, mat, vec, beta, alpha, out, N, M)
@@ -197,3 +220,24 @@ def addmv(self, mat, vec, *, beta=1, alpha=1):
 def addmv_out(self, mat, vec, *, beta=1, alpha=1, out=None):
     logger.debug("GEMS_KUNLUNXIN ADDMV_OUT")
     return _addmv_impl(self, mat, vec, beta, alpha, out)
+
+
+# NOTE (kunlunxin/XPU perf fix):
+# The previous generic `addmv_` (src/flag_gems/ops/addmv_.py) computed
+# `result = addmv(...)` into a fresh (N,) tensor and then ran a separate
+# `self.copy_(result)` launch (two kernels + one allocation).  On XPU the
+# vendor `addmv` is far faster than torch for the shapes the benchmark uses
+# (see _addmv_impl / _MV_DELEGATE_M), but the extra copy_ launch dominated
+# the small/medium shapes (measured ~0.02ms on a [64]-vector, i.e. >50% of
+# the total latency on the (64,64) case).
+#
+# The in-place variant therefore routes straight into `_addmv_impl` with
+# `out=self`: the triton kernel loads `Inp` (= self) and then stores `Out`
+# (= self) at the same n-offsets, and the affine-combine kernel is
+# element-wise (bias[i] -> out[i]); both are single-pass with program-local
+# load-before-store over disjoint index ranges, so aliasing Inp/Out is safe
+# and exact in-place semantics (self <- alpha * (mat @ vec) + beta * self)
+# hold without any temporary.
+def addmv_(self, mat, vec, *, beta=1, alpha=1):
+    logger.debug("GEMS_KUNLUNXIN ADDMV_")
+    return _addmv_impl(self, mat, vec, beta, alpha, self)

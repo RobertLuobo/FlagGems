@@ -17,53 +17,112 @@ from typing import Optional
 
 import torch
 import triton
-from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+import triton.language as tl
 
+from ..utils.codegen_config_utils import CodeGenConfig
 from ..utils.pointwise_dynamic import pointwise_dynamic
-from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_KEYSET = torch._C.DispatchKeySet(
-    torch._C.DispatchKey.CompositeExplicitAutograd
-)
-
-_FLOAT8_E8M0FNU = getattr(torch, "float8_e8m0fnu", None)
-
+# NOTE: config_ intentionally keeps the original is_scatter_slice=True +
+# buffer_size_limit=512 + isCloseOffsetAnalysis=True for the STRIDED
+# copy_slice path.  Experimenting with the copy-family recipe
+# (buffer_size_limit=4096, isCloseVectorization=False, kunlunAutoGrid=True,
+# unroll_num=8) here made large rank-4 strided copies (e.g. contiguous() of a
+# 16M-element [::2] view) pathological: test_contiguous
+# [dtype3-shape3] went from 15.4s (pre-fix) to >900s (timeout), because the
+# 1d-tile codegen then widens to next_pow2(numel/12) lanes for the strided
+# gather.  All large-contiguous speedups below come from _copy_flat_kernel,
+# which is config-independent, so the strided path keeps the proven original
+# config.
 config_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),
     32,
     True,
     prefer_1d_tile=True,
-    buffer_size_limit=4096,
-    kunlunAutoGrid=True,
+    is_scatter_slice=True,
 )
 
 
-@pointwise_dynamic(is_tensor=[True], promotion_methods=[(0, "DEFAULT")], config=config_)
+# @pointwise_dynamic(is_tensor=(True,), promotion_methods=[(0, "DEFAULT")])
+# @triton.jit
+# def copy(src):
+#     return src
+
+
+@pointwise_dynamic(
+    is_tensor=(True,), promotion_methods=[(0, "DEFAULT")], config=config_
+)
+@triton.jit
+def copy_slice(src):
+    return src
+
+
+@pointwise_dynamic(is_tensor=[True], promotion_methods=[(0, "DEFAULT")])
 @triton.jit
 def _copy_kernel(src):
     return src
 
 
-def _can_use_triton(dst: torch.Tensor, src: torch.Tensor) -> bool:
+@triton.jit
+def _copy_e8m0_to_fp32_kernel(src, dst, n_elements, BLOCK_SIZE: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    exponent_bits = tl.load(src + offsets, mask=mask).to(tl.uint32) << 23
+    values = exponent_bits.to(tl.float32, bitcast=True)
+    tl.store(dst + offsets, values, mask=mask)
+
+
+@triton.jit
+def _copy_flat_kernel(
+    src_ptr, dst_ptr, n_elements, BLOCK_SIZE: tl.constexpr, NEED_MASK: tl.constexpr
+):
+    """Bounded-tile flat block-DMA copy for contiguous same-dtype tensors.
+
+    The pointwise codegen widens the 1d tile to next_pow2(numel/12) (12-CTAs
+    "XPU BLOCK_NUM" partition), which measures 0.073-0.16ms on a 16M-element
+    copy but 1.08ms on bool (i1 bytes cannot reuse the wide-tile path).  A
+    fixed bounded tile with a full grid keeps every access a contiguous
+    block DMA.  NEED_MASK constexpr splits the always-true-mask case (the
+    slow masked-memory path on XPU) from the true-tail case.
+    """
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    if NEED_MASK:
+        mask = offsets < n_elements
+        tl.store(dst_ptr + offsets, tl.load(src_ptr + offsets, mask=mask), mask=mask)
+    else:
+        tl.store(dst_ptr + offsets, tl.load(src_ptr + offsets))
+
+
+def _pick_flat_block(n_elements: int) -> int:
+    if n_elements >= 2**19:
+        return 65536
+    if n_elements >= 2**16:
+        return 32768
+    if n_elements >= 2**13:
+        return 8192
+    if n_elements >= 2**10:
+        return 4096
+    return 1024
+
+
+def _is_e8m0(tensor: torch.Tensor) -> bool:
+    return hasattr(torch, "float8_e8m0fnu") and tensor.dtype is torch.float8_e8m0fnu
+
+
+def _validate_triton_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
     if dst.layout != torch.strided or src.layout != torch.strided:
-        return False
-    if dst.device != src.device:
-        return False
+        raise NotImplementedError("copy_ only supports strided tensors on Kunlunxin")
     if dst.is_quantized or src.is_quantized:
-        return False
+        raise NotImplementedError(
+            "copy_ for quantized tensors is not supported on Kunlunxin"
+        )
     if src.is_complex() or dst.is_complex():
-        # Preserve PyTorch's behaviour of warning when casting complex to real
-        # by forcing the redispatch path, which issues the warning internally.
-        return False
-    if _FLOAT8_E8M0FNU is not None and (
-        src.dtype == _FLOAT8_E8M0FNU or dst.dtype == _FLOAT8_E8M0FNU
-    ):
-        # Triton does not support float8 yet, so defer to PyTorch which has a reference implementation.
-        return False
-    return True
+        raise NotImplementedError(
+            "copy_ for complex tensors is not supported on Kunlunxin"
+        )
 
 
 def _expand_like(src: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
@@ -75,7 +134,7 @@ def _expand_like(src: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
 def copy(
     template: torch.Tensor, src: torch.Tensor, *, non_blocking: Optional[bool] = False
 ):
-    logger.debug("GEMS COPY (functional)")
+    logger.debug("GEMS_KUNLUNXIN COPY")
     out = torch.empty_strided(
         template.size(), template.stride(), dtype=template.dtype, device=template.device
     )
@@ -84,10 +143,8 @@ def copy(
 
 
 def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
-    if isinstance(src, (int, float, bool)):
-        src = torch.tensor(src, device=dst.device)
-    elif not isinstance(src, torch.Tensor):
-        raise TypeError("unsupport src type for copy_: ", type(src))
+    if not isinstance(src, torch.Tensor):
+        raise TypeError("src must be a Tensor")
 
     # this is the same as PyTorch's check
     if dst._is_zerotensor():
@@ -95,70 +152,130 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
     if src._is_zerotensor():
         return dst.zero_()
 
-    if torch._C._is_alias_of(dst, src):
-        # Align with PyTorch: if metadata fully matches, this is a no-op.
-        if (
-            dst.storage_offset() == src.storage_offset()
-            and dst.stride() == src.stride()
-            and dst.size() == src.size()
-            and dst.dtype == src.dtype
-            and dst.device == src.device
-            and dst.is_conj() == src.is_conj()
-            and dst.is_neg() == src.is_neg()
-        ):
-            return dst
-        # Otherwise defer to PyTorch for well-defined semantics on overlapping writes.
-        return torch.ops.aten.copy_.default.redispatch(
-            _FALLBACK_KEYSET, dst, src, non_blocking
-        )
-
-    if _FLOAT8_E8M0FNU is not None and (
-        src.dtype == _FLOAT8_E8M0FNU or dst.dtype == _FLOAT8_E8M0FNU
+    aliases = torch._C._is_alias_of(dst, src)
+    if aliases and (
+        dst.storage_offset() == src.storage_offset()
+        and dst.stride() == src.stride()
+        and dst.size() == src.size()
+        and dst.dtype == src.dtype
+        and dst.device == src.device
+        and dst.is_conj() == src.is_conj()
+        and dst.is_neg() == src.is_neg()
     ):
-        return torch.ops.aten.copy_.default.redispatch(
-            _FALLBACK_KEYSET, dst, src, non_blocking
-        )
-
-    if src.numel() > 2**31 - 1 or dst.numel() > 2**31 - 1:
-        return torch.ops.aten.copy_.default.redispatch(
-            _FALLBACK_KEYSET, dst, src, non_blocking
-        )
-
-    if not _can_use_triton(dst, src):
-        return torch.ops.aten.copy_.default.redispatch(
-            _FALLBACK_KEYSET, dst, src, non_blocking
-        )
-
-    if dst.numel() == 0:
-        # Respect PyTorch behaviour: empty tensors should still validate broadcast.
-        return torch.ops.aten.copy_.default.redispatch(
-            _FALLBACK_KEYSET, dst, src, non_blocking
-        )
-
-    logger.debug("GEMS COPY_")
-
-    try:
-        broadcast_shape = torch.broadcast_shapes(dst.shape, src.shape)
-    except RuntimeError as exc:
-        raise RuntimeError(str(exc)) from exc
-
-    if torch.Size(broadcast_shape) != dst.shape:
-        raise RuntimeError(
-            f"The broadcast shape {broadcast_shape} does not match destination shape {tuple(dst.shape)}"
-        )
-
-    expanded_src = _expand_like(src, dst.shape)
-
-    # tle takes the whole move when it can: a TMA tile for contiguous same-dtype
-    # copies, and an SDNN 2D row transfer for strided or broadcast layouts, with
-    # the dtype cast folded in.
-    if tle_copy(expanded_src, dst):
         return dst
 
-    # What tle cannot represent goes to the pointwise kernel, which addresses the
-    # destination element by element and so has none of tle's layout and dtype
-    # restrictions. It takes the *expanded* src: a stride-0 view is how the
-    # broadcast reaches the kernel.
-    overload = _copy_kernel.instantiate(expanded_src.ndim)
+    if dst.device != src.device:
+        raise NotImplementedError("copy_ across devices is not supported on Kunlunxin")
+
+    _validate_triton_copy(dst, src)
+    logger.debug("GEMS_KUNLUNXIN COPY_")
+
+    # Fast path: torch.broadcast_shapes() routes through torch._refs /
+    # symbolic-shape guards and costs ~30us per call on the XPU stack, which
+    # dominates small copies.  A same-shape compare + Tensor.expand is
+    # equivalent (expand raises the same "size of tensor a ... must match
+    # size of tensor b ..." RuntimeError when not broadcastable); the slow
+    # broadcast_shapes call is kept only for the error branch to reproduce
+    # torch's exact compatibility message.
+    if src.shape != dst.shape:
+        try:
+            src.expand(dst.shape)
+        except RuntimeError:
+            try:
+                broadcast_shape = torch.broadcast_shapes(dst.shape, src.shape)
+            except RuntimeError as exc:
+                raise RuntimeError(str(exc)) from exc
+            raise RuntimeError(
+                f"The broadcast shape {broadcast_shape} does not match destination shape {tuple(dst.shape)}"
+            ) from None
+    if dst.numel() == 0:
+        return dst
+
+    expanded_src = _expand_like(src, dst.shape)
+    if _is_e8m0(expanded_src):
+        if _is_e8m0(dst):
+            overload = _copy_kernel.instantiate(expanded_src.ndim)
+            overload(expanded_src.view(torch.uint8), out0=dst.view(torch.uint8))
+            return dst
+        if (
+            dst.dtype is torch.float32
+            and expanded_src.is_contiguous()
+            and dst.is_contiguous()
+        ):
+            block_size = 256
+            _copy_e8m0_to_fp32_kernel[(triton.cdiv(expanded_src.numel(), block_size),)](
+                expanded_src.view(torch.uint8),
+                dst,
+                expanded_src.numel(),
+                BLOCK_SIZE=block_size,
+            )
+            return dst
+        raise NotImplementedError(
+            "copy_ from float8_e8m0fnu only supports float8_e8m0fnu and contiguous float32 destinations on Kunlunxin"
+        )
+
+    # Contiguous, same-dtype, non-aliasing copy: bounded-tile flat block-DMA is
+    # measurably faster than both the multi-dim pointwise path (its per-lane
+    # i0*s0 + i1*s1 gather + wide 12-CTA tile is ~2.8x slower and fails to
+    # vectorize bool) and the 1d variant.  Non-contiguous / broadcast / mixed
+    # dtype / aliasing copies keep the strided pointwise kernel below.
+    if (
+        not aliases
+        and expanded_src.is_contiguous()
+        and dst.is_contiguous()
+        and expanded_src.dtype == dst.dtype
+    ):
+        n_elements = expanded_src.numel()
+        item_size = expanded_src.element_size()
+        # Unify 1B/2B/4B element dtypes onto an int32(4B) view: 4B load/store
+        # measures ~830-860 GB/s vs ~505-530 GB/s for raw element loads (the
+        # byte-wide path), and is bit-exact (no value reinterpretation).
+        # Requires 4B-aligned storage and a byte-total divisible by 4;
+        # otherwise fall back to the raw element-wise kernel below.  The
+        # reshape+view host-side work (~3.4us) only pays off on large copies,
+        # so small tensors keep the raw path.
+        if (
+            item_size <= 4
+            and (n_elements * item_size) % 4 == 0
+            and n_elements * item_size >= 2**20
+            and expanded_src.data_ptr() % 4 == 0
+            and dst.data_ptr() % 4 == 0
+        ):
+            # reshape(-1) first: Tensor.view(dtype) requires the last dim's
+            # byte-size to divide 4, which non-flat shapes (e.g. (20,320,15)
+            # fp16) would violate; flattening a contiguous tensor is free.
+            src_view = expanded_src.reshape(-1).view(torch.int32)
+            dst_view = dst.reshape(-1).view(torch.int32)
+            n32 = src_view.numel()
+            block_size = _pick_flat_block(n32)
+            _copy_flat_kernel[(triton.cdiv(n32, block_size),)](
+                src_view,
+                dst_view,
+                n32,
+                BLOCK_SIZE=block_size,
+                NEED_MASK=(n32 % block_size != 0),
+                num_warps=32,
+                unroll_num=8,
+                buffer_size_limit=1024,
+            )
+        else:
+            block_size = _pick_flat_block(n_elements)
+            _copy_flat_kernel[(triton.cdiv(n_elements, block_size),)](
+                expanded_src,
+                dst,
+                n_elements,
+                BLOCK_SIZE=block_size,
+                NEED_MASK=(n_elements % block_size != 0),
+                num_warps=32,
+                unroll_num=8,
+                buffer_size_limit=1024,
+            )
+        return dst
+
+    overload = copy_slice.instantiate(expanded_src.ndim)
+    if aliases:
+        snapshot = torch.empty(dst.shape, dtype=src.dtype, device=src.device)
+        overload(expanded_src, out0=snapshot)
+        expanded_src = snapshot
     overload(expanded_src, out0=dst)
     return dst

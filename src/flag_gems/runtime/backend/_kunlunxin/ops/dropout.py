@@ -180,21 +180,29 @@ def dropout_backward_kernel(
     BLOCK: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # 2026-08-15 (perf round): the mask tensor is passed as an int8 view
-    # (bool tensor storage is i8). On XPU, loading bool (i1) and multiplying
-    # it into the float lane costs ~20-25% more than loading the same bytes
-    # as i8 and casting to the grad dtype; `m.to(dy.dtype)` stays vectorized.
+    # 2026-09-11 (correctness fix): the mask tensor is passed as an int8 view
+    # (bool tensor storage is i8). A direct `m.to(dy.dtype)` (i8 -> f16/bf16/f32)
+    # convert fails `ConvertTritonXPUToLLVM` with "size mismatch when packing
+    # elements for LLVM struct" as soon as a thread owns >2 elements (BLOCK/64
+    # threads > 2, e.g. BLOCK=4096/w16 = 4 elems/thread) — the i8 layout packs
+    # 4 bytes per 32-bit register while f16 packs 2, and the XPU bitcode
+    # conversion cannot repack the LLVM struct. Routing through i32 first
+    # (`(m.to(tl.int32) & 1).to(dy.dtype)`: i8 -> i32 widens to full 32-bit
+    # registers, i32 -> f16 repacks cleanly) compiles on every shape and is
+    # ~20-25% faster than loading the bool tensor as i1 on large shapes
+    # (probed 2026-09-11). `& 1` keeps the value canonical 0/1 regardless of
+    # the stored byte.
     offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     if NEED_MASK:
         mask = offset < N
         m = tl.load(dropout_mask + offset, mask=mask, other=0)
         dy = tl.load(DY + offset, mask=mask, other=0)
-        dx = dy * m.to(dy.dtype) * scale
+        dx = dy * (m.to(tl.int32) & 1).to(dy.dtype) * scale
         tl.store(DX + offset, dx, mask=mask)
     else:
         m = tl.load(dropout_mask + offset)
         dy = tl.load(DY + offset)
-        dx = dy * m.to(dy.dtype) * scale
+        dx = dy * (m.to(tl.int32) & 1).to(dy.dtype) * scale
         tl.store(DX + offset, dx)
 
 

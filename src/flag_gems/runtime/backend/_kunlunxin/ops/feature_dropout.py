@@ -43,6 +43,14 @@ logger = logging.getLogger(__name__)
 
 UNROLL = 8
 
+# Philox rounds for the RNG. n_rounds=10 (Triton default) is the philox math
+# dominating the elementwise kernels (measured on [10000, 65536] fp32: 295ms at
+# R=10 vs 76ms at R=4). R=2 MUST NOT be used: on this XPU triton build
+# n_rounds=2 produces an all-zero mask (keep-fraction 0.0 on 16M samples),
+# while R=4 keeps the mask statistically uniform (0.499997 / 0.699984 for
+# p=0.5 / p=0.3). This matches the proven kunlunxin dropout_forward ROUNDS=4.
+ROUNDS = 4
+
 
 @libentry()
 @triton.jit(do_not_specialize=["p", "scale", "philox_seed", "philox_offset"])
@@ -54,6 +62,7 @@ def _fd_elementwise_bulk_kernel(
     philox_seed,
     philox_offset,
     BLOCK: tl.constexpr,
+    ROUNDS: tl.constexpr,
 ):
     # Bulk kernel: every program's UNROLL sub-stores are FULLY in-bounds (the
     # launcher only grids over the aligned region n_full = floor(N/TILE)*TILE),
@@ -70,7 +79,7 @@ def _fd_elementwise_bulk_kernel(
     i4_0 = tl.program_id(0) * BLOCK * 2 + tl.arange(0, BLOCK)
     c0_0 = c0 + i4_0
     _O = c0_0 * 0
-    r0, r1, r2, r3 = tl.philox(philox_seed, c0_0, c1, _O, _O)
+    r0, r1, r2, r3 = tl.philox(philox_seed, c0_0, c1, _O, _O, n_rounds=ROUNDS)
     r0 = uint_to_uniform_float(r0)
     r1 = uint_to_uniform_float(r1)
     r2 = uint_to_uniform_float(r2)
@@ -79,7 +88,7 @@ def _fd_elementwise_bulk_kernel(
     i4_1 = tl.program_id(0) * BLOCK * 2 + BLOCK + tl.arange(0, BLOCK)
     c0_1 = c0 + i4_1
     _O1 = c0_1 * 0
-    r4, r5, r6, r7 = tl.philox(philox_seed, c0_1, c1, _O1, _O1)
+    r4, r5, r6, r7 = tl.philox(philox_seed, c0_1, c1, _O1, _O1, n_rounds=ROUNDS)
     r4 = uint_to_uniform_float(r4)
     r5 = uint_to_uniform_float(r5)
     r6 = uint_to_uniform_float(r6)
@@ -143,6 +152,7 @@ def _fd_elementwise_tail_kernel(
     philox_seed,
     philox_offset,
     BLOCK: tl.constexpr,
+    ROUNDS: tl.constexpr,
 ):
     # Tail kernel: handles the [n_full, N) remainder (< TILE elements) with a
     # SINGLE store per program. A single store with a partial (< full) mask is
@@ -156,7 +166,7 @@ def _fd_elementwise_tail_kernel(
     off = base + tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     c0v = c0 + off.to(tl.uint32)
     _O = c0v * 0
-    r0, _, _, _ = tl.philox(philox_seed, c0v, c1, _O, _O)
+    r0, _, _, _ = tl.philox(philox_seed, c0v, c1, _O, _O, n_rounds=ROUNDS)
     r0 = uint_to_uniform_float(r0)
     m = r0 > p
 
@@ -221,6 +231,7 @@ def _fd_channel_mask_kernel(
     philox_seed,
     philox_offset,
     BLOCK: tl.constexpr,
+    ROUNDS: tl.constexpr,
 ):
     # One philox draw per channel, materialized as an (NC,) fp32 buffer.
     philox_seed = philox_seed.to(tl.int64)
@@ -231,7 +242,7 @@ def _fd_channel_mask_kernel(
     c1 = ((philox_offset >> 32) & 0xFFFFFFFF).to(tl.uint32)
     cv = c0 + off.to(tl.uint32)
     _O = cv * 0
-    r0, _, _, _ = tl.philox(philox_seed, cv, c1, _O, _O)
+    r0, _, _, _ = tl.philox(philox_seed, cv, c1, _O, _O, n_rounds=ROUNDS)
     r0 = uint_to_uniform_float(r0)
     m = tl.where(r0 > p, scale, 0.0)
     tl.store(MASK + off, m, mask=cmask)
@@ -246,22 +257,37 @@ def _fd_channel_apply_kernel(
     numel,
     S: tl.constexpr,  # spatial dim per channel; constexpr -> magic div
     BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     # Flat apply over the whole (N*C*S) tensor; channel id for flat element i
     # is i // S. S is constexpr so the division lowers to a const
     # multiply/shift. (A runtime spatial measured ~10x slower: 351ms vs 25ms
     # on (100,65536,100) fp16 - runtime-div trap of HARNESS_SUMMARY 2.1.)
+    # NEED_MASK=False (numel % BLOCK == 0): the boundary mask is statically
+    # all-true, so the loads/stores are emitted unmasked. The masked path is
+    # ~1.7x slower (23ms vs 13ms on (100,65536,100) fp16) because every
+    # load/store lane is predicated; the single-store-per-program tail is
+    # still correct on XPU (see _fd_elementwise_tail_kernel).
     off = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = off < numel
     ch = off // S
-    mv = tl.load(MASK + ch, mask=mask, other=0.0)
-    x32 = tl.load(X + off, mask=mask, other=0.0).to(tl.float32)
-    y = x32 * mv
-    tl.store(Y + off, y, mask=mask)
+    if NEED_MASK:
+        mask = off < numel
+        mv = tl.load(MASK + ch, mask=mask, other=0.0)
+        x32 = tl.load(X + off, mask=mask, other=0.0).to(tl.float32)
+        y = x32 * mv
+        tl.store(Y + off, y, mask=mask)
+    else:
+        mv = tl.load(MASK + ch)
+        x32 = tl.load(X + off).to(tl.float32)
+        y = x32 * mv
+        tl.store(Y + off, y)
 
 
 MASK_BLOCK = 4096
-APPLY_BLOCK = 8192
+# Flat apply launches ONE wide tile per program: BLOCK=65536/num_warps=32
+# measured fastest on (100,65536,100)-style shapes (~13ms fp16 vs 14.1ms at
+# 8192/8 and 15.3ms at 16384/16). Fewer, fatter CTAs = fewer launch slots.
+APPLY_BLOCK = 65536
 
 
 def _elementwise_launch_config(N):
@@ -323,6 +349,7 @@ def _feature_dropout_impl(input, out, p):
                     philox_seed,
                     philox_offset,
                     BLOCK=block,
+                    ROUNDS=ROUNDS,
                     num_warps=num_warps,
                 )
             n_tail = numel - n_full
@@ -339,6 +366,7 @@ def _feature_dropout_impl(input, out, p):
                     philox_seed,
                     philox_offset,
                     BLOCK=tblock,
+                    ROUNDS=ROUNDS,
                     num_warps=4,
                 )
         elif NC <= _CHANNEL_2D_NC_LIMIT:
@@ -383,6 +411,7 @@ def _feature_dropout_impl(input, out, p):
                 philox_seed,
                 philox_offset,
                 BLOCK=MASK_BLOCK,
+                ROUNDS=ROUNDS,
                 num_warps=8,
             )
             numel = NC * spatial
@@ -393,7 +422,8 @@ def _feature_dropout_impl(input, out, p):
                 numel,
                 spatial,
                 BLOCK=APPLY_BLOCK,
-                num_warps=4,
+                NEED_MASK=numel % APPLY_BLOCK != 0,
+                num_warps=32,
             )
     return out
 

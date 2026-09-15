@@ -2,6 +2,7 @@ import logging
 
 import triton
 import triton.language as tl
+import triton.language.extra.xpu.libdevice as xpu
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
@@ -23,11 +24,14 @@ config_ = CodeGenConfig(
 
 @triton.jit
 def _fmod(x, y):
-    x64 = x.to(tl.float64)
-    y64 = y.to(tl.float64)
-    quotient = x64 / y64
-    quotient = tl.where(quotient >= 0, tl.floor(quotient), -tl.floor(-quotient))
-    return x64 - y64 * quotient
+    # x, y are fp32. Use the XPU native fmodf extern (xpu::fmodf, exact C
+    # fmod semantics: x - trunc(x/y)*y, correctly rounded). The previous
+    # implementation went through fp64 division, which is emulated on XPU
+    # (measured ~10x slower on (4096,4096) fp32: 18.1ms vs 1.75ms). The
+    # single-instruction extern also removes the fp32-quotient trunc
+    # boundary hazard of an int-cast trunc implementation (off-by-one
+    # quotient when x/y is within 1 ulp of an integer).
+    return xpu.fmod(x, y)
 
 
 @pointwise_dynamic(

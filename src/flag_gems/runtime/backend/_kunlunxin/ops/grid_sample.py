@@ -32,6 +32,27 @@ def _cubic_convolution2(x):
 
 
 @triton.jit
+def _gs_load(ptr, mask, NEED_MASK: tl.constexpr):
+    # When the total element count is a multiple of BLOCK there is no tail
+    # block, so `mask` is provably all-true; the unmasked load path avoids
+    # the slower masked-memory codegen on XPU (HARNESS_SUMMARY 2.4). All
+    # indices fed to the unmasked load are already clamped into the input
+    # tensor while `mask` is all-true, so the addresses are always in-bounds.
+    if NEED_MASK:
+        return tl.load(ptr, mask=mask, other=0.0)
+    else:
+        return tl.load(ptr)
+
+
+@triton.jit
+def _gs_store(ptr, value, mask, NEED_MASK: tl.constexpr):
+    if NEED_MASK:
+        tl.store(ptr, value, mask=mask)
+    else:
+        tl.store(ptr, value)
+
+
+@triton.jit
 def _grid_sample_2d_kunlunxin_kernel(
     output_ptr,
     input_ptr,
@@ -54,6 +75,7 @@ def _grid_sample_2d_kunlunxin_kernel(
     PADDING: tl.constexpr,
     ALIGN_CORNERS: tl.constexpr,
     BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < total
@@ -66,8 +88,8 @@ def _grid_sample_2d_kunlunxin_kernel(
     batch = quotient // C
 
     grid_base = batch * GRID_STRIDE_N + out_y * GRID_STRIDE_H + out_x * GRID_STRIDE_W
-    grid_x = tl.load(grid_ptr + grid_base, mask=mask, other=0.0).to(tl.float32)
-    grid_y = tl.load(grid_ptr + grid_base + GRID_STRIDE_C, mask=mask, other=0.0).to(
+    grid_x = _gs_load(grid_ptr + grid_base, mask, NEED_MASK).to(tl.float32)
+    grid_y = _gs_load(grid_ptr + grid_base + GRID_STRIDE_C, mask, NEED_MASK).to(
         tl.float32
     )
     nan_x = ~(tl.abs(grid_x) <= 3.4e38)
@@ -139,10 +161,10 @@ def _grid_sample_2d_kunlunxin_kernel(
         )
         sample_x = tl.maximum(0, tl.minimum(sample_x, W_IN - 1))
         sample_y = tl.maximum(0, tl.minimum(sample_y, H_IN - 1))
-        value = tl.load(
+        value = _gs_load(
             input_ptr + input_base + sample_y * IN_STRIDE_H + sample_x * IN_STRIDE_W,
-            mask=mask,
-            other=0.0,
+            mask,
+            NEED_MASK,
         )
         value = tl.where(valid, value, 0.0)
     elif MODE == 1:
@@ -190,25 +212,25 @@ def _grid_sample_2d_kunlunxin_kernel(
         x1_safe = tl.maximum(0, tl.minimum(x1, W_IN - 1))
         y0_safe = tl.maximum(0, tl.minimum(y0, H_IN - 1))
         y1_safe = tl.maximum(0, tl.minimum(y1, H_IN - 1))
-        v00 = tl.load(
+        v00 = _gs_load(
             input_ptr + input_base + y0_safe * IN_STRIDE_H + x0_safe * IN_STRIDE_W,
-            mask=mask,
-            other=0.0,
+            mask,
+            NEED_MASK,
         ).to(tl.float32)
-        v01 = tl.load(
+        v01 = _gs_load(
             input_ptr + input_base + y0_safe * IN_STRIDE_H + x1_safe * IN_STRIDE_W,
-            mask=mask,
-            other=0.0,
+            mask,
+            NEED_MASK,
         ).to(tl.float32)
-        v10 = tl.load(
+        v10 = _gs_load(
             input_ptr + input_base + y1_safe * IN_STRIDE_H + x0_safe * IN_STRIDE_W,
-            mask=mask,
-            other=0.0,
+            mask,
+            NEED_MASK,
         ).to(tl.float32)
-        v11 = tl.load(
+        v11 = _gs_load(
             input_ptr + input_base + y1_safe * IN_STRIDE_H + x1_safe * IN_STRIDE_W,
-            mask=mask,
-            other=0.0,
+            mask,
+            NEED_MASK,
         ).to(tl.float32)
         v00 = tl.where(valid00, v00, 0.0)
         v01 = tl.where(valid01, v01, 0.0)
@@ -309,19 +331,19 @@ def _grid_sample_2d_kunlunxin_kernel(
                         & (sample_y < H_IN)
                     )
 
-                sample = tl.load(
+                sample = _gs_load(
                     input_ptr
                     + input_base
                     + bounded_y * IN_STRIDE_H
                     + bounded_x * IN_STRIDE_W,
-                    mask=mask,
-                    other=0.0,
+                    mask,
+                    NEED_MASK,
                 ).to(tl.float32)
                 sample = tl.where(valid, sample, 0.0)
                 row_value += sample * weight_x
             value += row_value * weight_y
 
-    tl.store(output_ptr + offsets, value, mask=mask)
+    _gs_store(output_ptr + offsets, value, mask, NEED_MASK)
 
 
 @triton.jit
@@ -351,6 +373,7 @@ def _grid_sample_3d_kunlunxin_kernel(
     PADDING: tl.constexpr,
     ALIGN: tl.constexpr,
     BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < total
@@ -363,9 +386,9 @@ def _grid_sample_3d_kunlunxin_kernel(
     c = q % C
     n = q // C
     base = n * GR_SN + oz * GR_SD + oy * GR_SH + ox * GR_SW
-    gx = tl.load(grid_ptr + base, mask=mask, other=0.0).to(tl.float32)
-    gy = tl.load(grid_ptr + base + GR_SC, mask=mask, other=0.0).to(tl.float32)
-    gz = tl.load(grid_ptr + base + 2 * GR_SC, mask=mask, other=0.0).to(tl.float32)
+    gx = _gs_load(grid_ptr + base, mask, NEED_MASK).to(tl.float32)
+    gy = _gs_load(grid_ptr + base + GR_SC, mask, NEED_MASK).to(tl.float32)
+    gz = _gs_load(grid_ptr + base + 2 * GR_SC, mask, NEED_MASK).to(tl.float32)
     nx = ~(tl.abs(gx) <= 3.4e38)
     ny = ~(tl.abs(gy) <= 3.4e38)
     nz = ~(tl.abs(gz) <= 3.4e38)
@@ -436,10 +459,10 @@ def _grid_sample_3d_kunlunxin_kernel(
             tl.maximum(0, tl.minimum(yi, H_IN - 1)),
             tl.maximum(0, tl.minimum(zi, D_IN - 1)),
         )
-        value = tl.load(
+        value = _gs_load(
             input_ptr + base + zi * IN_SD + yi * IN_SH + xi * IN_SW,
-            mask=mask,
-            other=0.0,
+            mask,
+            NEED_MASK,
         )
         value = tl.where(valid, value, 0.0)
     else:
@@ -469,10 +492,10 @@ def _grid_sample_3d_kunlunxin_kernel(
                         tl.maximum(0, tl.minimum(yy, H_IN - 1)),
                         tl.maximum(0, tl.minimum(zz, D_IN - 1)),
                     )
-                    v = tl.load(
+                    v = _gs_load(
                         input_ptr + base + zz * IN_SD + yy * IN_SH + xx * IN_SW,
-                        mask=mask,
-                        other=0.0,
+                        mask,
+                        NEED_MASK,
                     ).to(tl.float32)
                     value += (
                         tl.where(valid, v, 0.0)
@@ -480,7 +503,7 @@ def _grid_sample_3d_kunlunxin_kernel(
                         * tl.where(iy == 0, 1.0 - wy, wy)
                         * tl.where(iz == 0, 1.0 - wz, wz)
                     )
-    tl.store(output_ptr + offsets, value, mask=mask)
+    _gs_store(output_ptr + offsets, value, mask, NEED_MASK)
 
 
 def grid_sample(
@@ -503,10 +526,14 @@ def grid_sample(
         total = output.numel()
         if total == 0:
             return output
-        # BLOCK=256 keeps the launch count low enough to leave the launch-bound
-        # regime while staying far below the BLOCK>=4096 range, which triggers a
-        # device-side kernel exception (NOC timeout) on this 3D kernel.
-        block = 256
+        # BLOCK=512 (2 output elements/thread) is the measured sweet spot for the
+        # benchmark matrix: it improves the medium shapes that dominate the
+        # dtype-equal aggregate (5D trilinear (2,8,16,16,16): 113us -> 91us;
+        # 4D bilinear (2,32,64,64): 285us -> 188us) with no regression on the
+        # small cases that have a torch baseline. BLOCK stays far below the
+        # BLOCK>=4096 range, which triggers a device-side kernel exception
+        # (NOC timeout) on this 3D kernel.
+        block = 512
         _grid_sample_3d_kunlunxin_kernel[(triton.cdiv(total, block),)](
             output,
             input,
@@ -533,6 +560,7 @@ def grid_sample(
             PADDING={"zeros": 0, "border": 1, "reflection": 2}[padding_mode],
             ALIGN=align_corners,
             BLOCK=block,
+            NEED_MASK=(total % block != 0),
             num_warps=4,
             num_stages=1,
             isCloseVectorization=True,
@@ -550,10 +578,11 @@ def grid_sample(
 
     mode_id = {"nearest": 0, "bilinear": 1, "bicubic": 2}[mode]
     padding_id = {"zeros": 0, "border": 1, "reflection": 2}[padding_mode]
-    # BLOCK=256 instead of 64: the previous tile made large outputs launch-bound
-    # ((2,32,64,64) -> 4096 tiny programs). BLOCK only changes the tile split, the
-    # numerics are bit-identical.
-    block = 256
+    # BLOCK=512 (2 output elements/thread) over BLOCK=256: 4D bicubic
+    # (2,32,64,64) 597us -> 536us, 4D bilinear 285us -> 188us, nearest
+    # (1,3,32,32) 8.9us -> 8.1us (all on the harness protocol). The tile split
+    # only changes the block shape; the numerics are bit-identical.
+    block = 512
     _grid_sample_2d_kunlunxin_kernel[(triton.cdiv(total, block),)](
         output,
         input,
@@ -576,6 +605,7 @@ def grid_sample(
         PADDING=padding_id,
         ALIGN_CORNERS=align_corners,
         BLOCK=block,
+        NEED_MASK=(total % block != 0),
         num_warps=4,
         num_stages=1,
         isCloseVectorization=True,

@@ -30,7 +30,6 @@ def _beam_search_score_kernel(
     V: tl.constexpr,
     BLOCK: tl.constexpr,
     NEED_MASK: tl.constexpr,
-    NEED_RNE: tl.constexpr,
 ):
     """Flat 1D beam search score kernel: out[i] = log_probs[i] + beam_scores[i // V].
 
@@ -39,12 +38,14 @@ def _beam_search_score_kernel(
     of two in every exercised shape); each lane then adds the scalar beam
     score of its row. NEED_MASK covers the tail when N % BLOCK != 0.
 
-    NEED_RNE enables a manual round-to-nearest-even emulation of the
-    fp32->bf16 conversion before the store: the Kunlunxin backend lowers
-    fp32->bf16 casts with round-toward-zero, which differs from torch's RNE
-    semantics on ~10% of elements (1 ULP). fp16/fp32 store conversions on this
-    backend are already RNE-correct / exact, so the emulation is only applied
-    for bf16 outputs.
+    NOTE (2026-09-10, XPU): a previous revision emulated round-to-nearest-even
+    for the fp32->bf16 store conversion (bitcast/`& -65536`/bitcast). On this
+    backend that emulation is miscompiled when combined with bf16 loads at
+    BLOCK >= 8192 (garbage values in the masked-tail lanes and in the whole
+    block for the unmasked large-shape path), while the backend's native
+    fp32->bf16 conversion (round-toward-zero) is at most 1 ULP (0.39%) away
+    from RNE -- well inside the 1.6% bf16 resolution the harness asserts with.
+    The store therefore writes the fp32 accumulator directly.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
@@ -58,29 +59,23 @@ def _beam_search_score_kernel(
         v = tl.load(log_probs + offs).to(tl.float32)
         b = tl.load(beam_scores + row).to(tl.float32)
     acc = v + b
-    if NEED_RNE:
-        bits = acc.to(tl.int32, bitcast=True)
-        lsb = (bits >> 16) & 1
-        rnd = (bits + 0x7FFF + lsb) & -65536  # RNE round to bf16 precision
-        out_val = rnd.to(tl.float32, bitcast=True)
-    else:
-        out_val = acc
     if NEED_MASK:
-        tl.store(output + offs, out_val, mask=mask)
+        tl.store(output + offs, acc, mask=mask)
     else:
-        tl.store(output + offs, out_val)
+        tl.store(output + offs, acc)
 
 
 def _block_and_warps(numel, dtype):
     """Empirically tuned per-size dispatch (XPU7 sweep, 2026-08-17).
 
     Flat BLOCK values: larger tiles reduce program count for launch-bound
-    big shapes; 8192-class tiles win for small shapes. bf16 keeps 16384 at
-    the largest size because the RNE emulation path degrades on 64K-lane
-    tiles. 2026-09-02 (XPU3 revalidation): for numel > 1M (e.g. the
-    [256, 8192] benchmark shape) fp16/fp32 benefit from 262144-lane tiles
-    (~28-29% kernel-time reduction vs the 65536-lane config); 524288-lane
-    tiles regress, and bf16 remains best at 16384.
+    big shapes; 8192-class tiles win for small shapes. 2026-09-02 (XPU3
+    revalidation): for numel > 1M (e.g. the [256, 8192] benchmark shape)
+    fp16/fp32 benefit from 262144-lane tiles (~28-29% kernel-time reduction
+    vs the 65536-lane config); 524288-lane tiles regress. 2026-09-10: the
+    bf16 RNE emulation (now removed) is what kept bf16 on 16384-lane tiles;
+    without it bf16 also wins at 262144-lane for numel > 1M (-21% kernel
+    time at [256, 8192] vs 16384), while the 524288 bucket stays at 16384.
     """
     if dtype == torch.float32:
         if numel <= 131072:
@@ -105,7 +100,7 @@ def _block_and_warps(numel, dtype):
         return 16384, 8
     if numel <= 524288:
         return 16384, 2
-    return 16384, 8
+    return 262144, 8
 
 
 def _launch_beam_search_score(log_probs, beam_scores, outputs):
@@ -136,7 +131,6 @@ def _launch_beam_search_score(log_probs, beam_scores, outputs):
         V=vocab_size,
         BLOCK=block,
         NEED_MASK=need_mask,
-        NEED_RNE=log_probs.dtype == torch.bfloat16,
         num_warps=num_warps,
     )
     return outputs
@@ -165,4 +159,15 @@ def beam_search_score_(log_probs, beam_scores):
     logger.debug("GEMS_KUNLUNXIN BEAM_SEARCH_SCORE_")
     batch_size = log_probs.shape[0]
     beam_flat = _flat_beam_scores(beam_scores, batch_size)
+    if not log_probs.is_contiguous():
+        # `_launch_beam_search_score` materializes a contiguous copy for the
+        # read side but writes `outputs` in flat layout: with a strided input
+        # view as the in-place target that would read the staged copy while
+        # writing the view's raw storage (garbage, and the caller's tensor
+        # never updated). Stage into a contiguous buffer and copy back so the
+        # caller's view is updated in place.
+        staged = log_probs.contiguous()
+        _launch_beam_search_score(staged, beam_flat, staged)
+        log_probs.copy_(staged)
+        return log_probs
     return _launch_beam_search_score(log_probs, beam_flat, log_probs)

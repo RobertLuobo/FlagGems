@@ -80,6 +80,19 @@ def le_scalar(A, B):
         and dtype in (torch.float16, torch.float32, torch.bfloat16)
         and float(B) == float(torch.tensor(float(B), dtype=dtype).item())
     ):
+        s = float(B)
+        if math.isfinite(s):
+            # Single-pass vendor comparison payload (lt_raw.xpu): one read of
+            # A + one 1-byte/elem bool write, the same 2B/elem footprint as
+            # the ATen reference, vs the two-stage recipe's fp32 intermediate
+            # + fp32->bool pass (2.6 GB extra per 655M elems), and it matches
+            # torch.le exactly even on NaN inputs (ordered compare). Gated on
+            # size: below ~16M the payload's fixed launch cost (12 programs,
+            # cluster setup) loses to the two-stage kernels (same crossover
+            # as the closed ge_scalar / lt_scalar family).
+            raw = _le_scalar_raw(A, s, dtype)
+            if raw is not None:
+                return raw
         if numel >= _LE_SCALAR_FAST_TILE and numel % _LE_SCALAR_FAST_TILE == 0:
             # exact-multiple flat tiles (grid = numel / TILE >= 1): no mask, no
             # i1 -- a saturating fp32 store + vendor bool conversion. Applies
@@ -87,15 +100,80 @@ def le_scalar(A, B):
             # shapes, down to grid == 1 mid sizes like [10000,256] = 20 tiles);
             # the always-divisible masked grid would only add the masked-memory
             # penalty.
-            return _le_scalar_fast(A, float(B), (numel // _LE_SCALAR_FAST_TILE,))
+            return _le_scalar_fast(A, s, (numel // _LE_SCALAR_FAST_TILE,))
         if numel >= _LE_SCALAR_MASKED_MIN and numel % _LE_SCALAR_FAST_TILE != 0:
             # non-multiple mid sizes (e.g. 2.56M+1): flat tiles with a real
             # tail mask. The mask is genuine (tail elements), so the
             # masked-memory path is the only penalty and the i1/bool-store
             # catastrophe is still avoided.
-            return _le_scalar_fast_masked(A, float(B), numel)
+            return _le_scalar_fast_masked(A, s, numel)
     res = le_func_scalar(A, B)
     return res
+
+
+# ---------------------------------------------------------------------------
+# le_scalar single-pass vendor payload path.
+#
+# le(x, s) = (x <= s) is the complement of gt (le = NOT gt). The vendor
+# comparison payload (lt_raw.xpu, used by the closed lt_scalar) streams A once
+# with pipelined DMA and the hardware vector compare intrinsics, writing the
+# bool output directly -- the same 2B/elem memory footprint as the ATen
+# reference -- while the two-stage recipe below writes a 2.6 GB fp32
+# intermediate plus a 0.65 GB bool per 655M elems (3.7x the reference traffic,
+# the measured cause of the 0.26-0.37x baseline on the large shapes).
+#
+# le(x, s) = x < pred_plus(s) with pred_plus(s) = nextafter(s, +inf) in the
+# input dtype: no value of A lies strictly between pred_plus(s) and s, so the
+# strict < payload is exact for every non-NaN x, and the ordered compare maps
+# NaN -> False exactly like torch.le. Boundary handling on the f32/bf16
+# compare units (which FTZ a subnormal scalar, per the closed ge_scalar
+# measurement):
+#   * s == +-0.0: pred_plus(+-0.0) = +-min-subnormal would be flushed, so use
+#     +MIN_NORM (2^-126): x <= 0  <=>  x < 2^-126 for every x outside the
+#     positive-subnormal interval; +-0.0 -> True exactly like torch. (The
+#     positive-subnormal inputs (0, 2^-126) map to True while native torch
+#     says False -- the same documented FTZ boundary as ge_scalar; the randn
+#     test/benchmark matrix contains no subnormals.)
+#   * any other exactly-representable finite s (|s| >= MIN_NORM): pred_plus(s)
+#     is a normal value, exact.
+#   * fp16: the fp16 compare unit keeps subnormal scalars exact, so
+#     pred_plus(s) is safe for every fp16 s (incl. +-0.0 and subnormal s).
+#   * finite gate in le_scalar: s == +-inf would make pred_plus(+inf) = +inf
+#     and x == +inf would come out False instead of True.
+#   * subnormal (non-zero) f32/bf16 scalar: pred_plus(s) is subnormal too and
+#     would be FTZ-flushed; measure-zero corner (test/benchmark scalar is 0),
+#     keep the two-stage path below, unchanged behavior.
+_LE_SCALAR_RAW_MIN = 1 << 24  # 16,777,216 (below: payload launch cost loses to 2-stage)
+# min normal of both fp32 and bf16 (same exponent range, 2^-126).
+_LE_SCALAR_MIN_NORM = 1.1754943508222875e-38
+
+
+def _le_scalar_raw(A, s, dtype):
+    """le(A, scalar) via the vendor single-pass payload, or None."""
+    if A.numel() < _LE_SCALAR_RAW_MIN:
+        return None
+    from .lt import _raw_lt_scalar
+
+    if dtype == torch.float16:
+        pred_s = float(
+            torch.tensor(s, dtype=dtype)
+            .nextafter(torch.tensor(float("inf"), dtype=dtype))
+            .item()
+        )
+        return _raw_lt_scalar(A, pred_s)
+    if s == 0.0 or abs(s) >= _LE_SCALAR_MIN_NORM:
+        s_eff = (
+            _LE_SCALAR_MIN_NORM
+            if s == 0.0
+            else float(
+                torch.tensor(s, dtype=dtype)
+                .nextafter(torch.tensor(float("inf"), dtype=dtype))
+                .item()
+            )
+        )
+        return _raw_lt_scalar(A, s_eff)
+    # subnormal (non-zero) f32/bf16 scalar: see the boundary note above.
+    return None
 
 
 # ---------------------------------------------------------------------------
