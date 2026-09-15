@@ -24,6 +24,9 @@ from ._batch_norm_impl_index import batch_norm_impl_index as _batch_norm_impl_in
 from ._batch_norm_no_update import _batch_norm_no_update
 from ._dyn_quant_pack_4bit_weight import _dyn_quant_pack_4bit_weight
 from ._embedding_bag_dense_backward import _embedding_bag_dense_backward
+from ._embedding_bag_per_sample_weights_backward import (
+    _embedding_bag_per_sample_weights_backward,
+)
 from ._euclidean_dist import _euclidean_dist
 from ._functional_sym_constrain_range import _functional_sym_constrain_range
 from ._functional_sym_constrain_range_for_size import (
