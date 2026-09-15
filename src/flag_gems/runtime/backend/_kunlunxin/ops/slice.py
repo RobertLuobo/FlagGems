@@ -11,28 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Kunlunxin (TritonXPU) specialization of slice.
-#
-# Why this override exists (2026-09-05, XPU 6)
-# --------------------------------------------
-# The general implementation in src/flag_gems/ops/slice.py has the signature
-# ``slice(input_tensor, dim, start, end, step)`` with a *required* ``step``.
-# Under ``use_gems()`` the registered ``slice.Tensor`` python impl is invoked
-# from C++ ``Tensor::slice(dim, start, end)`` callsites (e.g. the ATen
-# implementation of ``tensor_split``) with only 4 positional arguments
-# (self, dim, start, end -- ``step`` is omitted), which raises::
-#
-#     TypeError: slice() missing 1 required positional argument: 'step'
-#
-# -> tests/test_tensor_split.py: 36 failed with that error on the first run.
-#
-# This override re-implements ``slice.Tensor`` with a defaulted ``step=1`` and
-# as a zero-copy *view* through ``torch.narrow`` (step == 1) or
-# ``torch.as_strided`` (step != 1), i.e. the same storage-sharing semantics as
-# ``aten::slice.Tensor``. Both helpers are safe inside ``use_gems()``:
-# ``torch.narrow`` is itself a registered view-based impl and
-# ``torch.as_strided`` is not registered at all (no re-dispatch/recursion).
 
 import logging
 
@@ -44,14 +22,6 @@ logger = logging.getLogger(__name__)
 def slice(
     input_tensor: torch.Tensor, dim: int, start, end, step: int = 1
 ) -> torch.Tensor:
-    r"""Return a zero-copy view of ``input_tensor`` along ``dim``.
-
-    Mirrors ``aten::slice.Tensor``: ``start``/``end`` may be ``None`` or
-    negative, and a non-unit ``step`` produces a strided (still zero-copy)
-    view.  The ``step`` argument is optional because the C++
-    ``Tensor::slice(dim, start, end)`` callsite (used internally by
-    ``tensor_split`` and friends) omits it.
-    """
     logger.debug("GEMS_KUNLUNXIN SLICE")
 
     if step == 0:

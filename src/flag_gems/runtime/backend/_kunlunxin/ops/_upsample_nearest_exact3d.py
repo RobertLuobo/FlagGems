@@ -26,18 +26,6 @@ logger = logging.getLogger(__name__)
 device = device.name
 
 
-# NOTE (kunlunxin/XPU): flat 1D grid over ALL output elements (decode nc/od/oh/ow
-# from the flat index, no per-plane loop) exposes full program-level parallelism.
-# Follows the vendor upsample_nearest3d precedent: geometry (OD/OH/OW/ID/IH/IW)
-# is tl.constexpr so the per-lane div/mod chain is strength-reduced to constant
-# arithmetic; nc is clamped to NC-1 and the nearest-exact source indices are
-# clamped to the source extent before use so every load is in-bounds for ANY
-# decoded lane and the loads drop the mask (masked-memory path is penalized on
-# XPU); the tail store is guarded by a NEED_MASK constexpr only when total_out
-# does not divide BLOCK_SIZE.  The nearest-exact source mapping is
-#   src = min(floor((dst + 0.5) / scale), in - 1)
-# where scale = out / in (reciprocal_scale = in / out, or 1 / scale when the
-# scale factor was given directly).
 @triton.jit
 def _upsample_nearest_exact3d_kernel(
     ptr_o,
@@ -80,27 +68,21 @@ def _upsample_nearest_exact3d_kernel(
         id = od
     else:
         id = tl.minimum(
-            tl.math.floor((od.to(tl.float32) + 0.5) * reciprocal_scale_d).to(
-                tl.int32
-            ),
+            tl.math.floor((od.to(tl.float32) + 0.5) * reciprocal_scale_d).to(tl.int32),
             ID - 1,
         )
     if SAME_H:
         ih = oh
     else:
         ih = tl.minimum(
-            tl.math.floor((oh.to(tl.float32) + 0.5) * reciprocal_scale_h).to(
-                tl.int32
-            ),
+            tl.math.floor((oh.to(tl.float32) + 0.5) * reciprocal_scale_h).to(tl.int32),
             IH - 1,
         )
     if SAME_W:
         iw = ow
     else:
         iw = tl.minimum(
-            tl.math.floor((ow.to(tl.float32) + 0.5) * reciprocal_scale_w).to(
-                tl.int32
-            ),
+            tl.math.floor((ow.to(tl.float32) + 0.5) * reciprocal_scale_w).to(tl.int32),
             IW - 1,
         )
 
@@ -155,9 +137,7 @@ def _upsample_nearest_exact3d(
     reciprocal_scale_h = calculate_scale(IH, OH, scales_h)
     reciprocal_scale_w = calculate_scale(IW, OW, scales_w)
 
-    output = torch.empty(
-        (N, C, OD, OH, OW), device=input.device, dtype=input.dtype
-    )
+    output = torch.empty((N, C, OD, OH, OW), device=input.device, dtype=input.dtype)
     if output.numel() == 0:
         return output
 

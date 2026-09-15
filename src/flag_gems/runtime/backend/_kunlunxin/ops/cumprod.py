@@ -27,9 +27,6 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_KEYSET = torch._C.DispatchKeySet(
-    torch._C.DispatchKey.CompositeExplicitAutograd
-)
 DEFAULT_BLOCK_SIZE = 1024
 CUDA_SMALL_SCAN_LIMIT = 1024 * 4
 ASCEND_SCAN_LIMIT = 1024
@@ -215,12 +212,6 @@ def _get_compute_dtype(dtype):
     return dtype
 
 
-def _should_redispatch_on_ascend(dtype):
-    return runtime_device.vendor_name == "ascend" and (
-        is_integer_dtype(dtype) or is_boolean_dtype(dtype)
-    )
-
-
 def _scan_block_size(length):
     limit = (
         ASCEND_SCAN_LIMIT
@@ -236,6 +227,14 @@ def cumprod_wrapper(inp, dim, dtype=None, out=None):
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
     dim = dim % inp.ndim
     out_dtype = _get_output_dtype(inp, dtype)
+
+    if not inp.is_contiguous():
+        if out is None:
+            out = torch.empty_like(inp, dtype=out_dtype)
+        if inp.numel() == 0:
+            return out
+        compute_dtype = _get_compute_dtype(out.dtype)
+        return _strided_scan(inp, out, dim, compute_dtype)
 
     inp = inp.contiguous()
     if out is None:
@@ -297,17 +296,17 @@ def cumprod_row_scan_chunk_kernel(
             x = tl.load(inp_ptr + row_offset + n_offsets).to(ACC_DTYPE)
         r = tl.cumprod(x, axis=0) * carry
         carry *= tl.reduce(x, axis=0, combine_fn=reduce_mul)
-        # Convert in-register on store: the scan stays in ACC_DTYPE (same
-        # numerics as before), only the stored value is narrowed to the
-        # output pointer's element type so the kernel can write `out`
-        # directly (the native torch-level scan_out.to(out.dtype) convert
-        # of the whole tile is ~30x slower on this backend than the scan
-        # itself). Chunk c+1 loads [start+BN, ...) which is disjoint from
-        # chunk c's stores, so writing in-place (out == inp) stays race-free.
         if NEED_TAIL:
-            tl.store(out_ptr + row_offset + n_offsets, r.to(out_ptr.dtype.element_ty), mask=mask)
+            tl.store(
+                out_ptr + row_offset + n_offsets,
+                r.to(out_ptr.type.element_ty),
+                mask=mask,
+            )
         else:
-            tl.store(out_ptr + row_offset + n_offsets, r.to(out_ptr.dtype.element_ty))
+            tl.store(
+                out_ptr + row_offset + n_offsets,
+                r.to(out_ptr.type.element_ty),
+            )
 
 
 def reduce_then_scan_row(x, out, M, N, compute_dtype):
@@ -323,12 +322,9 @@ def reduce_then_scan_row(x, out, M, N, compute_dtype):
         return out
 
     # N > persistent_limit: per-row chunked online scan. The scan runs in
-    # ACC_DTYPE and the kernel narrows each stored value to `out`'s element
-    # type in-register (see cumprod_row_scan_chunk_kernel), so `out` is
-    # written directly and no intermediate scan_out (which would require a
-    # torch-level convert + copy of the whole tile) is needed. Writing
-    # in-place is safe: chunk c+1 loads [start+BN, ...), disjoint from
-    # chunk c's stores.
+    # ACC_DTYPE and is cast back to the output pointee type in-kernel (the
+    # store value type then matches the pointer type, so no torch-level
+    # convert + `_copy_from` pass is needed).
     acc_tl = _TL_SCAN_DTYPES.get(compute_dtype, tl.float32)
     BN = 32768 if compute_dtype == torch.float32 else 16384
     need_tail = 1 if N % BN else 0
@@ -348,6 +344,147 @@ def reduce_then_scan_row(x, out, M, N, compute_dtype):
 
 
 @triton.jit
+def _strided_row_base(row, meta_ptr, ND_OTHER: tl.constexpr):
+    """Storage offset of the first element of virtual row ``row``.
+
+    ``row`` is a mixed-radix index over every dim of the tensor except the
+    scan dim, in program order (``meta`` is a (2, ND_OTHER) int64 tensor:
+    ``meta[0]`` = dim shapes, ``meta[1]`` = dim strides).  The scan dim is
+    the innermost of the virtual rows."""
+    off = 0
+    tmp = row
+    for i in tl.static_range(ND_OTHER):
+        idx = ND_OTHER - 1 - i
+        s = tl.load(meta_ptr + idx)
+        digit = tmp % s
+        tmp = tmp // s
+        off = off + digit * tl.load(meta_ptr + ND_OTHER + idx)
+    return off
+
+
+@libentry()
+@triton.jit(do_not_specialize=["N", "stride_n"])
+def cumprod_strided_row_scan_kernel(
+    inp_ptr,
+    out_ptr,
+    meta_ptr,
+    N,
+    stride_n,
+    ND_OTHER: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    row_off = _strided_row_base(row, meta_ptr, ND_OTHER)
+    offs = tl.arange(0, TILE_SIZE)
+    mask = offs < N
+    acc_dtype: tl.constexpr = get_prod_accum_type(out_ptr.type.element_ty)
+    x = tl.load(inp_ptr + row_off + offs * stride_n, mask=mask, other=1).to(acc_dtype)
+    r = tl.cumprod(x, 0)
+    tl.store(
+        out_ptr + row_off + offs * stride_n,
+        r.to(out_ptr.type.element_ty),
+        mask=mask,
+    )
+
+
+@libentry()
+@triton.jit(do_not_specialize=["N", "stride_n"])
+def cumprod_strided_row_scan_chunk_kernel(
+    inp_ptr,
+    out_ptr,
+    meta_ptr,
+    N,
+    stride_n,
+    ND_OTHER: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+    BN: tl.constexpr,
+    NEED_TAIL: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    row_off = _strided_row_base(row, meta_ptr, ND_OTHER)
+    carry = tl.full([BN], value=1, dtype=ACC_DTYPE)
+    for start in range(0, N, BN):
+        n_offsets = start + tl.arange(0, BN)
+        if NEED_TAIL:
+            mask = n_offsets < N
+            x = tl.load(
+                inp_ptr + row_off + n_offsets * stride_n, mask=mask, other=1
+            ).to(ACC_DTYPE)
+        else:
+            x = tl.load(inp_ptr + row_off + n_offsets * stride_n).to(ACC_DTYPE)
+        r = tl.cumprod(x, axis=0) * carry
+        carry *= tl.reduce(x, axis=0, combine_fn=reduce_mul)
+        if NEED_TAIL:
+            tl.store(
+                out_ptr + row_off + n_offsets * stride_n,
+                r.to(out_ptr.type.element_ty),
+                mask=mask,
+            )
+        else:
+            tl.store(
+                out_ptr + row_off + n_offsets * stride_n,
+                r.to(out_ptr.type.element_ty),
+            )
+
+
+def _strided_scan(x, out, dim, compute_dtype):
+    """Scan a non-contiguous tensor along ``dim`` into ``out`` (in place of
+    ``out``).  Every element of the scan axis is reached through the tensor's
+    own strides (mixed-radix row indexing), so no contiguous copy of the
+    input is made — ``inp.contiguous()`` inside ``use_gems()`` would go
+    through the gems ``copy_``, which faults (KL3) on strided int8 views."""
+    N = x.shape[dim]
+    stride_n = x.stride(dim)
+    other_dims = [i for i in range(x.ndim) if i != dim]
+    nd_other = len(other_dims)
+    meta = torch.tensor(
+        [
+            [x.shape[i] for i in other_dims],
+            [x.stride(i) for i in other_dims],
+        ],
+        dtype=torch.int64,
+        device=x.device,
+    )
+    R = math.prod(x.shape[i] for i in other_dims)
+    persistent_limit = (
+        ASCEND_SCAN_LIMIT if runtime_device.vendor_name == "ascend" else 16384
+    )
+    if N <= persistent_limit:
+        TILE_SIZE = triton.next_power_of_2(N)
+        num_warps = 8 if TILE_SIZE > 2048 else 4
+        with torch_device_fn.device(x.device):
+            cumprod_strided_row_scan_kernel[(R,)](
+                x,
+                out,
+                meta,
+                N,
+                stride_n,
+                ND_OTHER=nd_other,
+                TILE_SIZE=TILE_SIZE,
+                num_warps=num_warps,
+            )
+    else:
+        acc_tl = _TL_SCAN_DTYPES.get(compute_dtype, tl.float32)
+        BN = 32768 if compute_dtype == torch.float32 else 16384
+        need_tail = 1 if N % BN else 0
+        with torch_device_fn.device(x.device):
+            cumprod_strided_row_scan_chunk_kernel[(R,)](
+                x,
+                out,
+                meta,
+                N,
+                stride_n,
+                ND_OTHER=nd_other,
+                ACC_DTYPE=acc_tl,
+                BN=BN,
+                NEED_TAIL=need_tail,
+                num_warps=8,
+                buffer_size_limit=2048,
+            )
+    return out
+
+
+@triton.jit
 def reduce_then_scan_root_scan_kernel_row(in_ptr, out_ptr, N, TILE_SIZE: tl.constexpr):
     pid = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, TILE_SIZE)
@@ -361,21 +498,10 @@ def reduce_then_scan_root_scan_kernel_row(in_ptr, out_ptr, N, TILE_SIZE: tl.cons
 def cumprod(inp, dim, *, dtype=None):
     logger.debug("GEMS_KUNLUNXIN CUMPROD")
     out_dtype = _get_output_dtype(inp, dtype)
+    # bool 输入先转 uint8，按整型路径走 triton 内核（产品 0/1 无损）。
     if is_boolean_dtype(inp.dtype):
-        if is_boolean_dtype(out_dtype):
-            return torch.ops.aten.cumprod.default.redispatch(
-                _FALLBACK_KEYSET, inp, dim, dtype=dtype
-            )
         uint8_inp = inp.to(torch.uint8)
-        if runtime_device.vendor_name == "ascend":
-            return torch.ops.aten.cumprod.default.redispatch(
-                _FALLBACK_KEYSET, uint8_inp, dim, dtype=dtype
-            )
         return cumprod_wrapper(uint8_inp, dim, out_dtype)
-    if _should_redispatch_on_ascend(out_dtype):
-        return torch.ops.aten.cumprod.default.redispatch(
-            _FALLBACK_KEYSET, inp, dim, dtype=dtype
-        )
     return cumprod_wrapper(inp, dim, dtype)
 
 
@@ -389,10 +515,6 @@ def cumprod_(inp, dim, *, dtype=None):
         raise NotImplementedError(
             "In-place cumprod is not supported for boolean tensors"
         )
-    if _should_redispatch_on_ascend(inp.dtype):
-        return torch.ops.aten.cumprod_.default.redispatch(
-            _FALLBACK_KEYSET, inp, dim, dtype=dtype
-        )
     if inp.numel() == 0:
         return inp
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
@@ -400,18 +522,6 @@ def cumprod_(inp, dim, *, dtype=None):
         # Inclusive prefix product over an axis of length 1 is the identity,
         # so the in-place op needs no work at all.
         return inp
-    if inp.is_contiguous():
-        # The aliasing is safe: every program loads its own chunk before
-        # storing to it (load-before-store within a program), and the
-        # multi-pass tiers (scan -> fan multiply) are separated by kernel
-        # boundaries. This avoids an extra empty_like allocation plus a full
-        # device-to-device copy on top of the scan. `cumprod_wrapper` calls
-        # `.contiguous()` internally, which is a no-op here.
-        cumprod_wrapper(inp, dim, inp.dtype, out=inp)
-    else:
-        # Non-contiguous self: scan the contiguous copy, then write back with
-        # the native strided-copy engine (`_copy_from` is not overridden by
-        # flag_gems, so this avoids recursing into the gems `copy_`).
-        result = cumprod_wrapper(inp, dim, inp.dtype)
-        torch.ops.aten._copy_from(result, inp, False)
+
+    cumprod_wrapper(inp, dim, inp.dtype, out=inp)
     return inp

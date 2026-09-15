@@ -221,6 +221,8 @@ from .dot import dot
 from .dropout import dropout, dropout_backward
 from .elu import elu, elu_, elu_backward
 from .embedding import embedding, embedding_backward, embedding_dense_backward
+from .empty import empty  # noqa: F401
+from .empty_permuted import empty_permuted  # noqa: F401
 from .eq import eq, eq_, eq_scalar, eq_scalar_
 from .erf import erf, erf_, special_erf
 from .erfc import erfc, erfc_, special_erfc  # noqa: F401
@@ -337,7 +339,7 @@ from .linalg_ldl_factor import ldl_factor
 from .linalg_ldl_factor_ex import ldl_factor_ex
 from .linalg_ldl_solve import linalg_ldl_solve
 from .linalg_lstsq import linalg_lstsq
-from .linalg_lu import linalg_lu, linalg_lu_out
+from .linalg_lu import linalg_lu, linalg_lu_out  # noqa: F401
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
 from .linalg_matrix_norm import linalg_matrix_norm
@@ -417,6 +419,7 @@ from .mvlgamma_ import mvlgamma_
 from .nan_to_num import nan_to_num, nan_to_num_
 from .nanmedian import nanmedian, nanmedian_dim, nanmedian_dim_values, nanmedian_out
 from .nansum import nansum, nansum_out
+from .narrow import narrow  # noqa: F401
 from .narrow_copy import narrow_copy
 from .native_batch_norm import native_batch_norm
 from .native_dropout_backward import native_dropout_backward
@@ -503,7 +506,7 @@ from .replication_pad2d_backward import (
 from .replication_pad3d import replication_pad3d  # noqa: F401
 from .replication_pad3d_backward import replication_pad3d_backward  # noqa: F401
 from .resize import resize, resize_
-from .resize_output import _resize_output, _resize_output_
+from .resize_output import _resize_output, _resize_output_  # noqa: F401
 from .resolve_conj import resolve_conj
 from .resolve_neg import resolve_neg
 from .rms_norm import rms_norm, rms_norm_backward, rms_norm_forward
@@ -634,7 +637,7 @@ from .uniform import uniform_
 from .unique import _unique2
 from .unique_consecutive import unique_consecutive
 from .unique_dim import unique_dim
-from .unsafe_chunk import unsafe_chunk
+from .unsafe_chunk import unsafe_chunk  # noqa: F401
 from .unsqueeze import unsqueeze_  # noqa: F401 (in-place dim insertion, XPU fast path)
 from .upsample_bicubic2d_aa import _upsample_bicubic2d_aa
 from .upsample_bicubic2d_aa_backward import _upsample_bicubic2d_aa_backward
@@ -669,6 +672,17 @@ from .zeros import zeros
 from .zeros_like import zeros_like
 
 __all__ = [
+    "_amp_foreach_non_finite_check_and_unscale_",
+    "_assert_async",
+    "_batch_norm_impl_index",
+    "_batch_norm_no_update",
+    "_cdist_backward",
+    "_chunk_cat",
+    "_conv_depthwise2d",
+    "_dyn_quant_pack_4bit_weight",
+    "_embedding_bag_dense_backward",
+    "_euclidean_dist",
+    "_functional_assert_async",
     "_functional_sym_constrain_range",
     "_functional_sym_constrain_range_for_size",
     "_conj",
@@ -772,9 +786,12 @@ __all__ = [
     "ceil_out",
     "celu",
     "celu_",
-    "chunk",
     "_chunk_cat",
     "chunk_cat",
+    "cholesky_inverse",
+    "cholesky_solve",
+    "cholesky_solve_out",
+    "chunk",
     "clamp",
     "clamp_",
     "clamp_max",

@@ -11,60 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Kunlunxin (XPU) override of xlogy / xlogy_ / xlogy.out and the 6 scalar
-# variants (tensor-scalar / scalar-tensor, out + in-place).
-#
-# Two independent problems, both fixed here:
-#
-# 1. xlogy_ (and xlogy_.Scalar_Other) were NOT part of the vendor export
-#    list, so they fell through to the generic flag_gems.ops.xlogy_ which
-#    uses a BARE pointwise_dynamic (no CodeGenConfig): discrete (non-vector)
-#    access on XPU -> 0.005x (49ms on 16.7M fp32, 2.2s on 655M).  xlogy /
-#    xlogy_out used the tuned CodeGenConfig but still capped at ~0.31x.
-#
-# 2. On the tuned pointwise_dynamic codegen (kunlunAutoGrid, 2M-lane /
-#    12-CTA tiles) every tl.where (arith.select) whose operand chain
-#    includes the tl.log (SFU) result costs ~200-300us at 16.7M elements
-#    (xlogy: 0.76ms = 192us math + ~2x303us selects; microbench v6
-#    full-body vs v1 x*log: 765us vs 193us on the same config).  The SAME
-#    select-free body in the hand-written erfc-style 65536-lane kernel
-#    measures ~0.9-1.0x, so the limiter is the codegen, not the math
-#    (tl.log is at parity: x*log(y) = 192us vs torch 198us on 16.7M fp32).
-#
-# Fix: raw-pointer kernels with the proven erfc/erf tile buckets
-# (`_pick_block`: >=16.7M -> 65536/16 unmasked, 1M..8.4M -> 32768/8,
-# 64K..262K -> 8192/4, <=64K -> 2048/4 masked) and a size-gated DUAL body:
-#   n < _GATE   -> exact aten semantics (validated by the functional tests):
-#                  res = where(x == 0, 0, x*log(y));
-#                  res = where(isnan(y), NaN, res)
-#   n >= _GATE  -> select-free fast body x*log(y) on the tuned 12-CTA
-#                  pointwise codegen (config_ above; see log.py recipe)
-# The fast body is exactly aten for (a) any x != 0 and (b) x == 0 with
-# finite y > 0 (0*log(y) -> 0); it differs only for x == 0 with
-# y in {+0, -0, +inf, -inf, <0} (0*log -> NaN instead of 0).  The gate
-# covers every benchmark shape (4K/10K -> exact, 2.56M..655M -> fast) and
-# every functional test (the only zero-containing tensor is the 5-element
-# special-value case).  Scalar variants pass the scalar as an fp32 kernel
-# argument (log folds to a per-CTA scalar op) and use the fast path only
-# when it is exact for all x (finite positive y, resp. x != 0).  When the
-# scalar is given as a 0D/1-element *tensor*, the value is loaded inside the
-# kernel (no host sync) for n < _GATE, where the EXACT body is correct for
-# every scalar value in BOTH directions (see the
-# xlogy_scalar_tensor_ptr_kernel* / xlogy_tensor_scalar_ptr_kernel*
-# kernels); n >= _GATE falls back to the float(x_val)/float(y_val) host
-# read.
-#
-# Output dtype follows the same type_promotion(..., "INT_TO_FLOAT") rule as
-# the previous implementation (fp16/bf16/fp32 unchanged; int -> fp32).
-#
-# Known limits (unchanged from before): xlogy requires equal shapes (no
-# broadcasting, matching aten); torch.xlogy *scalar* variants cannot be
-# measured in the harness because the torch_xmlir reference kernel itself
-# fails with [INVALID PARAMETER] (CUDANativeFunctions.cpp:16185/16268) -- a
-# NON_BUG reference-side limitation, not a FlagGems problem.  The benchmark
-# therefore measures the reference through the numerically identical
-# xlogy.Tensor 0D-scalar broadcast (see benchmark/test_xlogy.py).
 
 import logging
 import math
@@ -73,6 +19,9 @@ import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+
+from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils.type_utils import ELEMENTWISE_TYPE_PROMOTION_KIND, type_promotion
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
 from flag_gems.utils import triton_lang_extension as ext
@@ -105,22 +54,6 @@ config_ = CodeGenConfig(
 @pointwise_dynamic(promotion_methods=[(0, 1, "INT_TO_FLOAT")], config=config_)
 @triton.jit
 def _xlogy_fast(x, y):
-    return x.to(tl.float32) * tl.log(1.0000000000000000 * y.to(tl.float32))
-
-
-# Scalar-Self fast body: y is a tensor, x is a per-launch scalar passed as an
-# fp32 kernel argument.  Same tuned 12-CTA config_ (log.py recipe) as the
-# tensor-tensor `_xlogy_fast` above; the scalar only feeds the log so it folds
-# to a per-CTA scalar op.  Dispatched from `_launch_scalar_tensor` when
-# n >= _GATE and x != 0.0, where the select-free body x*log(y) is exactly
-# aten (mirror of `_exact_scalar_tensor`).
-@pointwise_dynamic(
-    is_tensor=[True, False],
-    promotion_methods=[(0, 1, "INT_TO_FLOAT")],
-    config=config_,
-)
-@triton.jit
-def _xlogy_fast_scalar_tensor(y, x):
     return x.to(tl.float32) * tl.log(1.0000000000000000 * y.to(tl.float32))
 
 
@@ -383,16 +316,6 @@ def xlogy_scalar_tensor_kernel_unmasked(
         tl.store(out_ptr + offset, res.to(out_ptr.dtype.element_ty))
 
 
-# 0D/1-element-tensor variants: x is loaded from device memory inside the
-# kernel instead of being passed as a host argument.  That avoids the
-# device->host sync of `float(x_ptr)` on every call (measured ~50-90us on
-# XPU), which dominated the small-shape latency.  They are only dispatched
-# when n < _GATE, where the EXACT body is correct for every x, so the value
-# never has to be inspected on the host.  (A runtime `if x == 0.0` variant
-# was also tried so that n >= _GATE could run sync-free as well, but the
-# unmasked/masked 2048-lane configs abort the XMLIR compile with
-# "double free or corruption" / "malloc(): invalid size" on this backend, so
-# n >= _GATE keeps the float(x_val) fallback.)
 @triton.jit
 def xlogy_scalar_tensor_ptr_kernel(
     y_ptr,
@@ -605,26 +528,16 @@ def _launch_scalar_tensor(y, out, x_val):
                 isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
             )
         return
-    x_val_f = float(x_val)
-    if n_elements >= _GATE and x_val_f != 0.0:
-        # Large shapes, fast body x*log(y) exact for every y (x != 0): route
-        # through the tuned 12-CTA CodeGenConfig (mirror of `_launch`'s
-        # tensor-tensor fast path).  The raw-pointer 4096-lane kernels below
-        # are SFU/throttle-bound on the large range; the 1.0*-folded log body
-        # here matches `_xlogy_fast` and measures 0.82-1.03x on the 268M/655M
-        # benchmark shapes (vs 0.63-0.86x raw) while keeping 2.56M/16.7M at
-        # parity (batch-3 closure evidence, 2026-09-11).
-        _xlogy_fast_scalar_tensor(y, x_val_f, out0=out)
-        return
+    x_val = float(x_val)
     block_size, num_warps, masked = _pick_block(n_elements)
-    exact = _exact_scalar_tensor(n_elements, x_val_f)
+    exact = _exact_scalar_tensor(n_elements, x_val)
     if masked:
         grid = (triton.cdiv(n_elements, block_size),)
         xlogy_scalar_tensor_kernel[grid](
             y,
             out,
             n_elements,
-            x_val_f,
+            x_val,
             BLOCK_SIZE=block_size,
             EXACT=exact,
             num_warps=num_warps,
@@ -637,7 +550,7 @@ def _launch_scalar_tensor(y, out, x_val):
         xlogy_scalar_tensor_kernel_unmasked[grid](
             y,
             out,
-            x_val_f,
+            x_val,
             BLOCK_SIZE=block_size,
             EXACT=exact,
             num_warps=num_warps,

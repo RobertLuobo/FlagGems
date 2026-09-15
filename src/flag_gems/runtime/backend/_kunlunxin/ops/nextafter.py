@@ -139,7 +139,9 @@ def _nextafter_fp32_kernel(input, other):
     stepped = (x_bits + inc).to(tl.float32, bitcast=True)
     minimum = (x_bits * 0 + 1).to(tl.float32, bitcast=True)
     zero_result = tl.where(y_negative, -minimum, minimum)
-    infinite_result = tl.where(x_negative, -3.4028234663852886e38, 3.4028234663852886e38)
+    infinite_result = tl.where(
+        x_negative, -3.4028234663852886e38, 3.4028234663852886e38
+    )
     result = tl.where(is_zero, zero_result, stepped)
     result = tl.where(is_infinite & ~is_equal, infinite_result, result)
     result = tl.where(is_equal, y, result)

@@ -40,13 +40,6 @@ config_ = CodeGenConfig(
 )
 @triton.jit
 def threshold_kernel(self, threshold, value):
-    # `tl.where(self > threshold, self, value)` lowers `arith.cmpf` (fp compare
-    # -> i1) to a slow per-lane path on XPU (4096^2 fp16 ~0.70-0.76ms vs ~0.10ms
-    # memory floor). Saturating-arithmetic select keeps the vectorized fast
-    # path: m = saturate((x - t) * 1e30) lands exactly on {0, 1}; the two-term
-    # blend x*m + v*(1-m) is then exact. Note 1e30 (finite in fp32) saturates in
-    # f32; for fp16 the same constant overflows to inf, so the whole
-    # computation stays in the native dtype (f16<->f32 converts are slow here).
     if self.dtype == tl.float16:
         big = tl.full((), 1.0e30, dtype=self.dtype)
         d = (self - threshold) * big
@@ -65,24 +58,39 @@ def threshold_kernel(self, threshold, value):
 )
 @triton.jit
 def threshold_backward_kernel(grad_output, self, threshold):
-    # grad_input = grad_output where self > threshold else 0.
-    #
-    # Every compare-based formulation is slow on XPU: `tl.where(self > t, g, 0)`
-    # and `g * (self > t)` lower `arith.cmpf` to a per-lane path (~0.60ms for
-    # 4096^2 fp16, 0.09x), and even the integer bit-pattern compare
-    # (`yb > tbits & yb <= 0x7F800000`, 0.46ms) stays ~3x above the memory
-    # floor because the f32->u32 bitcast + i-cmps keep CoreTiling from
-    # vectorizing the blob. The proven fast form (same recipe as the
-    # `threshold` forward above and hardsigmoid_backward) is saturating
-    # arithmetic with no compare at all: m = min(1, max(0, (x - t) * 1e30))
-    # lands exactly on {0, 1} for any positive gap (1e30 saturates every
-    # representable gap >= 2^-149 in f32; in fp16/bf16 1e30 is +inf and
-    # saturates all gaps incl. subnormals), so `g * m` is exact and the
-    # compiler keeps the vectorized tensor-op path. Measured (do_bench, 16.7M
-    # fp16 on 4096^2): 0.46ms -> 0.061ms (fp16 0.117x -> 1.02x vs ATen).
-    d = (self - threshold) * 1.0e30
-    m = tl.minimum(1.0, tl.maximum(0.0, d))
-    return grad_output * m
+    return grad_output * (self > threshold)
+
+
+_THRESHOLD_BWD_BLOCK = 16384
+_THRESHOLD_BWD_BLOCK_SMALL = 8192
+_THRESHOLD_BWD_WARPS = 1
+
+
+@triton.jit
+def _threshold_backward_bits_kernel(
+    grad,
+    self,
+    out,
+    n_elements,
+    threshold_bits,
+    BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    if NEED_MASK:
+        m = offs < n_elements
+        x = tl.load(grad + offs, mask=m)
+        y = tl.load(self + offs, mask=m)
+        yb = y.to(tl.float32).to(tl.uint32, bitcast=True)
+        keep = (yb > threshold_bits) & (yb < 0x7F800000)
+        tl.store(out + offs, x * keep.to(x.dtype), mask=m)
+    else:
+        x = tl.load(grad + offs)
+        y = tl.load(self + offs)
+        yb = y.to(tl.float32).to(tl.uint32, bitcast=True)
+        keep = (yb > threshold_bits) & (yb < 0x7F800000)
+        tl.store(out + offs, x * keep.to(x.dtype))
 
 
 def threshold(self, threshold, value):

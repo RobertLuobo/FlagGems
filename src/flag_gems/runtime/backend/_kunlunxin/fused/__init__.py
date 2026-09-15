@@ -24,6 +24,7 @@ from .fused_deepseek_v4_qnorm_rope_kv_rope_insert import (
 )
 from .geglu import dgeglu, geglu
 from .gelu_and_mul import gelu_and_mul
+from .hc_split_sinkhorn import hc_split_sinkhorn
 from .instance_norm import instance_norm
 from .matmul_bias_activation import matmul_bias_activation
 from .matmuladd import matmuladd
@@ -67,6 +68,7 @@ __all__ = [
     "geglu",
     "dgeglu",
     "gelu_and_mul",
+    "hc_split_sinkhorn",
     "cross_entropy_loss",
     "outer",
     "instance_norm",

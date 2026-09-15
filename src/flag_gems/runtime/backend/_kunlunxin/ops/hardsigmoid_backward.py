@@ -12,31 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU) override of hardsigmoid_backward.
-#
-# The generic `flag_gems.ops.hardsigmoid_backward` runs through pointwise_dynamic
-# without an explicit CodeGenConfig, which on XPU generates a kernel with
-# runtime (non-constexpr) strides/num_tasks and no codegen knobs, forcing the
-# slow masked/scalarized memory path (measured: 53.9 ms for 16.7M fp16 vs
-# 0.056 ms torch, 0.001x).
-#
-# Two XPU-specific points, both measured on XPU 4 (2026-09-03, 16.7M fp16):
-#   1. The 1D-tile codegen with kunlunAutoGrid=True (12 CTAs, pow2 tile) is
-#      the established fast grid (mse_loss_backward / lt_ / hardsigmoid
-#      forward all use it; 0.089 ms here).
-#   2. isCloseVectorization must stay at its default (False). Passing True
-#      makes the XPU backend drop ALL vector loads/stores: the same kernel
-#      regresses 0.089 ms -> 5.34 ms (60x). The i1-compare form
-#      (`(x > -3) & (x < 3)` multiplied into a float) also lowers to the
-#      per-lane slow path (0.65 ms), so the derivative is written with
-#      saturating fp arithmetic only, exactly like the proven lt_/less_
-#      recipe: p = max(0,(x+3)*1e30), q = max(0,(3-x)*1e30), 1e30 saturates
-#      every fp16/bf16/fp32 gap around +-3 (min gap 1.2e-7 -> 1.2e23), so
-#      min(1,p)*min(1,q) is exactly 1.0 on (-3,3), 0.0 elsewhere, strict at
-#      +-3 (matches the CPU reference); NaN inputs resolve to 0.0 through
-#      the backend's min/max non-NaN preference, matching the CPU reference
-#      (the vendor XPU kernel's NaN->1/6 differs, but tests use --ref cpu).
-#      maxabsdiff vs torch CPU reference: 0.0 on 16.7M random fp16/fp32/bf16.
 import logging
 
 import triton

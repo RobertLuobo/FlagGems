@@ -11,19 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-# Kunlunxin (XPU) override of mish / mish_.
-#
-# The generic `flag_gems.ops.mish` uses pointwise_dynamic without an explicit
-# CodeGenConfig, so on XPU it specializes the kernel per input shape with the
-# default (small) tile -> huge grid / launch-bound: fp16 [4096,4096] 16.8M
-# elements takes ~40ms (0.036x speedup vs torch 1.45ms) while the same-size
-# [64,512,512] and small [64,64] shapes run at ~0.27-0.33x. Following the
-# established Kunlunxin pointwise recipe (acosh / asinh_ / mish_backward /
-# silu), the same kernel body is recompiled with an explicit bounded 1D-tile
-# CodeGenConfig: kunlunAutoGrid=True + prefer_1d_tile + unroll_num=8 +
-# buffer_size_limit=4096. Math unchanged (fp32 staging, softplus guard at
-# x>20 to avoid exp overflow for large x, downcast at store).
 import logging
 
 import triton

@@ -22,13 +22,6 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
-# Keep the same XPU-tuned codegen config as the other hyperbolic siblings
-# (asinh_/arcsinh/acosh): buffer_size_limit=4096 + kunlunAutoGrid + unroll_num=8
-# route memory through the XPU close-vectorized path.  A/B on [4096,4096] fp16
-# shows 0.30 ms here vs 55 ms for the generic flag_gems.utils.pointwise_dynamic
-# (which lacks the XPU 12-cluster task-partitioning and the _BAD_TILE_SIZE_1D
-# guard); isCloseVectorization=True is 1.7-1.9x faster than the cosh-style
-# False variant on the large shapes.
 config_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),

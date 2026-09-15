@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import logging
 import os
 import weakref
@@ -20,7 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-import flag_gems.fused.mhc.mhc_pre as _general_module
 from flag_gems.fused.mhc.mhc_pre import mhc_pre as _general_mhc_pre
 
 logger = logging.getLogger(__name__)
@@ -558,10 +556,12 @@ def mhc_pre(
     num_tokens = residual_flat.shape[0]
     device = residual.device
 
-    # ── Step 1: GEMM (vendor bf16 matmul) ──
+    # ── Step 1: GEMM (gems triton matmul, f32 accumulator -> bf16 out) ──
     x_flat = residual_flat.reshape(num_tokens, hc_hidden_size)
     fn_bf16 = _get_fn_bf16_cached(fn)
-    gemm_out = torch.mm(x_flat, fn_bf16.t()).float()
+    from flag_gems.runtime.backend._kunlunxin.ops.mm import mm as _gems_mm
+
+    gemm_out = _gems_mm(x_flat, fn_bf16.t()).float()
 
     # ── Step 2: fused sqrsum + norm + mix + sinkhorn + weighted sum ──
     T = (hc_mult * hidden_size) // _PART_BLOCK[hc_mult]

@@ -41,24 +41,6 @@ def upsample_bilinear2d_kernel(
     ALIGN_CORNERS: tl.constexpr,
     BX: tl.constexpr,
 ):
-    # One program per output row: pid = n*C*OH + oh. All per-lane index math is
-    # confined to the column axis (ow = arange(BX)), so N/C/OH/OW only ever
-    # appear in SCALAR (uniform) div/mod, hoisted out of the lane loop. This
-    # matters on KunlunXin: per-lane integer division/modulo is emulated and
-    # costs ~2.3ms per 3.1M lanes (measured), i.e. 50x the flat copy kernel;
-    # the flat 1D-grid variant that derives (n, c, oh, ow) via per-lane div/mod
-    # was ~2x slower than this row-grid form on the benchmark shapes.
-    #
-    # The four input reads are data-dependent gathers (w0 = f(ow) with
-    # min/max/floor clamps). The XPU Triton backend lowers any non-affine load
-    # to a discrete/scalarized access (no warp coalescing observed: even a
-    # perfectly coalescable `(o>>1)<<1` index pattern costs ~10x an affine
-    # stride-1 load). Measured ceiling: ~10G 4B-transactions/s, which caps any
-    # bilinear triton kernel at ~1.5ms for (1,3,512,512)->(1024,1024) versus
-    # 0.037ms for the native C++ kernel (see harness README for the full
-    # evidence chain). This kernel is retained because it is 20-90x faster than
-    # the generic 2D-tile implementation (serial N*C loop) and is numerically
-    # exact; it does not meet the 0.8x dtype-equal Gems Speedup gate.
     row = ext.program_id(axis=0)
     oh = row % OH
     nc = row // OH

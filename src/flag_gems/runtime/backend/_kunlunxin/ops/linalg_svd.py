@@ -12,68 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kunlunxin backend override for ``linalg_svd``.
-
-One-sided Jacobi (Hestenes) SVD on the XPU backend.
-
-Pipeline
---------
-A single ``_osj_pipeline`` kernel (grid ``(1,)``, one program per batch
-element) performs the whole one-sided Jacobi process:
-
-1. fill: copy ``A`` into a zero-padded ``(MP, NW)`` workspace ``B``
-   (``MP = next_pow2(m)``, ``nw = n + (n & 1)``, ``NW = next_pow2(nw)``)
-   with element-wise ``if``-guarded scalar stores.
-2. ``sweeps`` x ``(nw-1)`` cyclic rotations on the columns of ``B``
-   (``B -> B * J`` with ``J`` the plane rotation of the ``(p, q)`` columns),
-   expressed as one flattened runtime loop of ``sweeps*(nw-1)*(nw//2)``
-   steps.  After convergence the columns of ``B`` are orthogonal and
-   ``B = U S``.
-3. ``U = B * diag(1/S)`` with ``S = ||B[:, j]||``.
-4. Host: ``Bc = B.cpu()``; the column norms ``S`` are computed on the host
-   (``Bc.double().norm(dim=1)``); ``U`` is gathered on device and
-   ``Vh = S^{-1} U^H A`` is formed on device (``U`` orthonormal, exact
-   identity ``A = U S Vh``).
-
-Why the implementation looks like this (Triton-XPU backend limitations
-discovered while porting, see also the op black list):
-
-- The Triton XPU compiler cannot legalize ``tt.reduce`` when a ``tl.sum``
-  lives inside two nested *runtime* loops, so the pipeline keeps at most one
-  runtime loop with a ``tl.sum`` at a time (the loops are sequential, never
-  nested); the batch dimension is handled by launching one program per
-  batch element (grid ``(1,)``).
-- Multi-program grids that race a ``tl.sum`` (e.g. ``(batch, NW)``) produce
-  racy stores even for a fixed input, so every kernel that reduces uses a
-  single program.  Element-wise grids such as the original 3-D fill
-  ``(batch, MP, NW)`` are legal but extremely slow on this backend
-  (0.76 ms for a 64-element copy), which is why the fill lives inside the
-  pipeline kernel instead.
-- Vector ``tl.load(..., mask=..., other=...)`` is miscompiled on this
-  backend; masks are expressed with element-wise ``if`` instead.
-- Scalar stores of a warp-reduction result (``tl.store(S_ptr + j, s)`` after
-  ``tl.sum``) are corrupted ~1/3 of the time on this backend with
-  allocation-layout-dependent values (the same store sequence is correct on
-  CUDA).  The ``S`` vector is therefore computed on the host from the
-  Triton-produced ``B`` (``S = ||B[:, j]||`` is an O(mn) reduction, not an
-  SVD), while ``U`` is still normalized on device (vector stores).
-- An unmasked vector store whose address has the form ``base + p + rows*NW``
-  (``rows = tl.arange(0, MP)``) writes phantom lanes past the tensor: the
-  emitted store covers a fixed ~2 KB window at ``base`` regardless of the
-  tensor's true extent, so the elements immediately *above* the tensor
-  (e.g. a neighboring allocation) are silently overwritten with rotation
-  data.  Every such store therefore carries an explicit
-  ``mask = rows < MP``, which limits the store to the real ``MP`` rows
-  (a masked store yields bit-identical in-bounds results, and zero extra
-  stores; a row-padded ``(2*MP, NW)`` allocation does *not* contain the
-  phantom writes, they escape past the padding).
-- Kernel launches are asynchronous and launch-order completion is not
-  guaranteed; the D2H ``B.cpu()`` copy doubles as the synchronization
-  barrier for the pipeline launch.
-
-dtype: float32 only (matching the generic linalg_svd contract).
-"""
-
 import logging
 
 import torch
@@ -154,8 +92,17 @@ def _osj_svd_impl(A, sweeps=12, full_matrices=False):
     total = sweeps * (nw - 1) * (nw // 2)
     for b in range(batch):
         _osj_pipeline[(1,)](
-            A[b], B[b], U[b], m, n, nw, total, MP=MP, NW=NW,
-            num_warps=1, num_stages=1,
+            A[b],
+            B[b],
+            U[b],
+            m,
+            n,
+            nw,
+            total,
+            MP=MP,
+            NW=NW,
+            num_warps=1,
+            num_stages=1,
         )
 
     # S = column norms of B, computed on host (scalar-store workaround);

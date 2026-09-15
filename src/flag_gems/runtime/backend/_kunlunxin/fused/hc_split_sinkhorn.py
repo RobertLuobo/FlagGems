@@ -12,73 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-hc_split_sinkhorn (kunlunxin / XPU specialized).
-
-Why this file exists (XPU, measured 2026-09-04):
-- The general implementation in ``flag_gems/fused/mhc/hc_split_sinkhorn.py``
-  uses the vectorized ``mhc_split_sinkhorn_kernel_hcmult_4`` with per-lane
-  masks (``mask = offs < num_tokens``) on every load/store and
-  ``mhc_split_sinkhorn_kernel_generic`` (HC != 4) which keeps comb in global
-  memory and re-reads it inside the same program (store -> load read-back).
-- On XPU the masked loads of the vectorized kernel are not reliable at the
-  large-token boundary (same family of defect as documented in the harness
-  for reduction tails) and a kernel exception wedges the device for
-  subsequent launches: the full matrix run passes the two small configs
-  (N in {128, 2048}) and then faults with
-  ``kl3ChannelCheckFailed ... A kernel exception has occurred`` (status 299,
-  ``wait for noc idle timeout``) at the N=16384 config, after which every
-  subsequent case fails at ``torch.manual_seed`` and the card hangs until
-  reset.
-- The generic (HC != 4) kernel additionally performs scalar store -> load to
-  the same global address inside one program, which on XPU does NOT see the
-  updated value (documented defect, see ``_kunlunxin/fused/mhc_pre.py``);
-  for hc_mult=2 this produces silently wrong comb values (~88% mismatched
-  elements in the mhc_pre equivalent).
-
-Strategy (no autotune, single config, exact tiles, no masks):
-- hc_mult in {2, 4} and device.type == "cuda" -> vectorized exact-tile
-  kernel over BLOCK_N tokens with NO masks at all: the caller picks
-  BLOCK_N = 128 (64 for <= 128 tokens, see ``hc_split_sinkhorn`` below) and,
-  when ``num_tokens % BLOCK_N != 0``, pads the batch dim to the next multiple
-  of BLOCK_N (``torch.nn.functional.pad``) and slices the valid rows back out
-  (same guard pattern as ``_kunlunxin/fused/mhc_bwd.py``). For every shape in
-  the test/benchmark matrix (N in {128, 2048, 16384, 65536}) the padding is a
-  no-op (all are multiples of 64 and 128). BLOCK_N = 128 measured faster than
-  64 on XPU (2026-09-10, hc4 b256s256 7.45ms -> 4.80ms, hc2 b256s256 2.57ms ->
-  1.86ms); BLOCK_N = 256 aborts the XPU compiler (TritonXPUUnrollControl) so
-  128 is the largest safe exact-tile size.
-- All comb math stays in registers (no global read-back); the Sinkhorn
-  iterations use a runtime ``range`` loop (``tl.static_range`` unroll of the
-  Sinkhorn iterations is pathologically slow / hangs the XPU compiler,
-  measured in mhc_pre).
-- Any other hc_mult, non-cuda device or numel() == 0 is routed to the
-  general implementation to preserve upstream behavior.
-"""
-
 import sys
 
 import torch
 import triton
 import triton.language as tl
 
-import flag_gems.fused.mhc.hc_split_sinkhorn as _general_module
 from flag_gems.fused.mhc.hc_split_sinkhorn import (
     hc_split_sinkhorn as _general_hc_split_sinkhorn,
 )
 
 _SUPPORTED_HC = (2, 4)
-_BLOCK_N = 128
+_BLOCK_N = 64
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _hc_split_sinkhorn_kernel_hc4(
-    mixes_ptr,  # (N, 24) f32, N % BLOCK_N == 0
+    mixes_ptr,  # (N, 24) f32, N = 真实行数（无需 BLOCK 对齐）
     hc_scale_ptr,  # (3,) f32
     hc_base_ptr,  # (24,) f32
-    pre_ptr,  # (N, 4) f32
-    post_ptr,  # (N, 4) f32
-    comb_ptr,  # (N, 16) f32
+    pre_ptr,  # (N_pad, 4) f32, N_pad % BLOCK_N == 0
+    post_ptr,  # (N_pad, 4) f32
+    comb_ptr,  # (N_pad, 16) f32
+    num_tokens,  # 真实行数；[num_tokens, N_pad) 为冗余行（输入读被 clamp）
     BLOCK_N: tl.constexpr,
     SINKHORN_ITERS: tl.constexpr,
     EPS: tl.constexpr,
@@ -86,7 +42,11 @@ def _hc_split_sinkhorn_kernel_hc4(
     """Vectorized split + 4x4 Sinkhorn, exact tiles, no masks."""
     pid = tl.program_id(0)
     offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-    base = offs * 24
+    # Pad 行 (offs >= num_tokens) 的输入读被 clamp 到最后一行，输出落在
+    # pre/post/comb 尾部、由主机侧截断丢弃。免去对 mixes 做全量 pad 拷贝
+    # (ATen constant_pad_nd)，同时消除输出缓冲越界写。
+    offs_r = tl.minimum(offs, num_tokens - 1)
+    base = offs_r * 24
 
     scale_0 = tl.load(hc_scale_ptr + 0)
     scale_1 = tl.load(hc_scale_ptr + 1)
@@ -282,14 +242,15 @@ def _hc_split_sinkhorn_kernel_hc4(
     tl.store(comb_ptr + co + 15, cm_33)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _hc_split_sinkhorn_kernel_hc2(
-    mixes_ptr,  # (N, 8) f32, N % BLOCK_N == 0
+    mixes_ptr,  # (N, 8) f32, N = 真实行数（无需 BLOCK 对齐）
     hc_scale_ptr,  # (3,) f32
     hc_base_ptr,  # (8,) f32
-    pre_ptr,  # (N, 2) f32
-    post_ptr,  # (N, 2) f32
-    comb_ptr,  # (N, 4) f32
+    pre_ptr,  # (N_pad, 2) f32, N_pad % BLOCK_N == 0
+    post_ptr,  # (N_pad, 2) f32
+    comb_ptr,  # (N_pad, 4) f32
+    num_tokens,  # 真实行数；[num_tokens, N_pad) 为冗余行（输入读被 clamp）
     BLOCK_N: tl.constexpr,
     SINKHORN_ITERS: tl.constexpr,
     EPS: tl.constexpr,
@@ -297,7 +258,8 @@ def _hc_split_sinkhorn_kernel_hc2(
     """Vectorized split + 2x2 Sinkhorn, exact tiles, no masks."""
     pid = tl.program_id(0)
     offs = pid * BLOCK_N + tl.arange(0, BLOCK_N)
-    base = offs * 8
+    offs_r = tl.minimum(offs, num_tokens - 1)
+    base = offs_r * 8
 
     scale_0 = tl.load(hc_scale_ptr + 0)
     scale_1 = tl.load(hc_scale_ptr + 1)
@@ -400,11 +362,16 @@ def hc_split_sinkhorn(
     num_tokens = mixes_flat.shape[0]
     device = mixes.device
 
-    pre = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)
-    post = torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device)
-    comb = torch.empty(
-        num_tokens, hc_mult * hc_mult, dtype=torch.float32, device=device
-    )
+    # 输出缓冲按 _BLOCK_N 对齐的完整行数分配：exact-tile 内核按整个 grid
+    # 无 mask 写满，[num_tokens, n_pad) 的冗余行在返回前被截断丢弃。
+    # 输入 mixes_flat 不做任何 pad 拷贝（F.pad 在 XPU 上 fallback 到 ATen
+    # constant_pad_nd，且旧实现输出缓冲只按 num_tokens 分配会越界写）。
+    pad = (-num_tokens) % _BLOCK_N
+    n_pad = num_tokens + pad
+
+    pre = torch.empty((n_pad, hc_mult), dtype=torch.float32, device=device)
+    post = torch.empty((n_pad, hc_mult), dtype=torch.float32, device=device)
+    comb = torch.empty((n_pad, hc_mult * hc_mult), dtype=torch.float32, device=device)
 
     if num_tokens == 0:
         return (
@@ -413,28 +380,17 @@ def hc_split_sinkhorn(
             comb.view(*outer_shape, hc_mult, hc_mult),
         )
 
-    # Shape-fixed block size (no autotune): 128 lanes for the large-token
-    # shapes, 64 lanes for tiny token counts (<=128) where the 128-lane
-    # single-program launch measures slightly slower (launch-bound, measured
-    # 2026-09-10). Both are exact tiles with no masks; N % block_n == 0 holds
-    # for every shape in the test/benchmark matrix (N in {128, 2048, 16384,
-    # 65536}), and the pad guard below covers any other N.
-    block_n = 64 if num_tokens <= 128 else _BLOCK_N
-    pad = (-num_tokens) % block_n
-    if pad:
-        mixes_padded = torch.nn.functional.pad(mixes_flat, (0, 0, 0, pad))
-    else:
-        mixes_padded = mixes_flat
-    grid = (num_tokens + pad) // block_n
+    grid = n_pad // _BLOCK_N
 
     common = dict(
-        mixes_ptr=mixes_padded,
+        mixes_ptr=mixes_flat,
         hc_scale_ptr=hc_scale,
         hc_base_ptr=hc_base,
         pre_ptr=pre,
         post_ptr=post,
         comb_ptr=comb,
-        BLOCK_N=block_n,
+        num_tokens=num_tokens,
+        BLOCK_N=_BLOCK_N,
         SINKHORN_ITERS=sinkhorn_iters,
         EPS=eps,
         num_warps=4,
@@ -445,10 +401,9 @@ def hc_split_sinkhorn(
     else:
         _hc_split_sinkhorn_kernel_hc2[(grid,)](**common)
 
-    if pad:
-        pre = pre[:num_tokens]
-        post = post[:num_tokens]
-        comb = comb[:num_tokens]
+    pre = pre[:num_tokens]
+    post = post[:num_tokens]
+    comb = comb[:num_tokens]
 
     return (
         pre.view(*outer_shape, hc_mult),

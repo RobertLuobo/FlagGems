@@ -201,17 +201,6 @@ def bf16_paged_mqa_logits(
 
 
 def _install():
-    """Wire the XPU implementation into the direct-import entrypoint.
-
-    ``bf16_paged_mqa_logits`` is called via direct module import
-    (``from flag_gems.fused import bf16_paged_mqa_logits``) in both
-    tests/test_bf16_paged_mqa_logits.py and
-    benchmark/test_bf16_paged_mqa_logits.py, so the SpecOpRegistrar
-    namespace swap (which only patches the top-level ``flag_gems`` globals
-    through ``_state.fused_module``) can not reach those bindings.  Replace
-    the attributes on the already-imported modules (loaded during
-    ``import flag_gems``).
-    """
     from flag_gems.fused.bf16_paged_mqa_logits import (  # noqa: F401
         bf16_paged_mqa_logits as _generic_bf16_paged_mqa_logits,
     )

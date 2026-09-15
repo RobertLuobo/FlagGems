@@ -151,12 +151,6 @@ def add_rms_norm_tile2d_kernel(
     TILE_M: tl.constexpr,  # rows per program (M % TILE_M == 0 guaranteed)
     N: tl.constexpr,  # number of columns (normalized dim), used as tile width
 ):
-    # Unmasked 2D multi-row tile: each program owns TILE_M consecutive rows and
-    # the whole normalized dim as ONE contiguous column block, reducing along
-    # axis=1, so the launch count drops from M to M // TILE_M. Strictly
-    # unmasked: any mask on the 2D row-tile makes XPU OffsetAnalysis give up on
-    # block-DMA (measured rms_norm: unmasked ~292us vs masked ~2.4ms on
-    # [10000, 256]). Only launch when M % TILE_M == 0 (no out-of-range rows).
     pid = ext.program_id(0)
 
     n_off = tl.arange(0, N)
@@ -188,10 +182,6 @@ def add_rms_norm_multirow_kernel(
     TILE_M: tl.constexpr,
     N: tl.constexpr,  # number of columns (normalized dim), used as tile width
 ):
-    # Masked 2D multi-row tile: the launch-bound fallback for M not divisible by
-    # any TILE_M candidate. Only rows are masked; out-of-range rows load garbage
-    # (XPU ignores `other=`) but their axis=1 reduce is per-row independent and
-    # their store is masked out, so valid rows are unaffected.
     pid = ext.program_id(0)
 
     n_off = tl.arange(0, N)
@@ -223,10 +213,6 @@ def add_rms_norm_flat_kernel(
     eps,
     BLOCK: tl.constexpr,
 ):
-    # N == 1 fast path: every "row" is a single element, so add_rms_norm is
-    # elementwise: y = (x1 + x2) / sqrt((x1 + x2)^2 + eps) * w[0]. A flat
-    # BLOCK-lane kernel avoids the per-row launch-bound cost of one program per
-    # element (rms_norm [10000, 1]: ~236us per-row vs ~7-8us flat, all dtypes).
     pid = ext.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < xnumel
@@ -278,7 +264,7 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
         Normalized output tensor
     """
     logger.debug(
-        "GEMS ADD_RMS_NORM (kunlunxin), [input1 shape]: %s, [input2 shape]: %s, "
+        "GEMS_KUNLUNXIN add_rms_norm, [input1 shape]: %s, [input2 shape]: %s, "
         "[weight shape]: %s",
         x1.size(),
         x2.size(),
@@ -293,11 +279,6 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
     x1 = x1.contiguous()
     x2 = x2.contiguous()
     weight = weight.contiguous()
-    # NOTE (kunlunxin/XPU): allocate via native empty_strided instead of
-    # torch.empty_like. `empty` is intercepted by the gems empty op and the XPU
-    # triton JIT bakes the launch grid into the compile key, causing ~95-100ms
-    # per-call recompiles (see rms_norm_perf_fix). empty_strided is not
-    # intercepted, so it allocates natively.
     y = torch.empty_strided(x1.size(), x1.stride(), dtype=x1.dtype, device=x1.device)
 
     with torch_device_fn.device(x1.device):
@@ -315,17 +296,13 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
                 # Unmasked 2D tile: strictly faster than any masked per-row /
                 # masked multirow variant (see _pick_tile_m / rms_norm body).
                 grid = (M // TILE_M,)
-                add_rms_norm_tile2d_kernel[grid](
-                    y, x1, x2, weight, eps, TILE_M, N
-                )
+                add_rms_norm_tile2d_kernel[grid](y, x1, x2, weight, eps, TILE_M, N)
             elif N <= MULTIROW_N and M >= MULTIROW_M:
                 # Small N + many rows with M not divisible by any TILE_M
                 # candidate: batched masked multi-row fallback.
                 TILE_M = builtins.max(1, TILE_BUDGET // N)
                 grid = (triton.cdiv(M, TILE_M),)
-                add_rms_norm_multirow_kernel[grid](
-                    y, x1, x2, weight, M, eps, TILE_M, N
-                )
+                add_rms_norm_multirow_kernel[grid](y, x1, x2, weight, M, eps, TILE_M, N)
             else:
                 BLOCK_SIZE = builtins.min(MAX_BLOCK, triton.next_power_of_2(N))
                 need_mask = (N % BLOCK_SIZE) != 0

@@ -42,25 +42,6 @@ def adaptive_max_pool3d_forward_kernel(
     WIN_W: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Adaptive max pool 3d forward (Kunlunxin/XPU).
-
-    One lane per output position.  The adaptive window
-    [start, end) = [floor(o * in / out), ceil((o + 1) * in / out)) is scanned
-    in row-major (d, h, w) order with the same tie-break as the ATen reference
-    (first tap attaining the strict max; NaNs win over any value).  Indices are
-    stored as the flat spatial index d * H * W + h * W + w, matching ATen.
-
-    This replaces the vendor ``adaptive_max_pool3d`` for all dtypes: the
-    vendor XDNN wrapper rejects bfloat16 (``scalar type of (ret, ret_indices) :
-    (kbfloat16, kint64) combined is unsupported``) and returns uninitialized
-    index memory for float16/float32 on this stack, so every
-    ``adaptive_max_pool3d_backward`` generated against those indices either
-    faults or disagrees with the CPU reference.
-
-    Windows are provably non-empty; candidate addresses are clamped to the
-    window start so the (unmasked) loads can never leave the (n, c) plane
-    (the XPU backend treats compound i1 masked loads as a slow path).
-    """
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n_elems
     safe_offsets = tl.where(mask, offsets, 0)
@@ -102,9 +83,7 @@ def adaptive_max_pool3d_forward_kernel(
                     plane_base + d_safe * in_hw + h_safe * in_w + w_safe
                 ).to(tl.float32)
                 active = d_ok & h_ok & w_ok
-                is_new = active & (
-                    (value > acc_val) | (value != value) | (acc_idx < 0)
-                )
+                is_new = active & ((value > acc_val) | (value != value) | (acc_idx < 0))
                 acc_val = tl.where(is_new, value, acc_val)
                 acc_idx = tl.where(is_new, d * in_hw + h * in_w + w, acc_idx)
 

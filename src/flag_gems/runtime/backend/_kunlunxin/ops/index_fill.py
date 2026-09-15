@@ -12,50 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Kunlunxin (XPU) index_fill / index_fill_ override.
-
-The generic implementation in ``flag_gems.ops.index_fill`` decomposes the fill
-into a flat index ``m = outer * index_len + k`` and derives ``(outer, k)`` with
-a per-lane ``//``/``%`` pair; on XPU those software-emulated divisions put the
-row-fill (``dim < ndim-1``, inner_size > 1) path at ~2 GB/s.
-
-This override specializes three cases:
-
-1. ``inner_size == 1`` (``dim`` is the last dim): a 2-D grid scatter kernel
-   whose two axes map to (index position, outer position); no division at all
-   (kept from the original vendor implementation).
-2. ``inner_size > 1`` (row/column fill, e.g. ``dim=0`` on a 2-D tensor): the
-   output rows are contiguous runs, so each program handles ONE index value
-   and writes ``BLOCK`` contiguous elements at a runtime base pointer
-   (``out + norm*INNER + ib*BLOCK + arange``).  The pointer operand keeps the
-   ``arange`` as the only vector term, which is what the XPU store path
-   vectorizes (a ``runtime*INNER + arange`` folded vector degenerates to
-   per-lane discrete stores, ~3 GB/s).  Measured 210-570 GB/s vs ~2 GB/s for
-   the generic kernel on the benchmark matrix.
-3. Full-permutation index (``index.numel() == dim_size``, all values in range
-   and distinct): every position is filled exactly once, so the fill is a
-   dense ``fill_`` -- the vendor engine fills 16M+ elements in ~0.1 ms while
-   the Triton scatter takes 20 ms.
-
-A host-side bounds check (two elementwise compares + one all-reduce) routes a
-(rare) out-of-range index to the generic Triton implementation, which skips
-such lanes silently (matching the historic behavior).  No native/CPU fallback
-is used.
-"""
-
 import torch
 import triton
 import triton.language as tl
 
 from flag_gems.ops.index_fill import (
-    _FALLBACK_KEYSET,
-    index_fill as _generic_index_fill,
-    index_fill_ as _generic_index_fill_,
     _native_clone,
     _native_copy_,
     _prepare_index,
     _prepare_tensor_value,
 )
+from flag_gems.ops.index_fill import index_fill as _generic_index_fill
+from flag_gems.ops.index_fill import index_fill_ as _generic_index_fill_
 from flag_gems.utils import libentry
 
 _SCATTER_BLOCK_K = 128
@@ -150,7 +118,9 @@ def index_fill_row_kernel(
     if NEED_MASK:
         # Tail block only (inner % BLOCK != 0); full blocks keep the mask
         # all-true which the hardware folds away.
-        tl.store(p + tl.arange(0, BLOCK), val, mask=tl.arange(0, BLOCK) < inner - ib * BLOCK)
+        tl.store(
+            p + tl.arange(0, BLOCK), val, mask=tl.arange(0, BLOCK) < inner - ib * BLOCK
+        )
     else:
         tl.store(p + tl.arange(0, BLOCK), val)
 
@@ -193,7 +163,9 @@ def index_fill_burst_kernel(
         )
 
 
-def _index_fill_scatter_launch(out, index, value, value_is_tensor, dim_size, outer_size):
+def _index_fill_scatter_launch(
+    out, index, value, value_is_tensor, dim_size, outer_size
+):
     index_len = index.numel()
     grid = (
         triton.cdiv(index_len, _SCATTER_BLOCK_K),
@@ -236,7 +208,9 @@ def _index_fill_row_launch(out, index, value, value_is_tensor, dim_size, inner):
     )
 
 
-def _index_fill_burst_launch(out, index, value, value_is_tensor, dim_size, outer, inner):
+def _index_fill_burst_launch(
+    out, index, value, value_is_tensor, dim_size, outer, inner
+):
     index_len = index.numel()
     oblk = triton.cdiv(outer, _BURST_BO)
     grid = (index_len * oblk,)
@@ -296,7 +270,9 @@ def _try_dense_fill(out, dim, index, value, value_is_tensor):
     return True
 
 
-def _index_fill_impl(out, dim, index, value, value_is_tensor, check_dense=True, is_inplace=False):
+def _index_fill_impl(
+    out, dim, index, value, value_is_tensor, check_dense=True, is_inplace=False
+):
     """Fill `out` in place. `out` is either the input (in-place op) or a
     fresh empty_like copy (functional op)."""
     if out.numel() == 0 or index.numel() == 0:
@@ -337,7 +313,9 @@ def _index_fill_impl(out, dim, index, value, value_is_tensor, check_dense=True, 
     if outer == 1:
         _index_fill_row_launch(out, index, value, value_is_tensor, dim_size, inner)
     else:
-        _index_fill_burst_launch(out, index, value, value_is_tensor, dim_size, outer, inner)
+        _index_fill_burst_launch(
+            out, index, value, value_is_tensor, dim_size, outer, inner
+        )
     return out
 
 

@@ -5,36 +5,6 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-
-"""Kunlunxin (XPU) vendor implementation of chunk_gated_delta_rule_fwd.
-
-Rationale
----------
-The generic FLA chunked implementation (`flag_gems/fused/FLA/chunk.py`) never
-compiles on TritonXPU: its KKT / solve_tril kernels are built around 16x16
-``tl.dot`` tiles and hit ``TritonSDNNCombineBefore`` pass failures in the SDK
-pipeline (and then ``uni_sram`` OOM under the libtuner sweep).  Reproducing the
-chunked algorithm (cumsum + KKT + 16x16 blocked trich-solve + WY transform)
-without tl.dot is not feasible, so this override computes the same recurrence
-token-by-token with the column-parallel kernel proven by the sibling op
-``fused_recurrent_gated_delta_rule_fwd`` (one program per (sequence, value
-head, value column), state = a K-vector kept in registers, no tl.dot at all).
-
-The chunked algorithm is mathematically equivalent to the per-token gated
-delta rule recurrence, which is exactly what the accuracy tests compare
-against (a naive per-token reference), so the outputs (``o``, ``final_state``)
-are exact to fp32 accumulation semantics.
-
-Known limitations (documented, not tested by the suite):
-- ``g_out`` (tuple slot 0) is the within-chunk cumsum of ``g`` and ``A``
-  (slot 2, the chunk transition inverse) is returned as a zero tensor of the
-  generic shape: they are only consumed when ``GDN_RECOMPUTE_SUPPRESS_LEVEL
-  >= 3`` (w/h/v_new path), which this override does not support (returns
-  ``None`` for slots 4-6 like the generic default does).
-- Requires power-of-two head dim ``K`` (matches the vector of the test
-  matrix; same constraint as the sibling vendor kernel).
-"""
-
 import logging
 
 import torch
@@ -105,12 +75,7 @@ def _chunk_gated_delta_rule_fwd_kernel(
     p_beta = beta + t0 * stride_beta_t + i_hv * stride_beta_hv
     p_o = o + t0 * stride_o_t + i_hv * stride_o_hv + i_v * stride_o_v
 
-    p_h = (
-        h0
-        + (i_seq * H0_STRIDE_S + i_hv * H0_STRIDE_HV).to(tl.int64)
-        + offs * V
-        + i_v
-    )
+    p_h = h0 + (i_seq * H0_STRIDE_S + i_hv * H0_STRIDE_HV).to(tl.int64) + offs * V + i_v
     h = tl.load(p_h).to(tl.float32)
 
     # S_t = exp(g_t) * S_{t-1} + beta_t * k_t^T (v_t - k_t @ S_{t-1})
@@ -283,9 +248,7 @@ def chunk_gated_delta_rule_fwd(
 
     o = torch.empty(B, T, HV, V, device=q.device, dtype=v.dtype)
     if output_final_state:
-        final_state = torch.empty(
-            N, HV, K, V, device=q.device, dtype=torch.float32
-        )
+        final_state = torch.empty(N, HV, K, V, device=q.device, dtype=torch.float32)
     else:
         final_state = None
 
@@ -327,9 +290,7 @@ def chunk_gated_delta_rule_fwd(
         BK=BK,
         H0_STRIDE_S=h0.stride(0),
         H0_STRIDE_HV=h0.stride(1),
-        HT_STRIDE_S=(
-            final_state.stride(0) if final_state is not None else o.stride(0)
-        ),
+        HT_STRIDE_S=(final_state.stride(0) if final_state is not None else o.stride(0)),
         HT_STRIDE_HV=(
             final_state.stride(1) if final_state is not None else o.stride(1)
         ),

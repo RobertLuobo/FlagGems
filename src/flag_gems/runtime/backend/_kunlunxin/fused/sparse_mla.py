@@ -11,46 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kunlunxin (TritonXPU) specialization of ``triton_sparse_mla_fwd_interface``.
-
-The generic implementation in ``flag_gems/fused/DSA/sparse_mla.py`` runs one
-fused kernel that mixes ``tl.dot`` with a data-dependent gather through
-``indices`` and with ``tl.max``/``tl.math.exp2`` softmax reductions.  On this
-backend that combination is broken (see ``flashmla_sparse.py`` for the same
-finding on the sibling op):
-
-* ``tl.dot`` + data-dependent gather in the same kernel: hard compile failure.
-* ``tl.dot`` + ``tl.max``/``tl.math.exp`` in the same kernel: compiles but
-  silently returns wrong values.
-* the untyped ``qk`` accumulator (fp16 initial value, fp32 redefinition after
-  ``* log_scale``) is rejected by the XPU frontend type unification:
-  ``initial value for `qk` is of type fp16[...], but the then block redefines
-  it as fp32[...]``.
-
-So the op is split into four kernels, none of which mixes ``tl.dot`` with a
-data-dependent address or a transcendental/reduction:
-
-  A ``_spmla_gather_dt``/``_spmla_gather_td``: gather (no ``tl.dot``)
-  B ``_spmla_qk``   : dense ``tl.dot`` only                    -> logits
-  C ``_spmla_softmax``: reductions/exp (no ``tl.dot``)         -> probs, lse
-  D ``_spmla_pv``   : dense ``tl.dot`` only                    -> output
-
-The causal mask (keys ``n <= query``) is applied once, in the softmax kernel.
-All (b, sq, g) groups of the same ``indices`` gather into the same dense KV
-buffers.  All intermediate buffers are over-allocated to whole tile
-boundaries (``TP = cdiv(topk, 64) * 64`` topk, ``AH`` head blocks, exact
-``BD``/``BDV`` dividers) so that every store is unmasked (masked stores are
-known to write past tight allocations on this backend).  When a head block
-overruns ``H`` (possible only for the tiny ``G < 16`` edge shapes), the output
-is written into a padded buffer and the interface returns a slimmed view of
-it.
-"""
-
 import logging
 
 import torch
 import triton
 import triton.language as tl
+
+from flag_gems import full as _gems_full
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +60,7 @@ def _spmla_gather_dt(
     # clamp the address instead of using ``other=``: a masked load whose fill
     # value carries semantics (an invalid-index sentinel) is not reliable here.
     t_off = tl.minimum(offs_t, TOPK - 1)
-    ids = tl.load(
-        indices + i0 * (VGC * TOPK) + i_g * TOPK + t_off
-    ).to(tl.int64)
+    ids = tl.load(indices + i0 * (VGC * TOPK) + i_g * TOPK + t_off).to(tl.int64)
     m = in_range & (ids >= 0) & (ids < SKV)
     ids_safe = tl.where(m, ids, 0)
     # [BD, BT] tile: outer stride 1 (d contiguous), inner stride stride_kvn
@@ -140,9 +105,7 @@ def _spmla_gather_td(
     offs_d = i_d * BD + tl.arange(0, BD)
     in_range = offs_t < TOPK
     t_off = tl.minimum(offs_t, TOPK - 1)
-    ids = tl.load(
-        indices + i0 * (VGC * TOPK) + i_g * TOPK + t_off
-    ).to(tl.int64)
+    ids = tl.load(indices + i0 * (VGC * TOPK) + i_g * TOPK + t_off).to(tl.int64)
     m = in_range & (ids >= 0) & (ids < SKV)
     ids_safe = tl.where(m, ids, 0)
     # [BT, BD] tile: rows are gathered kv rows, d contiguous
@@ -194,10 +157,7 @@ def _spmla_qk(
         other=0.0,
     )
     kb = tl.load(
-        gkv_dt
-        + (i0 * VGC + i_g) * (DT * TP)
-        + offs_d[:, None] * TP
-        + offs_t[None, :]
+        gkv_dt + (i0 * VGC + i_g) * (DT * TP) + offs_d[:, None] * TP + offs_t[None, :]
     )
     acc = tl.dot(qb, kb, out_dtype=tl.float32)
     if TD > 0:
@@ -324,7 +284,9 @@ def _spmla_pv(
         vb = tl.load(v_base + (it * BT + offs_t)[:, None] * DT + offs_v[None, :])
         acc = tl.dot(pb, vb, acc, out_dtype=tl.float32)
 
-    tl.store(out + (i0 * APP + offs_h[:, None]) * DV + offs_v[None, :], acc.to(tl.bfloat16))
+    tl.store(
+        out + (i0 * APP + offs_h[:, None]) * DV + offs_v[None, :], acc.to(tl.bfloat16)
+    )
 
 
 def triton_sparse_mla_fwd_interface(
@@ -359,9 +321,7 @@ def triton_sparse_mla_fwd_interface(
     NDV = triton.cdiv(D, BDV)
     SQC = B * SQ
 
-    lse = torch.full(
-        (B, SQ, H), float("-inf"), device=q.device, dtype=torch.bfloat16
-    )
+    lse = _gems_full((B, SQ, H), float("-inf"), device=q.device, dtype=torch.bfloat16)
 
     gkv_dt = torch.empty((B, SQ, VG, DT, TP), device=q.device, dtype=q.dtype)
     gkv_td = torch.empty((B, SQ, VG, TP, DT), device=q.device, dtype=q.dtype)

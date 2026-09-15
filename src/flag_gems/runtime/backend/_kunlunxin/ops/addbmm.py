@@ -22,24 +22,11 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
+from .copy import copy_
+
 logger = logging.getLogger(__name__)
 
 
-# Fused batch-GEMM + bias/alpha/beta epilogue for addbmm / addbmm_
-# (out = beta * bias + alpha * sum_b(batch1[b] @ batch2[b]), bias is a 2D
-# [M, N] tensor shared across the batch, unlike baddbmm's 3D bias).
-#
-# XPU (kunlunxin) closure 2026-09-03: the previous path used the generic
-# src/flag_gems/ops/addbmm.py kernel, which is @triton.autotune'd on the addmm
-# config set. On this backend autotune (a) re-tunes per shape and dumps
-# multi-hundred-MB IR on the big BlasBenchmark shapes, and (b) the autotune
-# envelope is known-unsound for masked tiles (see _kunlunxin/ops/addmm.py
-# closure notes; 31 of 336 generated configs return wrong values), and it also
-# *selects by timing*. We now use a single fused kernel styled after the
-# addmm/baddbmm XPU closure kernels (always-masked loads other=0.0, GROUP_M L2
-# swizzle, dtype-dependent reduction tile, no @autotune): the batch dimension
-# is folded into the accumulation loop, so addbmm is one kernel launch with a
-# 2D [M, N] output.
 def heur_tile_m(args):
     M = args["M"]
     if M <= 512:
@@ -131,13 +118,11 @@ def addbmm_kernel(
             a_ptrs += TILE_K
             b_ptrs += TILE_K * N
 
-    # Bias is a 2D [M, N] tensor shared by every batch element; in the in-place
-    # variant O is the same tensor, so the bias load must complete before the
-    # store below. Within one program both touch exactly the same (non-
-    # overlapping) tile, so the read-before-write ordering is safe.
     c_ptrs = O + offs_am[:, None] * N + offs_bn[None, :]
     c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
-    bias_value = tl.load(bias + offs_am[:, None] * N + offs_bn[None, :], mask=c_mask, other=0.0)
+    bias_value = tl.load(
+        bias + offs_am[:, None] * N + offs_bn[None, :], mask=c_mask, other=0.0
+    )
 
     out = accumulator * alpha + bias_value * beta
     # tl.store converts to the output pointer dtype.
@@ -186,14 +171,8 @@ def addbmm(bias, batch1, batch2, beta=1.0, alpha=1.0):
 def addbmm_(self, batch1, batch2, *, beta=1.0, alpha=1.0):
     logger.debug("GEMS_KUNLUNXIN ADDBMM_")
     if self.is_contiguous():
-        # Write directly into self; the kernel stores the whole [M, N] tile
-        # exactly once (see the alias note in the kernel).
         _direct_addbmm(batch1, batch2, self, alpha, beta, out=self)
     else:
-        # Non-unit inner stride destroys the block store on this backend (see
-        # addmm.py _dest_with_unit_inner_stride notes), so compute on a
-        # contiguous scratch and write back through aten::_copy_from, which
-        # gems never overrides.
         tmp = _direct_addbmm(batch1, batch2, self, alpha, beta, out=None)
-        torch.ops.aten._copy_from(tmp, self, False)
+        copy_(self, tmp)
     return self
