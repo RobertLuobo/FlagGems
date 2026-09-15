@@ -55,15 +55,7 @@ def bitwise_and_tensor_(A, B):
     return bitwise_and_func(A, B, out0=A)
 
 
-# Scalar (tensor-vs-scalar) path. Same tuned recipe as the tensor path
-# (kunlunAutoGrid=True + unroll_num=8); a fresh-compile config sweep on
-# [4096,4096] (int16/int32/bool) showed this config cuts int16 0.180->0.106ms
-# and bool 0.395->0.357ms with int32 unchanged (0.095->0.097ms, noise), while
-# unroll_num=16 (u16ag/u16agb) improves int16 further (0.099ms) but regresses
-# bool (0.427ms). Pure codegen-param change: kernel body / numerics unchanged.
-# isCloseMemoryAsync must stay at its default (True = async copy closed) --
-# enabling async copy (=False) together with unroll_num=8 makes the LLVM
-# lowering materialize a ~478-pointer local-buffer struct (see config_ above).
+# Scalar (tensor-vs-scalar) path.
 @pointwise_dynamic(
     is_tensor=[True, False], promotion_methods=[(0, 1, "DEFAULT")], config=config_
 )
@@ -79,6 +71,31 @@ def bitwise_and_scalar(A, B):
 
 def bitwise_and_scalar_(A, B):
     logger.debug("GEMS_KUNLUNXIN BITWISE_AND_SCALAR_")
+    if (
+        A.dtype in (torch.bool, torch.int16)
+        and A.is_contiguous()
+        and isinstance(B, (int, bool))
+    ):
+        nbytes = A.numel() * A.element_size()
+        if nbytes > 0 and nbytes % 4 == 0:
+            scalar = int(B)
+            if A.dtype == torch.bool:
+                if type(B) is not bool:
+                    return bitwise_and_func_scalar(A, B, out0=A)
+                # torch bool conversion of a scalar = low bit (verified:
+                # 2->False, 3->True, 5->True, -2->False on reference).
+                mask = 0x01010101 if (scalar & 1) else 0
+            else:
+                if not -0x8000 <= scalar <= 0x7FFF:
+                    return bitwise_and_func_scalar(A, B, out0=A)
+                s = scalar & 0xFFFF
+                mask = s | (s << 16)
+            try:
+                in_view = A.reshape(-1).view(torch.int32)
+            except RuntimeError:  # e.g. unaligned storage offset
+                return bitwise_and_func_scalar(A, B, out0=A)
+            bitwise_and_func_scalar(in_view, mask, out0=in_view)
+            return A
     return bitwise_and_func_scalar(A, B, out0=A)
 
 
