@@ -30,11 +30,11 @@ def test_arctan2_(shape, dtype):
     x = torch.randn(shape, dtype=dtype, device=flag_gems.device)
     y = torch.randn(shape, dtype=dtype, device=flag_gems.device)
 
+    x1 = x.clone()
     ref_x = utils.to_reference(x, True)
     ref_y = utils.to_reference(y, True)
     ref_out = ref_x.arctan2_(ref_y)
 
-    x1 = x.clone()
     with flag_gems.use_gems():
         res_out = x1.arctan2_(y)
 
