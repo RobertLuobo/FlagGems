@@ -65,20 +65,6 @@ def mean(inp, *, dtype=None):
         mean_scalar_kernel[(1, 1, 1)](inp, out, M, BLOCK_SIZE, buffer_size_limit=2048)
     return out
 
-
-# Persisted-accumulator tile budget. The old heuristics allowed
-# BLOCK_M=next_pow2(cdiv(M,12)) (unbounded) x BLOCK_N=min(next_pow2(N),8192),
-# so the persisted [BLOCK_M, BLOCK_N] accumulator became a giant 2D constexpr
-# tile (IR shows tensor<1024x8192xf32> = 8.4M elements). ConvertTritonXPUToLLVM
-# materializes it per element -> the 1.78GB IR dump. We keep the numerically
-# correct persisted-accumulator + single final reduce (the in-loop
-# tl.sum(a, axis=1) alternative miscompiles on XPU for fp16/bf16 -> wrong
-# results), but bound BLOCK_M x BLOCK_N to a fixed budget so the tile can never
-# explode. Under that fixed budget we RESHAPE the tile by N (the all_dim
-# lesson): large-N reductions want a wide/short tile (few loop trips, wide DMA)
-# while small/medium-N want a tall tile (more rows in flight). The wide path
-# raised fp16 [1024,65536]/[1024,1M] but a blanket-wide tile starved medium-M
-# shapes like [4096,4096] (BLOCK_M collapsed to 16), so we switch on N.
 _TILE_BUDGET = 32768
 _N_WIDE = 8192
 
@@ -125,14 +111,6 @@ def mean_dim_kernel(X, Mean, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr)
     Mean = Mean + pid
     row_mask = pid < M
 
-    # Persisted [BLOCK_M, BLOCK_N] accumulator + a SINGLE reduce after the loop.
-    # Slot j accumulates cols j, j+BLOCK_N, j+2*BLOCK_N, ... (strided partials);
-    # tl.sum(_mean, axis=1) then combines them. This is numerically correct for
-    # any BLOCK_N. We deliberately do NOT reduce inside the loop
-    # (acc += tl.sum(a, axis=1)) because that pattern miscompiles on XPU for
-    # fp16/bf16 inputs (converted-tile in-loop axis=1 reduce returns garbage;
-    # verified: 97% mismatch at (200,40999,3)). The tile stays bounded because
-    # heur_m/heur_n cap BLOCK_M*BLOCK_N to _TILE_BUDGET, so no giant-tile IR.
     _mean = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
     for off in range(0, N, BLOCK_N):
         cols = off + tl.arange(0, BLOCK_N)[None, :]
@@ -172,12 +150,6 @@ def mean_dim_mid_kernel(X, Out, M, N, K, BLOCK_K: tl.constexpr):
     k_clamped = tl.minimum(k_off, K - 1)
     k_mask = k_off < K
 
-    # Pointer-increment form (p += K) instead of indexing with n*K: the
-    # vendor's TritonXPUUnrollControl budget-tiling cannot handle a
-    # [>=128]-lane load whose pointer is formed as `base + n * K + k_clamped`
-    # (compile-time uni_sram OutOfResources for every N), while the
-    # equivalent `p += K` strength-reduced form compiles and vectorizes
-    # correctly at BLOCK_K=128. Same strided [M, N, K] access pattern.
     p = X + pid_m * N * K + k_clamped
     acc = tl.zeros([BLOCK_K], dtype=cdtype)
     for _ in range(0, N):
@@ -194,9 +166,6 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
     if dtype is None:
         dtype = x.dtype
     if dim is None or dim == () or dim == []:
-        # Global mean (dim=None or empty dim list). keepdim only affects the
-        # output shape: mean.dim(self, None, keepdim) is 0-d when keepdim is
-        # False and all-ones when keepdim is True (matching ATen).
         out = mean(x, dtype=dtype)
         if keepdim:
             out = out.reshape([1] * x.ndim)
@@ -205,12 +174,6 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
     shape = list(x.shape)
     dim = [d % x.ndim for d in dim]
 
-    # -------- mid-dim (K>1) single-dim reduction: no-transpose path --------
-    # The generic path below does dim_compress = permute(...).contiguous(),
-    # a strided transpose copy that is ~1GB/s on XPU (62-2450ms for the
-    # benchmark's 3D shapes). Instead read the original [M, N, K] layout
-    # directly (strided kernel below; bmm(ones, x)/N fast path for fp16/bf16,
-    # see solution/performance/kernel/mean_dim_perf_fix.md).
     if len(dim) == 1:
         dim0 = dim[0]
         N = shape[dim0]
@@ -230,15 +193,6 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
                     out = out.squeeze(dim=dim0)
                 return out
             if x.dtype in (torch.float16, torch.bfloat16):
-                # bmm-as-reduction: out[m, k] = sum_n x[m, n, k] / N via the
-                # (vendor) matmul unit on the native layout, no transpose.
-                # The 1/N is folded into the ones multiplier (NOT divided
-                # after bmm): a fp16/bf16 bmm output = the raw sum, which
-                # overflows to inf for large-N high-magnitude inputs
-                # (e.g. all-1.5, N=65536 -> 98304 > fp16 max 65504).
-                # try/except: gems bmm_kernel refuses some extreme shapes
-                # (huge M1 / tiny M1 with large odd K); those fall through to
-                # the strided kernel below (zero regression).
                 try:
                     xv = x.view(M, N, K)
                     ones = torch.full(

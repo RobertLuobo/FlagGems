@@ -45,3 +45,8 @@ def special_log1p_out_func(x):
 def special_log1p_out(A, out):
     logger.debug("GEMS_KUNLUNXIN SPECIAL_LOG1P_OUT")
     return special_log1p_out_func(A, out0=out)
+
+
+def special_log1p(A):
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_LOG1P")
+    return special_log1p_out_func(A)

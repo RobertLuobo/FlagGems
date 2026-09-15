@@ -12,27 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU) vendor add_rms_norm.
-#
-# Why a vendor override exists: the generic `flag_gems.fused.add_rms_norm`
-# dispatches N > 4096 to `add_rms_norm_loop_kernel`, an `@triton.autotune`
-# kernel with no `add_rms_norm_loop` entry in this vendor's tune configs. On
-# XPU autotune + a large TILE_N drives `tl.sum` past its 8192-lane correctness
-# ceiling (see HARNESS_SUMMARY 2.5), producing NaN / 100% mismatch on
-# N = 40999 for all three dtypes (measured 2026-09-02, [200, 40999]).
-#
-# The kernels below mirror the XPU-validated `_kunlunxin/ops/rms_norm.py`
-# (R1/R2: 2D row-tile to amortize launch, constexpr-N contiguous block DMA,
-# NEED_MASK unmasked fast path, 8192-lane tl.sum) to the x = x1 + x2 inputs:
-#   * N >  8192          -> per-row looped kernel, BLOCK=8192 (tl.sum-safe),
-#                           two-pass (var then normalize) with fp32 accumulation
-#   * N == 1             -> flat elementwise kernel (each element is its own row)
-#   * M % TILE_M == 0    -> unmasked 2D multi-row tile (fastest: block DMA)
-#   * N <= 256, M >= 4096-> masked 2D multi-row tile (launch-bound corner)
-#   * otherwise          -> per-row kernel (constexpr-N, NEED_MASK fast path)
-#
-# No CPU/ATen/native/composite fallback is used.
-
 import builtins
 import logging
 import math

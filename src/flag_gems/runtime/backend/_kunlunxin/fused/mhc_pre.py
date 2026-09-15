@@ -12,47 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Triton implementation of the mHC Pre operator (kunlunxin / XPU specialized).
-
-Why a specialized file (XPU, measured 2026-08-20):
-- The general implementation in `flag_gems/fused/mhc/mhc_pre.py` uses
-  ``@triton.autotune`` (10 configs). On XPU triton, autotune recompiles ALL
-  configs for every new key -> a single hc_mult=4 case takes >15min just
-  compiling, blowing the 900s per-case gate (measured: one (512,1280,4)
-  benchmark case still compiling after 20+ min).
-- The generic (HC != 4) path of the general kernel implements the Sinkhorn
-  iterations by storing to / loading back from global memory inside one
-  program. On XPU, scalar stores followed by loads to the same address within
-  a single program do NOT see the updated value (measured: readback probe
-  returns 5.0 vs expected 3.0), so comb_mix is wrong (~88% mismatched
-  elements for hc_mult=2, case n512_h1280).
-- Masked tails are unreliable on XPU reductions: masked lanes contribute
-  adjacent-memory garbage even with `other=0.0` and further zeroing (measured
-  up to ~58% error, H=1280/BLOCK=1024). This file therefore:
-  * computes the rms sqrsum through an exact-tile PARTIAL kernel
-    (BLOCK=1024 for hc_mult=4, 512 for hc_mult=2; hidden sizes
-    {1280,2560,4096} are all divisible by 256 so every tile is exact and
-    unmasked);
-  * keeps the Sinkhorn and all mix math in registers (no global read-back);
-  * masks only in the final elementwise weighted pass (no reduction there,
-    masked loads/stores are safe in that pattern).
-
-Kernel decomposition (3 kernels, all single-shot, no internal loops):
-  1. sqrsum partials   grid (N, cdiv(HC*H, B))  -> (N, T) partials
-  2. mixes + sinkhorn  grid (N,)                -> post / comb / pre buffers
-  3. weighted row      grid (N,)                -> layer_input (masked, safe)
-
-Key points:
-- NO @triton.autotune, single config, num_stages=1.
-- H, HC are tl.constexpr; Sinkhorn repeat loop is a runtime loop
-  (`range(sinkhorn_repeat - 1)`); a `tl.static_range` unroll of the Sinkhorn
-  iterations is pathologically slow / hangs the XPU compiler (measured).
-- For hc_mult in (2, 4) and hidden_size % 256 == 0 the XPU kernels below are
-  used; any other shape is routed to the general implementation to preserve
-  upstream behavior.
-"""
-
 import logging
 import os
 import weakref
@@ -92,8 +51,6 @@ def _get_fn_bf16_cached(fn: torch.Tensor) -> torch.Tensor:
 
 
 # ─────────────────────────────── kernels ───────────────────────────────
-
-
 @triton.jit
 def _sqrsum_partials_kernel(
     residual_ptr,  # (N, HC, H) bf16, contiguous

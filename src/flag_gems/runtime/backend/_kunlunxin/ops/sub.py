@@ -124,3 +124,9 @@ def subtract_(A, B, *, alpha=1):
     """In-place subtraction: A.subtract_(B, alpha) == A -= B * alpha."""
     logger.debug("GEMS_KUNLUNXIN SUBTRACT_")
     return sub_(A, B, alpha=alpha)
+
+
+def subtract(A, B, *, alpha=1):
+    """Out-of-place subtraction (aten::subtract): alias of sub."""
+    logger.debug("GEMS_KUNLUNXIN SUBTRACT")
+    return sub(A, B, alpha=alpha)

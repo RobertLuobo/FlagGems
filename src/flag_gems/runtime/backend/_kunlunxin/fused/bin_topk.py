@@ -12,48 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Kunlunxin (XPU) specialized implementation of ``flag_gems.fused.DSA.bin_topk.bucket_sort_topk``.
-
-Why a specialized file (XPU, measured 2026-09-04):
-- The general implementation in ``flag_gems/fused/DSA/bin_topk.py`` cannot run
-  on XPU at all: its Triton legacy kernel uses ``tl.histogram`` which is not
-  lowered by the Triton-XPU backend (``ConvertTritonXPUToLLVM`` fails:
-  "failed to legalize operation 'tt.reduce'"), so the kernel never compiles
-  (``OutOfResources ... uni_sram``); the TLE kernel is disabled because the
-  kunlunxin VendorDescriptor sets ``tle_enabled=False``.
-
-XPU backend constraints discovered while writing this file (all verified
-with minimal kernels):
-- ``tl.histogram`` is unsupported; ``tl.sum`` / ``tl.max`` / ``tl.argmax`` /
-  ``tl.cumsum`` only legalize at ONE level of loop nesting (a reduce inside
-  two nested ``scf.for`` loops is "explicitly marked illegal").
-- A scatter store whose address tensor is data-dependent and whose value
-  tensor is an affine ``arange`` mis-pairs lanes (the value is stored from the
-  wrong lane; cluster-layout mismatch). Stores work when the value and the
-  address come from the same data-dependent chain (e.g. ``out[pos] = pos``)
-  or when the address is affine.
-- Masked stores whose mask is derived from value comparisons (``gt | eq``)
-  misapply the mask; affine masks (``offs < n``) are fine. Consequently the
-  fill kernel uses *dynamic loop bounds* (``range(0, c1)`` /
-  ``range(0, min(c2, K - c1))``) with unconditional affine stores instead of
-  value-derived store masks.
-- The ``@triton.autotune``-style multi-config path and ``tl.static_range``
-  unrolls hang / OOM the XPU compiler.
-
-Algorithm (numeric-safe, no ``tl.histogram``, no data-dependent scatter):
-per row: (1) binary search (32 host-driven iterations, one count kernel per
-bit) for the K-th largest order key; (2) rank kernel: per-lane 1-based rank of
-the strict-greater keys (+r) and of the equal keys (-r), stored via affine
-addresses; (3) fill kernel: for each output slot p, ``out[p] = sum((rank ==
-p+1) * lane)`` (affine store, pure ``tl.sum`` reductions). Rows longer than
-the 8192-lane block are processed chunk-wise (top-K per 8192-chunk) and the
-candidates are merged by re-applying the same pipeline recursively until the
-candidate count fits one block (candidate values are gathered with a simple
-indexed load; the final mapping from candidate positions back to global
-indices is an affine-store gather).
-"""
-
 import sys
 
 import torch
