@@ -662,9 +662,13 @@ def _softmax_forward_launch(output, inp, M, N):
                     output, inp, M, N=N, TILE_M=tile_m, num_warps=4
                 )
             return
-    if N > _SM_CHUNK_SPLIT_MAX_N:
+    if N > _SM_CHUNK_SPLIT_MAX_N and M > 1:
         # Beyond the split window keep the per-row two-pass kernel
         # (grid=(M,), TILE_N and ONE_TILE_PER_CTA from the heuristics).
+        # M == 1 (a single huge row) must NOT come here: one program walking
+        # the whole row serially measures ~6x slower than the chunk split
+        # (probed 2026-09-09, (2**28,) fp16/fp32/bf16: 197-209ms vs 31-33ms),
+        # so M == 1 falls through to the chunk split below regardless of N.
         grid = (M, 1, 1)
         softmax_kernel_inner[grid](
             output,
@@ -682,7 +686,9 @@ def _softmax_forward_launch(output, inp, M, N):
         # faster; with many rows the per-row kernel already has enough
         # programs and the split's extra launches/partial traffic only lose.
         # Threshold measured on XPU (2026-08-21): M * (N // 8192) < 1024.
-        if M * (N // _SM_CHUNK_BN) < 1024:
+        # M == 1 always takes the split (a single per-row program has no
+        # parallelism at all, see above).
+        if M * (N // _SM_CHUNK_BN) < 1024 or M == 1:
             _softmax_chunk_split(output, inp, M, N)
         else:
             grid = (M, 1, 1)

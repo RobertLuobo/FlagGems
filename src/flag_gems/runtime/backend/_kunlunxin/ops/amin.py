@@ -328,9 +328,17 @@ def amin_(inp, dim=None, keepdim=False):
                 buffer_size_limit=2048,
             )
             amin_kernel_2[(1, 1)](mid, out, mid_size, block_mid, buffer_size_limit=2048)
-        inp.copy_(out.reshape(inp.shape) if keepdim else out)
+        # NOTE (XPU): Tensor.copy_ on this torch_xmlir XPU build does NOT
+        # broadcast a size-1 (or 0-dim) src to a larger `inp`; it only
+        # flatten-copies the first numel(src) elements (leaving the rest of
+        # `inp` untouched, corrupting the inplace result).  `out.reshape(inp.shape)`
+        # also raises on size-1 -> larger shapes.  Expand first so src already has
+        # inp.shape (a stride-0 view), then copy_ is a plain same-shape copy.
+        inp.copy_(out if out.shape == inp.shape else out.expand_as(inp))
         return inp
     else:
         result = amin(inp, dim=dim, keepdim=True)
-        inp.copy_(result)
+        # See note above: expand the (reduced-size-1) result to inp.shape before
+        # the inplace copy, since XPU copy_ does not broadcast.
+        inp.copy_(result if result.shape == inp.shape else result.expand_as(inp))
         return inp

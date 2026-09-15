@@ -14,6 +14,7 @@
 
 import logging
 
+import torch
 import triton
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
@@ -54,7 +55,18 @@ def bitwise_and_tensor_(A, B):
     return bitwise_and_func(A, B, out0=A)
 
 
-@pointwise_dynamic(is_tensor=[True, False], promotion_methods=[(0, 1, "DEFAULT")])
+# Scalar (tensor-vs-scalar) path. Same tuned recipe as the tensor path
+# (kunlunAutoGrid=True + unroll_num=8); a fresh-compile config sweep on
+# [4096,4096] (int16/int32/bool) showed this config cuts int16 0.180->0.106ms
+# and bool 0.395->0.357ms with int32 unchanged (0.095->0.097ms, noise), while
+# unroll_num=16 (u16ag/u16agb) improves int16 further (0.099ms) but regresses
+# bool (0.427ms). Pure codegen-param change: kernel body / numerics unchanged.
+# isCloseMemoryAsync must stay at its default (True = async copy closed) --
+# enabling async copy (=False) together with unroll_num=8 makes the LLVM
+# lowering materialize a ~478-pointer local-buffer struct (see config_ above).
+@pointwise_dynamic(
+    is_tensor=[True, False], promotion_methods=[(0, 1, "DEFAULT")], config=config_
+)
 @triton.jit
 def bitwise_and_func_scalar(x, y):
     return x & y
@@ -67,9 +79,95 @@ def bitwise_and_scalar(A, B):
 
 def bitwise_and_scalar_(A, B):
     logger.debug("GEMS_KUNLUNXIN BITWISE_AND_SCALAR_")
+    # int32-word packing fast path for bool/int16 in-place, mirroring the
+    # (verified) bitwise_and_scalar_tensor recipe of this file and the
+    # bitwise_or_scalar_ in-place variant: a byte / 16-bit load-store pays a
+    # heavy per-byte penalty on XPU, while 4 bools (or 2 int16s) fit one
+    # int32 word whose bytes / 16-bit lanes are uniformly AND-ed with the
+    # replicated scalar (bool takes the low bit of the two's-complement
+    # scalar, int16 the low 16 bits -- both match torch).
+    # In-place: the AND-ed int32 words are written directly back into A's own
+    # storage (out0=in_view), preserving alias / mutation semantics.
+    # Gating: the bool lane only packs for a Python *bool* scalar; a Python
+    # int with a bool tensor type-promotes to Long in torch and the in-place
+    # op even raises (result type Long can't be cast to Bool), so such inputs
+    # keep the generic scalar kernel (long-faithful, unchanged behavior).
+    # int16 packs for int/bool scalars that fit the 16-bit signed range
+    # (torch's in-place .Scalar converts the scalar to the tensor dtype first
+    # and raises on overflow, e.g. 0x1FFFF / 0x10000); out-of-range scalars
+    # keep the generic kernel (unchanged behavior).
+    # Restricted to contiguous inputs with a full int32-aligned byte count;
+    # anything else (non-contiguous, tail bytes, 0-dim/empty, int32/int64)
+    # falls back to the generic scalar kernel.
+    if (
+        A.dtype in (torch.bool, torch.int16)
+        and A.is_contiguous()
+        and isinstance(B, (int, bool))
+    ):
+        nbytes = A.numel() * A.element_size()
+        if nbytes > 0 and nbytes % 4 == 0:
+            scalar = int(B)
+            if A.dtype == torch.bool:
+                if type(B) is not bool:
+                    return bitwise_and_func_scalar(A, B, out0=A)
+                # torch bool conversion of a scalar = low bit (verified:
+                # 2->False, 3->True, 5->True, -2->False on reference).
+                mask = 0x01010101 if (scalar & 1) else 0
+            else:
+                if not -0x8000 <= scalar <= 0x7FFF:
+                    return bitwise_and_func_scalar(A, B, out0=A)
+                s = scalar & 0xFFFF
+                mask = s | (s << 16)
+            try:
+                in_view = A.reshape(-1).view(torch.int32)
+            except RuntimeError:  # e.g. unaligned storage offset
+                return bitwise_and_func_scalar(A, B, out0=A)
+            bitwise_and_func_scalar(in_view, mask, out0=in_view)
+            return A
     return bitwise_and_func_scalar(A, B, out0=A)
 
 
 def bitwise_and_scalar_tensor(A, B):
     logger.debug("GEMS_KUNLUNXIN BITWISE_AND_SCALAR_TENSOR")
+    # Fast path for sub-32-bit dtypes. On XPU a byte (bool) / 16-bit (int16)
+    # load/store pays a heavy per-byte penalty vs an int32 word load -- measured
+    # ~17x (bool) / ~2.4x (int16) on a [100,65536,100] tensor with the plain
+    # scalar kernel. Bitwise AND with a *uniform* scalar is trivially
+    # packable: 4 bools (or 2 int16s) fit one int32 word and the scalar only has
+    # to be replicated to every byte / 16-bit lane of the word (scalar
+    # truncation to 1 / 16 bits matches torch: bool takes the low bit of the
+    # two's-complement scalar, int16 takes the low 16 bits). The int32-view
+    # kernel then runs at the full int32 load/store bandwidth.
+    # Restricted to contiguous inputs with a full int32-aligned byte count;
+    # anything else (non-contiguous, tail bytes, 0-dim/empty, int32/int64)
+    # falls back to the generic scalar kernel. The bool lane is only packed
+    # for Python-*bool* scalars: torch's `bitwise_and(int, bool_tensor)`
+    # type-promotes to int64, which the boolean mask cannot reproduce.
+    if (
+        B.dtype in (torch.bool, torch.int16)
+        and B.is_contiguous()
+        and isinstance(A, (int, bool))
+    ):
+        nbytes = B.numel() * B.element_size()
+        if nbytes > 0 and nbytes % 4 == 0:
+            scalar = int(A)
+            if B.dtype == torch.bool:
+                if type(A) is not bool:
+                    return bitwise_and_func_scalar(B, A)
+                # torch bool conversion of a scalar = low bit (verified:
+                # 2->False, 3->True, 5->True, -2->False on reference).
+                mask = 0x01010101 if (scalar & 1) else 0
+            else:
+                s = scalar & 0xFFFF
+                mask = s | (s << 16)
+            n_words = nbytes // 4
+            out = torch.empty_strided(
+                (n_words,), (1,), dtype=torch.int32, device=B.device
+            )
+            try:
+                in_view = B.reshape(-1).view(torch.int32)
+            except RuntimeError:  # e.g. unaligned storage offset
+                return bitwise_and_func_scalar(B, A)
+            bitwise_and_func_scalar(in_view, mask, out0=out)
+            return out.view(B.dtype).reshape(B.shape)
     return bitwise_and_func_scalar(B, A)

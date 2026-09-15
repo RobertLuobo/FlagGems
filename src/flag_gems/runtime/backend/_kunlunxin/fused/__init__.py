@@ -30,6 +30,7 @@ from .geglu import dgeglu, geglu
 from .gelu_and_mul import gelu_and_mul
 from .instance_norm import instance_norm
 from .matmul_bias_activation import matmul_bias_activation
+from .matmuladd import matmuladd
 from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
 from .outer import outer
 from .reglu import dreglu, reglu
@@ -78,6 +79,7 @@ __all__ = [
     "dreglu",
     "reglu",
     "matmul_bias_activation",
+    "matmuladd",
     "sparse_attn_triton",
     "swiglu",
     "dswiglu",
