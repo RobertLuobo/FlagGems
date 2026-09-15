@@ -68,12 +68,7 @@ def chunk(A: torch.Tensor, chunks: int, dim: int = 0) -> List[torch.Tensor]:
         if start >= dim_size:
             break
 
-        end = min(start + chunk_size, dim_size)
-        # ``A[a:b, ...]`` would dispatch to the registered ``slice.Tensor``
-        # python impl (missing the 'step' argument) under ``use_gems()``;
-        # ``torch.narrow`` falls back to an ATen kernel on XPU (forbidden),
-        # so build the zero-copy view via ``torch.as_strided`` (metadata-only,
-        # not registered -> no re-dispatch/recursion).
+        end = min(start + chunk_size, dim_size) 
         size = list(shape)
         size[dim] = end - start
         result.append(

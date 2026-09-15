@@ -15,6 +15,9 @@ import logging
 
 import torch
 
+from ..utils.tle_copy import tle_copy
+from .copy import copy_ as _vendor_copy_
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,8 +37,12 @@ def resize(inp: torch.Tensor, size, memory_format=None):
     copy_numel = min(inp.numel(), out.numel())
     src = inp.reshape(-1)[:copy_numel]
     dst = out.reshape(-1)[:copy_numel]
-    # Native contiguous copy (bypasses the slow gems/Triton copy path).
-    torch.ops.aten._copy_from(src, dst, False)
+    # tle hardware move (TMA/DMA) for everything it can express -- the common
+    # contiguous same-dtype copy; shapes/dtypes outside that envelope fall back
+    # to the vendor pointwise copy. Neither path re-enters ATen
+    # (``aten::_copy_from`` is a private op with no vendor handling).
+    if not tle_copy(src, dst):
+        _vendor_copy_(dst, src)
 
     return out
 

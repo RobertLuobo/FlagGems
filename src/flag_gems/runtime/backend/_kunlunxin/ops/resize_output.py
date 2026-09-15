@@ -15,6 +15,8 @@ import logging
 
 import torch
 
+from .copy import copy_
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,8 +36,10 @@ def _resize_output(inp: torch.Tensor, size, device):
     copy_numel = min(inp.numel(), out.numel())
     src = inp.reshape(-1)[:copy_numel]
     dst = out.reshape(-1)[:copy_numel]
-    # Native contiguous copy (bypasses the slow gems/Triton copy path).
-    torch.ops.aten._copy_from(src, dst, False)
+    # Vendor copy: a TMA/SDNN tile when the move is expressible (contiguous
+    # same-dtype), else the vendor pointwise kernel. Never the native
+    # _copy_from fallback.
+    copy_(dst, src)
 
     return out
 

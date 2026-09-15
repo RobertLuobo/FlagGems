@@ -28,13 +28,6 @@ from .fused_deepseek_v4_qnorm_rope_kv_rope_insert import (
 )
 from .geglu import dgeglu, geglu
 from .gelu_and_mul import gelu_and_mul
-
-# mhc fused family is called via direct module import
-# (``from flag_gems.fused.mhc.hc_split_sinkhorn import hc_split_sinkhorn``), so
-# SpecOpRegistrar's namespace swap cannot reach it; hc_split_sinkhorn patches
-# the already-imported general module attribute on import (its ``_install``).
-# Importing it here (``import flag_gems`` -> SpecOpRegistrar -> ``_kunlunxin.fused``)
-# makes the vendor implementation active for the repo tests too.
 from .hc_split_sinkhorn import hc_split_sinkhorn
 
 from .instance_norm import instance_norm

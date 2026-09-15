@@ -143,6 +143,7 @@ from .celu import celu, celu_
 from .cholesky_inverse import cholesky_inverse
 from .cholesky_solve import cholesky_solve, cholesky_solve_out
 from .chunk import chunk
+from .chunk_cat import chunk_cat as _chunk_cat
 from .clamp import (
     clamp,
     clamp_,
@@ -447,6 +448,7 @@ from .replication_pad2d_backward import (
 from .replication_pad3d import replication_pad3d  # noqa: F401
 from .replication_pad3d_backward import replication_pad3d_backward  # noqa: F401
 from .resize import resize, resize_
+from .resize_output import _resize_output, _resize_output_
 from .resolve_conj import resolve_conj
 from .resolve_neg import resolve_neg
 from .rms_norm import rms_norm, rms_norm_backward, rms_norm_forward
@@ -743,6 +745,7 @@ __all__ = [
     "cholesky_solve",
     "cholesky_solve_out",
     "chunk",
+    "_chunk_cat",
     "clamp",
     "clamp_",
     "clamp_max",
