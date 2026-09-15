@@ -263,7 +263,7 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
         Normalized output tensor
     """
     logger.debug(
-        "GEMS ADD_RMS_NORM (kunlunxin), [input1 shape]: %s, [input2 shape]: %s, "
+        "GEMS_KUNLUNXIN (kunlunxin), [input1 shape]: %s, [input2 shape]: %s, "
         "[weight shape]: %s",
         x1.size(),
         x2.size(),
