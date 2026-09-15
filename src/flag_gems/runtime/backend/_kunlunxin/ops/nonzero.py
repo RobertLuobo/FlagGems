@@ -88,8 +88,8 @@ def nonzero_dense_flat_kernel(
     mask = j < n_out
     i = j // ndim
     d = j % ndim
-    stride_d = tl.load(strides + d, mask=mask)
-    shape_d = tl.load(shape + d, mask=mask)
+    stride_d = tl.load(strides + d)
+    shape_d = tl.load(shape + d)
     coord = (i // stride_d) % shape_d
     tl.store(out + j, coord, mask=mask)
 

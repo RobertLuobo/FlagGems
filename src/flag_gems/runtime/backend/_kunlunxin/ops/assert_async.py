@@ -19,9 +19,11 @@
 # the host even after synchronization (verified on FlagTree/Triton 3.6.0).
 # Since `_assert_async` promises "raise RuntimeError when the value is
 # falsy", each assertion condition is additionally written to a device
-# scratch buffer and checked on the host after an explicit sync. This
-# keeps the assertion executed by a real XPU kernel while restoring the
-# ATen exception semantics without any CPU/native/composite fallback.
+# scratch buffer and checked on the host after a device read. The
+# host-side `scratch.item()` is a synchronizing device->host transfer, so
+# no extra `torch_device_fn.synchronize()` is needed. This keeps the
+# assertion executed by a real XPU kernel while restoring the ATen
+# exception semantics without any CPU/native/composite fallback.
 
 import logging
 
@@ -52,6 +54,7 @@ def _assert_async(tensor: torch.Tensor, msg: str = "Assertion failed"):
     scratch = torch.empty((), dtype=torch.bool, device=tensor.device)
     with torch_device_fn.device(tensor.device):
         _assert_async_kernel[(1,)](tensor, scratch, MSG=msg)
-    torch_device_fn.synchronize()
+    # scratch.item() is a synchronizing device->host transfer; it waits for
+    # the kernel above, so an explicit synchronize() would be redundant.
     if not scratch.item():
         raise RuntimeError(msg)

@@ -267,6 +267,31 @@ def min_norm_kernel_2(
 
 
 @libentry()
+@triton.jit
+def min_norm_rows_kernel(X, Out, M, N, buffer_size_limit: tl.constexpr):
+    """Partial-dim -inf norm: one program per row of the (M, N) row-major
+    compressed input.  The generic 2D min_norm_kernel (tl.min over a
+    [BLOCK_M, BLOCK_N] tile, axis=1) is silently mis-lowered by TritonXPU on
+    this backend: on (600, 40999) every one of the 1025 probed rows was wrong
+    and (3, 8199800) returned 0, while tl.sum/tl.max on the identical tile were
+    exact.  So the row is reduced with 1024-wide UNMASKED 1D loads (chunks are
+    exact multiples; every lane is in-bounds), an axis-free tl.min -- the same
+    1D min that the flat min_norm_kernel_1 path uses -- and a dynamic scalar
+    tail for the remainder.  All loads are exact multiples of the row so the
+    pointer stays affine (X + row * N + off + arange)."""
+    row = ext.program_id(0).to(tl.int64)
+    rmin = tl.full((), value=float("inf"), dtype=tl.float32)
+    full = (N // 1024) * 1024
+    for off in tl.range(0, full, 1024):
+        v = tl.load(X + row * N + off + tl.arange(0, 1024)).to(tl.float32)
+        rmin = tl.minimum(rmin, tl.min(tl.abs(v)))
+    for off in tl.range(0, N - full):
+        v = tl.load(X + row * N + full + off).to(tl.float32)
+        rmin = tl.minimum(rmin, tl.abs(v))
+    tl.store(Out + row, rmin, mask=row < M)
+
+
+@libentry()
 # @triton.autotune(configs=runtime.get_tuned_config("vector_norm"), key=["M", "N"])
 @triton.heuristics(
     {
@@ -465,7 +490,11 @@ def l1_norm_rows_tail_kernel(
 ):
     row = ext.program_id(0).to(tl.int64)
     total = 0.0
-    for offset in tl.static_range(TAIL_SIZE):
+    # tl.range (scf.for) instead of tl.static_range: TAIL_SIZE can reach 1023
+    # and the static unroll of ~500+ scalar loads blows the XPU ELF stack,
+    # which the buffer_size_limit tuning loop cannot recover from
+    # ("Failed to tune buffer size").
+    for offset in tl.range(0, TAIL_SIZE):
         value = tl.load(X + row * N + TAIL_OFFSET + offset).to(tl.float32)
         total += tl.abs(value)
     tl.store(Mid + row * MID_SIZE + MID_SIZE - 1, total, mask=row < M)
@@ -508,7 +537,10 @@ def l1_norm_rows_reduce_tail_kernel(
 ):
     row = ext.program_id(0).to(tl.int64)
     total = 0.0
-    for offset in tl.static_range(TAIL_SIZE):
+    # tl.range (scf.for) rather than tl.static_range: TAIL_SIZE can be 1000+
+    # and the static unroll overflows the XPU ELF stack ("Failed to tune
+    # buffer size").
+    for offset in tl.range(0, TAIL_SIZE):
         total += tl.load(Mid + row * MID_SIZE + TAIL_OFFSET + offset).to(tl.float32)
     tl.store(Next + row * NEXT_SIZE + NEXT_SIZE - 1, total, mask=row < M)
 
@@ -525,7 +557,10 @@ def l1_norm_rows_kernel_3(
 ):
     row = ext.program_id(0).to(tl.int64)
     total = 0.0
-    for offset in tl.static_range(NEXT_SIZE):
+    # tl.range (scf.for) rather than tl.static_range: NEXT_SIZE can reach 1024
+    # and the static unroll overflows the XPU ELF stack ("Failed to tune
+    # buffer size").
+    for offset in tl.range(0, NEXT_SIZE):
         total += tl.load(Next + row * NEXT_SIZE + offset).to(tl.float32)
     tl.store(Out + row, total, mask=row < M)
 
@@ -956,11 +991,19 @@ def _l2_dim_plan(m, n):
         if div_m * n < _DIM_MIN_TILE:
             return None
         if n & (n - 1) == 0:
-            # largest power of two that divides m, clamped to the tile budget
+            # largest power of two that divides m, clamped to the measured
+            # sweet spot TILE_M = 64 rows for the unmasked 2D tile on this
+            # XPU: the kernel is launch/scheduling-bound, so at
+            # n=256..4096, m=1024..8192 every TILE_M > 64 is 1.2-2.9x slower
+            # and every TILE_M in 8..32 is 1.7-3.2x slower, e.g.
+            # (4096,4096) tm=16 280us vs tm=64 132us, (2048,2048) tm=16 98us
+            # vs tm=64 51us, (4096,256) tm=256 35us vs tm=64 29us (measured
+            # 2026-09-11; TILE_M = 64 matches the mask kernel's BLOCK_M and
+            # the core count).  64 is a power of two, so the exact-tile rules
+            # (M % TILE_M == 0, pow2 x pow2) still hold.
             p2 = m & (-m)
-            lim = 1 << (int(cap).bit_length() - 1)
-            if p2 > lim:
-                p2 = lim
+            if p2 > _DIM_MASK_ROWS:
+                p2 = _DIM_MASK_ROWS
             if p2 * n >= _DIM_MIN_TILE:
                 return ("tile", p2)
         block_n = triton.next_power_of_2(n)
@@ -1170,7 +1213,11 @@ def vector_norm(x, ord=2, dim=None, keepdim=False, dtype=None):
             elif ord == float("inf"):
                 max_norm_kernel[grid](x, out, M, N)
             elif ord == -float("inf"):
-                min_norm_kernel[grid](x, out, M, N)
+                # min_norm_kernel's 2D tile (tl.min over axis=1) is silently
+                # mis-lowered by TritonXPU for partial reductions; the
+                # one-row-per-program min_norm_rows_kernel is exact on every
+                # measured shape.
+                min_norm_rows_kernel[(M,)](x, out, M, N, buffer_size_limit=2048)
             elif ord == 0:
                 l0_norm_kernel[grid](x, out, M, N)
             elif ord == 1 and N > 1024:

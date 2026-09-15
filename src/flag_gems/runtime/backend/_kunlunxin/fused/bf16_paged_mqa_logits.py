@@ -19,10 +19,9 @@ import torch
 import triton
 import triton.language as tl
 
-from flag_gems import empty as _gems_empty
-
 logger = logging.getLogger(__name__)
 
+# block_size = 64 hardcoded for both specializations
 _BLOCK = 64
 
 
@@ -142,8 +141,9 @@ def bf16_paged_mqa_logits(
     B, next_n, H, D = q.shape
     total_tokens = B * next_n
 
-    logits = _gems_empty(
-        (total_tokens, max_context_len),
+    logits = torch.empty(
+        total_tokens,
+        max_context_len,
         dtype=logits_dtype,
         device=q.device,
     )
@@ -157,8 +157,10 @@ def bf16_paged_mqa_logits(
     stride_bt = block_table.stride(0)
 
     # Explicit [total, max_ctx, H] fp32 scores round trip (see module docstring)
-    scores = _gems_empty(
-        (total_tokens, max_context_len, H),
+    scores = torch.empty(
+        total_tokens,
+        max_context_len,
+        H,
         dtype=torch.float32,
         device=q.device,
     )

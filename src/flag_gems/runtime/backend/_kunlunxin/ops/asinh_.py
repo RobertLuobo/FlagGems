@@ -47,7 +47,7 @@ def asinh__func(x):
         abs_x + tl.sqrt(abs_x * abs_x + 1.0),
     )
     y = tl.log(r)
-    result = tl.where(x_fp32 < 0.0, -y, y)
+    result = tl.where(x_fp32.to(tl.int32, bitcast=True) < 0, -y, y)
     return result.to(x.dtype)
 
 

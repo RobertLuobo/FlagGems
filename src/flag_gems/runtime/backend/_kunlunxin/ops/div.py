@@ -217,6 +217,18 @@ def true_divide_(A, B):
         return true_div_func_tensor_scalar(A, B, out0=A)
 
 
+def divide(A, B):
+    """Out-of-place division (aten::divide): alias of true_divide."""
+    logger.debug("GEMS_KUNLUNXIN DIVIDE")
+    return true_divide(A, B)
+
+
+def true_divide_tensor_(A, B):
+    """Canonical Tensor overload for in-place true division (aten::true_divide.Tensor_)."""
+    logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_TENSOR_")
+    return true_divide_(A, B)
+
+
 @triton.jit
 def _trunc_q(q):
     # Truncate a fp32 quotient toward zero without the slow `xpu_trunc`

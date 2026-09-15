@@ -17,6 +17,7 @@ import logging
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.xpu.libdevice as xpu
 
 from flag_gems.utils import triton_lang_extension as ext
 
@@ -66,15 +67,43 @@ def _pick_block(n_elements):
     # Bucket the tile into a few unmasked sizes + 1 masked fallback so the
     # kernel compiles at most ~4 times total. Unmasked runs when the shape
     # divides the tile exactly (masked memory path on XPU costs ~2x).
-    # Measured on the official matrix: 32768/8-warp tiles are the sweet spot
-    # (131072/32 costs +3% on 16.7M and +22% on 1M shapes).
-    if n_elements >= 16384 and n_elements % 32768 == 0:
+    # Measured in-place on the official matrix (XPU2, same-process A/B):
+    #   n=16384  : 2048/4w masked 5.9us beats 16384/8w unmasked 10.6us (a
+    #              single 8-warp CTA is launch/parallelism limited; 8 CTAs x
+    #              4 warps wins)
+    #   n=65536  : 8192/4w unmasked 7.9us beats 32768/8w unmasked 15.9us
+    #   n=262144 : 8192/4w unmasked 14.3us beats 32768/8w unmasked 16.0us
+    #   n>=1M    : 32768/8w unmasked remains the sweet spot (32+ CTAs;
+    #              8192/4w measured worse on 4194304/16777216/67108864).
+    if n_elements <= 16384:
+        return 2048, 4, True
+    if n_elements <= 262144 and n_elements % 8192 == 0:
+        return 8192, 4, False
+    if n_elements % 32768 == 0:
         return 32768, 8, False
-    if n_elements >= 16384 and n_elements % 16384 == 0:
-        return 16384, 8, False
     if n_elements <= 65536:
         return 2048, 4, True
     return 16384, 8, True
+
+
+@triton.jit
+def _acos_body(x):
+    t = 0.5 - 0.5 * tl.abs(x)
+    # |x| > 1 makes t < 0 -> rsqrt(NaN) -> NaN propagates out, matching torch.
+    s = t * xpu.rsqrt(t + 1e-30)
+    p = -493.19885254
+    p = p * t + 1060.03149414
+    p = p * t + -941.14831543
+    p = p * t + 445.70321655
+    p = p * t + -121.05153656
+    p = p * t + 18.99153519
+    p = p * t + -1.44778073
+    p = p * t + 0.39646727
+    p = p * t + 1.99919987
+    y = s * p
+    # acos(x) = y (x>=0) / pi - y (x<0); m = 1 iff x<0 (min/max, no select).
+    m = tl.minimum(1.0, tl.maximum(0.0, -x * 8.50705917e37))
+    return m * 3.1415927 + (1.0 - 2.0 * m) * y
 
 
 @triton.jit

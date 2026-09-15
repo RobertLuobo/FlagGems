@@ -568,29 +568,8 @@ def scatter_add_(x, dim, index, src):
         return scatter_add_0(x, dim, index, src)
 
 
-@triton.jit
-def scatter_add_copy_kernel(in_ptr, out_ptr, total, BLOCK: tl.constexpr):
-    # In-place-add source copy for `scatter_add` (out-of-place wrapper): the
-    # output starts as a copy of the input. Flat contiguous move, same shape as
-    # the copy-family kernels in alias_copy / lift_out.
-    pid = tl.program_id(axis=0)
-    o = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = o < total
-    vals = tl.load(in_ptr + o, mask=mask)
-    tl.store(out_ptr + o, vals, mask=mask)
-
-
 def scatter_add(inp, dim, index, src):
     logger.debug("GEMS_KUNLUNXIN SCATTER_ADD")
-    if not inp.is_contiguous():
-        out = inp.clone()
-        return scatter_add_(out, dim, index, src)
-    out = torch.empty_like(inp)
-    # Copy-family recipe (same as alias_copy / lift_out): tle takes the whole
-    # move when it can; `torch.ops.aten._copy_from` is gone, it dispatches to
-    # the XPU fallback.
-    if not tle_copy(inp, out):
-        total = out.numel()
-        grid = (triton.cdiv(total, 1024),)
-        scatter_add_copy_kernel[grid](inp, out, total, BLOCK=1024)
+    # Non-inplace variant: out = inp (copied), then scatter-add src into it.
+    out = inp.clone()
     return scatter_add_(out, dim, index, src)

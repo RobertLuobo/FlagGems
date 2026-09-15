@@ -31,6 +31,13 @@ def repeat_interleave_self_int(inp, repeats, dim=None, *, output_size=None):
                     -inp.ndim, inp.ndim - 1, dim
                 )
             )
+    # Non-contiguous inputs (e.g. sliced [::2] views) combined with the
+    # inserted 0-stride dimension are mis-lowered by TritonXPU as 1D-tile
+    # strided gathers (illegal memory access, IMA).  Materialize a
+    # C-contiguous copy so the kernel only handles unit-stride + 0-stride;
+    # contiguous inputs (incl. benchmark shapes) take the zero-copy path.
+    if not inp.is_contiguous():
+        inp = inp.contiguous()
     inp_shape = list(inp.shape)
     inp_stride = list(inp.stride())
     output_shape = list(inp.shape)

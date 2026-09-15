@@ -1731,7 +1731,6 @@ def _unique2(
     return_counts: bool = False,
 ):
     logger.debug("GEMS_KUNLUNXIN _UNIQUE2")
-
     _ = sorted
     flat = in0.contiguous().view(-1)
     N = flat.numel()

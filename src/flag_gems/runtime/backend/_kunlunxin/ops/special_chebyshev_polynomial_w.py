@@ -13,7 +13,12 @@ import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
-from flag_gems.utils import pointwise_dynamic
+# Must use the vendor (XPU) pointwise_dynamic codegen: the generic
+# flag_gems.utils.pointwise_dynamic instantiates with
+# `self.config.balance_grid`, an attribute the _kunlunxin CodeGenConfig does
+# not define, so every case died at JIT-instantiation time (same fix as
+# igammac_ / lgamma / smooth_l1_loss / special_chebyshev_polynomial_v).
+from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,13 @@ def special_chebyshev_polynomial_w(x, n):
 
 
 def special_chebyshev_polynomial_w_out(x, n, out):
-    result = special_chebyshev_polynomial_w(x, n)
-    out.copy_(result)
-    return out
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_CHEBYSHEV_POLYNOMIAL_W_OUT")
+    if x.dtype not in (torch.float32, torch.float64):
+        raise ValueError(
+            f"special_chebyshev_polynomial_w only supports float32/float64, got {x.dtype}"
+        )
+    if not isinstance(n, torch.Tensor):
+        n = torch.empty((), dtype=torch.int64, device=x.device).fill_(n)
+    else:
+        n = n.to(device=x.device)
+    return _chebyshev_polynomial_w(x, n, out0=out)

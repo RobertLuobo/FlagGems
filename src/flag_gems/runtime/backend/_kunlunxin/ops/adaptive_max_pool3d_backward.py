@@ -138,12 +138,7 @@ def _adaptive_max_pool3d_backward_gather_kernel(
     gop = grad_output_ptr + nc * out_per_nc
     iop = indices_ptr + nc * out_per_nc
 
-    acc = tl.zeros((BLOCK,), dtype=tl.float32)
-    # Small static bounds (MAX_* <= 2 whenever out <= in, the only legal
-    # adaptive-pool configuration): fully unrolled bodies let the compiler
-    # issue all candidate loads up front (ILP), matching the proven
-    # Kunlunxin ``max_pool3d_backward_flat_kernel`` pattern.  The recompute
-    # kernel above stays rolled because its window bound can reach 9^3 bodies.
+    acc = tl.zeros((BLOCK,), dtype=tl.float32) 
     for od in tl.static_range(0, MAX_D):
         o_d = d_min + od
         d_ok = o_d < d_max

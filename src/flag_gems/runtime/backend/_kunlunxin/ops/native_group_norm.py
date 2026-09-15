@@ -120,7 +120,16 @@ def native_group_norm(input, weight, bias, N, C, HxW, group, eps=1e-05):
     rstd = torch.empty((N, group), dtype=input.dtype, device=input.device)
 
     grid = (N * group,)
-    block_hw = min(triton.next_power_of_2(HxW), 1024)
+    # On XPU the per-iteration pipeline cost dominates: measured per-shape
+    # block sweep shows 64-512 lane tiles are 2-10x slower than 1K-8K lane
+    # tiles even when the extra lanes are fully masked off (the simulator
+    # tolerates masked OOB lanes far better than issuing many narrow
+    # iterations).  Size the tile from the group element count
+    # (group_size * HxW) instead of HxW alone, keep it in [1024, 8192]:
+    # 8192 is the largest tl.sum that stays correct without explicit
+    # mask+where (ONESHOT_N_MAX), and >= 1024 avoids the narrow-tile cliff.
+    num_elements = group_size * HxW
+    block_hw = min(8192, max(1024, triton.next_power_of_2(num_elements)))
     with torch_device_fn.device(input.device):
         native_group_norm_kernel[grid](
             input,

@@ -329,7 +329,13 @@ def _pdist_backward(grad, x, p, pdist):
 
     out = torch.empty_like(x)
 
-    BLOCK_M = min(triton.next_power_of_2(M), 128)
+    # BLOCK_M is capped at 64: the dynamic j-loop body carries a loop-carried
+    # BLOCK_M-lane accumulator and 128 lanes make TritonXPUUnrollControl fail
+    # to lower with ``OutOfResources: uni_sram ... Required: 0, Hardware
+    # limit: 0`` on this backend (same non-monotonic tile-width envelope as
+    # _embedding_bag_dense_backward._pow2_block).  64 lanes lower cleanly for
+    # all four p-branches; the m_offsets < M mask keeps any M correct.
+    BLOCK_M = min(triton.next_power_of_2(M), 64)
     grid = (triton.cdiv(M, BLOCK_M), N)
 
     with torch_device_fn.device(x.device):

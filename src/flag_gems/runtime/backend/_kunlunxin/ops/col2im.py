@@ -15,9 +15,21 @@
 # elements. Decode (n, c, h, w) via div/mod (all non-negative). Loop kh, kw
 # with tl.static_range and accumulate gathers into a fp32 accumulator.
 # All arithmetic on valid contributions is over non-negative indices, so
-# `h_num % stride_h` and `h_num // stride_h` are safe. Fixed BLOCK=1024
-# + CodeGenConfig(isCloseVectorization, buffer_size_limit=2048) avoids the
-# XPU tiling/vectorize pipelines that miscompile.
+# `h_num % stride_h` and `h_num // stride_h` are safe.
+#
+# Performance notes (measured on kunlunxin XPU, fp16):
+#  * The largest per-op cost is the data-dependent load address
+#    (l_h*L_w + l_w): A/B tests show a kernel with identical decode/valid
+#    work but a compile-time-affine load address is ~2x (stride 1) to
+#    ~17-28x (stride 2) faster than loading at the computed index.
+#    => when stride is 1 the index is the affine `w + (pad - kw*dil)`
+#    (constexpr stride => `x // 1` folds away), so the loaders see a
+#    register-offset load (no division), which is the fastest path.
+#  * ACCUMULATED trade: `tl.load` with `other=0.0` forces a scalarized
+#    masked path on this backend; loading UNMASKED at an index clamped
+#    into bounds (then `tl.where(valid, v, 0.0)`) is 15-25% faster.
+#  * num_warps/BLOCK/CodeGenConfig(buffer_size_limit, isCloseVectorization)
+#    have no measurable effect; BLOCK=1024 + num_warps=1 is kept.
 import logging
 from typing import List
 
@@ -59,51 +71,61 @@ def col2im_kernel_flat(
     pid = tl.program_id(axis=0)
     o = pid * BLOCK + tl.arange(0, BLOCK)
     mask = o < total_out
+    # Clamp the lane index so the tail program never issues an out-of-bounds
+    # address (the loads below are unmasked; the store keeps `mask`).
+    o_s = tl.minimum(o, total_out - 1)
 
     # Decode flat -> (n, c, h, w)
-    n_idx = o // CHW_out
-    rem = o % CHW_out
+    n_idx = o_s // CHW_out
+    rem = o_s % CHW_out
     c_idx = rem // HW_out
     rem2 = rem % HW_out
     h_idx = rem2 // out_w
     w_idx = rem2 % out_w
+    h_i = h_idx.to(tl.int32)
+    w_i = w_idx.to(tl.int32)
+
+    n_base = n_idx * (channels * KHW * L_all)
 
     acc = tl.zeros([BLOCK], dtype=tl.float32)
 
     for kh in tl.static_range(0, kernel_h):
-        for kw in tl.static_range(0, kernel_w):
-            # h_num = h_idx + padding_h - kh*dilation_h
-            h_num = h_idx.to(tl.int32) + padding_h - kh * dilation_h
-            w_num = w_idx.to(tl.int32) + padding_w - kw * dilation_w
-
-            # Both must be non-negative multiples of stride, and quotient in [0, L)
-            # Compute quotient only when h_num, w_num are non-negative to avoid
-            # negative floor-div / % semantics on XPU.
+        if stride_h == 1:
+            # l_h is affine in h: `x // 1` folds, so the load addresses stay
+            # register-affine (fast path). Clamp into [0, L_h) for the
+            # unmasked load; the h_ok mask re-zeroes invalid lanes.
+            l_h = h_i + (padding_h - kh * dilation_h)
+            h_ok = (l_h >= 0) & (l_h < L_h)
+            l_h_s = tl.maximum(l_h, 0)
+        else:
+            h_num = h_i + (padding_h - kh * dilation_h)
             h_pos = h_num >= 0
-            w_pos = w_num >= 0
-            h_num_c = tl.where(h_pos, h_num, 0)
-            w_num_c = tl.where(w_pos, w_num, 0)
-            l_h = h_num_c // stride_h
-            l_w = w_num_c // stride_w
-            h_mod = h_num_c - l_h * stride_h
-            w_mod = w_num_c - l_w * stride_w
-
-            valid = (
-                h_pos & w_pos & (h_mod == 0) & (w_mod == 0) & (l_h < L_h) & (l_w < L_w)
-            )
-
-            # Clamp indices for offset computation so masked-out lanes never
-            # dereference out-of-range memory on XPU (masked loads on this
-            # backend sometimes miscompile with negative/OOB addresses).
-            l_h_s = tl.where(valid, l_h, 0)
-            l_w_s = tl.where(valid, l_w, 0)
+            h_c = tl.where(h_pos, h_num, 0)
+            l_h = h_c // stride_h
+            h_mod = h_c - l_h * stride_h
+            h_ok = h_pos & (h_mod == 0) & (l_h < L_h)
+            l_h_s = tl.where(h_ok, l_h, 0)
+        for kw in tl.static_range(0, kernel_w):
+            if stride_w == 1:
+                l_w = w_i + (padding_w - kw * dilation_w)
+                w_ok = (l_w >= 0) & (l_w < L_w)
+                l_w_s = tl.maximum(l_w, 0)
+            else:
+                w_num = w_i + (padding_w - kw * dilation_w)
+                w_pos = w_num >= 0
+                w_c = tl.where(w_pos, w_num, 0)
+                l_w = w_c // stride_w
+                w_mod = w_c - l_w * stride_w
+                w_ok = w_pos & (w_mod == 0) & (l_w < L_w)
+                l_w_s = tl.where(w_ok, l_w, 0)
             c_k = c_idx * KHW + kh * kernel_w + kw
-            l_idx = l_h_s * L_w + l_w_s
-            in_offset = n_idx * (channels * KHW * L_all) + c_k * L_all + l_idx
+            in_offset = n_base + c_k * L_all + l_h_s * L_w + l_w_s
 
-            v = tl.load(input_ptr + in_offset, mask=mask & valid, other=0.0)
-            # XPU may ignore `other` on masked loads; force invalid lanes to 0.
-            v = tl.where(valid, v, 0.0)
+            # Unmasked load: both index operands are clamped into bounds.
+            # XPU may ignore `other` on masked loads, so force invalid
+            # lanes to 0 with an explicit where instead.
+            v = tl.load(input_ptr + in_offset)
+            v = tl.where(h_ok & w_ok, v, 0.0)
             acc += v.to(tl.float32)
 
     tl.store(output_ptr + o, acc.to(output_ptr.type.element_ty), mask=mask)

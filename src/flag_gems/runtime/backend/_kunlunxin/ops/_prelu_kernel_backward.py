@@ -17,9 +17,8 @@ logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
     dtypes=[None, None, float],
 )
 @triton.jit
-def _prelu_kernel_backward_scalar_func(grad_output, x, weight):
-    # weight is a Python float; fast path (all tensor args same shape).
-    pos = (x > 0).to(x.dtype)
+def _prelu_kernel_backward_scalar_func(grad_output, x, weight): 
+    pos = tl.minimum(1.0, tl.maximum(0.0, x.to(tl.float32) * 1.0e30)).to(x.dtype)
     x_neg = tl.minimum(x, 0.0)
     grad_input = grad_output * (pos + (1.0 - pos) * weight)
     grad_weight = grad_output * x_neg * (1.0 - pos)
@@ -32,9 +31,8 @@ def _prelu_kernel_backward_scalar_func(grad_output, x, weight):
     promotion_methods=[(0, 1, "DEFAULT"), (0, 1, "DEFAULT")],
 )
 @triton.jit
-def _prelu_kernel_backward_channel_func(grad_output, x, weight):
-    # weight is a last-dim broadcastable tensor [1, ..., 1, C].
-    pos = (x > 0).to(x.dtype)
+def _prelu_kernel_backward_channel_func(grad_output, x, weight): 
+    pos = tl.minimum(1.0, tl.maximum(0.0, x.to(tl.float32) * 1.0e30)).to(x.dtype)
     x_neg = tl.minimum(x, 0.0)
     grad_input = grad_output * (pos + (1.0 - pos) * weight)
     grad_weight = grad_output * x_neg * (1.0 - pos)

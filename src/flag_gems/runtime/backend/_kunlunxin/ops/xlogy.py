@@ -24,6 +24,8 @@ from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.type_utils import ELEMENTWISE_TYPE_PROMOTION_KIND, type_promotion
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
+from flag_gems.utils import triton_lang_extension as ext
+from flag_gems.utils.type_utils import ELEMENTWISE_TYPE_PROMOTION_KIND, type_promotion
 
 logger = logging.getLogger(__name__)
 

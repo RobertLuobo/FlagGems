@@ -22,6 +22,7 @@ import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
+from .greater import _RAW_SMALL_SCALAR_LIMIT, _raw_greater_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,19 @@ def gt_func_scalar(x, y):
 
 def gt_scalar(A, B):
     logger.debug("GEMS_KUNLUNXIN GT_SCALAR")
+    # Single-pass vendor cluster-C comparison payload (gt_raw.xpu), the same
+    # x > s payload the sibling greater_scalar (ops/greater.py) uses: one
+    # read of A + one write of the bool output at the ATen memory footprint,
+    # with ATen's exact wrapped-scalar promotion (the scalar is converted to
+    # A.dtype on the host and compared in that dtype, `_scalar_bits`).
+    # The two-stage saturating-fp32 paths below move ~3.7x the bytes (fp32
+    # intermediate + vendor fp32->bool conversion) and cap at ~0.26-0.31x of
+    # torch on the big shapes; the payload wins from ~64K elements up (same
+    # payload / crossover measured in greater.py; see _RAW_SMALL_SCALAR_LIMIT).
+    if A.numel() >= _RAW_SMALL_SCALAR_LIMIT:
+        raw_out = _raw_greater_scalar(A, B)
+        if raw_out is not None:
+            return raw_out
     numel = A.numel()
     dtype = A.dtype
     if (

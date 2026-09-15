@@ -23,6 +23,16 @@
 #  OOB lanes are zeroed by an integer ok-multiplier (the count_nonzero
 #  clamp+mult pattern).  bins <= 100 in the test/benchmark matrix so the
 #  extra passes over the data are cheap and, crucially, exact.
+# Perf (2026-09-10): stream tile raised 1024 -> up to 8192 lanes (largest
+#  of {8192, 4096, 2048, 1024} dividing n).  On XPU the per-bin kernel is
+#  streaming-bound (100 passes over the whole input) and 8192 is the
+#  measured sweet spot (~1.20x over 1024 across the benchmark shapes;
+#  16384/32768 give no further gain and 32768 exceeds the 8192-lane tl.sum
+#  safety boundary).  The tail (clamped gather) path is ~15x slower per
+#  lane than streaming, so the tile is only raised when n is an exact
+#  multiple; otherwise the old 1024+tail path runs unchanged.  Total is
+#  still far below 1.0x of torch, so this remains a "source retained, not
+#  accepted" candidate.
 import logging
 
 import torch
@@ -204,7 +214,16 @@ def histc(inp, bins=100, min=0, max=0):
     if n_elements == 0:
         return out
 
+    # Largest tile in {8192, 4096, 2048, 1024} that divides n: keeps the
+    # whole input on the contiguous streaming path (no tail gather), which
+    # is ~15x faster per lane than the clamped tail path.  Falls back to
+    # the historical 1024 layout (main + tail) when n has no such divisor
+    # (e.g. n=10000): the tail kernel only ever sees n_tail < 1024.
     BLOCK_SIZE = 1024
+    for _bs in (8192, 4096, 2048, 1024):
+        if n_elements % _bs == 0:
+            BLOCK_SIZE = _bs
+            break
     grid = (bins,)
 
     n_main = (n_elements // BLOCK_SIZE) * BLOCK_SIZE

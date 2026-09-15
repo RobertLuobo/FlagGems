@@ -1,4 +1,5 @@
 import logging
+import math
 
 import torch
 import triton
@@ -17,6 +18,14 @@ def _fractional_max_pool2d_forward_kernel(
     output_ptr,
     indices_ptr,
     random_samples_ptr,
+    numel,
+    # Flat 1-D layout over (n, c, oh, ow). All pooling geometry is constexpr so
+    # the per-lane decomposition compiles to cheap ALU, gather addresses stay
+    # affine and @libentry caches one kernel per shape. Taps are loaded
+    # unconditionally (the fractional window always lies fully inside the input:
+    # start in [0, in - k]), and only the store tail is masked. The interval
+    # formula and strict-> first-window-wins semantics are preserved verbatim
+    # from the previous per-output-element kernel so indices match ATen exactly.
     input_channels: tl.constexpr,
     input_height: tl.constexpr,
     input_width: tl.constexpr,
@@ -26,22 +35,28 @@ def _fractional_max_pool2d_forward_kernel(
     kernel_width: tl.constexpr,
     alpha_height,
     alpha_width,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    output_column = tl.program_id(0)
-    row_id = tl.program_id(1)
-    channel = tl.program_id(2)
-    batch = row_id // output_height
-    output_row = row_id % output_height
-    sample_offset = (batch * input_channels + channel) * 2
-    sample_height = tl.load(random_samples_ptr + sample_offset).to(tl.float32)
-    sample_width = tl.load(random_samples_ptr + sample_offset + 1).to(tl.float32)
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    store_mask = offsets < numel
+    safe_offsets = tl.where(store_mask, offsets, 0)
 
-    start_height = ((output_row.to(tl.float32) + sample_height) * alpha_height).to(
-        tl.int32
-    ) - (sample_height * alpha_height).to(tl.int32)
-    start_width = ((output_column.to(tl.float32) + sample_width) * alpha_width).to(
-        tl.int32
-    ) - (sample_width * alpha_width).to(tl.int32)
+    output_column = safe_offsets % output_width
+    ohw = safe_offsets // output_width
+    output_row = ohw % output_height
+    nc = ohw // output_height
+
+    sample_height = tl.load(random_samples_ptr + nc * 2).to(tl.float32)
+    sample_width = tl.load(random_samples_ptr + nc * 2 + 1).to(tl.float32)
+
+    sample_alpha_h = (sample_height * alpha_height).to(tl.int32)
+    sample_alpha_w = (sample_width * alpha_width).to(tl.int32)
+    start_height = (
+        (output_row.to(tl.float32) + sample_height) * alpha_height
+    ).to(tl.int32) - sample_alpha_h
+    start_width = (
+        (output_column.to(tl.float32) + sample_width) * alpha_width
+    ).to(tl.int32) - sample_alpha_w
     start_height = tl.where(
         output_row == output_height - 1,
         input_height - kernel_height,
@@ -53,69 +68,165 @@ def _fractional_max_pool2d_forward_kernel(
         start_width,
     )
 
-    max_value = tl.full((), -float("inf"), tl.float32)
-    max_index = tl.full((), -1, tl.int64)
+    plane_base = input_ptr + nc * (input_height * input_width)
+    max_value = tl.full((BLOCK_SIZE,), -float("inf"), tl.float32)
+    max_index = tl.full((BLOCK_SIZE,), -1, tl.int64)
     for kernel_row in tl.static_range(0, kernel_height):
+        input_row = start_height + kernel_row
         for kernel_column in tl.static_range(0, kernel_width):
-            input_row = start_height + kernel_row
             input_column = start_width + kernel_column
-            input_offset = (
-                (batch * input_channels + channel) * input_height + input_row
-            ) * input_width + input_column
-            value = tl.load(input_ptr + input_offset).to(tl.float32)
+            value = tl.load(
+                plane_base + input_row * input_width + input_column
+            ).to(tl.float32)
             update = value > max_value
             max_value = tl.where(update, value, max_value)
             max_index = tl.where(
                 update,
-                input_row * input_width + input_column,
+                input_row.to(tl.int64) * input_width + input_column,
                 max_index,
             )
 
-    output_offset = (
-        (batch * input_channels + channel) * output_height + output_row
-    ) * output_width + output_column
-    tl.store(output_ptr + output_offset, max_value)
-    tl.store(indices_ptr + output_offset, max_index)
+    tl.store(
+        output_ptr + offsets,
+        max_value.to(output_ptr.dtype.element_ty),
+        mask=store_mask,
+    )
+    tl.store(indices_ptr + offsets, max_index, mask=store_mask)
 
 
 @libentry()
 @triton.jit
-def _fractional_max_pool2d_backward_kernel(
+def _fractional_max_pool2d_backward_scatter_kernel(
     grad_output_ptr,
     indices_ptr,
     grad_input_ptr,
-    input_channels: tl.constexpr,
-    input_height: tl.constexpr,
-    input_width: tl.constexpr,
-    output_height: tl.constexpr,
-    output_width: tl.constexpr,
-    output_blocks: tl.constexpr,
+    n_out,
+    out_per_nc,
+    in_hw,
     BLOCK: tl.constexpr,
 ):
-    input_column = tl.program_id(0)
-    row_id = tl.program_id(1)
-    channel = tl.program_id(2)
-    batch = row_id // input_height
-    input_row = row_id % input_height
-    target_index = input_row * input_width + input_column
-    output_elements = output_height * output_width
-    gradient = tl.zeros((), dtype=tl.float32)
+    """One lane per output position, non-atomic scatter (Kunlunxin/XPU).
 
-    for block in tl.static_range(0, output_blocks):
-        offsets = block * BLOCK + tl.arange(0, BLOCK)
-        mask = offsets < output_elements
-        safe_offsets = tl.where(mask, offsets, tl.zeros_like(offsets))
-        base = (batch * input_channels + channel) * output_elements
-        indices = tl.load(indices_ptr + base + safe_offsets)
-        values = tl.load(grad_output_ptr + base + safe_offsets).to(tl.float32)
-        indices = tl.where(mask, indices, -1)
-        values = tl.where(mask, values, 0.0)
-        gradient += tl.sum(tl.where(indices == target_index, values, 0.0), axis=0)
+    Fast path, valid whenever ``alpha >= k`` in both dims (``in - k >= k *
+    (out - 1)``, or ``out == 1``).  The pool window of output ``o`` is
+    ``[start(o), start(o) + k)`` with ``start(o) = trunc((o + s) * alpha) -
+    trunc(s * alpha)``; consecutive starts satisfy ``start(o + 1) - start(o)
+    >= floor(alpha) >= k`` (``start(out - 1)`` is clamped to ``in - k`` but
+    ``(out - 1) * alpha == in - k`` up to sub-ulp fp32 rounding, so the final
+    gap is ``>= k`` as well).  Hence the k-wide windows are pairwise disjoint,
+    every input position belongs to at most one window, each output's argmax
+    index is distinct, and the plain (non-atomic) stores can never race --
+    exact, deterministic, O(n_out).  This is the same pattern as the proven
+    ``adaptive_max_pool2d`` scatter fast path (``tl.atomic_add`` scatter loses
+    updates on this backend ~1e-5 per op, seed-dependent).
+    """
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_out
+    idx = tl.load(indices_ptr + offsets).to(tl.int32)
+    val = tl.load(grad_output_ptr + offsets).to(tl.float32)
+    nc = offsets // out_per_nc
+    tl.store(
+        grad_input_ptr + nc * in_hw + idx,
+        val.to(grad_input_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
-    output_offset = (
-        (batch * input_channels + channel) * input_height + input_row
-    ) * input_width + input_column
-    tl.store(grad_input_ptr + output_offset, gradient)
+
+@libentry()
+@triton.jit
+def _fractional_max_pool2d_backward_gather_kernel(
+    grad_output_ptr,
+    indices_ptr,
+    grad_input_ptr,
+    n_elems,
+    in_h,
+    in_w,
+    out_h,
+    out_w,
+    inv_alpha_h,
+    inv_alpha_w,
+    k_h: tl.constexpr,
+    k_w: tl.constexpr,
+    MAX_H: tl.constexpr,
+    MAX_W: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Gather-based fractional max pool 2d backward (Kunlunxin/XPU).
+
+    General fallback (used when ``alpha < k`` in some dim, i.e. overlapping
+    windows where the scatter fast path is not race-free).  One lane per input
+    position (flat 1-D over n, c, h, w).  Every output's argmax is looked up
+    in the per-plane flat index ``h * in_w + w`` produced by the Gems forward
+    and the upstream gradient is accumulated in registers wherever it equals
+    this lane's position, then written with one masked store.  This is the
+    exact, deterministic, race-free pattern of the proven
+    ``adaptive_max_pool2d_backward`` gather kernel (``tl.atomic_add`` scatter
+    loses updates on this backend ~1e-5 per op, seed-dependent).
+
+    The candidate output box is bounded *without* knowing the random samples.
+    With ``start(o) = trunc((o + s) * alpha) - trunc(s * alpha)`` we have
+    ``o*alpha - 1 <= start(o) <= o*alpha + 1``, and ``start(out - 1)`` is the
+    clamped ``in - k``; hence every output row whose k-window may contain
+    input row ``h`` satisfies ``(h - k_h) / alpha_h <= o <= (h + 1) / alpha_h``.
+    `inv_alpha` is passed host-side as ``1 / alpha`` (0 when ``out == 1`` or
+    ``in == k``, where the only candidate is ``o = 0``), the ``+-2`` margin
+    absorbs fp32 rounding, and each candidate is verified exactly against the
+    stored indices, so the result is identical to scanning every output
+    (even across overlapping windows, multiple outputs can map to the same
+    input position and their gradients all accumulate).  ``MAX_*`` is the
+    host-computed tight bound ``(k + 1) / alpha + 5`` (see the host function);
+    the scan range is rolled (not ``tl.static_range``): the XPU unroll control
+    pass fails when the per-program body is fully unrolled.
+    """
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < n_elems
+    safe_offsets = tl.where(mask, offsets, 0)
+
+    in_hw = in_h * in_w
+    nc = safe_offsets // in_hw
+    rem = safe_offsets % in_hw
+    h = rem // in_w
+    w = rem % in_w
+    my_flat = h * in_w + w
+
+    oh_lo = tl.maximum(
+        0, (tl.maximum(h - k_h, 0).to(tl.float32) * inv_alpha_h).to(tl.int32) - 2
+    )
+    oh_hi = tl.minimum(out_h - 1, ((h + 1).to(tl.float32) * inv_alpha_h).to(tl.int32) + 2)
+    ow_lo = tl.maximum(
+        0, (tl.maximum(w - k_w, 0).to(tl.float32) * inv_alpha_w).to(tl.int32) - 2
+    )
+    ow_hi = tl.minimum(out_w - 1, ((w + 1).to(tl.float32) * inv_alpha_w).to(tl.int32) + 2)
+
+    out_per_nc = out_h * out_w
+    gop = grad_output_ptr + nc * out_per_nc
+    iop = indices_ptr + nc * out_per_nc
+
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    # Rolled loops (compile-time constant bounds), not tl.static_range: the
+    # XPU unroll control pass (TritonXPUUnrollControl) fails with uni_sram
+    # OOR when the candidate box is fully unrolled.  Loads are clamped (never
+    # masked) so they stay inside the (n, c) plane; the active mask only
+    # gates the accumulation.
+    for oh in range(0, MAX_H):
+        o_h = oh_lo + oh
+        h_ok = (o_h <= oh_hi) & (o_h < out_h)
+        c_h = tl.minimum(o_h, out_h - 1)
+        for ow in range(0, MAX_W):
+            o_w = ow_lo + ow
+            w_ok = (o_w <= ow_hi) & (o_w < out_w)
+            c_w = tl.minimum(o_w, out_w - 1)
+            o_off = c_h * out_w + c_w
+            idx = tl.load(iop + o_off).to(tl.int32)
+            val = tl.load(gop + o_off).to(tl.float32)
+            active = mask & h_ok & w_ok
+            acc += tl.where(active & (idx == my_flat), val, 0.0)
+
+    tl.store(
+        grad_input_ptr + offsets,
+        acc.to(grad_input_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 def _parse_size(value):
@@ -173,6 +284,8 @@ def fractional_max_pool2d(
         device=input.device,
         dtype=torch.int64,
     )
+    if output.numel() == 0:
+        return (output, indices) if return_indices else output
     alpha_height = (
         (input_height - kernel_height) / (output_height - 1)
         if output_height > 1
@@ -181,13 +294,19 @@ def fractional_max_pool2d(
     alpha_width = (
         (input_width - kernel_width) / (output_width - 1) if output_width > 1 else 0.0
     )
-    grid = (output_width, batch_size * output_height, channels)
+    numel = output.numel()
+    # 128 lanes is the largest tile this kernel compiles at on XPU; below
+    # 64 * 128 outputs the 64-lane tile wins because the masked tail is a
+    # smaller share of the launch (same heuristic as adaptive_max_pool2d).
+    block_size = 128 if numel >= 8192 else 64
+    grid = (triton.cdiv(numel, block_size),)
     with torch_device_fn.device(input.device):
         _fractional_max_pool2d_forward_kernel[grid](
             input,
             output,
             indices,
             _random_samples.reshape(batch_size * channels, 2),
+            numel,
             channels,
             input_height,
             input_width,
@@ -197,6 +316,8 @@ def fractional_max_pool2d(
             kernel_width,
             alpha_height,
             alpha_width,
+            BLOCK_SIZE=block_size,
+            num_warps=1,
             isCloseVectorization=True,
             buffer_size_limit=2048,
         )
@@ -217,24 +338,97 @@ def fractional_max_pool2d_backward(
     grad_output = grad_output.contiguous()
     indices = indices.contiguous()
     batch_size, channels, input_height, input_width = input.shape
+    kernel_height, kernel_width = _parse_size(kernel_size)
     output_height, output_width = _parse_size(output_size)
-    grad_input = torch.empty_like(input)
-    block = 32
-    output_blocks = triton.cdiv(output_height * output_width, block)
-    grid = (input_width, batch_size * input_height, channels)
+    if input.numel() == 0 or grad_output.numel() == 0:
+        return torch.zeros_like(input)
+    out_per_nc = output_height * output_width
+    in_hw = input_height * input_width
+    n_out = grad_output.numel()
+    # Fast path: alpha = (in - k) / (out - 1) >= k in both dims (out == 1 is a
+    # single window per dim, trivially fine) -- see the scatter kernel
+    # docstring: the k-wide pool windows are then pairwise disjoint, every
+    # output's argmax index is distinct and the non-atomic scatter is exact
+    # and O(n_out).  The scatter kernel writes only the n_out argmax
+    # positions, so every other input position must still read 0 (ATen
+    # semantics) -- zeros_like, same as the proven adaptive scatter fast path.
+    # Otherwise fall back to the bounded gather (which writes every input
+    # position, no pre-zeroing needed: it can use empty_like).
+    scatter_h = (output_height == 1) or (
+        input_height - kernel_height >= kernel_height * (output_height - 1)
+    )
+    scatter_w = (output_width == 1) or (
+        input_width - kernel_width >= kernel_width * (output_width - 1)
+    )
     with torch_device_fn.device(input.device):
-        _fractional_max_pool2d_backward_kernel[grid](
-            grad_output,
-            indices,
-            grad_input,
-            channels,
-            input_height,
-            input_width,
-            output_height,
-            output_width,
-            output_blocks,
-            BLOCK=block,
-            isCloseVectorization=True,
-            buffer_size_limit=2048,
-        )
+        if scatter_h and scatter_w:
+            grad_input = torch.zeros_like(input)
+            _fractional_max_pool2d_backward_scatter_kernel[
+                (triton.cdiv(n_out, 256),)
+            ](
+                grad_output,
+                indices,
+                grad_input,
+                n_out,
+                out_per_nc,
+                in_hw,
+                BLOCK=256,
+                num_warps=4,
+                isCloseVectorization=True,
+                buffer_size_limit=2048,
+            )
+        else:
+            # Candidate-box bounds are shape-derived only (see gather kernel
+            # docstring): inv_alpha = 1 / alpha with alpha = (in - k) / (out - 1).
+            # out == 1 (or in == k) makes alpha 0, in which case the only
+            # candidate is o = 0 (clamped start = in - k), handled by
+            # inv_alpha = 0.  The compile-time scan bound is the per-lane
+            # worst-case candidate count (k + 1) / alpha + 5, clamped to
+            # [1, out].
+            inv_alpha_h = (
+                (output_height - 1) / (input_height - kernel_height)
+                if input_height > kernel_height
+                else 0.0
+            )
+            inv_alpha_w = (
+                (output_width - 1) / (input_width - kernel_width)
+                if input_width > kernel_width
+                else 0.0
+            )
+            max_h = max(
+                1,
+                min(output_height, int(math.ceil((kernel_height + 1) * inv_alpha_h)) + 6),
+            )
+            max_w = max(
+                1,
+                min(output_width, int(math.ceil((kernel_width + 1) * inv_alpha_w)) + 6),
+            )
+            n_elems = input.numel()
+            # The gather kernel writes every input position (one lane per
+            # input element, single masked store covering [0, n_elems)), so
+            # no pre-zeroing is needed: empty_like skips the vendor
+            # zeros-kernel launch (bitwise-identical output).
+            grad_input = torch.empty_like(input)
+            _fractional_max_pool2d_backward_gather_kernel[
+                (triton.cdiv(n_elems, 128),)
+            ](
+                grad_output,
+                indices,
+                grad_input,
+                n_elems,
+                input_height,
+                input_width,
+                output_height,
+                output_width,
+                inv_alpha_h,
+                inv_alpha_w,
+                kernel_height,
+                kernel_width,
+                MAX_H=max_h,
+                MAX_W=max_w,
+                BLOCK=128,
+                num_warps=2,
+                isCloseVectorization=True,
+                buffer_size_limit=2048,
+            )
     return grad_input

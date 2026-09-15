@@ -128,12 +128,9 @@ def adaptive_max_pool2d_backward(
     in_n, in_c, in_h, in_w = self.shape
     out_h, out_w = grad_output.shape[2], grad_output.shape[3]
 
-    # ATen semantics: grad_input is zero everywhere except at the argmax
-    # positions of each output (unwritten positions must be 0, never garbage).
-    grad_input = torch.zeros_like(self)
-
-    n_in = grad_input.numel()
-    if n_in == 0 or grad_output.numel() == 0:
+    n_in = in_n * in_c * in_h * in_w
+    if n_in == 0 or grad_output.numel() == 0: 
+        grad_input = torch.zeros_like(self)
         return grad_input.squeeze(0) if input_is_3d else grad_input
 
     # Exact division on both dims: each input position belongs to exactly one
@@ -141,11 +138,12 @@ def adaptive_max_pool2d_backward(
     exact = (in_h % out_h == 0) and (in_w % out_w == 0)
 
     with torch_device_fn.device(self.device):
-        if exact:
-            # Fast path: exact division -> each output's argmax is a distinct
-            # input position, one lane per output, no atomics, no races.
+        if exact: 
+            grad_input = torch.zeros_like(self) 
             n_out = grad_output.numel()
-            _adaptive_max_pool2d_backward_scatter_kernel[(triton.cdiv(n_out, 256),)](
+            _adaptive_max_pool2d_backward_scatter_kernel[
+                (triton.cdiv(n_out, 256),)
+            ](
                 grad_output,
                 indices,
                 grad_input,
@@ -157,10 +155,8 @@ def adaptive_max_pool2d_backward(
                 buffer_size_limit=2048,
                 isCloseVectorization=True,
             )
-        else:
-            # Exact upper bounds for the per-dim candidate counts (see gather
-            # kernel comment): at most 1 when in is a multiple of out, at most
-            # floor(out / in) + 2 otherwise.
+        else: 
+            grad_input = torch.empty_like(self) 
             max_h = 1 if in_h % out_h == 0 else (out_h // in_h + 2)
             max_w = 1 if in_w % out_w == 0 else (out_w // in_w + 2)
             _adaptive_max_pool2d_backward_gather_kernel[(triton.cdiv(n_in, 128),)](

@@ -31,6 +31,14 @@ logger = logging.getLogger("flag_gems." + __name__)
 #      再以 torch.nested.as_nested_tensor 视图组装嵌套张量（view 路径不经过
 #      被 override 的 cat），保持 _copy 的拷贝语义：use_gems 稳态约 0.4ms，
 #      无逐组件拷贝 launch。
+# 性能修复（v2，当前实现）：
+#   3. 不经过 torch._nested_view_from_jagged 的完整 torch-function 调度
+#      （该调用链在 use_gems 下被 _FULL_CONFIG 中的 resolve_conj / resolve_neg
+#      注册逐次拦截 ~4.5us，且整体 Python dispatch 开销 ~125us/call）；
+#      直接调用 torch.nested._internal.nested_tensor.NestedTensor(...) 构造
+#      —— 与 _nested_view_from_jagged_default（register_jagged_func 处理器）
+#      逐参数等价（lengths 显式传入、metadata_cache 为空），对拍逐位一致；
+#      同时把整块拷贝快照 + 组件路径缩短 ~28us/call（base/gems 双方）。
 def _nested_view_from_buffer_copy(
     self: torch.Tensor,
     nested_size: torch.Tensor,
@@ -38,7 +46,47 @@ def _nested_view_from_buffer_copy(
     offsets: torch.Tensor,
 ):
     logger.debug("GEMS_KUNLUNXIN _NESTED_VIEW_FROM_BUFFER_COPY")
+    num_components = nested_size.shape[0]
 
+    if (
+        self.dim() == 1
+        and nested_size.dim() == 2
+        and nested_size.shape[1] == 1
+        and nested_size.dtype == torch.int64
+        and nested_strides.dtype == torch.int64
+        and offsets.dtype == torch.int64
+        and all(s == 1 for s in nested_strides.reshape(-1).tolist())
+    ):
+        # One flat copy of the whole buffer (copy semantics of the op; the
+        # nested tensor then is a vi ew of `values`).
+        values = torch.empty_strided(
+            self.shape, self.stride(), dtype=self.dtype, device=self.device
+        )
+        torch.ops.aten._copy_from(self, values, False)
+        # Jagged offsets must have num_components+1 entries; with explicit
+        # `lengths` the trailing entry is not used for component sizes, so the
+        # input offsets (padded by one element) are passed through unchanged.
+        full_offsets = torch.empty_strided(
+            (num_components + 1,), (1,), dtype=torch.int64, device=self.device
+        )
+        torch.ops.aten._copy_from(offsets, full_offsets[:num_components], False)
+        torch.ops.aten._copy_from(offsets[:1], full_offsets[num_components:], False)
+        # Construct the jagged NestedTensor directly instead of going through
+        # torch._nested_view_from_jagged (whose torch-function dispatch chain
+        # costs ~125us/call and hits use_gems-intercepted resolve_conj /
+        # resolve_neg); this is exactly what _nested_view_from_jagged_default
+        # produces for (values, full_offsets, lengths, ragged_idx=1,
+        # min_seqlen=None, max_seqlen=None).
+        from torch.nested._internal.nested_tensor import NestedTensor
+
+        return NestedTensor(
+            values,
+            full_offsets,
+            lengths=nested_size[:, 0],
+            _ragged_idx=1,
+        )
+
+    # Generic fallback: per-component as_strided views of a snapshot copy.
     snapshot = torch.empty_strided(
         self.shape, self.stride(), dtype=self.dtype, device=self.device
     )
