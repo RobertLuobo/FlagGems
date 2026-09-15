@@ -189,7 +189,22 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
                 f"The broadcast shape {broadcast_shape} does not match destination shape {tuple(dst.shape)}"
             ) from None
     if dst.numel() == 0:
-        return dst
+        # Respect PyTorch behaviour: empty tensors should still validate broadcast.
+        return torch.ops.aten.copy_.default.redispatch(
+            _FALLBACK_KEYSET, dst, src, non_blocking
+        )
+
+    logger.debug("GEMS_KUNLUNXIN COPY_")
+
+    try:
+        broadcast_shape = torch.broadcast_shapes(dst.shape, src.shape)
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    if torch.Size(broadcast_shape) != dst.shape:
+        raise RuntimeError(
+            f"The broadcast shape {broadcast_shape} does not match destination shape {tuple(dst.shape)}"
+        )
 
     expanded_src = _expand_like(src, dst.shape)
     if _is_e8m0(expanded_src):

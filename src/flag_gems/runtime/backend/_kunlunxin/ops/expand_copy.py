@@ -89,8 +89,8 @@ def _expand_bcast_kernel(
 
 def _launch_bcast(shape, strides, src, dst, n):
     ndim = len(shape)
-    shapes = (tuple(shape) + (1,) * (6 - ndim))
-    strided = (tuple(strides) + (0,) * (6 - ndim))
+    shapes = tuple(shape) + (1,) * (6 - ndim)
+    strided = tuple(strides) + (0,) * (6 - ndim)
     grid = (triton.cdiv(n, _BCAST_BLOCK),)
     _expand_bcast_kernel[grid](
         src,
@@ -104,24 +104,7 @@ def _launch_bcast(shape, strides, src, dst, n):
     )
 
 
-def expand_copy(x: torch.Tensor, size, implicit: bool = False) -> torch.Tensor:
-    """Kunlunxin override for aten::expand_copy.
-
-    Matches the full ATen schema ``expand_copy(Tensor self, SymInt[] size,
-    *, bool implicit=False)``: the ``implicit`` flag only marks an implicit
-    expand in autograd and does not affect the materialized value, so it is
-    accepted and ignored here (the result is always a fresh contiguous copy).
-
-    The generic ``flag_gems.ops.expand_copy`` calls the triton ``copy_`` from
-    ``flag_gems.ops.copy``, whose pointwise kernel (default KUNLUNXIN config:
-    no ``buffer_size_limit``/``kunlunAutoGrid``/``unroll``, per-lane
-    ``offset//stride%size`` index math) defeats the XPU OffsetAnalysis pass and
-    measures ~39ms on a 16M-element same-shape copy (0.00093x torch).  This
-    override routes contiguous sources through the Kunlunxin ``copy_``
-    (bounded-tile flat block-DMA kernel) and broadcast (stride-0) sources
-    through a fixed-tile leaf gather kernel, avoiding both the generic slow
-    path and the per-launch Python overhead of the generated pointwise wrapper.
-    """
+def expand_copy(x: torch.Tensor, size) -> torch.Tensor:
     logger.debug("GEMS_KUNLUNXIN EXPAND_COPY")
 
     # Convert size to tuple and handle -1 (meaning keep original size)

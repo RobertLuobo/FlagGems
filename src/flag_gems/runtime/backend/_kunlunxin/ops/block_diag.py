@@ -11,41 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kunlunxin (XPU) override for torch.block_diag.
-
-``block_diag`` is a pure block-scatter copy: the output is a zero
-``(total_rows, total_cols)`` matrix and each input block is written into its
-own ``(row_off:row_off+rows, col_off:col_off+cols)`` tile. On this backend
-the Triton forms of that scatter are structurally 10-100x slower than the
-vendor's native copy engine:
-
-* A discrete (computed per-lane) STORE is ~400x more expensive than a
-  contiguous store and a discrete LOAD ~30x; only 1D ``tl.arange``-derived
-  (affine, unit inner stride) pointer vectors lower to block-DMA. A
-  block-diagonal scatter needs a data-dependent (row_off, col_off) per block,
-  so every Triton variant pays discrete loads or stores on at least one side.
-* The per-block base-pointer patterns that would recover contiguity are
-  themselves miscompiled on this backend: an int->pointer cast of a
-  ``scalar-where`` selected address (``_coalesce16_kernel``) and the
-  device-pointer-table + unmasked affine vector load (``_coalesce_blocks_kernel``)
-  both silently produce garbage on masked-off / repeated lanes
-  (nondeterministic, verified bit-level); a masked table load plus a
-  per-lane gather (the old ``varlen_general`` kernel) works but caps out at
-  ~3 GB/s.
-
-Native ``torch.block_diag`` on this device is a memcpy-class op (fill +
-per-block strided copy, ~0.015-0.05 ms for the benchmark shapes), so the
-override mirrors the native semantics exactly: ``torch.zeros`` output plus
-one ``torch.ops.aten.slice`` view (``out[r0:r1, c0:c1]``) and one
-``torch.ops.aten._copy_from(src, view, False)`` per block. gems overrides
-``copy_``/``copy``/``cat``/``stack`` but never ``_copy_from``, so every copy
-reaches the vendor's native strided-copy engine regardless of
-``flag_gems.use_gems`` being active; this is the same pattern already used by
-the accepted kunlunxin ``slice_backward``/``resize``/``constant_pad_nd``
-overrides. 0D inputs are promoted to (1,1), 1D to (1,K); mixed dtypes are
-promoted with ``torch.promote_types`` exactly as ATen does; empty blocks
-contribute no copy (the output is already zeroed).
-"""
 
 import logging
 
@@ -96,13 +61,7 @@ def block_diag(*tensors):
                 if (t.is_contiguous() and t.dtype == out_dtype)
                 else t.contiguous().to(out_dtype)
             )
-            view = torch.ops.aten.slice(
-                torch.ops.aten.slice(out, 0, row_off, row_off + rows),
-                1,
-                col_off,
-                col_off + cols,
-            )
-            torch.ops.aten._copy_from(src, view, False)
+            out[row_off : row_off + rows, col_off : col_off + cols] = src
         row_off += rows
         col_off += cols
 

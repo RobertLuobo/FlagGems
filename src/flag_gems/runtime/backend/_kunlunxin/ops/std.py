@@ -1,17 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import logging
 
 import torch
@@ -27,12 +13,6 @@ logger = logging.getLogger(__name__)
 
 @triton.jit
 def _std_partial_sum_kernel(X, Tmp, N, CHUNK, BLOCK_N: tl.constexpr):
-    # Each program accumulates the sum of a contiguous CHUNK of elements in
-    # BLOCK_N-sized tiles (BLOCK_N < 8192: safe tl.sum on XPU). Partial sums
-    # are reduced by _std_finalize_kernel. IMPORTANT: the load mask must
-    # bound to the program-local end (min(start+CHUNK, N)), never the global
-    # N, otherwise the last tile of each program overlaps the next program's
-    # range and partial sums are inflated.
     pid = tl.program_id(0)
     start = pid * CHUNK
     end = tl.minimum(start + CHUNK, N)
@@ -47,15 +27,6 @@ def _std_partial_sum_kernel(X, Tmp, N, CHUNK, BLOCK_N: tl.constexpr):
 
 @triton.jit
 def _std_partial_sq_kernel(X, Tmp, N, Mean, CHUNK, BLOCK_N: tl.constexpr):
-    # Second pass: sum of squared deviations from the already-computed mean.
-    # Two-pass (mean, then (x-mean)^2) avoids the E[x^2]-E[x]^2 catastrophic
-    # cancellation that silently zeroes the variance for large N with
-    # non-zero mean. Mask bounded to program-local end, see above.
-    # NOTE: OOB lanes must be explicitly zeroed with tl.where AFTER the
-    # subtraction. On XPU the masked-load other=0.0 value does not survive
-    # the v - mean subf in tiled loops; without the where, each program
-    # under-counts its mean term by ~12 lanes and the squared sum is
-    # inflated ~100x for non-zero-mean data.
     pid = tl.program_id(0)
     start = pid * CHUNK
     end = tl.minimum(start + CHUNK, N)
@@ -162,16 +133,6 @@ def std(x, dim=None, *, correction=None, keepdim=False):
             out = torch.zeros([], device=x.device, dtype=x.dtype)
             return out.view([1] * input_ndim) if keepdim else out
 
-        # Two-pass (mean, then sum of squared deviations). The previous
-        # E[x^2]-E[x]^2 single-pass formulation suffers catastrophic
-        # cancellation in fp32 for large N with non-zero mean (sum ~ N*2.5
-        # has ULP ~ 0.5, destroying the ~1e-5 variance signal) and silently
-        # returns std = 0. Grid is capped at 1024 programs; each program
-        # walks a contiguous CHUNK in BLOCK_N tiles. Tuned on XPU:
-        # BLOCK_N=4096 (vs 1024) cuts the per-program loop trip count 4x and
-        # speeds up the 2^30-element global reduction ~2.5x (115ms -> 46ms
-        # for fp16); GRID=min(max(cdiv(N,16384),256),1024) keeps >= 256
-        # programs so even 1M-element reductions get enough parallelism.
         GRID = min(max(triton.cdiv(N, 16384), 256), 1024)
         CHUNK = triton.cdiv(N, GRID)
         BLOCK_N = 4096
@@ -197,13 +158,6 @@ def std(x, dim=None, *, correction=None, keepdim=False):
         dim_list = list(dim)
     dim_list_normalized = [d % input_ndim for d in dim_list]
 
-    # Route EVERY dim reduction (single-dim AND multi-dim) through dim_compress so
-    # the reduced dims land on the trailing axis => it is always a contiguous
-    # (M, N) inner reduction (K == 1). We only ever launch the @libentry-cached
-    # _std_dim_kernel_inner. This (a) avoids the giant 2D tile + heuristic-supplied
-    # launch param IR explosion of the old _std_fused_dim_kernel path
-    # (ir-std-dev5.log = 7.7M lines) and (b) avoids the non_inner (K>1) softmax
-    # kernel, which was numerically wrong on XPU (std ~sqrt(K)x too small).
     x_view = dim_compress(x, dim_list_normalized)
     N = 1
     for d in dim_list_normalized:

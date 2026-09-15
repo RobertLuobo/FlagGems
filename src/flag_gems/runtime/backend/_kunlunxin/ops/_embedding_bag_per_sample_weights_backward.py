@@ -11,35 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Kunlunxin (TritonXPU) specialization of
-# aten::_embedding_bag_per_sample_weights_backward.
-#
-# Why this override exists
-# ------------------------
-# The generic implementation (src/flag_gems/ops/_embedding_bag_per_sample_weights_backward.py)
-# launches one program per sample and, for embedding_dim > 1024 (NUM_BLOCKS >= 2),
-# issues ``tl.load(..., mask=m, other=0.0)`` inside the block loop.  On this
-# TritonXPU build the partial masked load (mask with false lanes) does NOT
-# return ``other`` for the masked lanes whenever the kernel contains more than
-# one block: the second and later blocks contribute garbage, so the output of
-# every sample is wrong for any embedding_dim in (1024 * k, 1024 * (k + 1)) with
-# k >= 1 (measured max abs error 62.5 for D=1025, 95.1 for D=2049).  A CPU
-# float64 oracle is clean for the same shapes as soon as the loads are made
-# unmasked.
-#
-# The override therefore never uses ``other=``: out-of-range lanes are clamped
-# to a legal in-bounds address (``tl.where(m, offs, 0)``) and zeroed afterwards
-# with ``tl.where(m, w, 0.0)`` before the reduction, mirroring the backend rules
-# kept in _embedding_bag_dense_backward.py (no ``other=`` on any load).  The
-# reduction stays a 1-D ``tl.sum`` per block with the store AFTER the (load-only)
-# block loop: the [NUM_BLOCKS, BLOCK_D] single-tile alternative fails to lower
-# (``OutOfResources: uni_sram``) on this backend.
-#
-# Semantics match ATen exactly:
-#   * output[i] = dot(grad[offset2bag[i]], weight[indices[i]]);
-#   * mode != 0 raises (per_sample_weights is only defined for mode='sum');
-#   * padding_idx >= 0 zeroes the output of samples whose index == padding_idx.
+
 import logging
 
 import torch
@@ -107,7 +79,10 @@ def _embedding_bag_per_sample_weights_backward(
         raise RuntimeError(
             "embedding_bag_backward: per_sample_weights only supported for mode='sum'"
         )
-    assert indices.dtype in (torch.int32, torch.int64), "Indices must be int32 or int64."
+    assert indices.dtype in (
+        torch.int32,
+        torch.int64,
+    ), "Indices must be int32 or int64."
     assert (
         grad.device == weight.device == indices.device == offset2bag.device
     ), "All inputs must be on the same device."

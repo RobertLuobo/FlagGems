@@ -11,39 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Kunlunxin (XPU) override for ``_jagged_to_padded_dense_forward``.
-
-Why a vendor override:
-  The generic implementation in ``flag_gems/ops/_jagged_to_padded_dense_forward.py``
-  uses one program per batch row with **two** passes (a full-row padding fill,
-  then a data-dependent ``tl.range(0, seq_length, BLOCK_SIZE)`` copy loop whose
-  bound is a runtime value).  On XPU the runtime-bound inner loop does not
-  unroll well and the padding pass doubles the write traffic, which measured
-  ~10-2000x slower than native for mid/large rows (e.g. bf16 [512, 256] row
-  matrix: 16.7ms vs 0.26ms native).
-
-Design (kept to constructs proven reliable on the TritonXPU backend):
-  - Output is pre-filled natively with ``torch.full(..., padding_value)`` and
-    the kernel only writes the real (non-padding) elements, so **every output
-    element is written exactly once** (no double write of the padding region).
-  - One program handles ``ROWS_PER_PROG`` rows sequentially; the row loop and
-    the column loop both have ``constexpr`` bounds (statically unrolled), so
-    there is no data-dependent loop bound.
-  - All loads/stores are **1-D** (a 2-D tiled variant was measured to be
-    incorrect on this backend: 2-D masked loads ignore ``other`` and 2-D
-    ``tl.where``/mask selects do not apply, leaving masked lanes uninitialized).
-  - Load addresses are clamped to ``[0, total_length-1]``; every store is
-    guarded by ``col < seq_len`` (no store ever touches the padding region, so
-    a mis-lowered masked load cannot leak garbage into the output).
-"""
-
 import logging
 
-import torch
 import triton
 import triton.language as tl
 
+# Use the gems implementations for allocation/fill instead of raw torch calls.
+import flag_gems.ops as _general_ops
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
@@ -95,7 +69,7 @@ def _jagged_to_padded_dense_forward_kernel(
                 src = tl.minimum(seq_start + col, total_length - 1)
                 val = tl.load(values + src, mask=col < seq_len, other=padding_value)
                 # Store only the real region: padded lanes are never written
-                # (they already hold padding_value from torch.full).
+                # (they already hold padding_value from the pre-fill).
                 tl.store(
                     output + row * max_length + col,
                     val,
@@ -109,7 +83,7 @@ def _jagged_to_padded_dense_forward(values, offsets, max_lengths, padding_value=
     Supports the single-batch-dimension case (1-D ``values``, 1-D ``offsets``);
     same calling convention as ``flag_gems.ops._jagged_to_padded_dense_forward``.
     """
-    logger.debug("GEMS JAGGED TO PADDED DENSE FORWARD (kunlunxin)")
+    logger.debug("GEMS_KUNLUNXIN _JAGGED_TO_PADDED_DENSE_FORWARD")
 
     if not isinstance(offsets, (list, tuple)):
         offsets = [offsets]
@@ -126,14 +100,17 @@ def _jagged_to_padded_dense_forward(values, offsets, max_lengths, padding_value=
     max_length = int(max_lengths[0])
 
     if batch_size <= 0 or max_length <= 0:
-        return torch.empty(
+        return _general_ops.empty(
             (max(batch_size, 0), max(max_length, 0)),
             dtype=values.dtype,
             device=values.device,
         )
 
-    output = torch.full(
-        (batch_size, max_length), padding_value, dtype=values.dtype, device=values.device
+    output = _general_ops.full(
+        (batch_size, max_length),
+        padding_value,
+        dtype=values.dtype,
+        device=values.device,
     )
 
     total_length = int(values.numel())

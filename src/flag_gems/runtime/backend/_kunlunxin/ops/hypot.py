@@ -291,7 +291,7 @@ def _launch_hypot_inplace_strided(
 
 
 def hypot(a: torch.Tensor, b: torch.Tensor):
-    logger.debug("GEMS HYPOT (KUNLUNXIN)")
+    logger.debug("GEMS_KUNLUNXIN HYPOT")
     out_dtype = _infer_hypot_out_dtype(a, b)
     device = a.device
     if b.device != device:

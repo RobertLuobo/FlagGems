@@ -1131,7 +1131,7 @@ def segment_reduce(
     unsafe=False,
     initial=None,
 ):
-    logger.debug("GEMS SEGMENT_REDUCE")
+    logger.debug("GEMS_KUNLUNXIN SEGMENT_REDUCE")
     _check_reduce_and_dtype(data, reduce)
     axis = _wrap_axis(axis, data.dim())
     if indices is not None:
@@ -1200,7 +1200,7 @@ def segment_reduce_out(
     initial=None,
     out,
 ):
-    logger.debug("GEMS SEGMENT_REDUCE_OUT")
+    logger.debug("GEMS_KUNLUNXIN SEGMENT_REDUCE_OUT")
     result = segment_reduce(
         data,
         reduce,
@@ -1228,7 +1228,7 @@ def _segment_reduce_backward(
     axis=0,
     initial=None,
 ):
-    logger.debug("GEMS _SEGMENT_REDUCE_BACKWARD")
+    logger.debug("GEMS_KUNLUNXIN _SEGMENT_REDUCE_BACKWARD")
     if (
         initial is None
         and lengths is not None
@@ -1342,7 +1342,7 @@ def _segment_reduce_backward_out(
     initial=None,
     out,
 ):
-    logger.debug("GEMS _SEGMENT_REDUCE_BACKWARD_OUT")
+    logger.debug("GEMS_KUNLUNXIN _SEGMENT_REDUCE_BACKWARD_OUT")
     result = _segment_reduce_backward(
         grad,
         output,

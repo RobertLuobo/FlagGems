@@ -20,7 +20,7 @@ from ._batch_norm_no_update import _batch_norm_no_update
 from ._conj import _conj  # noqa: F401
 from ._dyn_quant_pack_4bit_weight import _dyn_quant_pack_4bit_weight
 from ._embedding_bag_dense_backward import _embedding_bag_dense_backward
-from ._embedding_bag_per_sample_weights_backward import (
+from ._embedding_bag_per_sample_weights_backward import (  # noqa: F401
     _embedding_bag_per_sample_weights_backward,
 )
 from ._euclidean_dist import _euclidean_dist
@@ -31,10 +31,10 @@ from ._functional_sym_constrain_range_for_size import (
 from ._fused_adam import _fused_adam, _fused_adam_
 from ._fused_rms_norm import _fused_rms_norm  # noqa: F401
 from ._is_all_true import _is_all_true
-from ._jagged_to_padded_dense_forward import (
+from ._linalg_eigvals import _linalg_eigvals
+from ._jagged_to_padded_dense_forward import (  # noqa: F401
     _jagged_to_padded_dense_forward,
 )
-from ._linalg_eigvals import _linalg_eigvals
 from ._native_batch_norm_legit_functional import _native_batch_norm_legit_functional
 from ._native_batch_norm_legit_no_training import _native_batch_norm_legit_no_training
 from ._nested_view_from_buffer_copy import _nested_view_from_buffer_copy
@@ -144,7 +144,7 @@ from .bitwise_xor import (
     xor_scalar_,
     xor_scalar_tensor,
 )
-from .block_diag import block_diag
+from .block_diag import block_diag  # noqa: F401
 from .bmm import bmm, bmm_out
 from .broadcast_tensors import broadcast_tensors
 from .broadcast_to import broadcast_to
@@ -228,6 +228,7 @@ from .erfinv import erfinv
 from .erfinv_ import erfinv_  # noqa: F401
 from .exp import exp, exp_, exp_out
 from .exp2 import exp2, exp2_
+from .expand_copy import expand_copy
 from .expm1 import expm1, expm1_, expm1_out
 from .exponential import exponential  # noqa: F401
 from .exponential_ import exponential_
@@ -593,7 +594,7 @@ from .special_modified_bessel_k0 import (
 from .special_multigammaln import special_multigammaln
 from .special_ndtr import special_ndtr
 from .special_ndtri import special_ndtri
-from .special_expit import special_expit  # noqa: F401
+from .special_round import special_round, special_round_out
 from .special_shifted_chebyshev_polynomial_t import (
     special_shifted_chebyshev_polynomial_t,
 )
@@ -973,6 +974,13 @@ __all__ = [
     "nanmedian_out",
     "new_full",
     "new_ones",
+    "nansum",
+    "nansum_out",
+    "narrow_copy",
+    "native_batch_norm",
+    "native_dropout_backward",
+    "native_group_norm",
+    "native_layer_norm",
     "ne",
     "ne_scalar",
     "neg",
@@ -1084,6 +1092,45 @@ __all__ = [
     "softplus",
     "sort",
     "sort_stable",
+    "special_bessel_j0",
+    "special_bessel_j1",
+    "special_bessel_y0",
+    "special_bessel_y1",
+    "special_chebyshev_polynomial_u",
+    "special_chebyshev_polynomial_v",
+    "special_chebyshev_polynomial_w",
+    "special_chebyshev_polynomial_w_out",
+    "special_digamma",
+    "special_erf",
+    "special_erfcx",
+    "special_erfinv",
+    "special_erfinv_",
+    "special_erfinv_out",
+    "special_exp2",
+    "special_gammainc",
+    "special_gammaincc",
+    "special_gammaln",
+    "special_gammaln_out",
+    "special_i0e",
+    "special_i0e_out",
+    "special_legendre_polynomial_p",
+    "special_log1p_out",
+    "special_log_ndtr",
+    "special_log_ndtr_",
+    "special_log_softmax",
+    "special_logsumexp",
+    "special_modified_bessel_k0",
+    "special_modified_bessel_k0_out",
+    "special_multigammaln",
+    "special_ndtri",
+    "special_round",
+    "special_round_out",
+    "special_shifted_chebyshev_polynomial_t",
+    "special_shifted_chebyshev_polynomial_u",
+    "special_shifted_chebyshev_polynomial_u_",
+    "special_shifted_chebyshev_polynomial_v",
+    "special_shifted_chebyshev_polynomial_w",
+    "special_sinc",
     "sqrt",
     "sqrt_",
     "stack",

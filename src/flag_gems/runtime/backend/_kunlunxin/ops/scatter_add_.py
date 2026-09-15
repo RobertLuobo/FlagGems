@@ -1,17 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import importlib
 import logging
 import os
@@ -26,20 +12,12 @@ from flag_gems.utils.code_cache import code_cache_dir
 from flag_gems.utils.code_utils import IndentedBuffer
 from flag_gems.utils.shape_utils import restride_dim
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 
 def span_for_slice(slice_n: int, block: int) -> int:
-    # Number of linear index elements owned by one program.
-    #
-    # tl.atomic_add on this backend silently drops updates when the same output
-    # address is touched by more than one program (two contending programs are
-    # already enough to lose updates; see
-    # harness/results/functional/scatter_add_contention_xpu4_20260901).
-    # Duplicate index values can only alias inside one "slice" of
-    # prod(index.shape[dim:]) consecutive linear elements, so the per-program
-    # span is forced to a whole multiple of that slice; every possible address
-    # conflict then stays program-local.
     if slice_n <= 0:
         return block
     if slice_n >= block:
