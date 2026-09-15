@@ -282,10 +282,10 @@ def chunk_cat(tensors: List[torch.Tensor], dim: int, num_chunks: int) -> torch.T
     for s in tensors[0].shape[dim + 1 :]:
         stride_after *= s
 
-    out_shape = (
-        list(tensors[0].shape[:dim])
-        + [num_chunks, chunk_size * num_tensors * stride_after]
-    )
+    out_shape = list(tensors[0].shape[:dim]) + [
+        num_chunks,
+        chunk_size * num_tensors * stride_after,
+    ]
     out = torch.empty(out_shape, dtype=tensors[0].dtype, device=tensors[0].device)
 
     total = 1

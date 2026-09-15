@@ -18,7 +18,6 @@ import torch
 import triton
 import triton.language as tl
 
-import flag_gems.fused.mhc.hc_split_sinkhorn as _general_module
 from flag_gems.fused.mhc.hc_split_sinkhorn import (
     hc_split_sinkhorn as _general_hc_split_sinkhorn,
 )
@@ -372,9 +371,7 @@ def hc_split_sinkhorn(
 
     pre = torch.empty((n_pad, hc_mult), dtype=torch.float32, device=device)
     post = torch.empty((n_pad, hc_mult), dtype=torch.float32, device=device)
-    comb = torch.empty(
-        (n_pad, hc_mult * hc_mult), dtype=torch.float32, device=device
-    )
+    comb = torch.empty((n_pad, hc_mult * hc_mult), dtype=torch.float32, device=device)
 
     if num_tokens == 0:
         return (

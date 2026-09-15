@@ -17,14 +17,13 @@ import triton
 import triton.language as tl
 
 from flag_gems.ops.index_fill import (
-    _FALLBACK_KEYSET,
-    index_fill as _generic_index_fill,
-    index_fill_ as _generic_index_fill_,
     _native_clone,
     _native_copy_,
     _prepare_index,
     _prepare_tensor_value,
 )
+from flag_gems.ops.index_fill import index_fill as _generic_index_fill
+from flag_gems.ops.index_fill import index_fill_ as _generic_index_fill_
 from flag_gems.utils import libentry
 
 _SCATTER_BLOCK_K = 128
@@ -119,7 +118,9 @@ def index_fill_row_kernel(
     if NEED_MASK:
         # Tail block only (inner % BLOCK != 0); full blocks keep the mask
         # all-true which the hardware folds away.
-        tl.store(p + tl.arange(0, BLOCK), val, mask=tl.arange(0, BLOCK) < inner - ib * BLOCK)
+        tl.store(
+            p + tl.arange(0, BLOCK), val, mask=tl.arange(0, BLOCK) < inner - ib * BLOCK
+        )
     else:
         tl.store(p + tl.arange(0, BLOCK), val)
 
@@ -162,7 +163,9 @@ def index_fill_burst_kernel(
         )
 
 
-def _index_fill_scatter_launch(out, index, value, value_is_tensor, dim_size, outer_size):
+def _index_fill_scatter_launch(
+    out, index, value, value_is_tensor, dim_size, outer_size
+):
     index_len = index.numel()
     grid = (
         triton.cdiv(index_len, _SCATTER_BLOCK_K),
@@ -205,7 +208,9 @@ def _index_fill_row_launch(out, index, value, value_is_tensor, dim_size, inner):
     )
 
 
-def _index_fill_burst_launch(out, index, value, value_is_tensor, dim_size, outer, inner):
+def _index_fill_burst_launch(
+    out, index, value, value_is_tensor, dim_size, outer, inner
+):
     index_len = index.numel()
     oblk = triton.cdiv(outer, _BURST_BO)
     grid = (index_len * oblk,)
@@ -265,7 +270,9 @@ def _try_dense_fill(out, dim, index, value, value_is_tensor):
     return True
 
 
-def _index_fill_impl(out, dim, index, value, value_is_tensor, check_dense=True, is_inplace=False):
+def _index_fill_impl(
+    out, dim, index, value, value_is_tensor, check_dense=True, is_inplace=False
+):
     """Fill `out` in place. `out` is either the input (in-place op) or a
     fresh empty_like copy (functional op)."""
     if out.numel() == 0 or index.numel() == 0:
@@ -306,7 +313,9 @@ def _index_fill_impl(out, dim, index, value, value_is_tensor, check_dense=True, 
     if outer == 1:
         _index_fill_row_launch(out, index, value, value_is_tensor, dim_size, inner)
     else:
-        _index_fill_burst_launch(out, index, value, value_is_tensor, dim_size, outer, inner)
+        _index_fill_burst_launch(
+            out, index, value, value_is_tensor, dim_size, outer, inner
+        )
     return out
 
 

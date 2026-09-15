@@ -149,7 +149,7 @@ def add_rms_norm_tile2d_kernel(
     eps: tl.constexpr,
     TILE_M: tl.constexpr,  # rows per program (M % TILE_M == 0 guaranteed)
     N: tl.constexpr,  # number of columns (normalized dim), used as tile width
-): 
+):
     pid = ext.program_id(0)
 
     n_off = tl.arange(0, N)
@@ -180,7 +180,7 @@ def add_rms_norm_multirow_kernel(
     eps: tl.constexpr,
     TILE_M: tl.constexpr,
     N: tl.constexpr,  # number of columns (normalized dim), used as tile width
-): 
+):
     pid = ext.program_id(0)
 
     n_off = tl.arange(0, N)
@@ -211,7 +211,7 @@ def add_rms_norm_flat_kernel(
     xnumel,  # number of elements (== M * N == M)
     eps,
     BLOCK: tl.constexpr,
-): 
+):
     pid = ext.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < xnumel
@@ -277,7 +277,7 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
 
     x1 = x1.contiguous()
     x2 = x2.contiguous()
-    weight = weight.contiguous() 
+    weight = weight.contiguous()
     y = torch.empty_strided(x1.size(), x1.stride(), dtype=x1.dtype, device=x1.device)
 
     with torch_device_fn.device(x1.device):
@@ -295,17 +295,13 @@ def add_rms_norm(x1, x2, normalized_shape, weight, eps=1e-5):
                 # Unmasked 2D tile: strictly faster than any masked per-row /
                 # masked multirow variant (see _pick_tile_m / rms_norm body).
                 grid = (M // TILE_M,)
-                add_rms_norm_tile2d_kernel[grid](
-                    y, x1, x2, weight, eps, TILE_M, N
-                )
+                add_rms_norm_tile2d_kernel[grid](y, x1, x2, weight, eps, TILE_M, N)
             elif N <= MULTIROW_N and M >= MULTIROW_M:
                 # Small N + many rows with M not divisible by any TILE_M
                 # candidate: batched masked multi-row fallback.
                 TILE_M = builtins.max(1, TILE_BUDGET // N)
                 grid = (triton.cdiv(M, TILE_M),)
-                add_rms_norm_multirow_kernel[grid](
-                    y, x1, x2, weight, M, eps, TILE_M, N
-                )
+                add_rms_norm_multirow_kernel[grid](y, x1, x2, weight, M, eps, TILE_M, N)
             else:
                 BLOCK_SIZE = builtins.min(MAX_BLOCK, triton.next_power_of_2(N))
                 need_mask = (N % BLOCK_SIZE) != 0

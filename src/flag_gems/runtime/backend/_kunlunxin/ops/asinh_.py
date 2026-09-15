@@ -35,7 +35,7 @@ config_ = CodeGenConfig(
 )
 
 
-# asinh(x) = sign(x) * log(|x| + sqrt(x^2 + 1)) 
+# asinh(x) = sign(x) * log(|x| + sqrt(x^2 + 1))
 @pointwise_dynamic(promotion_methods=[(0, "INT_TO_FLOAT")], config=config_)
 @triton.jit
 def asinh__func(x):

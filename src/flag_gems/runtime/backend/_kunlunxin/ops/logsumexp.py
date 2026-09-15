@@ -89,9 +89,7 @@ def logsumexp_kernel_multirow(
     bits = inp.to(tl.uint32, bitcast=True)
     key = tl.where(bits < 0x80000000, bits | 0x80000000, bits ^ 0xFFFFFFFF)
     m_key = tl.max(key, axis=1)
-    bits_m = tl.where(
-        m_key < 0x80000000, m_key ^ 0xFFFFFFFF, m_key ^ 0x80000000
-    )
+    bits_m = tl.where(m_key < 0x80000000, m_key ^ 0xFFFFFFFF, m_key ^ 0x80000000)
     m = bits_m.to(tl.float32, bitcast=True)
     safe_m = tl.where(m == float("-inf"), 0.0, m)
     z = tl.sum(tl.exp(inp - safe_m[:, None]), axis=1)
@@ -137,9 +135,7 @@ def logsumexp_kernel_partial(
     bits = a.to(tl.uint32, bitcast=True)
     key = tl.where(bits < 0x80000000, bits | 0x80000000, bits ^ 0xFFFFFFFF)
     m_key = tl.max(key, axis=1)
-    bits_m = tl.where(
-        m_key < 0x80000000, m_key ^ 0xFFFFFFFF, m_key ^ 0x80000000
-    )
+    bits_m = tl.where(m_key < 0x80000000, m_key ^ 0xFFFFFFFF, m_key ^ 0x80000000)
     m = bits_m.to(tl.float32, bitcast=True)
     safe_m = tl.where(m == float("-inf"), 0.0, m)
     z = tl.sum(tl.exp(a - safe_m[:, None]), axis=1)
@@ -412,9 +408,7 @@ def logsumexp_kernel_mid_online(
         all_neg = m_new == -float("inf")
         z = tl.where(all_neg, z, z * tl.exp(m - m_new) + tl.exp(a - m_new))
         m = m_new
-    res = tl.where(
-        m == -float("inf"), m, tl.where(m == float("inf"), m, m + tl.log(z))
-    )
+    res = tl.where(m == -float("inf"), m, tl.where(m == float("inf"), m, m + tl.log(z)))
     if TILE_K <= 64:
         res = tl.where(nan_seen, float("nan"), res)
     tl.store(output_ptr + pid_m * K + k_offsets, res, mask=k_mask)

@@ -18,6 +18,7 @@ import sys
 import torch
 import triton
 import triton.language as tl
+
 from flag_gems import empty as _gems_empty
 
 logger = logging.getLogger(__name__)
@@ -197,7 +198,7 @@ def bf16_paged_mqa_logits(
     return logits
 
 
-def _install(): 
+def _install():
     from flag_gems.fused.bf16_paged_mqa_logits import (  # noqa: F401
         bf16_paged_mqa_logits as _generic_bf16_paged_mqa_logits,
     )

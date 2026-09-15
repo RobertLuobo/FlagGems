@@ -18,8 +18,9 @@ import torch
 import triton
 import triton.language as tl
 
-from ..utils.pointwise_dynamic import pointwise_dynamic
 from flag_gems.runtime import torch_device_fn
+
+from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -99,9 +100,7 @@ def polar(abs, angle):
 
     polar_kernel(abs, angle, out0=real, out1=imag)
 
-    cplx_dtype = (
-        torch.complex128 if abs.dtype == torch.float64 else torch.complex64
-    )
+    cplx_dtype = torch.complex128 if abs.dtype == torch.float64 else torch.complex64
     out = torch.empty(abs.shape, dtype=cplx_dtype, device=abs.device)
     if abs.dtype == torch.float64 and abs.numel() > 0:
         n2 = 2 * out.numel()

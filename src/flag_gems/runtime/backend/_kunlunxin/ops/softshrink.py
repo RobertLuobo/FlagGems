@@ -19,8 +19,9 @@ import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
-from ..utils.pointwise_dynamic import pointwise_dynamic
 from flag_gems.runtime import torch_device_fn
+
+from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,9 @@ def _softshrink_big_func(x, lambd):
 
 
 @triton.jit
-def _softshrink_small_kernel(x_ptr, out_ptr, n_elements, lambd, BLOCK_SIZE: tl.constexpr):
+def _softshrink_small_kernel(
+    x_ptr, out_ptr, n_elements, lambd, BLOCK_SIZE: tl.constexpr
+):
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)

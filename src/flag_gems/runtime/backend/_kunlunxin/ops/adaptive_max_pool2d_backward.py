@@ -95,7 +95,7 @@ def _adaptive_max_pool2d_backward_scatter_kernel(
     out_per_nc,
     in_hw,
     BLOCK: tl.constexpr,
-): 
+):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n_out
     idx = tl.load(indices_ptr + offsets).to(tl.int32)
@@ -112,7 +112,7 @@ def adaptive_max_pool2d_backward(
     grad_output: torch.Tensor,
     self: torch.Tensor,
     indices: torch.Tensor,
-) -> torch.Tensor: 
+) -> torch.Tensor:
     logger.debug("GEMS_KUNLUNXIN ADAPTIVE_MAX_POOL2D_BACKWARD")
 
     input_is_3d = self.dim() == 3
@@ -145,9 +145,7 @@ def adaptive_max_pool2d_backward(
             # Fast path: exact division -> each output's argmax is a distinct
             # input position, one lane per output, no atomics, no races.
             n_out = grad_output.numel()
-            _adaptive_max_pool2d_backward_scatter_kernel[
-                (triton.cdiv(n_out, 256),)
-            ](
+            _adaptive_max_pool2d_backward_scatter_kernel[(triton.cdiv(n_out, 256),)](
                 grad_output,
                 indices,
                 grad_input,

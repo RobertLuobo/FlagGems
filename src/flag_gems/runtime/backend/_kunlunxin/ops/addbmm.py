@@ -26,6 +26,7 @@ from .copy import copy_
 
 logger = logging.getLogger(__name__)
 
+
 def heur_tile_m(args):
     M = args["M"]
     if M <= 512:
@@ -119,7 +120,9 @@ def addbmm_kernel(
 
     c_ptrs = O + offs_am[:, None] * N + offs_bn[None, :]
     c_mask = (offs_am[:, None] < M) & (offs_bn[None, :] < N)
-    bias_value = tl.load(bias + offs_am[:, None] * N + offs_bn[None, :], mask=c_mask, other=0.0)
+    bias_value = tl.load(
+        bias + offs_am[:, None] * N + offs_bn[None, :], mask=c_mask, other=0.0
+    )
 
     out = accumulator * alpha + bias_value * beta
     # tl.store converts to the output pointer dtype.
@@ -167,9 +170,9 @@ def addbmm(bias, batch1, batch2, beta=1.0, alpha=1.0):
 
 def addbmm_(self, batch1, batch2, *, beta=1.0, alpha=1.0):
     logger.debug("GEMS_KUNLUNXIN ADDBMM_")
-    if self.is_contiguous(): 
+    if self.is_contiguous():
         _direct_addbmm(batch1, batch2, self, alpha, beta, out=self)
-    else: 
+    else:
         tmp = _direct_addbmm(batch1, batch2, self, alpha, beta, out=None)
         copy_(self, tmp)
     return self

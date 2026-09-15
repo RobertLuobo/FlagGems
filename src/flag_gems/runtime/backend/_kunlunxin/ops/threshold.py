@@ -41,7 +41,7 @@ config_ = CodeGenConfig(
     is_tensor=[True, False, False], promotion_methods=[(0, "DEFAULT")], config=config_
 )
 @triton.jit
-def threshold_kernel(self, threshold, value): 
+def threshold_kernel(self, threshold, value):
     if self.dtype == tl.float16:
         big = tl.full((), 1.0e30, dtype=self.dtype)
         d = (self - threshold) * big
@@ -59,8 +59,9 @@ def threshold_kernel(self, threshold, value):
     is_tensor=[True, True, False], promotion_methods=[(0, 1, "DEFAULT")], config=config_
 )
 @triton.jit
-def threshold_backward_kernel(grad_output, self, threshold): 
+def threshold_backward_kernel(grad_output, self, threshold):
     return grad_output * (self > threshold)
+
 
 _THRESHOLD_BWD_BLOCK = 16384
 _THRESHOLD_BWD_BLOCK_SMALL = 8192

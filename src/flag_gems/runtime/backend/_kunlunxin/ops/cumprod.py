@@ -378,9 +378,7 @@ def cumprod_strided_row_scan_kernel(
     offs = tl.arange(0, TILE_SIZE)
     mask = offs < N
     acc_dtype: tl.constexpr = get_prod_accum_type(out_ptr.type.element_ty)
-    x = tl.load(inp_ptr + row_off + offs * stride_n, mask=mask, other=1).to(
-        acc_dtype
-    )
+    x = tl.load(inp_ptr + row_off + offs * stride_n, mask=mask, other=1).to(acc_dtype)
     r = tl.cumprod(x, 0)
     tl.store(
         out_ptr + row_off + offs * stride_n,
@@ -524,6 +522,6 @@ def cumprod_(inp, dim, *, dtype=None):
         # Inclusive prefix product over an axis of length 1 is the identity,
         # so the in-place op needs no work at all.
         return inp
-        
+
     cumprod_wrapper(inp, dim, inp.dtype, out=inp)
     return inp

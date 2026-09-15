@@ -50,7 +50,9 @@ def bitwise_or_tensor_(A, B):
     return bitwise_or_func(A, B, out0=A)
 
 
-@pointwise_dynamic(is_tensor=[True, False], promotion_methods=[(0, 1, "DEFAULT")], config=config_)
+@pointwise_dynamic(
+    is_tensor=[True, False], promotion_methods=[(0, 1, "DEFAULT")], config=config_
+)
 @triton.jit
 def bitwise_or_func_scalar(x, y):
     return x | y
@@ -67,7 +69,7 @@ def bitwise_or_scalar_(A, B):
 
 
 def bitwise_or_scalar_tensor(A, B):
-    logger.debug("GEMS_KUNLUNXIN BITWISE_OR_SCALAR_TENSOR") 
+    logger.debug("GEMS_KUNLUNXIN BITWISE_OR_SCALAR_TENSOR")
     if (
         B.dtype in (torch.bool, torch.int16)
         and B.is_contiguous()

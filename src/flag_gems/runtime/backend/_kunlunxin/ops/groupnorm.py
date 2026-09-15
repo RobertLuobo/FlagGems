@@ -24,7 +24,8 @@ from flag_gems.utils import libentry, tl_extra_shim
 from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
-rsqrt = tl_extra_shim.rsqrt 
+rsqrt = tl_extra_shim.rsqrt
+
 
 @libentry()
 @triton.jit(do_not_specialize=["eps"])

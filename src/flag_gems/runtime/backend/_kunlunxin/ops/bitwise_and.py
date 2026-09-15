@@ -83,7 +83,7 @@ def bitwise_and_scalar_(A, B):
 
 
 def bitwise_and_scalar_tensor(A, B):
-    logger.debug("GEMS_KUNLUNXIN BITWISE_AND_SCALAR_TENSOR") 
+    logger.debug("GEMS_KUNLUNXIN BITWISE_AND_SCALAR_TENSOR")
     if (
         B.dtype in (torch.bool, torch.int16)
         and B.is_contiguous()

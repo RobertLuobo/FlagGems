@@ -315,8 +315,8 @@ def block_diag(*tensors):
         block_numel = block_rows * block_cols
         total_rows = n * block_rows
         total_cols = n * block_cols
-        device = t0.device 
-        
+        device = t0.device
+
         use_wos = (
             block_rows == block_cols
             and _is_pow2(block_cols)
@@ -336,7 +336,7 @@ def block_diag(*tensors):
                     == i * block_numel
                     for i in range(2, n)
                 )
-            ) 
+            )
         use_empty = use_wos
         out = (
             torch.empty((total_rows, total_cols), dtype=dtype0, device=device)
@@ -346,14 +346,14 @@ def block_diag(*tensors):
 
         if block_numel == 0:
             return out
- 
+
         if n == 1:
             src = t0
             input_stride = block_numel
         elif contiguous:
             src = t0
             input_stride = block_numel
-        else: 
+        else:
             src = torch.empty((n, block_numel), dtype=dtype0, device=device)
             if n <= 16:
                 bases = [t.data_ptr() for t in tensors] + [0] * (16 - n)

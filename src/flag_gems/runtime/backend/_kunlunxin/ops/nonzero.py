@@ -28,11 +28,11 @@ from .cumsum import cumsum
 logger = logging.getLogger(__name__)
 
 
-def nonzero_kernel_heur_block_size(args): 
+def nonzero_kernel_heur_block_size(args):
     return min(triton.next_power_of_2(triton.cdiv(args["n_elements"], 12)), 4096)
 
 
-@libentry() 
+@libentry()
 @triton.heuristics(
     values={
         "BLOCK_SIZE": nonzero_kernel_heur_block_size,
@@ -82,7 +82,7 @@ def nonzero_dense_flat_kernel(
     shape,
     ndim: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-): 
+):
     pid = ext.program_id(0)
     j = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
     mask = j < n_out
@@ -331,9 +331,7 @@ def _unbind_views(out):
     [N, ndim], so column i is the view shape (N,), stride (ndim,), offset i.
     """
     n, ndim = out.shape
-    return [
-        torch.as_strided(out, (n,), (ndim,), storage_offset=i) for i in range(ndim)
-    ]
+    return [torch.as_strided(out, (n,), (ndim,), storage_offset=i) for i in range(ndim)]
 
 
 def nonzero(inp, *, as_tuple=False):

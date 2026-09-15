@@ -40,7 +40,7 @@ def upsample_bilinear2d_kernel(
     C: tl.constexpr,
     ALIGN_CORNERS: tl.constexpr,
     BX: tl.constexpr,
-): 
+):
     row = ext.program_id(axis=0)
     oh = row % OH
     nc = row // OH

@@ -55,7 +55,7 @@ def not_equal(A, B):
     return res
 
 
-# --------------------------------------------------------------------------- 
+# ---------------------------------------------------------------------------
 _NOT_EQUAL_TENSOR_TILE_SMALL = 2048
 _NOT_EQUAL_TENSOR_SMALL_MAX = 16384
 _NOT_EQUAL_TENSOR_TILE_MID = 8192
@@ -173,6 +173,7 @@ def not_equal_scalar(A, B):
     # `arith.cmpf same-type` and overflows uni_sram -> compile failure.
     res = not_equal_func_scalar(A, B)
     return res
+
 
 _NOT_EQUAL_SCALAR_FAST_TILE = 131072
 _NOT_EQUAL_SCALAR_MIN_GRID = 128

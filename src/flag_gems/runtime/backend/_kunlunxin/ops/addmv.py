@@ -23,9 +23,10 @@ from flag_gems.utils import broadcastable_to, libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
-from .mv import mv 
+from .mv import mv
 
 logger = logging.getLogger(__name__)
+
 
 @pointwise_dynamic(
     is_tensor=[True, True, False, False],
@@ -34,6 +35,7 @@ logger = logging.getLogger(__name__)
 @triton.jit
 def _addmv_combine_kernel(mv_res, bias, alpha, beta):
     return mv_res.to(tl.float32) * alpha + bias.to(tl.float32) * beta
+
 
 _MV_DELEGATE_M = 2048
 
@@ -164,6 +166,7 @@ def addmv(self, mat, vec, *, beta=1, alpha=1):
 def addmv_out(self, mat, vec, *, beta=1, alpha=1, out=None):
     logger.debug("GEMS_KUNLUNXIN ADDMV_OUT")
     return _addmv_impl(self, mat, vec, beta, alpha, out)
+
 
 def addmv_(self, mat, vec, *, beta=1, alpha=1):
     logger.debug("GEMS_KUNLUNXIN ADDMV_")

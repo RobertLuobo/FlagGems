@@ -20,9 +20,10 @@ import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
-from ..utils.pointwise_dynamic import pointwise_dynamic
 from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.type_utils import ELEMENTWISE_TYPE_PROMOTION_KIND, type_promotion
+
+from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -311,6 +312,7 @@ def xlogy_scalar_tensor_kernel_unmasked(
     else:
         res = x * tl.log(y)
         tl.store(out_ptr + offset, res.to(out_ptr.dtype.element_ty))
+
 
 @triton.jit
 def xlogy_scalar_tensor_ptr_kernel(

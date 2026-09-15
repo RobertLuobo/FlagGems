@@ -14,8 +14,6 @@
 
 import logging
 
-import torch
-
 from flag_gems.runtime import torch_device_fn
 
 from .copy import copy_
@@ -54,8 +52,10 @@ def linalg_lu_out(input, *, pivot=True, P=None, L=None, U=None, out=None):
     p_out, l_out, u_out = _resolve_linalg_lu_out_args(P, L, U, out)
     with torch_device_fn.device(input.device):
         lu, pivots = _linalg_lu_factor(input, pivot)
-        P_res, L_res, U_res = lu_unpack(lu, pivots, unpack_data=True, unpack_pivots=True)
-        
+        P_res, L_res, U_res = lu_unpack(
+            lu, pivots, unpack_data=True, unpack_pivots=True
+        )
+
     if P_res.numel() > 0:
         if p_out.numel() != P_res.numel():
             p_out.resize_(P_res.shape)

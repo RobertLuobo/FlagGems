@@ -21,7 +21,7 @@ from .copy import copy_ as _vendor_copy_
 logger = logging.getLogger(__name__)
 
 
-def resize(inp: torch.Tensor, size, memory_format=None): 
+def resize(inp: torch.Tensor, size, memory_format=None):
     logger.debug("GEMS RESIZE")
 
     if not isinstance(size, tuple):

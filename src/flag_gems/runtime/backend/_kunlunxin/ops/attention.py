@@ -25,7 +25,6 @@ import triton.language as tl
 from flag_gems import runtime
 from flag_gems.config import use_c_extension
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import tl_extra_shim
 
 from .flash_api import mha_varlan_fwd
 from .flash_kernel import keep
@@ -382,7 +381,7 @@ def prob_dp_partial_kernel(
     score = tl.zeros((BLOCK_N_,), dtype=tl.float32)
     dp = tl.zeros((BLOCK_N_,), dtype=tl.float32)
     for d_offset in tl.static_range(RED_):
-        d_idx = d_chunk * RED_ + d_offset 
+        d_idx = d_chunk * RED_ + d_offset
         if d_idx < D:
             q_value = tl.load(Q + (query_bh * Q_LEN + q_idx) * D + d_idx)
             do_value = tl.load(DO + (query_bh * Q_LEN + q_idx) * D + d_idx).to(
@@ -673,7 +672,7 @@ def scaled_dot_product_attention_forward(
     is_causal=False,
     scale=None,
     enable_gqa=False,
-): 
+):
     if dropout_p != 0.0:
         raise NotImplementedError(
             "Kunlunxin scaled_dot_product_attention_forward does not support dropout"
@@ -695,10 +694,8 @@ def scaled_dot_product_attention_forward(
     out = torch.empty(
         (batch, q_head_num, q_len, value_dim), dtype=value.dtype, device=device
     )
-    lse = torch.empty(
-        (batch, q_head_num, q_len), dtype=torch.float32, device=device
-    )
- 
+    lse = torch.empty((batch, q_head_num, q_len), dtype=torch.float32, device=device)
+
     if q_len % 128 == 0 and kv_len % 128 == 0:
         BLOCK_M = 128
         BLOCK_N = 128
@@ -730,9 +727,7 @@ def scaled_dot_product_attention_forward(
         elif cm_vals.dim() == 3:  # (B, Q, K)
             cm_vals = cm_vals[:, None]
         elif cm_vals.dim() != 4:  # (B, H, Q, K)
-            raise ValueError(
-                f"attn_mask must be 2D/3D/4D, got {cm_vals.dim()}D"
-            )
+            raise ValueError(f"attn_mask must be 2D/3D/4D, got {cm_vals.dim()}D")
         if cm_vals.shape[-2] != q_len or cm_vals.shape[-1] != kv_len:
             raise ValueError("attn_mask shape must be (Q, K) along the last dims")
         cm_vals = cm_vals.expand(batch, q_head_num, q_len, kv_len)
@@ -753,9 +748,9 @@ def scaled_dot_product_attention_forward(
             rows = torch.arange(q_len, device=device)[:, None]
             cols = torch.arange(kv_len, device=device)[None, :]
             allowed = cols <= (rows + kv_len - q_len)  # (Q, K)
-            cmask[..., :kv_len] = torch.where(
-                allowed[None, None], 0.0, 1e30
-            ).expand(batch, q_head_num, q_len, kv_len)
+            cmask[..., :kv_len] = torch.where(allowed[None, None], 0.0, 1e30).expand(
+                batch, q_head_num, q_len, kv_len
+            )
         cmask = cmask.reshape(batch * q_head_num, q_len, k_pad)
 
     if kv_len % BLOCK_N == 0:
@@ -766,11 +761,12 @@ def scaled_dot_product_attention_forward(
         )
     else:
         qk_buf = torch.full(
-            (batch * q_head_num, q_len, k_pad), -1e30, dtype=torch.float32, device=device
+            (batch * q_head_num, q_len, k_pad),
+            -1e30,
+            dtype=torch.float32,
+            device=device,
         )
-    m_buf = torch.empty(
-        (batch, q_head_num, q_len), dtype=torch.float32, device=device
-    )
+    m_buf = torch.empty((batch, q_head_num, q_len), dtype=torch.float32, device=device)
     grid = (triton.cdiv(q_len, BLOCK_M), batch * q_head_num)
     common_q = dict(
         GROUP_HEAD=q_head_num // kv_head_num,
@@ -1347,7 +1343,9 @@ def scaled_dot_product_efficient_attention_backward(
         dbias = None
     return dq, dk, dv, dbias
 
+
 _LOG2E = tl.constexpr(1.4426950408889634)
+
 
 @triton.jit
 def _fa_qk_m_kernel(
@@ -1598,7 +1596,11 @@ def flash_attention_forward(
     # side; pad the last dim with zeros when head_dim is not a power of 2
     # (stores are guarded by offs_d < HEAD_DIM).
     if padded_d != head_dim:
-        q_in, k_in, v_in = _fa_pad_d(query, padded_d), _fa_pad_d(key, padded_d), _fa_pad_d(value, padded_d)
+        q_in, k_in, v_in = (
+            _fa_pad_d(query, padded_d),
+            _fa_pad_d(key, padded_d),
+            _fa_pad_d(value, padded_d),
+        )
     else:
         q_in, k_in, v_in = query, key, value
 
@@ -1608,9 +1610,7 @@ def flash_attention_forward(
     # (qk' - m) < -12 explicitly.
     cmask = None
     if is_causal or has_window:
-        cmask2d = torch.full(
-            (q_len, k_pad), 50.0, dtype=torch.float32, device=device
-        )
+        cmask2d = torch.full((q_len, k_pad), 50.0, dtype=torch.float32, device=device)
         rows = torch.arange(q_len, device=device)[:, None]
         cols = torch.arange(k_pad, device=device)[None, :]
         off = k_len - q_len
@@ -1626,9 +1626,7 @@ def flash_attention_forward(
         # Materialize the dense (B*H, Q, K_PAD) layout the kernel indexes
         # (off_hz * Q_CTX * K_PAD + m * K_PAD + n); head-independent.
         cmask = (
-            cmask2d.unsqueeze(0)
-            .expand(batch * q_head_num, q_len, k_pad)
-            .contiguous()
+            cmask2d.unsqueeze(0).expand(batch * q_head_num, q_len, k_pad).contiguous()
         )
 
     # qk scratch prefilled with -1e30: exp2(-1e30) underflows to exactly 0.0

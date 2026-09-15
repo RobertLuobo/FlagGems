@@ -999,7 +999,7 @@ def global_cumsum_flat_impl_stage_1(
     r = tl.arange(0, tile_size)
     i0 = offset + r
     mask = i0 < num_tasks
-    
+
     total_in_mask = global_pid < global_ctas_num
     total = tl.load(total_in_ptr + global_pid, mask=total_in_mask)
 
@@ -1730,7 +1730,7 @@ def _unique2(
     return_inverse: bool = False,
     return_counts: bool = False,
 ):
-    logger.debug("GEMS_KUNLUNXIN _UNIQUE2") 
+    logger.debug("GEMS_KUNLUNXIN _UNIQUE2")
 
     _ = sorted
     flat = in0.contiguous().view(-1)
@@ -1755,7 +1755,7 @@ def _unique2(
             ),
             counts,
         )
- 
+
     sorted_data, sorted_indices = torch.sort(flat)
     ne = torch.empty(N, dtype=torch.bool, device=flat.device)
     cum_input = torch.empty(N, dtype=torch.int64, device=flat.device)

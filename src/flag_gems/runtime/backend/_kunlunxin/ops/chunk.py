@@ -46,7 +46,7 @@ def chunk(A: torch.Tensor, chunks: int, dim: int = 0) -> List[torch.Tensor]:
     # Handle negative dim
     if dim < 0:
         dim = dim + A.ndim
-        
+
     shape = A.shape
     dim_size = shape[dim]
     chunk_size = (dim_size + chunks - 1) // chunks
@@ -64,7 +64,7 @@ def chunk(A: torch.Tensor, chunks: int, dim: int = 0) -> List[torch.Tensor]:
         if start >= dim_size:
             break
 
-        end = min(start + chunk_size, dim_size) 
+        end = min(start + chunk_size, dim_size)
         size = list(shape)
         size[dim] = end - start
         result.append(
