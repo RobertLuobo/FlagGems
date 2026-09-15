@@ -136,7 +136,6 @@ def _pdist_backward_p1_kernel(
             tl.float32
         )
 
-        diff = x_vals - xj_vals
         sign = tl.where(x_vals > xj_vals, 1.0, tl.where(x_vals < xj_vals, -1.0, 0.0))
 
         pdist_idx = pid_n * N - (pid_n * (pid_n + 1)) // 2 + (j - pid_n - 1)
@@ -151,7 +150,6 @@ def _pdist_backward_p1_kernel(
             tl.float32
         )
 
-        diff = x_vals - xj_vals
         sign = tl.where(x_vals > xj_vals, 1.0, tl.where(x_vals < xj_vals, -1.0, 0.0))
 
         pdist_idx = j * N - (j * (j + 1)) // 2 + (pid_n - j - 1)
