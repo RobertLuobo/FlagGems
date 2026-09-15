@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Generator
+
 import pytest
 import torch
 
 import flag_gems
 
-from . import base, consts
+from . import base, consts, utils
 
 
 @pytest.mark.tanh
@@ -45,15 +47,22 @@ def test_tanh_inplace():
     bench.run()
 
 
+class TanhBackwardBenchmark(base.UnaryPointwiseBenchmark):
+    def get_input_iter(self, dtype: torch.dtype) -> Generator:
+        for shape in self.shapes:
+            inp = utils.generate_tensor_input(shape, dtype, self.device)
+            grad_out = torch.randn_like(inp)
+            yield grad_out, inp
+
+
 @pytest.mark.tanh_backward
 @pytest.mark.skipif(
     flag_gems.vendor_name == "tsingmicro", reason="Issue #4131: not working"
 )
 def test_tanh_backward():
-    bench = base.UnaryPointwiseBenchmark(
+    bench = TanhBackwardBenchmark(
         op_name="tanh_backward",
-        torch_op=torch.tanh,
+        torch_op=torch.ops.aten.tanh_backward,
         dtypes=consts.FLOAT_DTYPES,
-        is_backward=True,
     )
     bench.run()

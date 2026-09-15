@@ -27,7 +27,9 @@ try:
     )
 
     VLLM_AVAILABLE = True
-except ImportError:  # pragma: no cover - optional dependency guard
+except Exception:  # pragma: no cover - optional dependency guard
+    # vllm can be missing OR partially broken (its xpu import hook raises
+    # AssertionError instead of ImportError); either way it is unusable here.
     base_fused_recurrent_gated_delta_rule = None
     VLLM_AVAILABLE = False
 

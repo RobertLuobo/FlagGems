@@ -30,10 +30,17 @@ except ImportError:
     TE_OP = None
 
 
+class RegluForwardBenchmark(base.TexGluForwardBenchmark):
+    def set_more_shapes(self):
+        # base returns lists; Benchmark.init_user_config dedups the merged
+        # shapes with dict.fromkeys, which needs hashable entries.
+        return [tuple(shape) for shape in super().set_more_shapes()]
+
+
 @pytest.mark.reglu
 @pytest.mark.skipif(TE_OP is None, reason="'reglu' not found in TransformerEngine")
 def test_reglu():
-    bench = base.TexGluForwardBenchmark(
+    bench = RegluForwardBenchmark(
         op_name="reglu",
         torch_op=TE_OP,
         gems_op=flag_gems.reglu,

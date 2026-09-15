@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+
 import pytest
 
 import flag_gems
@@ -31,14 +33,39 @@ except ImportError:
     TE_AVAILABLE = False
     TE_OP = None
 
+# TransformerEngine changed the dgeglu signature across releases. Newer builds
+# take (grad_output, inp, quantizer=...), while older ones take the FP8-era
+# signature (grad_output, inp, otype) and forward `otype` straight into the
+# pybind11 `tex.gelu` binding, which rejects `None`. Probe the installed
+# signature so the reference side keeps working on both.
+_TE_PARAMS = list(inspect.signature(TE_OP).parameters) if TE_OP is not None else []
+
+if "otype" in _TE_PARAMS:
+    from transformer_engine.pytorch.constants import TE_DType
+
+
+def te_dgeglu(grad_output, inp, otype=None):
+    if "otype" in _TE_PARAMS:
+        return TE_OP(grad_output, inp, TE_DType[inp.dtype])
+    if "quantizer" in _TE_PARAMS:
+        return TE_OP(grad_output, inp, quantizer=otype)
+    return TE_OP(grad_output, inp, otype)
+
+
+class DgegluBackwardBenchmark(base.TexGluBackwardBenchmark):
+    def set_more_shapes(self):
+        # base returns lists; Benchmark.init_user_config dedups the merged
+        # shapes with dict.fromkeys, which needs hashable entries.
+        return [tuple(shape) for shape in super().set_more_shapes()]
+
 
 @pytest.mark.dgeglu
 @pytest.mark.skipif(not TE_AVAILABLE, reason="TransformerEngine not installed")
 @pytest.mark.skipif(TE_OP is None, reason="'dgeglu' not found in TransformerEngine")
 def test_dgeglu():
-    bench = base.TexGluBackwardBenchmark(
+    bench = DgegluBackwardBenchmark(
         op_name="dgeglu",
-        torch_op=TE_OP,
+        torch_op=te_dgeglu,
         gems_op=flag_gems.dgeglu,
         dtypes=consts.FLOAT_DTYPES,
         # TODO(Qiming): Is this flag correct?
