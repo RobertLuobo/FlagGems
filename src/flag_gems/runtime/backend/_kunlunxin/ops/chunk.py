@@ -46,11 +46,7 @@ def chunk(A: torch.Tensor, chunks: int, dim: int = 0) -> List[torch.Tensor]:
     # Handle negative dim
     if dim < 0:
         dim = dim + A.ndim
-
-    # Hoist metadata lookups out of the loop: the Python-visible access cost of
-    # shape/stride/storage_offset per chunk (not ``as_strided`` itself, which
-    # is a metadata-only view primitive with no re-dispatch) dominates the
-    # per-chunk time at large chunk counts.
+        
     shape = A.shape
     dim_size = shape[dim]
     chunk_size = (dim_size + chunks - 1) // chunks

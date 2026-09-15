@@ -27,9 +27,6 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-_FALLBACK_KEYSET = torch._C.DispatchKeySet(
-    torch._C.DispatchKey.CompositeExplicitAutograd
-)
 DEFAULT_BLOCK_SIZE = 1024
 CUDA_SMALL_SCAN_LIMIT = 1024 * 4
 ASCEND_SCAN_LIMIT = 1024
@@ -213,12 +210,6 @@ def _get_compute_dtype(dtype):
     if is_integer_dtype(dtype) or is_boolean_dtype(dtype):
         return torch.int64
     return dtype
-
-
-def _should_redispatch_on_ascend(dtype):
-    return runtime_device.vendor_name == "ascend" and (
-        is_integer_dtype(dtype) or is_boolean_dtype(dtype)
-    )
 
 
 def _scan_block_size(length):
@@ -509,21 +500,10 @@ def reduce_then_scan_root_scan_kernel_row(in_ptr, out_ptr, N, TILE_SIZE: tl.cons
 def cumprod(inp, dim, *, dtype=None):
     logger.debug("GEMS_KUNLUNXIN CUMPROD")
     out_dtype = _get_output_dtype(inp, dtype)
+    # bool 输入先转 uint8，按整型路径走 triton 内核（产品 0/1 无损）。
     if is_boolean_dtype(inp.dtype):
-        if is_boolean_dtype(out_dtype):
-            return torch.ops.aten.cumprod.default.redispatch(
-                _FALLBACK_KEYSET, inp, dim, dtype=dtype
-            )
         uint8_inp = inp.to(torch.uint8)
-        if runtime_device.vendor_name == "ascend":
-            return torch.ops.aten.cumprod.default.redispatch(
-                _FALLBACK_KEYSET, uint8_inp, dim, dtype=dtype
-            )
         return cumprod_wrapper(uint8_inp, dim, out_dtype)
-    if _should_redispatch_on_ascend(out_dtype):
-        return torch.ops.aten.cumprod.default.redispatch(
-            _FALLBACK_KEYSET, inp, dim, dtype=dtype
-        )
     return cumprod_wrapper(inp, dim, dtype)
 
 
@@ -537,10 +517,6 @@ def cumprod_(inp, dim, *, dtype=None):
         raise NotImplementedError(
             "In-place cumprod is not supported for boolean tensors"
         )
-    if _should_redispatch_on_ascend(inp.dtype):
-        return torch.ops.aten.cumprod_.default.redispatch(
-            _FALLBACK_KEYSET, inp, dim, dtype=dtype
-        )
     if inp.numel() == 0:
         return inp
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
@@ -548,13 +524,6 @@ def cumprod_(inp, dim, *, dtype=None):
         # Inclusive prefix product over an axis of length 1 is the identity,
         # so the in-place op needs no work at all.
         return inp
-    # The aliasing is safe: every program loads its own chunk before
-    # storing to it (load-before-store within a program), and the
-    # multi-pass tiers (scan -> fan multiply) are separated by kernel
-    # boundaries. This avoids an extra empty_like allocation plus a full
-    # device-to-device copy on top of the scan.  A non-contiguous self is
-    # scanned through the strided (mixed-radix) kernels that reach every
-    # element through the tensor's own strides, so no temporary contiguous
-    # copy is needed either.
+        
     cumprod_wrapper(inp, dim, inp.dtype, out=inp)
     return inp

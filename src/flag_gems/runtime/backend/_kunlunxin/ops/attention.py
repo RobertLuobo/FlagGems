@@ -25,8 +25,9 @@ import triton.language as tl
 from flag_gems import runtime
 from flag_gems.config import use_c_extension
 from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import tl_extra_shim
 
-from .flash_api import mha_fwd, mha_varlan_fwd
+from .flash_api import mha_varlan_fwd
 from .flash_kernel import keep
 
 logger = logging.getLogger(__name__)
@@ -381,14 +382,7 @@ def prob_dp_partial_kernel(
     score = tl.zeros((BLOCK_N_,), dtype=tl.float32)
     dp = tl.zeros((BLOCK_N_,), dtype=tl.float32)
     for d_offset in tl.static_range(RED_):
-        d_idx = d_chunk * RED_ + d_offset
-        # TritonXPU does not honour `mask=`/`other=` on these narrow loads once
-        # `d_idx` is a runtime value, which happens as soon as D_CHUNKS > 1
-        # (head_dim not a multiple of RED_, e.g. head_dim=96).  The masked-off
-        # lanes come back holding the neighbouring row's data instead of
-        # `other`, silently poisoning `score`/`dp`.  Use scalar control flow for
-        # the head-dim tail and an explicit `tl.where` for the kv tail so no
-        # semantic fill value is ever delegated to `other=`.
+        d_idx = d_chunk * RED_ + d_offset 
         if d_idx < D:
             q_value = tl.load(Q + (query_bh * Q_LEN + q_idx) * D + d_idx)
             do_value = tl.load(DO + (query_bh * Q_LEN + q_idx) * D + d_idx).to(
@@ -679,18 +673,174 @@ def scaled_dot_product_attention_forward(
     is_causal=False,
     scale=None,
     enable_gqa=False,
-):
-    return torch.ops.aten._scaled_dot_product_attention_math.default(
-        query,
-        key,
-        value,
-        attn_mask,
-        dropout_p,
-        is_causal,
-        None,
-        scale=scale,
-        enable_gqa=enable_gqa,
-    )[0]
+): 
+    if dropout_p != 0.0:
+        raise NotImplementedError(
+            "Kunlunxin scaled_dot_product_attention_forward does not support dropout"
+        )
+    if attn_mask is not None and is_causal:
+        raise RuntimeError("Explicit attn_mask should not be set when is_causal=True")
+
+    batch, q_head_num, q_len, head_dim = query.shape
+    kv_head_num = key.shape[1]
+    kv_len = key.shape[2]
+    value_dim = value.shape[3]
+    assert key.shape[3] == head_dim, "key head dim must match query head dim"
+    assert (
+        q_head_num % kv_head_num == 0
+    ), f"q_head_num {q_head_num} must be divisible by kv_head_num {kv_head_num}"
+    device = query.device
+    softmax_scale = scale if scale is not None else 1.0 / (head_dim**0.5)
+
+    out = torch.empty(
+        (batch, q_head_num, q_len, value_dim), dtype=value.dtype, device=device
+    )
+    lse = torch.empty(
+        (batch, q_head_num, q_len), dtype=torch.float32, device=device
+    )
+ 
+    if q_len % 128 == 0 and kv_len % 128 == 0:
+        BLOCK_M = 128
+        BLOCK_N = 128
+    else:
+        BLOCK_M = 32
+        BLOCK_N = 32
+    k_pad = triton.cdiv(kv_len, BLOCK_N) * BLOCK_N
+    padded_dq = triton.next_power_of_2(head_dim)
+    padded_dv = triton.next_power_of_2(value_dim)
+    q_in = _fa_pad_d(query, padded_dq) if padded_dq != head_dim else query
+    v_in = _fa_pad_d(value, padded_dv) if padded_dv != value_dim else value
+
+    # Build the (B, H, Q, K_PAD) cmask: cm = -bias for allowed cells, +1e30
+    # for masked cells.  n >= K cells are never stored by kernel A (they stay
+    # -1e30 in qk_buf -- prefill only when there is padding -- and are zeroed
+    # by kernel B's (qk' - m) < -12 test).
+    cm_vals = None
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            cm_vals = torch.where(attn_mask, 0.0, 1e30)
+        else:
+            bias = attn_mask.to(torch.float32)
+            bias = torch.where(
+                bias == float("-inf"), torch.full_like(bias, -1e30), bias
+            )
+            cm_vals = -bias
+        if cm_vals.dim() == 2:  # (Q, K)
+            cm_vals = cm_vals[None, None]
+        elif cm_vals.dim() == 3:  # (B, Q, K)
+            cm_vals = cm_vals[:, None]
+        elif cm_vals.dim() != 4:  # (B, H, Q, K)
+            raise ValueError(
+                f"attn_mask must be 2D/3D/4D, got {cm_vals.dim()}D"
+            )
+        if cm_vals.shape[-2] != q_len or cm_vals.shape[-1] != kv_len:
+            raise ValueError("attn_mask shape must be (Q, K) along the last dims")
+        cm_vals = cm_vals.expand(batch, q_head_num, q_len, kv_len)
+
+    use_cmask = cm_vals is not None or is_causal
+    if use_cmask:
+        cmask = torch.full(
+            (batch, q_head_num, q_len, k_pad), 1e30, dtype=torch.float32, device=device
+        )
+        if cm_vals is not None:
+            cmask[..., :kv_len] = cm_vals
+        else:
+            cmask[..., :kv_len] = 0.0
+        if is_causal:
+            # Bottom-right alignment: n <= m + (K - Q) (matches torch SDPA).
+            # Build a (Q, K) pattern instead of a 4D broadcast where: the 4D
+            # form materializes a B*H-sized f32 temp just to pick entries.
+            rows = torch.arange(q_len, device=device)[:, None]
+            cols = torch.arange(kv_len, device=device)[None, :]
+            allowed = cols <= (rows + kv_len - q_len)  # (Q, K)
+            cmask[..., :kv_len] = torch.where(
+                allowed[None, None], 0.0, 1e30
+            ).expand(batch, q_head_num, q_len, kv_len)
+        cmask = cmask.reshape(batch * q_head_num, q_len, k_pad)
+
+    if kv_len % BLOCK_N == 0:
+        # Every column is written by kernel A (no n >= KV_CTX padding), so the
+        # -1e30 prefill is dead cost: torch.empty avoids a full-buffer write.
+        qk_buf = torch.empty(
+            (batch * q_head_num, q_len, k_pad), dtype=torch.float32, device=device
+        )
+    else:
+        qk_buf = torch.full(
+            (batch * q_head_num, q_len, k_pad), -1e30, dtype=torch.float32, device=device
+        )
+    m_buf = torch.empty(
+        (batch, q_head_num, q_len), dtype=torch.float32, device=device
+    )
+    grid = (triton.cdiv(q_len, BLOCK_M), batch * q_head_num)
+    common_q = dict(
+        GROUP_HEAD=q_head_num // kv_head_num,
+        HEAD_DIM=head_dim,
+        PADDED_D=padded_dq,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+    )
+    common_v = dict(
+        GROUP_HEAD=q_head_num // kv_head_num,
+        HEAD_DIM=value_dim,
+        PADDED_D=padded_dv,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+    )
+    with torch_device_fn.device(device):
+        _fa_qk_m_kernel[grid](
+            q_in,
+            key,
+            qk_buf,
+            m_buf,
+            cmask if use_cmask else qk_buf,
+            softmax_scale,
+            q_in.stride(0),
+            q_in.stride(2),
+            q_in.stride(1),
+            q_in.stride(3),
+            key.stride(0),
+            key.stride(2),
+            key.stride(1),
+            key.stride(3),
+            q_len,
+            kv_len,
+            k_pad,
+            q_head_num,
+            USE_CMASK=use_cmask,
+            num_warps=8,
+            num_stages=1,
+            **common_q,
+        )
+        d_off = 0
+        while d_off < padded_dv:
+            _fa_lout_kernel[grid](
+                qk_buf,
+                v_in,
+                out,
+                lse,
+                m_buf,
+                v_in.stride(0),
+                v_in.stride(2),
+                v_in.stride(1),
+                v_in.stride(3),
+                out.stride(0),
+                out.stride(2),
+                out.stride(1),
+                out.stride(3),
+                q_len,
+                kv_len,
+                k_pad,
+                q_head_num,
+                D_WIDTH=min(128, padded_dv - d_off),
+                D_OFF=d_off,
+                STORE_LSE=False,
+                num_warps=8,
+                num_stages=1,
+                **common_v,
+            )
+            d_off += 128
+
+    return out
 
 
 def _staged_attention_backward(do, query, key, value, o, lse, sm_scale, is_causal):
@@ -1197,6 +1347,179 @@ def scaled_dot_product_efficient_attention_backward(
         dbias = None
     return dq, dk, dv, dbias
 
+_LOG2E = tl.constexpr(1.4426950408889634)
+
+@triton.jit
+def _fa_qk_m_kernel(
+    Q,
+    K,
+    QK,
+    M,
+    CMASK,
+    sm_scale,
+    stride_qb,
+    stride_qs,
+    stride_qh,
+    stride_qd,
+    stride_kb,
+    stride_ks,
+    stride_kh,
+    stride_kd,
+    Q_CTX,
+    KV_CTX,
+    K_PAD,
+    q_head_num,
+    GROUP_HEAD: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PADDED_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_CMASK: tl.constexpr,
+):
+    """Pass 1: ``qk' = (Q @ K^T) * scale - cmask`` and ``m = max(rowmax(qk'), 0)``.
+
+    When ``USE_CMASK``, the mask is folded into the stored qk here
+    (``qk' = qk - cm``) from a dense ``(B*H, Q_CTX, K_PAD)`` f32 ``CMASK``:
+    0.0/50.0 for the FA3 causal/window masks, ``-attn_mask`` / ``+1e30`` for
+    SDPA.  Masking must NOT happen in kernel B: the XPU compiler corrupts
+    that kernel's loop-carried ``l_i``/``acc`` when the loop body holds an
+    in-loop load/branch.  ``QK`` is prefilled with -1e30 so cells with
+    ``n >= KV_CTX`` stay at a value whose ``exp2`` underflows to exactly 0.0.
+
+    ``m`` is computed over the MASK-APPLIED qk' (NOT the raw qk) so that
+    ``m >= max(qk')``: the XPU ``exp2`` saturates at 1.0 for positive
+    arguments, and kernel B's ``(qk' - m)`` must stay ``<= 0`` to avoid the
+    saturation (this matters for positive additive masks, e.g.
+    ``attn_mask = +3``, which raise qk' above rowmax of the raw qk).
+    """
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    batch_id = off_hz // q_head_num
+    head_id = off_hz % q_head_num
+    kv_head_id = head_id // GROUP_HEAD
+    q_base = Q + batch_id * stride_qb + head_id * stride_qh
+    k_base = K + batch_id * stride_kb + kv_head_id * stride_kh
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, PADDED_D)
+    q_mask = offs_m < Q_CTX
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    q_ptrs = q_base + offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd
+    query = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+    qk_base = QK + off_hz * Q_CTX * K_PAD
+    cm_base = CMASK + off_hz * Q_CTX * K_PAD + offs_m[:, None] * K_PAD
+    for start_n in range(0, KV_CTX, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        kv_mask = offs_n < KV_CTX
+        k_ptrs = k_base + offs_n[:, None] * stride_ks + offs_d[None, :] * stride_kd
+        key = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+        qk = tl.dot(query, tl.trans(key)).to(tl.float32) * sm_scale
+        if USE_CMASK:
+            cm = tl.load(cm_base + offs_n[None, :], mask=q_mask[:, None], other=0.0)
+            qk = qk - cm
+        # m MUST be taken over the mask-applied qk' (NOT the raw qk): the XPU
+        # exp2 saturates at 1.0 for positive arguments (it implements
+        # min(2^v, 1.0)), so kernel B relies on the invariant (qk' - m) <= 0.
+        # A positive additive mask (attn_mask > 0) makes qk' > rowmax(raw qk),
+        # which would leave those p cells clamped at 1.0 (wrong softmax).
+        m_i = tl.maximum(m_i, tl.max(qk, 1))
+        qk_ptrs = qk_base + offs_m[:, None] * K_PAD + offs_n[None, :]
+        # separable (1D-broadcast) store mask; n >= KV_CTX stays -1e30.
+        tl.store(qk_ptrs, qk, mask=q_mask[:, None] & (offs_n[None, :] < KV_CTX))
+    m_safe = tl.maximum(m_i, 0.0)
+    m_ptrs = M + off_hz * Q_CTX + offs_m
+    tl.store(m_ptrs, m_safe, mask=q_mask)
+
+
+@triton.jit
+def _fa_lout_kernel(
+    QK,
+    V,
+    Out,
+    Lse,
+    M,
+    stride_vb,
+    stride_vs,
+    stride_vh,
+    stride_vd,
+    stride_ob,
+    stride_os,
+    stride_oh,
+    stride_od,
+    Q_CTX,
+    KV_CTX,
+    K_PAD,
+    q_head_num,
+    GROUP_HEAD: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    PADDED_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    D_WIDTH: tl.constexpr,
+    D_OFF: tl.constexpr,
+    STORE_LSE: tl.constexpr,
+):
+    """Pass 2: ``p = exp2((qk' - m) * LOG2E) = e^(qk' - m)``, ``out = p @ V / sum``.
+
+    The mask was already folded into ``qk`` by kernel A (``qk' = qk - cmask``)
+    with ``m >= max(qk')`` (so ``(qk' - m) <= 0`` and the XPU ``exp2`` -- which
+    saturates at 1.0 for positive arguments -- never leaves its exact range),
+    and the ``n >= KV_CTX`` padding stays at ``-1e30``.  There is NO
+    branch/load inside the loop: the XPU compiler corrupts the loop-carried
+    ``l_i``/``acc`` otherwise.  The ``tl.where`` zeroes cells with
+    ``(qk' - m) < -12`` explicitly because the XPU ``exp2``/underflow is
+    inexact for inputs below ~-11.09: such cells would otherwise return
+    ``2^-16`` instead of their true value (``1023 * 2^-16 = 0.016`` would
+    leak into ``l_i`` of short rows).  The threshold is on ``(qk' - m)`` (not
+    ``qk'``) so cells with very negative additive mask biases (e.g.
+    ``attn_mask = -20``) are also zeroed exactly.
+    """
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    batch_id = off_hz // q_head_num
+    head_id = off_hz % q_head_num
+    kv_head_id = head_id // GROUP_HEAD
+    v_base = V + batch_id * stride_vb + kv_head_id * stride_vh
+    o_base = Out + batch_id * stride_ob + head_id * stride_oh
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = D_OFF + tl.arange(0, D_WIDTH)
+    d_mask = offs_d < HEAD_DIM
+    q_mask = offs_m < Q_CTX
+    m_i = tl.load(M + off_hz * Q_CTX + offs_m, mask=q_mask, other=0.0)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D_WIDTH], dtype=tl.float32)
+    qk_base = QK + off_hz * Q_CTX * K_PAD
+    for start_n in range(0, KV_CTX, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        kv_mask = offs_n < KV_CTX
+        qk_ptrs = qk_base + offs_m[:, None] * K_PAD + offs_n[None, :]
+        qk = tl.load(qk_ptrs, mask=q_mask[:, None], other=0.0)
+        p = tl.exp2((qk - m_i[:, None]) * _LOG2E)
+        p = tl.where((qk - m_i[:, None]) > -12.0, p, 0.0)
+        v_ptrs = v_base + offs_n[:, None] * stride_vs + offs_d[None, :] * stride_vd
+        value = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+        acc = tl.dot(p.to(value.dtype), value, acc=acc)
+        l_i = l_i + tl.sum(p, 1)
+    l_safe = tl.maximum(l_i, 1e-30)
+    acc = acc / l_safe[:, None]
+    o_ptrs = o_base + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od
+    tl.store(
+        o_ptrs,
+        acc.to(Out.dtype.element_ty),
+        mask=q_mask[:, None] & d_mask[None, :],
+    )
+    if STORE_LSE:
+        # Natural log: lse = m + ln(sum(exp2((qk - m) * LOG2E))).
+        lse = m_i + tl.log(l_i)
+        lse_ptrs = Lse + off_hz * Q_CTX + offs_m
+        tl.store(lse_ptrs, lse, mask=q_mask)
+
+
+def _fa_pad_d(t, padded):
+    """Zero-pad the last dim of ``t`` up to ``padded`` (for non-pow2 D)."""
+    tp = torch.zeros((*t.shape[:-1], padded), dtype=t.dtype, device=t.device)
+    tp[..., : t.shape[-1]].copy_(t)
+    return tp
+
 
 def flash_attention_forward(
     query,
@@ -1222,99 +1545,161 @@ def flash_attention_forward(
     assert (
         cumulative_sequence_length_q is None and cumulative_sequence_length_k is None
     ), "varlen is not supported yet."
+    if dropout_p != 0.0:
+        raise NotImplementedError(
+            "Kunlunxin flash_attention_forward does not support dropout"
+        )
+    if return_debug_mask:
+        raise NotImplementedError(
+            "Kunlunxin flash_attention_forward does not support debug mask"
+        )
+    if softcap > 0.0:
+        # exp2-tanh softcap chain is miscompiled by the XPU backend in every
+        # placement (see the two-pass notes above).
+        raise NotImplementedError(
+            "Kunlunxin flash_attention_forward does not support softcap"
+        )
+    if alibi_slopes is not None:
+        # 0-d loaded scalar x 2D alibi is miscompiled by the XPU backend.
+        raise NotImplementedError(
+            "Kunlunxin flash_attention_forward does not support alibi_slopes"
+        )
 
     HEAD_DIM_Q, HEAD_DIM_K = query.shape[-1], key.shape[-1]
     HEAD_DIM_V = value.shape[-1]
     assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
     assert HEAD_DIM_K in {16, 32, 64, 96, 128, 192, 256}
 
-    softmax_scale = scale or 1.0 / (HEAD_DIM_K**0.5)
-    q = query.transpose(1, 2)
-    k = key.transpose(1, 2)
-    v = value.transpose(1, 2)
-    if k.shape[1] != q.shape[1]:
-        k = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
-        v = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
-    scores = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale
-    if is_causal:
-        q_len, k_len = q.shape[-2], k.shape[-2]
-        row = torch.arange(q_len, device=q.device)[:, None]
-        col = torch.arange(k_len, device=q.device)[None, :]
-        scores = scores.masked_fill(col > row + k_len - q_len, float("-inf"))
-    if window_size_left is not None or window_size_right is not None:
-        q_len, k_len = q.shape[-2], k.shape[-2]
-        row = torch.arange(q_len, device=q.device)[:, None]
-        col = torch.arange(k_len, device=q.device)[None, :]
-        left = -1 if window_size_left is None else window_size_left
-        right = -1 if window_size_right is None else window_size_right
-        valid = (left < 0) | (col >= row + k_len - q_len - left)
-        valid &= (right < 0) | (col <= row + k_len - q_len + right)
-        scores = scores.masked_fill(~valid, float("-inf"))
-    if alibi_slopes is not None:
-        q_len, k_len = q.shape[-2], k.shape[-2]
-        row = torch.arange(q_len, device=q.device)[:, None]
-        col = torch.arange(k_len, device=q.device)[None, :]
-        relative_pos = (row + k_len - q_len - col).abs()
-        scores = scores - alibi_slopes[..., None, None] * relative_pos
-    lse = torch.logsumexp(scores, dim=-1)
-    attn = torch.softmax(scores, dim=-1)
-    if dropout_p:
-        attn = torch.dropout(attn, dropout_p, True)
-    out = torch.matmul(attn, v).transpose(1, 2)
-    return out, lse, None, None, None
+    batch, q_len, q_head_num, head_dim = query.shape
+    k_len = key.shape[1]
+    kv_head_num = key.shape[2]
+    assert (
+        q_head_num % kv_head_num == 0
+    ), f"q_head_num {q_head_num} must be divisible by kv_head_num {kv_head_num}"
 
-    if window_size_left is not None:
-        non_null_window_left = window_size_left
-    else:
-        non_null_window_left = -1
-    if window_size_right is not None:
-        non_null_window_right = window_size_right
-    else:
-        non_null_window_right = -1
+    softmax_scale = scale if scale is not None else 1.0 / (head_dim**0.5)
+    device = query.device
 
-    out = torch.empty_like(query)
-    if cumulative_sequence_length_q is not None:
-        out, q, k, v, lse, philox_seed, philox_offset, p = mha_varlan_fwd(
-            query,
-            key,
-            value,
-            out,
-            cumulative_sequence_length_q,
-            cumulative_sequence_length_k,
-            seqused_k,
-            None,
-            None,  # block_table
-            alibi_slopes,
-            max_q,
-            max_k,
-            dropout_p,
-            scale,
-            False,
-            is_causal,
-            non_null_window_left,
-            non_null_window_right,
-            softcap,
-            return_debug_mask and dropout_p > 0,
-            None,
+    out = torch.empty(
+        (batch, q_len, q_head_num, head_dim), dtype=query.dtype, device=device
+    )
+    lse = torch.empty((batch, q_head_num, q_len), dtype=torch.float32, device=device)
+
+    wl = -1 if window_size_left is None else window_size_left
+    wr = -1 if window_size_right is None else window_size_right
+    has_window = wl >= 0 or wr >= 0
+
+    BLOCK_M = 32
+    BLOCK_N = 32
+    k_pad = triton.cdiv(k_len, BLOCK_N) * BLOCK_N
+    padded_d = triton.next_power_of_2(head_dim)
+
+    # The kernels process the full PADDED_D width with no d-mask on the load
+    # side; pad the last dim with zeros when head_dim is not a power of 2
+    # (stores are guarded by offs_d < HEAD_DIM).
+    if padded_d != head_dim:
+        q_in, k_in, v_in = _fa_pad_d(query, padded_d), _fa_pad_d(key, padded_d), _fa_pad_d(value, padded_d)
+    else:
+        q_in, k_in, v_in = query, key, value
+
+    # cmask (B*H, Q, K_PAD): 0.0 = valid, 50.0 = masked (causal bound
+    # n <= row+off, window bounds, and the n >= k_len padding).  Kernel A
+    # folds it into the stored qk (qk' = qk - 50); kernel B zeroes cells with
+    # (qk' - m) < -12 explicitly.
+    cmask = None
+    if is_causal or has_window:
+        cmask2d = torch.full(
+            (q_len, k_pad), 50.0, dtype=torch.float32, device=device
         )
-    else:
-        out, q, k, v, lse, philox_seed, philox_offset, p = mha_fwd(
-            query,
-            key,
-            value,
-            out,
-            alibi_slopes,
-            dropout_p,
+        rows = torch.arange(q_len, device=device)[:, None]
+        cols = torch.arange(k_pad, device=device)[None, :]
+        off = k_len - q_len
+        if is_causal:
+            valid = cols <= (rows + off)
+        else:
+            valid = torch.ones_like(cols, dtype=torch.bool)
+        if wl >= 0:
+            valid = valid & (cols >= (rows + off - wl))
+        if wr >= 0:
+            valid = valid & (cols <= (rows + off + wr))
+        cmask2d[valid] = 0.0
+        # Materialize the dense (B*H, Q, K_PAD) layout the kernel indexes
+        # (off_hz * Q_CTX * K_PAD + m * K_PAD + n); head-independent.
+        cmask = (
+            cmask2d.unsqueeze(0)
+            .expand(batch * q_head_num, q_len, k_pad)
+            .contiguous()
+        )
+
+    # qk scratch prefilled with -1e30: exp2(-1e30) underflows to exactly 0.0
+    # (the backend miscompiles exp2(-inf) to nan/inf).
+    qk_buf = torch.full(
+        (batch * q_head_num, q_len, k_pad), -1e30, dtype=torch.float32, device=device
+    )
+    m_buf = torch.empty((batch, q_head_num, q_len), dtype=torch.float32, device=device)
+    grid = (triton.cdiv(q_len, BLOCK_M), batch * q_head_num)
+    common = dict(
+        GROUP_HEAD=q_head_num // kv_head_num,
+        HEAD_DIM=head_dim,
+        PADDED_D=padded_d,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+    )
+    with torch_device_fn.device(device):
+        _fa_qk_m_kernel[grid](
+            q_in,
+            k_in,
+            qk_buf,
+            m_buf,
+            cmask if (is_causal or has_window) else qk_buf,
             softmax_scale,
-            is_causal,
-            non_null_window_left,
-            non_null_window_right,
-            softcap,
-            return_debug_mask,
-            disable_splitkv=disable_splitkv,
+            q_in.stride(0),
+            q_in.stride(1),
+            q_in.stride(2),
+            q_in.stride(3),
+            k_in.stride(0),
+            k_in.stride(1),
+            k_in.stride(2),
+            k_in.stride(3),
+            q_len,
+            k_len,
+            k_pad,
+            q_head_num,
+            USE_CMASK=(is_causal or has_window),
+            num_warps=8,
+            num_stages=1,
+            **common,
         )
+        d_off = 0
+        while d_off < padded_d:
+            _fa_lout_kernel[grid](
+                qk_buf,
+                v_in,
+                out,
+                lse,
+                m_buf,
+                v_in.stride(0),
+                v_in.stride(1),
+                v_in.stride(2),
+                v_in.stride(3),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                out.stride(3),
+                q_len,
+                k_len,
+                k_pad,
+                q_head_num,
+                D_WIDTH=min(128, padded_d - d_off),
+                D_OFF=d_off,
+                STORE_LSE=(d_off == 0),
+                num_warps=8,
+                num_stages=1,
+                **common,
+            )
+            d_off += 128
 
-    return (out, lse, philox_seed, philox_offset, p)
+    return out, lse, None, None, None
 
 
 # Adapted from https://github.com/vllm-project/flash-attention/blob/main/vllm_flash_attn/flash_attn_interface.py

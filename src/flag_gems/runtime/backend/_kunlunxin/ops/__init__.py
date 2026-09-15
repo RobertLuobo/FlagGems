@@ -67,6 +67,7 @@ from .amin import amin, amin_
 from .aminmax import aminmax
 from .angle import angle
 from .any import any, any_dim, any_dims
+from .addbmm import addbmm, addbmm_
 from .apply_repetition_penalties import apply_repetition_penalties
 from .arange import arange, arange_start
 from .arccos import arccos, arccos_
@@ -290,6 +291,7 @@ from .linalg_householder_product import linalg_householder_product
 from .linalg_ldl_factor import ldl_factor
 from .linalg_ldl_factor_ex import ldl_factor_ex
 from .linalg_lstsq import linalg_lstsq
+from .linalg_lu import linalg_lu, linalg_lu_out
 from .linalg_lu_factor import linalg_lu_factor, linalg_lu_factor_out
 from .linalg_lu_factor_ex import linalg_lu_factor_ex, linalg_lu_factor_ex_out
 from .linalg_matrix_norm import linalg_matrix_norm

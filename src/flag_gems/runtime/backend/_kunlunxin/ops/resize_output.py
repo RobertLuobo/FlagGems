@@ -31,14 +31,9 @@ def _resize_output(inp: torch.Tensor, size, device):
     if inp.numel() == 0 or out.numel() == 0:
         return out
 
-    # Preserve the first min(old_numel, new_numel) elements; the rest
-    # (when growing) is left uninitialized, matching native semantics.
     copy_numel = min(inp.numel(), out.numel())
     src = inp.reshape(-1)[:copy_numel]
-    dst = out.reshape(-1)[:copy_numel]
-    # Vendor copy: a TMA/SDNN tile when the move is expressible (contiguous
-    # same-dtype), else the vendor pointwise kernel. Never the native
-    # _copy_from fallback.
+    dst = out.reshape(-1)[:copy_numel] 
     copy_(dst, src)
 
     return out
@@ -55,8 +50,6 @@ def _resize_output_(inp: torch.Tensor, size, device):
             f"_resize_output_: device mismatch, input tensor is on {inp.device} "
             f"but the requested device is {device}"
         )
-
-    # resize_ is itself backed by the kunlunxin vendor implementation
-    # (set_-based, keeps storage, returns self).
+        
     inp.resize_(size)
     return inp

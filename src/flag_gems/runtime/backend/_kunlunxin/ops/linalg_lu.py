@@ -18,6 +18,7 @@ import torch
 
 from flag_gems.runtime import torch_device_fn
 
+from .copy import copy_
 from .linalg_lu_factor import _check_linalg_lu_factor, _linalg_lu_factor
 from .lu_unpack import lu_unpack
 
@@ -54,19 +55,17 @@ def linalg_lu_out(input, *, pivot=True, P=None, L=None, U=None, out=None):
     with torch_device_fn.device(input.device):
         lu, pivots = _linalg_lu_factor(input, pivot)
         P_res, L_res, U_res = lu_unpack(lu, pivots, unpack_data=True, unpack_pivots=True)
-    # Write back through the raw native strided-copy engine
-    # (``aten::_copy_from``) instead of the gems-registered ``copy_``
-    # to avoid a nested dispatch through the overridden operator.
+        
     if P_res.numel() > 0:
         if p_out.numel() != P_res.numel():
             p_out.resize_(P_res.shape)
-        torch.ops.aten._copy_from(P_res, p_out, False)
+        copy_(p_out, P_res)
     else:
         p_out.resize_((0,))
     if l_out.shape != L_res.shape:
         l_out.resize_(L_res.shape)
-    torch.ops.aten._copy_from(L_res, l_out, False)
+    copy_(l_out, L_res)
     if u_out.shape != U_res.shape:
         u_out.resize_(U_res.shape)
-    torch.ops.aten._copy_from(U_res, u_out, False)
+    copy_(u_out, U_res)
     return (p_out, l_out, u_out)
