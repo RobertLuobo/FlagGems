@@ -28,14 +28,6 @@ CUSTOMIZED_UNUSED_OPS = (
     "topk",
     "unique",
     "slice",
-    # The 097c718a (batch 20260914) vendor conv_transpose1d.py was only an
-    # fp16/bf16-upcast wrapper around
-    #   aten::conv_transpose1d.default.redispatch(CompositeImplicitAutograd, ...)
-    # and was never imported by _kunlunxin/ops/__init__.py (dead code). The
-    # generic flag_gems.ops.conv_transpose1d (triton autotune + tl.dot) has no
-    # kunlunxin tune_configs.yaml entry and the conv family is unsupported on
-    # this stack (cf. op_black_list.yaml: conv1d "All dtypes failed"), so
-    # exclude it from use_gems() registration and keep the native ATen path.
     "conv_transpose1d",
 )
 
