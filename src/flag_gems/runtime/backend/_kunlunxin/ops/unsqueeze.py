@@ -14,7 +14,7 @@ def unsqueeze_(A: torch.Tensor, dim: int) -> torch.Tensor:
     Mutates ``A`` itself: inserts a size-1 dimension into ``A``'s
     shape/strides in place, matching the semantics of ``torch.Tensor.unsqueeze_``.
     """
-    logger.debug("GEMS UNSQUEEZE_ (kunlunxin)")
+    logger.debug("GEMS_KUNLUNXIN UNSQUEEZE_")
     ndim = A.dim()
     d = dim if dim >= 0 else ndim + dim + 1
     if d < 0 or d > ndim:

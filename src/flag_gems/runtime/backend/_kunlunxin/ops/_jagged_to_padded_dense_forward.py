@@ -85,7 +85,7 @@ def _jagged_to_padded_dense_forward(values, offsets, max_lengths, padding_value=
     Supports the single-batch-dimension case (1-D ``values``, 1-D ``offsets``);
     same calling convention as ``flag_gems.ops._jagged_to_padded_dense_forward``.
     """
-    logger.debug("GEMS JAGGED TO PADDED DENSE FORWARD (kunlunxin)")
+    logger.debug("GEMS_KUNLUNXIN _JAGGED_TO_PADDED_DENSE_FORWARD")
 
     if not isinstance(offsets, (list, tuple)):
         offsets = [offsets]
