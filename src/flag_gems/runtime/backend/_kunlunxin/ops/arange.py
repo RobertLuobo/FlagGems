@@ -66,13 +66,7 @@ def arange_func_float(
     step,
     size,
     BLOCK_SIZE: tl.constexpr,
-):
-    # For floating output dtypes: computing the whole value in int32 then
-    # casting a large-magnitude integer to float is the XPU bottleneck (~85 GB/s
-    # fp16 / 160 GB/s fp32). Instead convert only the small per-block `cols`
-    # (0..BLOCK_SIZE) to fp32 and add a precomputed fp32 base scalar, which halves
-    # the runtime (~170 GB/s fp16 / ~330 GB/s fp32). Results are bit-identical to
-    # the int kernel on all shapes.
+): 
     pid = ext.program_id(0)
     offset = pid * BLOCK_SIZE
     cols = tl.arange(0, BLOCK_SIZE)
@@ -86,12 +80,7 @@ def arange_start(
     start, end, step=1, *, dtype=None, layout=None, device=None, pin_memory=None
 ):
     logger.debug("GEMS_KUNLUNXIN ARANGE")
-    if dtype is None:
-        # Match ATen default dtype inference (range factory): all-integral
-        # scalars -> int64, any floating-point scalar -> float32. Previously
-        # dtype was unconditionally forced to int64, which truncated float
-        # outputs (e.g. torch.arange(1.5, 5.5, 1.0) -> [1,2,3,4] instead of
-        # [1.5,2.5,3.5,4.5]).
+    if dtype is None: 
         if all(_is_integral_scalar(x) for x in (start, end, step)):
             dtype = torch.int64
         else:

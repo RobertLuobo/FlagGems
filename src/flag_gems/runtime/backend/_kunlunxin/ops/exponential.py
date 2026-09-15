@@ -25,13 +25,7 @@ from flag_gems.utils.random_utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-# philox rounds used for the exponential RNG stream. 10 -> 5 (2026-08-16):
-# statistical quality at 5 rounds is identical to 10 (KS D<=0.00033, lag-1..8
-# autocorrelation <= 0.003, same-seed bitwise reproducible, cross-seed distinct;
-# 4 rounds fails with lag-1 ac ~0.08). 5 rounds is the same knob validated for
-# randn on XPU (see harness/solution/performance/randn_xpu4_20260813.md) and for
-# the in-place exponential_ (harness/solution/performance/exponential__xpu4_20260816.md).
+ 
 PHILOX_ROUNDS = tl.constexpr(5)
 
 

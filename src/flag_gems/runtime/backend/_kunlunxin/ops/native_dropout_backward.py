@@ -12,17 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU) override of native_dropout_backward.
-#
-# The generic adapter (src/flag_gems/ops/native_dropout_backward.py) does
-# `from flag_gems.ops.dropout import dropout_backward` at module-import time,
-# so it always binds the GENERIC dropout_backward (heuristic BLOCK<=1024,
-# grid = cdiv(N, 1024)) => hundreds of thousands of tiny programs on large
-# shapes -> launch-bound at 0.01-0.06x speedup. The vendor-optimized
-# _kunlunxin.ops.dropout.dropout_backward (1-D tiles up to 131072 elems,
-# int8-view mask load, NEED_MASK constexpr branch) was unreachable through
-# aten::native_dropout_backward. This override routes the ATen op to the
-# vendor-optimized kernel.
 import logging
 
 from .dropout import dropout_backward

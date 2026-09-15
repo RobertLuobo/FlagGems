@@ -1,28 +1,34 @@
 import logging
 
 import torch
+import triton
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 import flag_gems
 
+from ..utils.pointwise_dynamic import pointwise_dynamic
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
 
+config_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    buffer_size_limit=4096,
+    kunlunAutoGrid=True,
+)
 
-def _launch_t_copy_kernel(inp: torch.Tensor, out: torch.Tensor):
-    """Transpose-and-copy delivered by the vendor native strided-copy engine.
 
-    `t_copy` is a pure data-movement op (out[i, j] = inp[j, i] for 2D input, a
-    plain copy for 0-D/1-D input).  We express it as a view of `inp`
-    (`transpose(0, 1)` / the tensor itself) + `torch.ops.aten._copy_from` into
-    the pre-allocated `out`.  Gems never registers `_copy_from`, so the call
-    reaches the vendor native strided-copy kernel (RegisterCUDA.cpp) instead of
-    a Triton transpose kernel: on XPU a Triton transpose has one inherently
-    discrete (stride != 1) side and measured ~8.7ms for 4096^2, while the
-    native strided-copy engine does the same transpose in ~0.05-0.1ms
-    (~100x+).  Same pattern as the accepted `sum_dim._compress` /
-    `slice_backward` / `resize` / `constant_pad_nd` / `block_diag` fixes
-    ("同一把钥匙"); not a CPU/native-composite fallback -- the copy executes
-    on-device in the vendor engine and the output is a device tensor.
-    """
+@pointwise_dynamic(is_tensor=[True], promotion_methods=[(0, "DEFAULT")], config=config_)
+@triton.jit
+def _t_copy_pw(src):
+    return src
+
+
+def _launch_t_copy_kernel(inp: torch.Tensor, out: torch.Tensor): 
     if inp.device.type != flag_gems.device or out.device.type != flag_gems.device:
         raise ValueError(f"t_copy kernels require {flag_gems.device} tensors")
     assert inp.dtype == out.dtype, "dtype mismatch between input and output"
@@ -45,7 +51,17 @@ def _launch_t_copy_kernel(inp: torch.Tensor, out: torch.Tensor):
         assert out.numel() == inp.numel(), "Output size mismatch for t_copy"
         src = inp
 
-    torch.ops.aten._copy_from(src, out, False)
+    # tle takes the whole transpose when it can: the 2-D copy, whose two sides
+    # disagree about which run is contiguous, is exactly what the on-chip
+    # transposed tile covers (and it matches the vendor strided-copy engine on
+    # KL3 while a pointwise transpose was ~100x slower); 0-D/1-D and
+    # already-contiguous views ride the TMA tile path. What tle cannot express
+    # (e.g. an 8-byte dtype whose inner run is not unit-strided) goes to the
+    # pointwise copy kernel instead of `torch.ops.aten._copy_from`, which
+    # bypasses gems and dispatches to the vendor fallback.
+    if tle_copy(src, out):
+        return
+    _t_copy_pw(src, out0=out)
 
 
 def t_copy_out(

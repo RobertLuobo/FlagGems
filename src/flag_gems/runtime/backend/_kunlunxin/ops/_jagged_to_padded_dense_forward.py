@@ -11,34 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Kunlunxin (XPU) override for ``_jagged_to_padded_dense_forward``.
-
-Why a vendor override:
-  The generic implementation in ``flag_gems/ops/_jagged_to_padded_dense_forward.py``
-  uses one program per batch row with **two** passes (a full-row padding fill,
-  then a data-dependent ``tl.range(0, seq_length, BLOCK_SIZE)`` copy loop whose
-  bound is a runtime value).  On XPU the runtime-bound inner loop does not
-  unroll well and the padding pass doubles the write traffic, which measured
-  ~10-2000x slower than native for mid/large rows (e.g. bf16 [512, 256] row
-  matrix: 16.7ms vs 0.26ms native).
-
-Design (kept to constructs proven reliable on the TritonXPU backend):
-  - Output is pre-filled with ``flag_gems.ops.full(..., padding_value)`` (the
-    gems full kernel) and the kernel only writes the real (non-padding)
-    elements, so **every output element is written exactly once** (no double
-    write of the padding region).
-  - One program handles ``ROWS_PER_PROG`` rows sequentially; the row loop and
-    the column loop both have ``constexpr`` bounds (statically unrolled), so
-    there is no data-dependent loop bound.
-  - All loads/stores are **1-D** (a 2-D tiled variant was measured to be
-    incorrect on this backend: 2-D masked loads ignore ``other`` and 2-D
-    ``tl.where``/mask selects do not apply, leaving masked lanes uninitialized).
-  - Load addresses are clamped to ``[0, total_length-1]``; every store is
-    guarded by ``col < seq_len`` (no store ever touches the padding region, so
-    a mis-lowered masked load cannot leak garbage into the output).
-"""
-
 import logging
 
 import torch

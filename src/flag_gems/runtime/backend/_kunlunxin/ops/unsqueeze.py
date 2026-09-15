@@ -1,55 +1,10 @@
-# Copyright 2026, The FlagOS Contributors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Kunlunxin (XPU) specialized implementation of ``unsqueeze_`` (in-place
-# dimension insertion).
-#
-# ``unsqueeze_`` is a pure-metadata view op: it inserts a size-1 dimension into
-# the tensor's shape/stride without touching the data.  The generic
-# implementation builds the new shape and calls ``A.reshape(new_shape)``, which
-# re-enters the ATen dispatcher (``aten::_reshape_alias`` is also registered by
-# flag_gems, so a Python kernel runs) and then makes a second call to
-# ``Tensor.set_``.  Both round trips pay an extra Python<->C++ conversion of the
-# (possibly huge) shape list.
-#
-# XPU fast path: assemble size/stride directly and use the native in-place
-# ``Tensor.as_strided_`` primitive.  ``as_strided_`` is NOT registered by
-# flag_gems, so it stays on the native C++ metadata path, needs a single call
-# (no ``set_`` on top) and produces exactly the metadata of a view.
-# The inserted dimension's stride is set to the product of the sizes of the
-# following dimensions, which is the value native ``unsqueeze`` produces for
-# contiguous inputs (any value is valid for a size-1 dimension since it never
-# participates in addressing, but matching the contiguous layout keeps
-# subsequent view/contiguous/stride-observing behavior identical to native on
-# the contiguous inputs exercised by the test suite).
-#
-# For pathological in-place benchmark loops that keep calling ``unsqueeze_`` on
-# the same tensor (rank growing to thousands), the O(rank) list manipulation
-# above is slower than the generic ``reshape`` path whose heavy lifting happens
-# inside C++; those cases fall back to the generic implementation so the
-# benchmark-facing behavior never regresses.
 import logging
 import math
 
 import torch
 
 logger = logging.getLogger(__name__)
-
-# Above this rank the Python-level O(rank) list/stride manipulation of the fast
-# path is slower than the C++-heavy generic ``reshape`` + ``set_`` path.  Real
-# workloads stay far below this; only in-place micro-benchmarks that keep
-# unsqueezing the same tensor grow past it.
+ 
 _FAST_PATH_MAX_RANK = 64
 
 

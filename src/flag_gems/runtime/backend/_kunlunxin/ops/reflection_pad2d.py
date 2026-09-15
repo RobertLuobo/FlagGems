@@ -21,34 +21,10 @@ import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
-
-# Flat 1D kernel over the ENTIRE output (all batches at once).
-#
-# ROOT CAUSE of the old slowness: the previous kernel wrapped every store index
-# with `% HW_out` ("modulo wrap") to avoid masked stores. On KunlunXin XPU that
-# runtime modulo defeats OffsetAnalysis, so EVERY load/store degrades to the
-# discrete per-element path (~1.2 GB/s). Even a pure contiguous copy written with
-# `%total` measured 228ms / 1.2 GB/s vs 0.49ms / 578 GB/s for the mask-based
-# copy — a ~470x penalty (see reflection_pad2d_perf_fix.md).
-#
-# Fix: flatten (b, h_out, w_out) into one linear output index `o` and store to
-# `o` directly (provably stride-1 -> block DMA). A single boolean mask
-# `o < total_out` handles the tail. The masked-off lanes only exist in the final
-# partial block; their store addresses fall past the end of the buffer and are
-# suppressed by the mask (verified maxdiff=0 across the whole shape matrix,
-# incl. tail-masked shapes). Note that clamping `o` (min with a runtime scalar)
-# is NOT an option here: it defeats the compiler's contiguity proof and
-# degrades the store to the discrete per-element path (~3x slower, measured
-# A/B). The border kernels of the split path (pad2d_hside_kernel /
-# pad2d_wside_kernel) DO clamp every lane's address in-bounds, because their
-# offsets are non-affine anyway and unclamped pad kernels on XPU corrupt
-# neighboring memory (see reflection_pad1d_out 2026-09-08).
-#
-# The reflected input index is still a data-dependent gather (structural XPU
-# wall), and the flat-index decode needs integer div/mod (slow on XPU), so the
-# big shape stays ~40ms; but that is ~4.5x faster than the 183ms modulo version.
 @triton.jit
 def reflection_pad2d_kernel(
     in_ptr,
@@ -67,14 +43,6 @@ def reflection_pad2d_kernel(
     o = pid * BLOCK + tl.arange(0, BLOCK)
     mask = o < total_out
 
-    # Decode flat output index -> (batch, h_out, w_out). NOTE: do NOT clamp `o`
-    # here — a min with a runtime scalar defeats the compiler's contiguity proof
-    # and degrades the store to the discrete per-element path (measured ~3x
-    # slower on small shapes). The masked-off lanes only exist in the final
-    # partial block and their stores are suppressed by `mask` (maxdiff=0 across
-    # the whole shape matrix, incl. tail-masked shapes). Bounds-safe addressing
-    # IS mandatory in the border kernels of the split path (see
-    # pad2d_hside_kernel) where the offsets are non-affine anyway.
     b = o // HW_out
     rem = o % HW_out
     h_idx = rem // W_out
@@ -108,19 +76,6 @@ def copy_tensor_kernel(in_ptr, out_ptr, total, BLOCK: tl.constexpr):
     vals = tl.load(in_ptr + o, mask=mask)
     tl.store(out_ptr + o, vals, mask=mask)
 
-
-# Top (h_out in [0, pad_top)) + bottom (h_out in [H_in+pad_top, H_out)) rows of
-# the output. Used by the big-shape split path (see _launch_reflection_pad2d_split):
-# the interior is copied by the native `_copy_from` engine, only these
-# B*(pad_top+pad_bottom)*W_out border elements use a Triton gather.
-#
-# IMPORTANT (XPU backend hazard, same as pad1d_side_kernel in reflection_pad1d):
-# every lane's addresses MUST stay in-bounds. The flat index is clamped
-# (oc = min(o, total_h-1)) BEFORE decoding, so every lane decodes a valid
-# (b, r, w) and both load and store addresses are in-bounds by construction.
-# Masked-off lanes therefore re-read/re-write the last valid element
-# (idempotent), which prevents the XPU masked-tail corruption of neighboring
-# memory seen with unclamped pad kernels.
 @triton.jit
 def pad2d_hside_kernel(
     in_ptr,
@@ -170,12 +125,8 @@ def pad2d_hside_kernel(
 
     vals = tl.load(in_ptr + b * HW_in + ih * W_in + iw)
     tl.store(out_ptr + b * HW_out + h_out * W_out + w, vals, mask=m)
+ 
 
-
-# Left/right pad columns of the INTERIOR (non-padded-height) rows:
-# out[b, pad_top+y, w] for w in [0, pad_left) U [pad_left+W_in, W_out).
-# Flat index o over B*H_in*(pad_left+pad_right); same in-bounds clamping as
-# pad2d_hside_kernel.
 @triton.jit
 def pad2d_wside_kernel(
     in_ptr,
@@ -212,21 +163,67 @@ def pad2d_wside_kernel(
     tl.store(out_ptr + b * HW_out + (pad_top + y) * W_out + w_out, vals, mask=m)
 
 
+@triton.jit
+def interior_copy_kernel(
+    in_ptr,
+    out_ptr,
+    HW_out,
+    interior_off,
+    H_in: tl.constexpr,
+    W_in: tl.constexpr,
+    W_out: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Interior block, one program per (row, column-block): the interior is
+    # H_in*W_in elements per batch laid out as H_in rows of W_in at row stride
+    # W_out, NOT one contiguous run. Grid axis 0 = b*H_in + y and axis 1 =
+    # column blocks, so every address is affine in the program ids -- no
+    # runtime div/mod (H_in constexpr -> compile-time magic-number division;
+    # a runtime divisor on XPU costs ~30 instructions, see
+    # pad2d_hside_kernel). The tail is masked exactly like copy_tensor_kernel
+    # (affine indices + mask, verified maxdiff=0).
+    r = tl.program_id(axis=0)
+    b = r // H_in
+    y = r - b * H_in
+    o = tl.program_id(axis=1) * BLOCK + tl.arange(0, BLOCK)
+    mask = o < W_in
+    vals = tl.load(in_ptr + b * (H_in * W_in) + y * W_in + o, mask=mask)
+    tl.store(out_ptr + b * HW_out + y * W_out + interior_off + o, vals, mask=mask)
+
+
 def _launch_reflection_pad2d_split(
     x, out, pad_left, pad_right, pad_top, pad_bottom, H_in, W_in, H_out, W_out, B
 ):
-    """Big-shape split: native `_copy_from` for the contiguous interior + two
-    small Triton kernels for the H-side (top/bottom rows) and W-side (interior
-    left/right columns) borders. `_copy_from` is never overridden by gems, so it
-    reaches the vendor strided-copy engine (same trick as slice_backward /
-    constant_pad_nd / reflection_pad1d big-shape path)."""
+    """Big-shape split: copy-family recipe (tle SDNN row transfer, Triton
+    fallback) for the contiguous interior + two small Triton kernels for the
+    H-side (top/bottom rows) and W-side (interior left/right columns) borders.
+    No `torch.ops.aten.slice` / `_copy_from` here: slice is intercepted by gems
+    and `_copy_from` lands on the XPU fallback, so both are replaced by the
+    same copy-family path as alias_copy / lift_out (tle first, pointwise
+    fallback)."""
     HW_out = H_out * W_out
     HW_in = H_in * W_in
+    interior_off = pad_top * W_out + pad_left
     with torch_device_fn.device(x.device):
-        # 1. Interior block: native strided copy.
-        mid = torch.ops.aten.slice(out, -2, pad_top, pad_top + H_in)
-        mid = torch.ops.aten.slice(mid, -1, pad_left, pad_left + W_in)
-        torch.ops.aten._copy_from(x, mid, False)
+        # 1. Interior block: B*H_in rows of W_in elements at row stride W_out.
+        interior = torch.as_strided(
+            out,
+            size=(B, H_in, W_in),
+            stride=(HW_out, W_out, 1),
+            storage_offset=interior_off,
+        )
+        if not tle_copy(x, interior):
+            grid = (B * H_in, triton.cdiv(W_in, 4096))
+            interior_copy_kernel[grid](
+                x,
+                out,
+                HW_out,
+                interior_off,
+                H_in,
+                W_in,
+                W_out,
+                BLOCK=4096,
+            )
         # 2. Top/bottom rows.
         if pad_top > 0 or pad_bottom > 0:
             total_h = B * (pad_top + pad_bottom) * W_out
@@ -334,20 +331,7 @@ def launch_reflection_pad2d(input: torch.Tensor, padding, out: torch.Tensor = No
     HW_out = H_out * W_out
     HW_in = H_in * W_in
     total_out = B * HW_out
-
-    # Big-output split path: the flat kernel below is gather-bound for large
-    # shapes (measured ~40ms on 70M output elements vs native ~0.3ms; the
-    # per-lane gather + soft integer div/decode dominates), while the split's
-    # interior runs on the vendor's native strided-copy engine and only the
-    # B*(pad_top+pad_bottom)*W_out + B*H_in*(pad_left+pad_right) border
-    # elements stay in Triton. Small outputs keep the single flat kernel: the
-    # border kernels are scatter/gather-bound at ~3.2ns/element (vs ~0.6ns/el
-    # for the flat kernel at 0.6M elements), so the split only wins when the
-    # interior dominates - measured: split LOSES at (8,16,64,64) pad(3,5,3,5)
-    # (663K output, 21% border: 493us vs flat 387us) and WINS by 3.3-3.8x at
-    # (16,32,64,128) (17.8M, 1.1% border: 0.73ms vs 2.50ms) and
-    # (32,64,128,256) (70.3M, 7.5% border: 10.6ms vs 40.3ms). Threshold
-    # 2^20 keeps the whole measured matrix regression-free.
+ 
     if total_out >= 1048576:
         return _launch_reflection_pad2d_split(
             x,

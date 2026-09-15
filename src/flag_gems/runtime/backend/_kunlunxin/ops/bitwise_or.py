@@ -57,24 +57,7 @@ def bitwise_or_func_scalar(x, y):
 
 
 def bitwise_or_scalar(A, B):
-    logger.debug("GEMS_KUNLUNXIN BITWISE_OR_SCALAR")
-    # int32-word packing fast path for bool/int16, mirroring the (verified)
-    # bitwise_or_scalar_ in-place recipe below / bitwise_or_scalar_tensor: a
-    # byte / 16-bit load-store pays a heavy per-byte penalty on XPU, while 4
-    # bools (or 2 int16s) fit one int32 word whose bytes / 16-bit lanes are
-    # uniformly OR-ed with the replicated scalar (bool takes the low bit of
-    # the two's-complement scalar, int16 the low 16 bits -- both match torch).
-    # Out-of-place: the OR-ed int32 words go to a freshly allocated tensor
-    # (the kernel treats the int32 view of A as read-only input), which is
-    # then viewed back to A's dtype/shape -- functional semantics, the
-    # result never aliases A.
-    # Gating: the bool lane only packs for a Python *bool* scalar; a Python
-    # int with a bool tensor type-promotes to Long in torch (2|x != (2&1)|x),
-    # so such inputs keep the generic scalar kernel (long-faithful, unchanged
-    # behavior). int16 packs for any int/bool scalar (torch truncates to low
-    # 16 bits). Restricted to contiguous inputs with a full int32-aligned
-    # byte count; anything else (non-contiguous, tail bytes, 0-dim/empty,
-    # int32/int64) falls back to the generic scalar kernel.
+    logger.debug("GEMS_KUNLUNXIN BITWISE_OR_SCALAR") 
     if (
         A.dtype in (torch.bool, torch.int16)
         and A.is_contiguous()
@@ -100,23 +83,7 @@ def bitwise_or_scalar(A, B):
 
 
 def bitwise_or_scalar_(A, B):
-    logger.debug("GEMS_KUNLUNXIN BITWISE_OR_SCALAR_")
-    # int32-word packing fast path for bool/int16 in-place, mirroring the
-    # (verified) bitwise_or_scalar_tensor recipe of the same file: a byte /
-    # 16-bit load-store pays a heavy per-byte penalty on XPU, while 4 bools
-    # (or 2 int16s) fit one int32 word whose bytes / 16-bit lanes are
-    # uniformly OR-ed with the replicated scalar (bool takes the low bit of
-    # the two's-complement scalar, int16 the low 16 bits -- both match torch).
-    # In-place: the OR-ed int32 words are written directly back into A's own
-    # storage (out0=in_view), preserving alias / mutation semantics.
-    # Gating: the bool lane only packs for a Python *bool* scalar; a Python
-    # int with a bool tensor type-promotes to Long in torch and the in-place
-    # op even raises (result type Long can't be cast to Bool), so such inputs
-    # keep the generic scalar kernel (long-faithful, unchanged behavior).
-    # int16 packs for any int/bool scalar (torch truncates to low 16 bits).
-    # Restricted to contiguous inputs with a full int32-aligned byte count;
-    # anything else (non-contiguous, tail bytes, 0-dim/empty, int32/int64)
-    # falls back to the generic scalar kernel.
+    logger.debug("GEMS_KUNLUNXIN BITWISE_OR_SCALAR_") 
     if (
         A.dtype in (torch.bool, torch.int16)
         and A.is_contiguous()
@@ -142,23 +109,7 @@ def bitwise_or_scalar_(A, B):
 
 
 def bitwise_or_scalar_tensor(A, B):
-    logger.debug("GEMS_KUNLUNXIN BITWISE_OR_SCALAR_TENSOR")
-    # Fast path for sub-32-bit dtypes, mirroring bitwise_and_scalar_tensor.
-    # On XPU a byte (bool) / 16-bit (int16) load/store pays a heavy per-byte
-    # penalty vs an int32 word load. Bitwise OR with a *uniform* scalar is
-    # trivially packable: 4 bools (or 2 int16s) fit one int32 word and the
-    # scalar only has to be replicated to every byte / 16-bit lane of the word
-    # (scalar truncation to 1 / 16 bits matches torch: bool takes the low bit
-    # of the two's-complement scalar, int16 takes the low 16 bits). The
-    # int32-view kernel then runs at the full int32 load/store bandwidth.
-    # Gating: the bool lane is only packed when the scalar is a Python *bool*.
-    # torch's `bitwise_or(int, bool_tensor)` type-promotes to int64 (the full
-    # int is OR-ed, e.g. 2|x -> 2/3), which a per-byte mask cannot reproduce;
-    # such inputs fall back to the generic scalar kernel (int64-faithful).
-    # int16 packs for any int/bool scalar (torch truncates to low 16 bits).
-    # Restricted to contiguous inputs with a full int32-aligned byte count;
-    # anything else (non-contiguous, tail bytes, 0-dim/empty, int32/int64)
-    # falls back to the generic scalar kernel.
+    logger.debug("GEMS_KUNLUNXIN BITWISE_OR_SCALAR_TENSOR") 
     if (
         B.dtype in (torch.bool, torch.int16)
         and B.is_contiguous()
