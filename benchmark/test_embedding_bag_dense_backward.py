@@ -39,7 +39,13 @@ class EmbeddingBagDenseBackwardBenchmark(base.Benchmark):
                 dtype=torch.long,
                 device=self.device,
             )[:num_bags]
-            # Forward pass to get required tensors
+            # Forward pass to get required tensors.  NOTE: on this platform
+            # (matching ATen CPU), ``_embedding_bag(mode=0)`` does not
+            # materialize ``offset2bag`` (it is only needed by the SUM-mode
+            # backward), so the native reference cannot consume the returned
+            # (empty) tensor.  Rebuild it from first principles instead: every
+            # bag here holds exactly ``samples_per_bag`` samples, so sample ``i``
+            # belongs to bag ``i // samples_per_bag``.
             (
                 output,
                 offset2bag,
@@ -48,6 +54,16 @@ class EmbeddingBagDenseBackwardBenchmark(base.Benchmark):
             ) = torch.ops.aten._embedding_bag(
                 weight, indices, offsets, False, 0, False, None, False, -1
             )
+            if offset2bag.numel() != num_samples:
+                offset2bag = (
+                    torch.arange(num_samples, device=self.device) // samples_per_bag
+                )
+                bag_size = torch.full(
+                    (num_bags,), samples_per_bag, dtype=torch.long, device=self.device
+                )
+                maximum_indices = torch.zeros(
+                    (num_bags,), dtype=torch.long, device=self.device
+                )
             # Generate random gradient
             grad = torch.randn_like(output)
             yield (
