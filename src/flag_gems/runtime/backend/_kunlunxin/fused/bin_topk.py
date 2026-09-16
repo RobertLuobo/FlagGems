@@ -214,7 +214,6 @@ def _bst_rows(xv, st_val, en_val, n_val, K, out, gmap=None):
     nn = int(n_val[0].item())
     if nn <= 0:
         return
-    S = xv.shape[1]
     st0 = int(st_val[0].item())
     starts = torch.tensor([st0], dtype=torch.int32, device=xv.device)
     if nn <= BS:

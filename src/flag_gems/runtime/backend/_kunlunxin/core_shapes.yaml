@@ -41,7 +41,6 @@ reshape_and_cache:
   shape_desc: "num_tokens, num_heads, head_size, block_size, num_blocks"
 
 smooth_l1_loss_backward:
-smooth_l1_loss_backward:
   shapes:
     - [262144]
     - [1024, 1024]

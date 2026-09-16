@@ -251,7 +251,6 @@ def _multiblock_nonzero_static(input, size, fill_value, out):
     )
     counts = torch.empty((num_blocks,), device=input.device, dtype=torch.int64)
     shape = tuple(input.shape) + (1,) * (6 - ndim)
-    scan_size = 1 << (num_blocks - 1).bit_length()
     with torch_device_fn.device(input.device):
         _nonzero_static_multiblock_count_kernel[(num_blocks,)](
             x,

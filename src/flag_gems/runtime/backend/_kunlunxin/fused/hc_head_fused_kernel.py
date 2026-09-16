@@ -5,7 +5,6 @@ import torch
 import triton
 import triton.language as tl
 
-import flag_gems.fused.mhc.hc_head_fused_kernel as _general_module
 from flag_gems.fused.mhc.hc_head_fused_kernel import (
     hc_head_fused_kernel as _general_hc_head_fused_kernel,
 )
@@ -208,7 +207,9 @@ def _install():
 def _ensure_vllm_collect_works():
     """Neutralize the vllm site-packages import-hook collection crash (XPU env)."""
     try:
-        import vllm_xpu._C
+        import importlib
+
+        importlib.import_module("vllm_xpu._C")
 
         return
     except Exception:

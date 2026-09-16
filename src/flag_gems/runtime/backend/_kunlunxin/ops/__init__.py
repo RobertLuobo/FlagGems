@@ -245,7 +245,7 @@ from .fill import (
     fill_tensor_out,
 )
 from .flip import flip
-from .float_power_ import (
+from .float_power_ import (  # noqa: F401  (registered via _FULL_CONFIG)
     float_power_scalar_tensor,
     float_power_scalar_tensor_out,
     float_power_tensor_scalar,
@@ -298,7 +298,10 @@ from .igammac_ import igammac_
 from .im2col import im2col
 from .index import index
 from .index_add import index_add, index_add_
-from .index_copy_ import index_copy, index_copy_
+from .index_copy_ import (  # noqa: F401  (registered via _FULL_CONFIG)
+    index_copy,
+    index_copy_,
+)
 from .index_fill import index_fill, index_fill_  # noqa: F401
 from .index_put import index_put, index_put_
 from .index_put_impl import _index_put_impl_
@@ -367,7 +370,7 @@ from .logical_and import logical_and, logical_and_
 from .logical_not import logical_not, logical_not_
 from .logical_or import logical_or, logical_or_
 from .logical_xor import logical_xor, logical_xor_
-from .logit_backward import logit_backward
+from .logit_backward import logit_backward  # noqa: F401  (registered via _FULL_CONFIG)
 from .logspace import logspace
 from .logsumexp import logsumexp
 from .lt import less_, less_scalar_, lt, lt_, lt_scalar, lt_scalar_
@@ -1454,7 +1457,6 @@ def _patch_adaptive_max_pool3d_functional():
     module (not ``_kunlunxin/__init__.py``): the package __init__ is loaded
     before ``flag_gems.runtime`` finishes initializing.
     """
-    import torch
     import torch.nn.functional as F
 
     from .adaptive_max_pool3d import adaptive_max_pool3d as _gems_fwd
@@ -1550,5 +1552,3 @@ def _patch_adaptive_max_pool3d_aten():
 
 
 _patch_adaptive_max_pool3d_aten()
-
-from .expand_copy import expand_copy
