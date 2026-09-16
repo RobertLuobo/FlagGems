@@ -19,7 +19,13 @@ import triton.language as tl
 
 from flag_gems.ops.lcm import _materialize_inputs
 
-from .gcd import _ITERS_32, _ITERS_64
+# Iteration bounds for the signed-Euclidean loop above, sized for the
+# worst-case (Fibonacci) pair of 32-/64-bit magnitudes. The current gcd.py
+# exports _ITERS_U32/_ITERS_U64 (36/72) tuned for its binary-gcd kernel, which
+# is NOT enough for this modulo-based loop (a pair like (F(38), F(37)) needs
+# 37 steps), so lcm keeps its own constants.
+_LCM_ITERS_32 = 48
+_LCM_ITERS_64 = 96
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +94,9 @@ def lcm_kernel_64(
 
 def _kernel_meta(dtype):
     if dtype in (torch.int8, torch.int16, torch.int32):
-        return lcm_kernel_32, _ITERS_32, 128, 1
+        return lcm_kernel_32, _LCM_ITERS_32, 128, 1
     if dtype == torch.int64:
-        return lcm_kernel_64, _ITERS_64, 64, 1
+        return lcm_kernel_64, _LCM_ITERS_64, 64, 1
     raise TypeError(f"unsupported dtype for lcm: {dtype}")
 
 
