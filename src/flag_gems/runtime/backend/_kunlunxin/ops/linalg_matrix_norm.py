@@ -24,9 +24,9 @@ _OP_MIN = 4
 
 _BLOCK_M = 64
 _BLOCK_N = 128
-# `_BLOCK_M * _BLOCK_N` is a multiple of this, so a padded buffer sized in whole
-# row blocks is exactly covered by the flat grid of `_pad_rows_kernel`.
-_PAD_BLOCK = 1024
+# `_pad_col_kernel` runs one program per `_PAD_BLOCK` rows of a buffer sized in
+# whole `_BLOCK_M` row blocks, which `_BLOCK_M` divides evenly.
+_PAD_BLOCK = 64
 _PROG_TARGET = 96
 _SPLIT_MIN_ELEMS = 1 << 18
 
@@ -125,59 +125,29 @@ def _row_reduce_kernel(
 
 
 @libentry()
-@triton.jit(do_not_specialize=["R", "C", "XPITCH", "NCOLS"])
-def _pad_rows_kernel(
-    X,
-    PAD,
-    R,
-    C,
-    XPITCH,
-    NCOLS,
-    IDENT: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Write ``X`` into the first ``C`` columns of ``PAD``, ``IDENT`` after.
+@triton.jit(do_not_specialize=["R", "XPITCH", "PITCH"])
+def _pad_col_kernel(X, PAD, R, XPITCH, PITCH, BLOCK: tl.constexpr):
+    """Scatter a one-column ``X`` into the first column of the padded buffer.
 
-    The copy engine cannot express this destination -- ``tle_copy`` writes runs
-    back to back, and once ``C`` reaches 1 the only run left is a single element
-    with the row pitch as its stride -- so the padding step lays the buffer down
-    with a kernel instead.  Filling and scattering in one launch is what lets
-    ``_row_reduce`` keep its unmasked loads.
-
-    One flat block, with the row recovered by division: giving the *stored*
-    index a row clamp makes the store non-affine, which costs 5x here (365us vs
-    32us for an 8x128 buffer) while the flat form is already at the launch
-    floor.  Rows and columns past the source are clamped rather than masked --
-    out-of-range rows rewrite the tail of ``PAD``, which the reduction never
-    reads, and the clamped column keeps every read inside ``X``.
+    ``tle_copy`` has no layout for this destination: collapsing the shape leaves
+    a single element-wide run whose stride is the row pitch, which the copy
+    engine rejects, so the ``R`` live values are laid down by a kernel instead.
+    The buffer is sized in whole ``_BLOCK_M`` row blocks, so the grid covers it
+    exactly and no store needs a mask; the rows past ``R`` re-read the last row
+    and rewrite padding the reduction never reads.  The clamp sits on the
+    *load* -- clamping the stored row instead makes the address non-affine,
+    which costs 5x on this backend (365us vs 32us for an 8x128 buffer) -- and
+    writing only ``R`` elements beats a full-buffer pass, which the backend runs
+    at ~29GB/s against 1187GB/s for ``torch.full``.
     """
-    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    row = offs // NCOLS
-    col = offs - row * NCOLS
-
-    r = tl.minimum(row, R - 1)
-    c = tl.minimum(col, C - 1)
-
-    val = tl.load(X + r * XPITCH + c)
-    val = tl.where(col < C, val, IDENT).to(val.dtype)
-    tl.store(PAD + offs, val)
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(PAD + row * PITCH, tl.load(X + tl.minimum(row, R - 1) * XPITCH))
 
 
-def _pad_rows(x, pad, R, C, pitch, ident):
-    """Materialise ``x`` into the first ``C`` columns of the ``pad`` buffer.
-
-    ``pad`` must be sized in whole ``_BLOCK_M`` row blocks -- the caller passes
-    ``RP`` -- so the flat grid divides it exactly and no block is left unfilled.
-    """
-    _pad_rows_kernel[(pad.numel() // _PAD_BLOCK,)](
-        x,
-        pad,
-        R,
-        C,
-        pitch,
-        pad.shape[1],
-        IDENT=ident,
-        BLOCK=_PAD_BLOCK,
+def _pad_col(x, pad, R, pitch, ncols):
+    """Write ``x``'s single column into column 0 of ``pad`` (``R`` live rows)."""
+    _pad_col_kernel[(pad.shape[0] // _PAD_BLOCK,)](
+        x, pad, R, pitch, ncols, BLOCK=_PAD_BLOCK
     )
 
 
@@ -226,10 +196,23 @@ def _row_reduce(x, R, C, op, final_sqrt=False):
     ncols = C
     if C % BN:
         ncols = triton.cdiv(C, BN) * BN
-        # Whole row blocks, so `_pad_rows_kernel`'s flat grid covers the buffer
-        # exactly and needs no mask.
-        pad = torch.empty((RP, ncols), dtype=x.dtype, device=dev)
-        _pad_rows(x, pad, R, C, pitch, _identity(op))
+        # `torch.full` lays the identity down natively (1187GB/s), where a
+        # kernel writing the whole buffer manages ~29GB/s, so only the `R` live
+        # rows are written and sized in `_BLOCK_M` row blocks -- that keeps
+        # `_pad_col_kernel`'s grid exact, and the reduction clamps to `R - 1`
+        # rather than reading the rows past `R`.
+        pad = torch.full((RP, ncols), _identity(op), dtype=x.dtype, device=dev)
+        if C == 1:
+            # The one destination `tle_copy` cannot express, and at one element
+            # per row a scatter costs less than the strided copy that used to
+            # stand in for it.
+            _pad_col(x, pad, R, pitch, ncols)
+        elif not tle_copy(x, pad[:R, :C]):
+            # Every wider destination is expressible; if that ever stops being
+            # true, fail loudly rather than reduce a buffer left all identity.
+            raise NotImplementedError(
+                f"tle_copy cannot express a {C}-column pad destination"
+            )
         x = pad
         pitch = ncols
     nfull = ncols // BN

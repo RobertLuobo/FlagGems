@@ -70,31 +70,35 @@ def _osj_svals_pipeline(
 # ``_DEV_SORT_MIN_NW`` lanes; the padding zeros are negative-free, and
 # ``S >= 0`` (column norms), so they always sort to the tail (unchanged from
 # the previous host ``np.sort``, which sorted the same zero-padded row).
+#
+# NOTE(kunlunxin): a launch may also run at most ONE program and ONE stage --
+# grid > 1 (>= ~9 programs) or a single program looping over rows/stages is
+# silently corrupted as well, so the host launches one program per (stage, row).
 _DEV_SORT_MIN_NW = 64
 
 
 @triton.jit
 def _svd_sort_stage_kernel(
     S_ptr,
-    LO_ptr,
-    COND_ptr,
+    TAB_ptr,
+    st: tl.int32,
     d: tl.constexpr,
-    stage: tl.constexpr,
     NW: tl.constexpr,
     PAD: tl.constexpr,
+    TSTR: tl.constexpr,
 ):
-    """One bitonic compare-exchange stage (descending). One program per row."""
+    """One bitonic compare-exchange stage (descending). One program per launch."""
     pid = tl.program_id(0)
     offs = tl.arange(0, NW)
     base = S_ptr + pid * (NW + 2 * PAD) + PAD
     x = tl.load(base + offs)
     xf = tl.load(base + offs + d)
     xb = tl.load(base + offs - d)
-    is_lo = tl.load(LO_ptr + offs) > 0.5
+    is_lo = tl.load(TAB_ptr + st * TSTR + offs) > 0.5
     v = tl.where(is_lo, xf, xb)
     mn = tl.minimum(x, v)
     mx = tl.maximum(x, v)
-    cond = tl.load(COND_ptr + offs) > 0.5
+    cond = tl.load(TAB_ptr + st * TSTR + NW + offs) > 0.5
     tl.store(base + offs, tl.where(cond, mx, mn))
 
 
@@ -110,6 +114,12 @@ def _device_desc_sort(S, k, dev, dtype):
     Returns:
         ``[batch, k]`` f32 device tensor = the k largest values of each row,
         in descending order.
+
+    The stage kernel contains shifted-affine loads (``base + offs +/- d``); on
+    this backend such kernels are silently corrupted when a launch runs more
+    than one program or when one program executes more than one stage, so we
+    launch exactly one program per (stage, row).  The per-stage ``is_lo``/``cond``
+    direction patterns are precomputed on the host and transferred as one table.
     """
     batch, NW = S.shape
     NWs = max(NW, _DEV_SORT_MIN_NW)
@@ -117,6 +127,7 @@ def _device_desc_sort(S, k, dev, dtype):
     buf = torch.zeros(batch, NWs + 2 * PAD, device=dev, dtype=torch.float32)
     buf[:, PAD : PAD + NW] = S.to(device=dev, dtype=torch.float32)
     offs = np.arange(NWs)
+    patterns = []
     for lev in range(1, NWs.bit_length()):
         stage = 1 << lev
         for s in range(lev):
@@ -124,14 +135,22 @@ def _device_desc_sort(S, k, dev, dtype):
             is_lo = ((offs % (2 * d)) < d).astype(np.float32)
             block_odd = ((offs // stage) % 2 == 1).astype(np.float32)
             cond = (np.logical_xor(is_lo > 0.5, block_odd > 0.5)).astype(np.float32)
-            _svd_sort_stage_kernel[(batch,)](
-                buf,
-                torch.tensor(is_lo, device=dev),
-                torch.tensor(cond, device=dev),
+            patterns.append((d, stage, is_lo, cond))
+    tab = torch.tensor(
+        np.stack([np.concatenate([p[2], p[3]]) for p in patterns], axis=0),
+        device=dev,
+        dtype=torch.float32,
+    )
+    for st, (d, stage, _, _) in enumerate(patterns):
+        for b in range(batch):
+            _svd_sort_stage_kernel[(1,)](
+                buf[b : b + 1],
+                tab,
+                st,
                 d,
-                stage,
                 NW=NWs,
                 PAD=PAD,
+                TSTR=2 * NWs,
                 num_warps=4,
             )
     return buf[:, PAD : PAD + k].contiguous()
