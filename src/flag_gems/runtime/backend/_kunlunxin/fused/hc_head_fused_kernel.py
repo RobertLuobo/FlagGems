@@ -187,8 +187,6 @@ def hc_head_fused_kernel(
     return out
 
 
-
-
 def _use_general_for_ab():
     """A/B escape hatch (FLAGGEMS_XPU_HC_HEAD_GENERAL=1 forces the general impl)."""
     return os.environ.get("FLAGGEMS_XPU_HC_HEAD_GENERAL", "0") == "1"

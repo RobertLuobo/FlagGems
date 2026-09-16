@@ -513,9 +513,7 @@ def _ormqr_sweep(input, tau, other, left, transpose):
             s_tb,
             tau.stride(-1),
         )
-        ckw = dict(
-            XS=_SWEEP_FAST_MP, LEFT=bool(left), REV=rev, MP=_SWEEP_FAST_MP
-        )
+        ckw = dict(XS=_SWEEP_FAST_MP, LEFT=bool(left), REV=rev, MP=_SWEEP_FAST_MP)
         if cc == 1:
             _ormqr_sweep_fused_kernel[grid](*args, **ckw)
         elif cc == 2:

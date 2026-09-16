@@ -28,7 +28,7 @@ CUSTOMIZED_UNUSED_OPS = (
     "grid_sampler_3d_backward",
     "randperm",
     "topk",
-    "unique", 
+    "unique",
     "slice",
     "conv_transpose1d",
     "mkldnn_rnn_layer",

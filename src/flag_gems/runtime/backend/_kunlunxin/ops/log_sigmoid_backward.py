@@ -1,15 +1,13 @@
-
 import logging
 
 import torch
 import triton
 import triton.language as tl
+from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from flag_gems.utils import triton_lang_extension as ext
-from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
-from ..utils.pointwise_dynamic import (
-    pointwise_dynamic as xpu_pointwise_dynamic,
-)
+
+from ..utils.pointwise_dynamic import pointwise_dynamic as xpu_pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +84,6 @@ def log_sigmoid_backward_flat_kernel_unmasked(
     derivative = 1.0 / (1.0 + tl.exp(x.to(tl.float32)))
     res = g.to(tl.float32) * derivative
     tl.store(grad_input_ptr + offsets, res.to(grad_input_ptr.dtype.element_ty))
-
-
 
 
 def _can_use_flat_kernel(grad_output, self, grad_input=None):

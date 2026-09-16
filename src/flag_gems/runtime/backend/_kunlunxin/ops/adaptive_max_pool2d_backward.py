@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -113,19 +112,17 @@ def adaptive_max_pool2d_backward(
     out_h, out_w = grad_output.shape[2], grad_output.shape[3]
 
     n_in = in_n * in_c * in_h * in_w
-    if n_in == 0 or grad_output.numel() == 0: 
+    if n_in == 0 or grad_output.numel() == 0:
         grad_input = torch.zeros_like(self)
         return grad_input.squeeze(0) if input_is_3d else grad_input
 
     exact = (in_h % out_h == 0) and (in_w % out_w == 0)
 
     with torch_device_fn.device(self.device):
-        if exact: 
-            grad_input = torch.zeros_like(self) 
+        if exact:
+            grad_input = torch.zeros_like(self)
             n_out = grad_output.numel()
-            _adaptive_max_pool2d_backward_scatter_kernel[
-                (triton.cdiv(n_out, 256),)
-            ](
+            _adaptive_max_pool2d_backward_scatter_kernel[(triton.cdiv(n_out, 256),)](
                 grad_output,
                 indices,
                 grad_input,
@@ -137,8 +134,8 @@ def adaptive_max_pool2d_backward(
                 buffer_size_limit=2048,
                 isCloseVectorization=True,
             )
-        else: 
-            grad_input = torch.empty_like(self) 
+        else:
+            grad_input = torch.empty_like(self)
             max_h = 1 if in_h % out_h == 0 else (out_h // in_h + 2)
             max_w = 1 if in_w % out_w == 0 else (out_w // in_w + 2)
             _adaptive_max_pool2d_backward_gather_kernel[(triton.cdiv(n_in, 128),)](

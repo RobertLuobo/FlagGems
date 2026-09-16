@@ -37,18 +37,28 @@ _RAW_TYPE_CODE = {
 if _TLE_OK:
 
     @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "ne_raw.xpu"))
-    def ne_scalar_raw(in_, out, numel, esz, type_code, scalar_bits,
-                      chunk_start, chunk_count):
-        ...
+    def ne_scalar_raw(
+        in_, out, numel, esz, type_code, scalar_bits, chunk_start, chunk_count
+    ): ...
 
-    @triton.jit(do_not_specialize=["numel", "esz", "type_code", "scalar_bits",
-                                   "chunk_count"])
-    def ne_scalar_raw_kernel(In, Out, numel, esz, type_code, scalar_bits,
-                             chunk_count):
+    @triton.jit(
+        do_not_specialize=["numel", "esz", "type_code", "scalar_bits", "chunk_count"]
+    )
+    def ne_scalar_raw_kernel(In, Out, numel, esz, type_code, scalar_bits, chunk_count):
         pid = tl.program_id(0)
-        tle.raw.call(ne_scalar_raw, (In, Out, numel, esz, type_code,
-                                     scalar_bits, pid * chunk_count,
-                                     chunk_count))
+        tle.raw.call(
+            ne_scalar_raw,
+            (
+                In,
+                Out,
+                numel,
+                esz,
+                type_code,
+                scalar_bits,
+                pid * chunk_count,
+                chunk_count,
+            ),
+        )
 
 
 def _view_u8(t):
@@ -94,8 +104,10 @@ def _raw_not_equal_scalar(A, B):
     per = (total_chunks + _NCLUSTER - 1) // _NCLUSTER
     with torch_device_fn.device(A.device):
         ne_scalar_raw_kernel[(_NCLUSTER,)](
-            _view_u8(A), _view_u8(out), M, esz, type_code, s_bits, per)
+            _view_u8(A), _view_u8(out), M, esz, type_code, s_bits, per
+        )
     return out
+
 
 config_ = CodeGenConfig(
     512,
@@ -140,7 +152,7 @@ def not_equal(A, B):
     del os.environ["TRITONXPU_FP16_FAST"]
     return res
 
- 
+
 _NOT_EQUAL_TENSOR_TILE_SMALL = 2048
 _NOT_EQUAL_TENSOR_SMALL_MAX = 16384
 _NOT_EQUAL_TENSOR_TILE_MID = 8192
@@ -182,7 +194,7 @@ def _not_equal_tensor_fast(A, B, numel, TILE):
                 unroll_num=16,
                 isCloseMemoryAsync=False,
             )
-        else: 
+        else:
             not_equal_tensor_fast_kernel[(triton.cdiv(numel, TILE),)](
                 A,
                 B,
@@ -211,26 +223,26 @@ def not_equal_func_scalar(x, y):
 
 
 def not_equal_scalar(A, B):
-    logger.debug("GEMS_KUNLUNXIN NOT_EQUAL_SCALAR") 
+    logger.debug("GEMS_KUNLUNXIN NOT_EQUAL_SCALAR")
     numel = A.numel()
     dtype = A.dtype
     if (
         A.is_contiguous()
         and dtype in (torch.float16, torch.float32, torch.bfloat16)
         and numel >= _NOT_EQUAL_SCALAR_MASKED_MIN
-    ): 
+    ):
         s = float(B)
         wrapped = torch.tensor(s, dtype=dtype).item()
         if math.isfinite(wrapped):
             if (
                 numel % _NOT_EQUAL_SCALAR_FAST_TILE == 0
                 and numel >= _NOT_EQUAL_SCALAR_FAST_TILE * _NOT_EQUAL_SCALAR_MIN_GRID
-            ): 
+            ):
                 return _not_equal_scalar_fast(
                     A, float(wrapped), (numel // _NOT_EQUAL_SCALAR_FAST_TILE,)
                 )
-            if numel % _NOT_EQUAL_SCALAR_FAST_TILE != 0: 
-                return _not_equal_scalar_fast_masked(A, float(wrapped), numel) 
+            if numel % _NOT_EQUAL_SCALAR_FAST_TILE != 0:
+                return _not_equal_scalar_fast_masked(A, float(wrapped), numel)
     res = not_equal_func_scalar(A, B)
     return res
 
@@ -261,7 +273,7 @@ def _not_equal_scalar_fast(A, scalar, grid):
         buffer_size_limit=8192,
         unroll_num=16,
         isCloseMemoryAsync=False,
-    ) 
+    )
     return out32.to(torch.bool)
 
 
@@ -291,5 +303,5 @@ def _not_equal_scalar_fast_masked(A, scalar, numel):
         buffer_size_limit=8192,
         unroll_num=16,
         isCloseMemoryAsync=False,
-    ) 
+    )
     return out32.to(torch.bool)

@@ -40,7 +40,6 @@ def _pdist_backward_p2_kernel(
 
     acc = tl.zeros([BLOCK_M], dtype=tl.float32)
 
-
     for j in range(pid_n + 1, N):
         xj_offset = j * stride_x
         xj_vals = tl.load(x_ptr + xj_offset + m_offsets, mask=m_mask, other=0.0).to(

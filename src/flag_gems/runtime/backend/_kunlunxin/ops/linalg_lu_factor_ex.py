@@ -28,8 +28,7 @@ def _check_linalg_lu_factor_input(input, pivot):
         )
     if input.shape[-2] == 0 or input.shape[-1] == 0:
         raise NotImplementedError(
-            "FlagGems linalg_lu_factor_ex currently does not support empty "
-            "matrices"
+            "FlagGems linalg_lu_factor_ex currently does not support empty " "matrices"
         )
     if not isinstance(pivot, bool):
         raise TypeError(f"pivot must be a bool, got {type(pivot)}")

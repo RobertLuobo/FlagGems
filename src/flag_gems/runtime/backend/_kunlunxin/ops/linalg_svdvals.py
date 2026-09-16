@@ -1,4 +1,3 @@
-
 """Kunlunxin backend override for ``linalg_svdvals``.
 
 The generic ``flag_gems.ops.linalg_svdvals`` routes through the generic CUDA
@@ -35,7 +34,9 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
-def _osj_svals_pipeline(A_ptr, B_ptr, m, n, nw, total, MP: tl.constexpr, NW: tl.constexpr):
+def _osj_svals_pipeline(
+    A_ptr, B_ptr, m, n, nw, total, MP: tl.constexpr, NW: tl.constexpr
+):
     """Fill ``B`` and run the one-sided Jacobi sweeps (singular values only).
 
     Identical to the rotation part of ``linalg_svd._osj_pipeline`` (same cyclic
@@ -81,7 +82,6 @@ def _osj_svals_pipeline(A_ptr, B_ptr, m, n, nw, total, MP: tl.constexpr, NW: tl.
         tl.store(B_ptr + q + rows * NW, s_rot * ap + c * aq, mask=msk)
 
 
-
 def _osj_svals_impl(A, sweeps=12):
     """One-sided Jacobi singular values only; returns ``S`` (descending)."""
     dev = A.device
@@ -96,8 +96,16 @@ def _osj_svals_impl(A, sweeps=12):
     total = sweeps * (nw - 1) * (nw // 2)
     for b in range(batch):
         _osj_svals_pipeline[(1,)](
-            A[b], B[b], m, n, nw, total, MP=MP, NW=NW,
-            num_warps=1, num_stages=1,
+            A[b],
+            B[b],
+            m,
+            n,
+            nw,
+            total,
+            MP=MP,
+            NW=NW,
+            num_warps=1,
+            num_stages=1,
         )
 
     Bc = B.cpu().double()

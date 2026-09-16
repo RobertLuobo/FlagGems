@@ -1,4 +1,3 @@
-
 import logging
 import math
 
@@ -218,9 +217,7 @@ def _segment_reduce_uniform_other_backward_kernel(
     )
     output_offsets = rows * inner_size + k_offsets
 
-    grad_value = tl.load(grad + output_offsets, mask=mask, other=0.0).to(
-        compute_dtype
-    )
+    grad_value = tl.load(grad + output_offsets, mask=mask, other=0.0).to(compute_dtype)
     output_value = tl.load(output + output_offsets, mask=mask, other=0.0).to(
         compute_dtype
     )
@@ -987,9 +984,7 @@ def _segment_reduce_backward_element_kernel(
             )
             value = tl.load(data + data_offset).to(compute_dtype)
             output_is_nan = output_value != output_value
-            match = tl.where(
-                output_is_nan, value != value, value == output_value
-            )
+            match = tl.where(output_is_nan, value != value, value == output_value)
             counter += match.to(tl.int32)
 
         current_match = tl.where(

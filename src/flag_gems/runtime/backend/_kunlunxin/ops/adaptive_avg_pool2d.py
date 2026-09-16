@@ -115,11 +115,7 @@ def adaptive_avg_pool2d(input, output_size):
 
     output_rows = output.numel() // output_width
     with torch_device_fn.device(input.device):
-        if (
-            output_height == 1
-            and output_width == 1
-            and input_contiguous.size(-1) > 0
-        ):
+        if output_height == 1 and output_width == 1 and input_contiguous.size(-1) > 0:
             planes = output.numel()
             _adaptive_avg_pool2d_plane_kernel[(planes,)](
                 input_contiguous,

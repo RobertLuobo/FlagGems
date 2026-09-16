@@ -147,9 +147,7 @@ def unfold_copy(input, dimension, size, step):
         outer = 1
         inner = 1
     else:
-        out_shape = (
-            input.shape[:dim] + (n_windows,) + input.shape[dim + 1 :] + (size,)
-        )
+        out_shape = input.shape[:dim] + (n_windows,) + input.shape[dim + 1 :] + (size,)
         outer = math.prod(input.shape[:dim])
         inner = math.prod(input.shape[dim + 1 :])
     out = torch.empty(out_shape, dtype=input.dtype, device=input.device)
@@ -161,7 +159,15 @@ def unfold_copy(input, dimension, size, step):
     if input.is_contiguous():
         grid = (triton.cdiv(numel, _BLOCK),)
         _unfold_copy_kernel[grid](
-            input, out, outer, dim_size, inner, n_windows, size, step, numel,
+            input,
+            out,
+            outer,
+            dim_size,
+            inner,
+            n_windows,
+            size,
+            step,
+            numel,
             BLOCK=_BLOCK,
         )
         return out

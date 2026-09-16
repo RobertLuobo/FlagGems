@@ -72,7 +72,9 @@ def _plan(n):
 
 @libentry()
 @triton.jit
-def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.constexpr, ALPHA):
+def _dsytf2_step_kernel(
+    W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.constexpr, ALPHA
+):
     """One Bunch-Kaufman step (K) of DSYTF2 (UPLO='L'), one program per matrix.
 
     W    - (batch, N, LDA) float32 flat workspace (lower triangle persists
@@ -115,9 +117,7 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
         axis=0,
     )
     col_imax = tl.load(W + base + rcl * LDA + imax)
-    r2 = tl.max(
-        tl.where((ridx > imax) & (ridx < N), tl.abs(col_imax), 0.0), axis=0
-    )
+    r2 = tl.max(tl.where((ridx > imax) & (ridx < N), tl.abs(col_imax), 0.0), axis=0)
     rowmax = tl.maximum(r1, r2)
     dimax = tl.sum(tl.where(ridx == imax, row_imax, 0.0), axis=0)
 
@@ -159,22 +159,50 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     rkp_c = tl.load(W + base + kp * LDA + colc)
     a_kp_kk = tl.load(W + base + kp * LDA + kk)
 
-    x = tl.where(row > kp, tl.where(two, ck_r, ckp_r),
-          tl.where(row == kp, tl.where(two, a_kkK, a_kpK),
-          tl.where(row == kk, tl.where(two, a_kpK, d_kp),
-          tl.where(row > kk, tl.where(two, ck_r, rkp_r), ck_r))))
-    xc = tl.where(col > kp, tl.where(two, ck_c, ckp_c),
-          tl.where(col == kp, tl.where(two, a_kkK, a_kpK),
-          tl.where(col == kk, tl.where(two, a_kpK, d_kp),
-          tl.where(col > kk, tl.where(two, ck_c, rkp_c), ck_c))))
-    x1 = tl.where(row > kp, ckp_r,
-          tl.where(row == kp, a_kp_kk,
-          tl.where(row == kk, d_kp,
-          tl.where(row > kk, ckp_r, ck1_r))))
-    x1c = tl.where(col > kp, ckp_c,
-          tl.where(col == kp, a_kp_kk,
-          tl.where(col == kk, d_kp,
-          tl.where(col > kk, ckp_c, ck1_c))))
+    x = tl.where(
+        row > kp,
+        tl.where(two, ck_r, ckp_r),
+        tl.where(
+            row == kp,
+            tl.where(two, a_kkK, a_kpK),
+            tl.where(
+                row == kk,
+                tl.where(two, a_kpK, d_kp),
+                tl.where(row > kk, tl.where(two, ck_r, rkp_r), ck_r),
+            ),
+        ),
+    )
+    xc = tl.where(
+        col > kp,
+        tl.where(two, ck_c, ckp_c),
+        tl.where(
+            col == kp,
+            tl.where(two, a_kkK, a_kpK),
+            tl.where(
+                col == kk,
+                tl.where(two, a_kpK, d_kp),
+                tl.where(col > kk, tl.where(two, ck_c, rkp_c), ck_c),
+            ),
+        ),
+    )
+    x1 = tl.where(
+        row > kp,
+        ckp_r,
+        tl.where(
+            row == kp,
+            a_kp_kk,
+            tl.where(row == kk, d_kp, tl.where(row > kk, ckp_r, ck1_r)),
+        ),
+    )
+    x1c = tl.where(
+        col > kp,
+        ckp_c,
+        tl.where(
+            col == kp,
+            a_kp_kk,
+            tl.where(col == kk, d_kp, tl.where(col > kk, ckp_c, ck1_c)),
+        ),
+    )
 
     g_KK = tl.where(two, tl.load(W + base + K * LDA + K), d_kp)
     d21 = a_kpK
@@ -212,7 +240,10 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     oldpiv = tl.load(PIV + b * N + K)
     oldpiv2 = tl.load(PIV + b * N + idx2)
     tl.store(PIV + b * N + K, tl.where(is_prev2x2, oldpiv, kp_val))
-    tl.store(PIV + b * N + idx2, tl.where(is_prev2x2, oldpiv2, tl.where(two2, -(kp + 1), kp_val)))
+    tl.store(
+        PIV + b * N + idx2,
+        tl.where(is_prev2x2, oldpiv2, tl.where(two2, -(kp + 1), kp_val)),
+    )
 
     cur_info = tl.load(INFO + b)
     new_info = tl.where((skip & (cur_info == 0)), K + 1, cur_info)

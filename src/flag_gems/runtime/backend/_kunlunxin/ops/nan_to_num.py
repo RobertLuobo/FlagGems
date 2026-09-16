@@ -1,4 +1,3 @@
-
 import functools
 import logging
 import os
@@ -7,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+
 from flag_gems.runtime import torch_device_fn
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
@@ -35,20 +35,49 @@ _RAW_TYPE_CODE = {
 if _TLE_OK:
 
     @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "nan_to_num_raw.xpu"))
-    def nan_to_num_raw_(in_, out, numel, esz, type_code, nan_bits, pinf_bits,
-                        ninf_bits, chunk_start, chunk_count):
-        ...
+    def nan_to_num_raw_(
+        in_,
+        out,
+        numel,
+        esz,
+        type_code,
+        nan_bits,
+        pinf_bits,
+        ninf_bits,
+        chunk_start,
+        chunk_count,
+    ): ...
 
-    @triton.jit(do_not_specialize=[
-        "numel", "esz", "type_code", "nan_bits", "pinf_bits", "ninf_bits",
-        "chunk_count",
-    ])
-    def nan_to_num_raw_kernel(In, Out, numel, esz, type_code, nan_bits,
-                              pinf_bits, ninf_bits, chunk_count):
+    @triton.jit(
+        do_not_specialize=[
+            "numel",
+            "esz",
+            "type_code",
+            "nan_bits",
+            "pinf_bits",
+            "ninf_bits",
+            "chunk_count",
+        ]
+    )
+    def nan_to_num_raw_kernel(
+        In, Out, numel, esz, type_code, nan_bits, pinf_bits, ninf_bits, chunk_count
+    ):
         pid = tl.program_id(0)
-        tle.raw.call(nan_to_num_raw_, (In, Out, numel, esz, type_code,
-                                       nan_bits, pinf_bits, ninf_bits,
-                                       pid * chunk_count, chunk_count))
+        tle.raw.call(
+            nan_to_num_raw_,
+            (
+                In,
+                Out,
+                numel,
+                esz,
+                type_code,
+                nan_bits,
+                pinf_bits,
+                ninf_bits,
+                pid * chunk_count,
+                chunk_count,
+            ),
+        )
 
 
 @functools.lru_cache(maxsize=1024)
@@ -78,16 +107,20 @@ def _raw_nan_to_num_(A, nan, posinf, neginf):
     if M == 0 or M > _RAW_MAX_ELEMS:
         return None
     esz = A.element_size()
-    nb, pb, mb = (_replacement_bits(nan, A.dtype),
-                  _replacement_bits(posinf, A.dtype),
-                  _replacement_bits(neginf, A.dtype))
+    nb, pb, mb = (
+        _replacement_bits(nan, A.dtype),
+        _replacement_bits(posinf, A.dtype),
+        _replacement_bits(neginf, A.dtype),
+    )
     chunk_elems = _RAW_CHUNK_BYTES // esz
     total_chunks = (M + chunk_elems - 1) // chunk_elems
     per = (total_chunks + _NCLUSTER - 1) // _NCLUSTER
     with torch_device_fn.device(A.device):
         nan_to_num_raw_kernel[(_NCLUSTER,)](
-            _view_u8(A), _view_u8(A), M, esz, type_code, nb, pb, mb, per)
+            _view_u8(A), _view_u8(A), M, esz, type_code, nb, pb, mb, per
+        )
     return A
+
 
 config_ = CodeGenConfig(
     512,

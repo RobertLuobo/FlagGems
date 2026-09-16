@@ -58,8 +58,7 @@ def selu_flat_kernel(
     x_f32 = x.to(tl.float32)
     x_neg = tl.minimum(x_f32, 0.0)
     y = _SCALE * (
-        tl.maximum(x_f32, 0.0)
-        + tl.minimum(_ALPHA * (tl.exp(x_neg) - 1.0), 0.0)
+        tl.maximum(x_f32, 0.0) + tl.minimum(_ALPHA * (tl.exp(x_neg) - 1.0), 0.0)
     )
 
     if NEED_MASK:

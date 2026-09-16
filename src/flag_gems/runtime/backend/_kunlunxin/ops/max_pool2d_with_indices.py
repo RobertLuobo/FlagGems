@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -675,7 +674,7 @@ def max_pool2d_backward(
                     if (m_count >= 8 and n_count >= 2 * m_count) or m_count >= 64:
                         residue_classes.append((r_h, r_w, m_count, n_count))
             if residue_classes:
-                for (r_h, r_w, m_count, n_count) in residue_classes:
+                for r_h, r_w, m_count, n_count in residue_classes:
                     block = min(max(1 << (n_count - 1).bit_length(), 4), 256)
                     max_pool2d_backward_residue_kernel[
                         (triton.cdiv(n_count, block), m_count, n_c)

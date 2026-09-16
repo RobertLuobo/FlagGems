@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -102,7 +101,7 @@ def normal_(self, mean=0, std=1, *, generator=None):
     cluster_num = 12
     BLOCK_SIZE = min(triton.next_power_of_2(triton.cdiv(N, cluster_num * UNROLL)), 1024)
     grid_fn = triton.cdiv(N, BLOCK_SIZE * UNROLL)
-    FULL = (N % (BLOCK_SIZE * UNROLL) == 0)
+    FULL = N % (BLOCK_SIZE * UNROLL) == 0
     increment = triton.cdiv(N, UNROLL)
     philox_seed, philox_offset = philox_backend_seed_offset(
         increment, generator=generator

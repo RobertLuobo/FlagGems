@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -38,7 +37,11 @@ _SILU_BW_MAX_BLOCK = 65536
 @libentry()
 @triton.jit(do_not_specialize=["n_elements"])
 def silu_backward_kernel_xpu(
-    x_ptr, dy_ptr, out_ptr, n_elements, BLOCK: tl.constexpr,
+    x_ptr,
+    dy_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     tid = pid * BLOCK + tl.arange(0, BLOCK)
@@ -53,7 +56,10 @@ def silu_backward_kernel_xpu(
 @libentry()
 @triton.jit
 def silu_backward_kernel_xpu_unmasked(
-    x_ptr, dy_ptr, out_ptr, BLOCK: tl.constexpr,
+    x_ptr,
+    dy_ptr,
+    out_ptr,
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     tid = pid * BLOCK + tl.arange(0, BLOCK)
@@ -75,8 +81,6 @@ def _silu_backward_pick_block(n_elements):
         ctas = 128
     block = (n_elements + ctas - 1) // ctas
     return min(triton.next_power_of_2(block), _SILU_BW_MAX_BLOCK)
-
-
 
 
 def silu(self):

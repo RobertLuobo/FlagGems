@@ -1,4 +1,3 @@
-
 import importlib
 import logging
 import os
@@ -30,8 +29,6 @@ def generate_imports(code: IndentedBuffer) -> IndentedBuffer:
     code.newline()
     code.newline()
     return code
-
-
 
 
 def generate_gather_kernel(
@@ -255,8 +252,6 @@ def gather(inp, dim, index, out=None, sparse_grad=False):
             inp_strided, out, index, dim, stride_dim, inp_dim_size, M, N
         )
     return out
-
-
 
 
 def generate_gather_legacy_kernel(
@@ -551,10 +546,20 @@ def _gather_backward_sum_kernel(
     tl.store(output + oo, acc, mask=ov)
 
 
-@triton.jit(do_not_specialize=[
-    "N", "SLICE", "index_dim_size", "stride_dim",
-    "i_s0", "i_s1", "i_s2", "o_s0", "o_s1", "o_s2",
-])
+@triton.jit(
+    do_not_specialize=[
+        "N",
+        "SLICE",
+        "index_dim_size",
+        "stride_dim",
+        "i_s0",
+        "i_s1",
+        "i_s2",
+        "o_s0",
+        "o_s1",
+        "o_s2",
+    ]
+)
 def _gather_backward_scatter_kernel(
     index,
     grad,

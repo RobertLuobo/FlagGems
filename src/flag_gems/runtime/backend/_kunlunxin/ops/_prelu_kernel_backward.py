@@ -17,7 +17,7 @@ logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
     dtypes=[None, None, float],
 )
 @triton.jit
-def _prelu_kernel_backward_scalar_func(grad_output, x, weight): 
+def _prelu_kernel_backward_scalar_func(grad_output, x, weight):
     pos = tl.minimum(1.0, tl.maximum(0.0, x.to(tl.float32) * 1.0e30)).to(x.dtype)
     x_neg = tl.minimum(x, 0.0)
     grad_input = grad_output * (pos + (1.0 - pos) * weight)
@@ -31,7 +31,7 @@ def _prelu_kernel_backward_scalar_func(grad_output, x, weight):
     promotion_methods=[(0, 1, "DEFAULT"), (0, 1, "DEFAULT")],
 )
 @triton.jit
-def _prelu_kernel_backward_channel_func(grad_output, x, weight): 
+def _prelu_kernel_backward_channel_func(grad_output, x, weight):
     pos = tl.minimum(1.0, tl.maximum(0.0, x.to(tl.float32) * 1.0e30)).to(x.dtype)
     x_neg = tl.minimum(x, 0.0)
     grad_input = grad_output * (pos + (1.0 - pos) * weight)

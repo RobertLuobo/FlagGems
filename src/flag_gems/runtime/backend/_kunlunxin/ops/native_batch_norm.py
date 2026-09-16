@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -19,8 +18,6 @@ def make_3d_for_bn(input: Tensor) -> Tensor:
     elif input.ndim >= 4:
         input = input.flatten(2, -1)
     return input
-
-
 
 
 def _nbn_tile_s(spatial_dim):
@@ -99,7 +96,9 @@ def native_batch_norm_fused_stats_kernel(
             idx = off + tl.arange(0, TILE_S)
             if NEED_MASK:
                 m = idx < spatial_dim
-                x = tl.load(input_pointer + base + idx, mask=m, other=0.0).to(tl.float32)
+                x = tl.load(input_pointer + base + idx, mask=m, other=0.0).to(
+                    tl.float32
+                )
                 x = tl.where(m, x, 0.0)
                 acc += x
                 acc_sq += x * x
@@ -113,7 +112,9 @@ def native_batch_norm_fused_stats_kernel(
     tl.store(mean_pointer + c, mean)
     tl.store(inv_std_pointer + c, inv_std)
     tl.store(save_mean_pointer + c, mean.to(save_mean_pointer.dtype.element_ty))
-    tl.store(save_inv_std_pointer + c, inv_std.to(save_inv_std_pointer.dtype.element_ty))
+    tl.store(
+        save_inv_std_pointer + c, inv_std.to(save_inv_std_pointer.dtype.element_ty)
+    )
     if HAS_RM:
         running_mean = tl.load(running_mean_pointer + c).to(tl.float32)
         tl.store(
@@ -126,9 +127,9 @@ def native_batch_norm_fused_stats_kernel(
         running_var = tl.load(running_var_pointer + c).to(tl.float32)
         tl.store(
             running_var_pointer + c,
-            (
-                (1.0 - momentum) * running_var + momentum * var * var_correction
-            ).to(running_var_pointer.dtype.element_ty),
+            ((1.0 - momentum) * running_var + momentum * var * var_correction).to(
+                running_var_pointer.dtype.element_ty
+            ),
         )
 
 
@@ -176,7 +177,9 @@ def native_batch_norm_fused_normalize_kernel(
             else:
                 x = tl.load(input_pointer + base + idx).to(tl.float32)
                 y = weight * (x - mean) * inv_std + bias
-                tl.store(output_pointer + base + idx, y.to(output_pointer.dtype.element_ty))
+                tl.store(
+                    output_pointer + base + idx, y.to(output_pointer.dtype.element_ty)
+                )
 
 
 @libentry()
@@ -374,7 +377,11 @@ def native_batch_norm(
     has_bias = bias is not None
     var_correction = (count / (count - 1)) if count > 1 else 1.0
 
-    if training and (spatial_dim <= NBN_FUSED_S_MAX or batch_dim <= 1) and feat_dim <= NBN_MAX_PROGRAMS:
+    if (
+        training
+        and (spatial_dim <= NBN_FUSED_S_MAX or batch_dim <= 1)
+        and feat_dim <= NBN_MAX_PROGRAMS
+    ):
         mean_f = torch.empty(feat_dim, device=input.device, dtype=torch.float32)
         inv_f = torch.empty_like(mean_f)
         fused_tile_s, fused_need_m = _nbn_fused_tile_s(spatial_dim)

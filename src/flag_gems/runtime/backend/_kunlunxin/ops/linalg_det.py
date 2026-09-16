@@ -260,7 +260,9 @@ def _det_reduce_kernel(DG, OUT, N, LDA: tl.constexpr):
 
 @libentry()
 @triton.jit
-def _det_elim_kernel(W0, W1, OUT, N, LDA: tl.constexpr, TOT: tl.constexpr, BLK: tl.constexpr):
+def _det_elim_kernel(
+    W0, W1, OUT, N, LDA: tl.constexpr, TOT: tl.constexpr, BLK: tl.constexpr
+):
     """Single-launch Gaussian elimination with partial pivoting, one program
     per matrix.
 

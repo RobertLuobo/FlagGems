@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -10,8 +9,6 @@ from flag_gems.runtime import torch_device_fn
 from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
-
-
 
 
 @triton.jit

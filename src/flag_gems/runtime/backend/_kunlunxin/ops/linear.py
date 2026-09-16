@@ -218,9 +218,7 @@ def linear(input, weight, bias=None):
                 output.stride(1),
                 bias.stride(0) if bias is not None else 0,
                 BIAS=bias is not None,
-                EVEN=(
-                    (M % blk_m == 0) and (N % blk_n == 0) and (K % blk_k == 0)
-                ),
+                EVEN=((M % blk_m == 0) and (N % blk_n == 0) and (K % blk_k == 0)),
                 BLOCK_SIZE_M=blk_m,
                 BLOCK_SIZE_N=blk_n,
                 BLOCK_SIZE_K=blk_k,
@@ -235,7 +233,6 @@ def linear(input, weight, bias=None):
         output = output.squeeze(0)
 
     return output
-
 
 
 @libentry()
@@ -382,9 +379,7 @@ def _linear_legacy_kernel(input, weight, bias=None):
             output.stride(1),
             bias.stride(0) if bias is not None else 0,
             BIAS=bias is not None,
-            EVEN=(
-                _even(M, _EVEN_M) and _even(N, _EVEN_N) and _even(K, _EVEN_K)
-            ),
+            EVEN=(_even(M, _EVEN_M) and _even(N, _EVEN_N) and _even(K, _EVEN_K)),
         )
 
     output = output.view(*batch_dims, N)

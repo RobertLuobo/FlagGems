@@ -1,4 +1,3 @@
-
 import logging
 import math
 
@@ -11,8 +10,6 @@ from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.type_utils import ELEMENTWISE_TYPE_PROMOTION_KIND, type_promotion
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
-from flag_gems.utils import triton_lang_extension as ext
-from flag_gems.utils.type_utils import ELEMENTWISE_TYPE_PROMOTION_KIND, type_promotion
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +55,6 @@ def _pick_block(n_elements):
     if n_elements <= 65_536:
         return MIN_BLOCK, 4, True
     return _MASKED_FALLBACK_BLOCK, 4, True
-
-
 
 
 @triton.jit
@@ -110,8 +105,6 @@ def xlogy_kernel_unmasked(
     else:
         res = x * tl.log(y)
         tl.store(out_ptr + offset, res.to(out_ptr.dtype.element_ty))
-
-
 
 
 @triton.jit
@@ -212,8 +205,6 @@ def xlogy_tensor_scalar_ptr_kernel_unmasked(
     else:
         res = x * tl.log(y)
         tl.store(out_ptr + offset, res.to(out_ptr.dtype.element_ty))
-
-
 
 
 @triton.jit

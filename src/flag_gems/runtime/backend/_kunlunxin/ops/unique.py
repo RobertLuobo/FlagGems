@@ -1,4 +1,3 @@
-
 import logging
 import os
 
@@ -1024,7 +1023,6 @@ def global_cumsum_flat_impl_stage_2(
     sorted_data = tl.load(sorted_data_ptr + i0, mask=mask)
     sorted_indices = tl.load(sorted_indices_ptr + i0, mask=mask)
 
-
     total_in_mask = global_pid < global_ctas_num
     total = tl.load(total_in_ptr + global_pid, mask=total_in_mask)
 
@@ -1137,7 +1135,6 @@ def sorted_indices_unique_flat(
     if return_counts:
         idx = torch.empty_like(inverse_indices)
 
-
     with torch_device_fn.device(sorted_data.device.index):
         os.environ["TRITONXPU_OTHER_SIM"] = "1"
         os.environ["TRITONXPU_STORE_MASK_SIM"] = "1"
@@ -1206,7 +1203,6 @@ def sorted_indices_unique_flat(
                 ne_result, cumsum_result, num_blocks, num_tasks, W=2048
             )
 
-
             os.environ["TRITONXPU_OTHER_SIM"] = "1"
             os.environ["TRITONXPU_STORE_MASK_SIM"] = "1"
             os.environ["TRITONXPU_INTERLEAVE"] = "0"
@@ -1236,7 +1232,6 @@ def sorted_indices_unique_flat(
                 del os.environ["TRITONXPU_STORE_MASK_SIM"]
             if "TRITONXPU_INTERLEAVE" in os.environ:
                 del os.environ["TRITONXPU_INTERLEAVE"]
-
 
             os.environ["TRITONXPU_OTHER_SIM"] = "1"
             os.environ["TRITONXPU_STORE_MASK_SIM"] = "1"

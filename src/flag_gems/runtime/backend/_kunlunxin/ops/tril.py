@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -235,8 +234,6 @@ def _tril_strided_out_tile_kernel(
     x = tl.load(in_ptr + offs_n, mask=mask, other=0.0)
     result = tl.where(keep, x, 0.0)
     tl.store(out_ptr + offs_n * STRIDE_N, result, mask=mask)
-
-
 
 
 @triton.jit
@@ -926,9 +923,7 @@ def _launch_tril_inplace_contiguous(
         return input
 
     if _is_power_of_2(N) and active_rows * N >= _INPLACE_POW2_MIN_TOTAL:
-        return _launch_v2_pow2(
-            input, input, int(diagonal), active_rows=active_rows
-        )
+        return _launch_v2_pow2(input, input, int(diagonal), active_rows=active_rows)
 
     MN = M * N
     active_total = active_rows * N
@@ -1186,7 +1181,16 @@ def _zc_zero_upper_storage_kernel(
 
 @triton.jit
 def _zc_zero_upper_row_kernel(
-    ptr, M, N, diag, B, BATCH_STRIDE, ROW_STRIDE, NI, BLOCK: tl.constexpr, RPC: tl.constexpr
+    ptr,
+    M,
+    N,
+    diag,
+    B,
+    BATCH_STRIDE,
+    ROW_STRIDE,
+    NI,
+    BLOCK: tl.constexpr,
+    RPC: tl.constexpr,
 ):
     """out [B, M, N] with unit col stride: zero [i + diag + 1, N) of logical row
     (b, i). NI = min(M, N - diag - 1) = rows per batch with nonzero work.
@@ -1203,13 +1207,19 @@ def _zc_zero_upper_row_kernel(
             if lo < hi:
                 m = tl.arange(0, BLOCK) < (hi - lo)
                 tl.store(
-                    ptr + (row // NI) * BATCH_STRIDE + i * ROW_STRIDE + lo + tl.arange(0, BLOCK),
+                    ptr
+                    + (row // NI) * BATCH_STRIDE
+                    + i * ROW_STRIDE
+                    + lo
+                    + tl.arange(0, BLOCK),
                     0.0,
                     mask=m,
                 )
 
 
-def _launch_tril_out_copied_zero(input: torch.Tensor, out: torch.Tensor, diagonal: int) -> bool:
+def _launch_tril_out_copied_zero(
+    input: torch.Tensor, out: torch.Tensor, diagonal: int
+) -> bool:
     """Copy-first + store-only-zero-upper for non-contiguous tril_out.
 
     Returns True if the fast path was taken. The vendor native strided copy

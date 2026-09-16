@@ -1,4 +1,3 @@
-
 """Fast Hadamard Transform in Triton (KunlunXin).
 
 v0: Multi-pass butterfly via global memory, 1 kernel launch per stage.
@@ -14,8 +13,6 @@ import triton.language as tl
 from ..utils.tle_copy import tle_copy
 
 MAX_GRID = 65535
-
-
 
 
 @triton.jit
@@ -53,8 +50,6 @@ def _butterfly_stage(
             tl.store(OUT_ptr + base + offsets, result)
 
 
-
-
 @triton.jit
 def _scale_cast(
     IN_ptr,
@@ -75,8 +70,6 @@ def _scale_cast(
         if row_id < N_ROWS:
             x = tl.load(IN_ptr + row_id * stride_in_row + offsets)
             tl.store(OUT_ptr + row_id * stride_out_row + offsets, x * scale)
-
-
 
 
 def _hadamard_transform_fwd(x, scale):
@@ -138,8 +131,6 @@ def _hadamard_transform_fwd(x, scale):
     return out.reshape(orig_shape)
 
 
-
-
 class HadamardTransformFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, scale):
@@ -154,8 +145,6 @@ class HadamardTransformFn(torch.autograd.Function):
             ),
             None,
         )
-
-
 
 
 def hadamard_transform(x, scale=1.0):
@@ -173,8 +162,6 @@ def hadamard_transform(x, scale=1.0):
     the next power of 2.
     """
     return HadamardTransformFn.apply(x, scale)
-
-
 
 
 def hadamard_transform_12N(x, scale=1.0):

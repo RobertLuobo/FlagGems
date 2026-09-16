@@ -1,4 +1,3 @@
-
 import logging
 import math
 from collections import namedtuple
@@ -550,7 +549,15 @@ def min_dim(inp, dim=None, keepdim=False):
         CHUNK = (
             1024
             if N % 1024 == 0
-            else (512 if N % 512 == 0 else (256 if N % 256 == 0 else (128 if N % 128 == 0 else 64 if N % 64 == 0 else 0)))
+            else (
+                512
+                if N % 512 == 0
+                else (
+                    256
+                    if N % 256 == 0
+                    else (128 if N % 128 == 0 else 64 if N % 64 == 0 else 0)
+                )
+            )
         )
         M2 = M * K
         is_fp32 = inp.dtype == torch.float32
@@ -579,7 +586,15 @@ def min_dim(inp, dim=None, keepdim=False):
                     bm2 = (
                         32
                         if M2 % 32 == 0
-                        else (16 if M2 % 16 == 0 else (8 if M2 % 8 == 0 else (4 if M2 % 4 == 0 else 2 if M2 % 2 == 0 else 1)))
+                        else (
+                            16
+                            if M2 % 16 == 0
+                            else (
+                                8
+                                if M2 % 8 == 0
+                                else (4 if M2 % 4 == 0 else 2 if M2 % 2 == 0 else 1)
+                            )
+                        )
                     )
                     bm3 = (
                         8

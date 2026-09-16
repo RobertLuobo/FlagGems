@@ -1,4 +1,3 @@
-
 import importlib
 import os
 from typing import Callable, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -817,7 +816,6 @@ class WrapperGenerator:
             code.writeline(f"    tile_size = {_BAD_TILE_SIZE_1D_FALLBACK}")
             code.writeline("    num_tiles = triton.cdiv(num_tasks, tile_size)")
             code.writeline("    num_ctas = num_tiles")
-
 
             code.writeline("tiles_per_cta = triton.cdiv(num_tiles, num_ctas)")
             code.writeline("num_warps = heuristics_for_num_warps(tile_size)")

@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -218,8 +217,6 @@ def _trsm_diag_xpu_kernel(
         tl.store(B_ptr + bbase + row * csb + cc, acc, mask=cm)
 
 
-
-
 @libentry()
 @triton.jit
 def _trsm_m_square_kernel(
@@ -244,8 +241,11 @@ def _trsm_m_square_kernel(
     t = R0 + rows
     if PAD:
         rm = t < N
-        a_blk = tl.load(A_ptr + abase + t[:, None] * rsa + t[None, :],
-                        mask=rm[:, None] & rm[None, :], other=0.0)
+        a_blk = tl.load(
+            A_ptr + abase + t[:, None] * rsa + t[None, :],
+            mask=rm[:, None] & rm[None, :],
+            other=0.0,
+        )
         diag = tl.load(A_ptr + abase + t * rsa + t, mask=rm, other=1.0)
     else:
         a_blk = tl.load(A_ptr + abase + t[:, None] * rsa + t[None, :])
@@ -302,8 +302,9 @@ def _trsm_m_apply_kernel(
     t = R0 + rows
     if PAD:
         rm = t < N
-        b = tl.load(B_ptr + bbase + t[:, None] * csb + cn[None, :],
-                    mask=rm[:, None], other=0.0)
+        b = tl.load(
+            B_ptr + bbase + t[:, None] * csb + cn[None, :], mask=rm[:, None], other=0.0
+        )
     else:
         b = tl.load(B_ptr + bbase + t[:, None] * csb + cn[None, :])
     if K0 == 0:
@@ -365,12 +366,21 @@ def _trsm_window_dot_kernel(
     if PAD:
         rmr = (mrow >= 0) & (mrow < N)
         rmc = (mcol >= 0) & (mcol < N)
-        a = tl.load(A_ptr + abase + mrow[:, None] * rsa + mcol[None, :],
-                    mask=rmr[:, None] & rmc[None, :], other=0.0)
-        x = tl.load(B_ptr + bbase + mcol[:, None] * csb + cn[None, :],
-                    mask=rmc[:, None], other=0.0)
-        b = tl.load(B_ptr + bbase + mrow[:, None] * csb + cn[None, :],
-                    mask=rmr[:, None], other=0.0)
+        a = tl.load(
+            A_ptr + abase + mrow[:, None] * rsa + mcol[None, :],
+            mask=rmr[:, None] & rmc[None, :],
+            other=0.0,
+        )
+        x = tl.load(
+            B_ptr + bbase + mcol[:, None] * csb + cn[None, :],
+            mask=rmc[:, None],
+            other=0.0,
+        )
+        b = tl.load(
+            B_ptr + bbase + mrow[:, None] * csb + cn[None, :],
+            mask=rmr[:, None],
+            other=0.0,
+        )
     else:
         a = tl.load(A_ptr + abase + mrow[:, None] * rsa + mcol[None, :])
         x = tl.load(B_ptr + bbase + mcol[:, None] * csb + cn[None, :])
@@ -482,7 +492,7 @@ def _solve_tri_dot(A_view, B_view, unitriangular, upper, n, k, batch, orig_shape
     rsa = A_view.stride(1)
     csb = kpad
     nb = (n + bs - 1) // bs
-    pad = (n % bs != 0)
+    pad = n % bs != 0
     Ms = torch.empty((batch, 6, bs, bs), dtype=dtype, device=device)
     msa = bs * bs
     msa_b = 6 * msa

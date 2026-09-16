@@ -1,5 +1,3 @@
-
-
 import logging
 
 import torch
@@ -304,11 +302,7 @@ def hypot_(self: torch.Tensor, other):
             f"tensor self {tuple(self.shape)}"
         )
 
-    if (
-        self.is_contiguous()
-        and other_t.shape == self.shape
-        and other_t.is_contiguous()
-    ):
+    if self.is_contiguous() and other_t.shape == self.shape and other_t.is_contiguous():
         _launch_hypot_inplace_flat(self, other_t)
         return self
 

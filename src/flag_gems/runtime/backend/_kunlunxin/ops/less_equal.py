@@ -75,7 +75,9 @@ def less_equal_scalar(A, B):
             numel >= _LESS_EQUAL_SCALAR_FAST_TILE
             and numel % _LESS_EQUAL_SCALAR_FAST_TILE == 0
         ):
-            return _less_equal_scalar_fast(A, s, (numel // _LESS_EQUAL_SCALAR_FAST_TILE,))
+            return _less_equal_scalar_fast(
+                A, s, (numel // _LESS_EQUAL_SCALAR_FAST_TILE,)
+            )
         if (
             numel >= _LESS_EQUAL_SCALAR_MASKED_MIN
             and numel % _LESS_EQUAL_SCALAR_FAST_TILE != 0

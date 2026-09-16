@@ -1,4 +1,3 @@
-
 import torch
 import triton
 import triton.language as tl
@@ -97,9 +96,9 @@ def _te_rmsnorm_bwd_dgamma_reduce_kernel(
     cmask = cols < N
     acc = tl.zeros([C], dtype=tl.float32)
     for i in range(0, P):
-        acc += tl.load(
-            dgamma_partial_ptr + i * N + cols, mask=cmask, other=0.0
-        ).to(tl.float32)
+        acc += tl.load(dgamma_partial_ptr + i * N + cols, mask=cmask, other=0.0).to(
+            tl.float32
+        )
     tl.store(dgamma_ptr + cols, acc, mask=cmask)
 
 

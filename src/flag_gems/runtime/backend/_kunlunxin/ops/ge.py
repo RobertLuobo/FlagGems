@@ -1,4 +1,3 @@
-
 import logging
 import math
 import os
@@ -90,10 +89,14 @@ def _ge_scalar_raw(A, s, dtype):
         )
         return _raw_greater_scalar(A, pred_s)
     if s == 0.0 or abs(s) >= _GE_SCALAR_MIN_NORM:
-        s_eff = -_GE_SCALAR_MIN_NORM if s == 0.0 else float(
-            torch.tensor(s, dtype=dtype)
-            .nextafter(torch.tensor(float("-inf"), dtype=dtype))
-            .item()
+        s_eff = (
+            -_GE_SCALAR_MIN_NORM
+            if s == 0.0
+            else float(
+                torch.tensor(s, dtype=dtype)
+                .nextafter(torch.tensor(float("-inf"), dtype=dtype))
+                .item()
+            )
         )
         return _raw_greater_scalar(A, s_eff)
     out = _raw_lt_scalar(A, s)

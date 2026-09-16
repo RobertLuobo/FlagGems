@@ -1,4 +1,3 @@
-
 import logging
 import math
 from collections import namedtuple
@@ -16,7 +15,6 @@ from .sort import radix_sort_low_mem
 logger = logging.getLogger(__name__)
 
 ModeResult = namedtuple("mode", ["values", "indices"])
-
 
 
 @libentry()

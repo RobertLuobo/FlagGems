@@ -1,4 +1,3 @@
-
 """Kunlunxin (XPU) reflection_pad2d_backward.
 
 The backward of reflection padding is a *separable* bilinear fold::

@@ -64,7 +64,9 @@ def diff(input, n=1, dim=-1, prepend=None, append=None) -> torch.Tensor:
         empty_tensor = torch.tensor([], dtype=input.dtype, device=input.device)
         return torch.reshape(empty_tensor, shape[:dim] + [0] + shape[(dim + 1) :])
 
-    if (n == 1 or (n == 2 and input.dtype != torch.bfloat16)) and input.numel() > TINY_NUMEL:
+    if (
+        n == 1 or (n == 2 and input.dtype != torch.bfloat16)
+    ) and input.numel() > TINY_NUMEL:
         out = input
         for _ in range(n):
             idx_hi = [slice(None)] * out.ndim

@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -22,10 +21,6 @@ def make_3d_for_bn(input: Tensor) -> Tensor:
     elif input.ndim >= 4:
         input = input.flatten(2, -1)
     return input
-
-
-
-
 
 
 @libentry()
@@ -181,10 +176,6 @@ def batch_norm_normalize_kernel(
             x = tl.load(input_pointer + base + idx).to(tl.float32)
             y = weight * (x - mean) * inv_std + bias
             tl.store(output_pointer + base + idx, y.to(output_pointer.dtype.element_ty))
-
-
-
-
 
 
 @libentry()
@@ -445,8 +436,6 @@ def batch_norm_forward_kernel(
                 output,
                 mask=batch_mask[:, None] & spatial_mask[None, :],
             )
-
-
 
 
 @libentry()
@@ -795,7 +784,9 @@ def batch_norm(
     )
     has_weight = weight is not None
     has_bias = bias is not None
-    var_correction = (count / (count - 1)) if (unbiased_running_var and count > 1) else 1.0
+    var_correction = (
+        (count / (count - 1)) if (unbiased_running_var and count > 1) else 1.0
+    )
 
     if count <= BN_FUSED_TRAIN_MAX_ELEMS:
         fused_tile_s, fused_need_m = _bn_fused_tile_s(spatial_dim)

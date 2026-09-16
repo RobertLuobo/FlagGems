@@ -44,12 +44,12 @@ def _fractional_max_pool2d_forward_kernel(
 
     sample_alpha_h = (sample_height * alpha_height).to(tl.int32)
     sample_alpha_w = (sample_width * alpha_width).to(tl.int32)
-    start_height = (
-        (output_row.to(tl.float32) + sample_height) * alpha_height
-    ).to(tl.int32) - sample_alpha_h
-    start_width = (
-        (output_column.to(tl.float32) + sample_width) * alpha_width
-    ).to(tl.int32) - sample_alpha_w
+    start_height = ((output_row.to(tl.float32) + sample_height) * alpha_height).to(
+        tl.int32
+    ) - sample_alpha_h
+    start_width = ((output_column.to(tl.float32) + sample_width) * alpha_width).to(
+        tl.int32
+    ) - sample_alpha_w
     start_height = tl.where(
         output_row == output_height - 1,
         input_height - kernel_height,
@@ -68,9 +68,9 @@ def _fractional_max_pool2d_forward_kernel(
         input_row = start_height + kernel_row
         for kernel_column in tl.static_range(0, kernel_width):
             input_column = start_width + kernel_column
-            value = tl.load(
-                plane_base + input_row * input_width + input_column
-            ).to(tl.float32)
+            value = tl.load(plane_base + input_row * input_width + input_column).to(
+                tl.float32
+            )
             update = value > max_value
             max_value = tl.where(update, value, max_value)
             max_index = tl.where(
@@ -185,11 +185,15 @@ def _fractional_max_pool2d_backward_gather_kernel(
     oh_lo = tl.maximum(
         0, (tl.maximum(h - k_h, 0).to(tl.float32) * inv_alpha_h).to(tl.int32) - 2
     )
-    oh_hi = tl.minimum(out_h - 1, ((h + 1).to(tl.float32) * inv_alpha_h).to(tl.int32) + 2)
+    oh_hi = tl.minimum(
+        out_h - 1, ((h + 1).to(tl.float32) * inv_alpha_h).to(tl.int32) + 2
+    )
     ow_lo = tl.maximum(
         0, (tl.maximum(w - k_w, 0).to(tl.float32) * inv_alpha_w).to(tl.int32) - 2
     )
-    ow_hi = tl.minimum(out_w - 1, ((w + 1).to(tl.float32) * inv_alpha_w).to(tl.int32) + 2)
+    ow_hi = tl.minimum(
+        out_w - 1, ((w + 1).to(tl.float32) * inv_alpha_w).to(tl.int32) + 2
+    )
 
     out_per_nc = out_h * out_w
     gop = grad_output_ptr + nc * out_per_nc
@@ -339,9 +343,7 @@ def fractional_max_pool2d_backward(
     with torch_device_fn.device(input.device):
         if scatter_h and scatter_w:
             grad_input = torch.zeros_like(input)
-            _fractional_max_pool2d_backward_scatter_kernel[
-                (triton.cdiv(n_out, 256),)
-            ](
+            _fractional_max_pool2d_backward_scatter_kernel[(triton.cdiv(n_out, 256),)](
                 grad_output,
                 indices,
                 grad_input,
@@ -366,7 +368,9 @@ def fractional_max_pool2d_backward(
             )
             max_h = max(
                 1,
-                min(output_height, int(math.ceil((kernel_height + 1) * inv_alpha_h)) + 6),
+                min(
+                    output_height, int(math.ceil((kernel_height + 1) * inv_alpha_h)) + 6
+                ),
             )
             max_w = max(
                 1,
@@ -374,9 +378,7 @@ def fractional_max_pool2d_backward(
             )
             n_elems = input.numel()
             grad_input = torch.empty_like(input)
-            _fractional_max_pool2d_backward_gather_kernel[
-                (triton.cdiv(n_elems, 128),)
-            ](
+            _fractional_max_pool2d_backward_gather_kernel[(triton.cdiv(n_elems, 128),)](
                 grad_output,
                 indices,
                 grad_input,

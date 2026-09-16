@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -90,7 +89,6 @@ def softmax_kernel_inner(
             inp = tl.load(input_ptr + n_offsets, mask=mask, other=-float("inf"))
             o = tl.exp(inp - m) / z
             tl.store(output_ptr + n_offsets, o, mask=mask)
-
 
 
 _SM_MR_MAX_N = 4096
@@ -596,8 +594,6 @@ def _softmax_forward_launch(output, inp, M, N):
     )
 
 
-
-
 def softmax_backward_kernel_inner_heru_tile_n(args):
     N = args["N"]
     if N <= 32768:
@@ -673,7 +669,6 @@ def softmax_backward_kernel_inner(
             )
             in_grad_tile = out_tile * (out_grad_tile - scale)
             tl.store(in_grad_ptr + n_offsets, in_grad_tile, mask=mask)
-
 
 
 _SB_MR_MAX_N = 4096
@@ -816,8 +811,6 @@ def softmax_backward_kernel_tail_pass(
         tl.float32
     )
     tl.store(in_grad_ptr + pid * N + PREV + tno, o * (g - scale), mask=tmask)
-
-
 
 
 def _softmax_backward_launch_k1(output, grad_output, in_grad, M, N, input_dtype):
@@ -1099,9 +1092,7 @@ def softmax_backward(grad_output, output, dim, input_dtype, grad_input=None):
             _softmax_backward_launch_k1(
                 out_reshaped, out_grad_reshaped, in_grad_reshaped, M * K, N, input_dtype
             )
-            in_grad = (
-                in_grad_reshaped.view(M, K, N).transpose(1, 2).view(output.shape)
-            )
+            in_grad = in_grad_reshaped.view(M, K, N).transpose(1, 2).view(output.shape)
         else:
             _softmax_backward_launch_k1(output, grad_output, in_grad, M, N, input_dtype)
     return in_grad

@@ -1,4 +1,3 @@
-
 import functools
 import logging
 import math
@@ -8,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
+
 from flag_gems.runtime import torch_device_fn
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
@@ -35,18 +35,28 @@ _RAW_TYPE_CODE = {
 if _TLE_OK:
 
     @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "lt_raw.xpu"))
-    def lt_scalar_raw(in_, out, numel, esz, type_code, scalar_bits,
-                      chunk_start, chunk_count):
-        ...
+    def lt_scalar_raw(
+        in_, out, numel, esz, type_code, scalar_bits, chunk_start, chunk_count
+    ): ...
 
-    @triton.jit(do_not_specialize=["numel", "esz", "type_code", "scalar_bits",
-                                   "chunk_count"])
-    def lt_scalar_raw_kernel(In, Out, numel, esz, type_code, scalar_bits,
-                             chunk_count):
+    @triton.jit(
+        do_not_specialize=["numel", "esz", "type_code", "scalar_bits", "chunk_count"]
+    )
+    def lt_scalar_raw_kernel(In, Out, numel, esz, type_code, scalar_bits, chunk_count):
         pid = tl.program_id(0)
-        tle.raw.call(lt_scalar_raw, (In, Out, numel, esz, type_code,
-                                     scalar_bits, pid * chunk_count,
-                                     chunk_count))
+        tle.raw.call(
+            lt_scalar_raw,
+            (
+                In,
+                Out,
+                numel,
+                esz,
+                type_code,
+                scalar_bits,
+                pid * chunk_count,
+                chunk_count,
+            ),
+        )
 
 
 def _view_u8(t):
@@ -92,8 +102,10 @@ def _raw_lt_scalar(A, B):
     per = (total_chunks + _NCLUSTER - 1) // _NCLUSTER
     with torch_device_fn.device(A.device):
         lt_scalar_raw_kernel[(_NCLUSTER,)](
-            _view_u8(A), _view_u8(out), M, esz, type_code, s_bits, per)
+            _view_u8(A), _view_u8(out), M, esz, type_code, s_bits, per
+        )
     return out
+
 
 logger = logging.getLogger(__name__)
 

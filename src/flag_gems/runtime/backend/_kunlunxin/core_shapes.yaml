@@ -13,7 +13,6 @@
 # limitations under the License.
 
 fractional_max_pool2d_backward:
-fractional_max_pool2d_backward:
   shapes:
     - [4, 3, 224, 224]
     - [16, 64, 56, 56]

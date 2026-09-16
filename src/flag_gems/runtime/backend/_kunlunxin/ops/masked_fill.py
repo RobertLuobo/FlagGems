@@ -6,8 +6,8 @@ import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
-from flag_gems.runtime import torch_device_fn
 
+from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import broadcastable_to
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
@@ -129,19 +129,36 @@ _RAW_TYPE_CODE = {
 if _TLE_OK:
 
     @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "masked_fill_raw.xpu"))
-    def masked_fill_raw_(in_, mask, numel, esz, type_code, value_bits,
-                         chunk_start, chunk_count):
-        ...
+    def masked_fill_raw_(
+        in_, mask, numel, esz, type_code, value_bits, chunk_start, chunk_count
+    ): ...
 
-    @triton.jit(do_not_specialize=[
-        "numel", "esz", "type_code", "value_bits", "chunk_count",
-    ])
-    def masked_fill_raw_kernel(In, Mask, numel, esz, type_code, value_bits,
-                               chunk_count):
+    @triton.jit(
+        do_not_specialize=[
+            "numel",
+            "esz",
+            "type_code",
+            "value_bits",
+            "chunk_count",
+        ]
+    )
+    def masked_fill_raw_kernel(
+        In, Mask, numel, esz, type_code, value_bits, chunk_count
+    ):
         pid = tl.program_id(0)
-        tle.raw.call(masked_fill_raw_, (In, Mask, numel, esz, type_code,
-                                        value_bits, pid * chunk_count,
-                                        chunk_count))
+        tle.raw.call(
+            masked_fill_raw_,
+            (
+                In,
+                Mask,
+                numel,
+                esz,
+                type_code,
+                value_bits,
+                pid * chunk_count,
+                chunk_count,
+            ),
+        )
 
 
 def _raw_masked_fill_(inp, mask, value):
@@ -164,8 +181,14 @@ def _raw_masked_fill_(inp, mask, value):
     per = (total_chunks + _NCLUSTER - 1) // _NCLUSTER
     with torch_device_fn.device(inp.device):
         masked_fill_raw_kernel[(_NCLUSTER,)](
-            inp.view(torch.uint8), mask.view(torch.uint8), M, esz, type_code,
-            value_bits, per)
+            inp.view(torch.uint8),
+            mask.view(torch.uint8),
+            M,
+            esz,
+            type_code,
+            value_bits,
+            per,
+        )
     return inp
 
 

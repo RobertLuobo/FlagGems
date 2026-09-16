@@ -1,4 +1,3 @@
-
 import logging
 from typing import Optional
 
@@ -19,8 +18,6 @@ config_ = CodeGenConfig(
     prefer_1d_tile=True,
     is_scatter_slice=True,
 )
-
-
 
 
 @pointwise_dynamic(

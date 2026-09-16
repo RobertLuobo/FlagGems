@@ -1,4 +1,3 @@
-
 import builtins
 import logging
 
@@ -48,6 +47,7 @@ def mean(inp, *, dtype=None):
     with torch_device_fn.device(inp.device):
         mean_scalar_kernel[(1, 1, 1)](inp, out, M, BLOCK_SIZE, buffer_size_limit=2048)
     return out
+
 
 _TILE_BUDGET = 32768
 _N_WIDE = 8192
@@ -201,7 +201,16 @@ def mean_dim_mid_combine_kernel(Sum, Out, nchunks, stride, N, TILE_C: tl.constex
 @libentry()
 @triton.jit
 def mean_dim_mid_wide_partial_kernel(
-    X, Sum, M, N, K, nchunks, n_groups, n_base, slot_base, K_PAD: tl.constexpr,
+    X,
+    Sum,
+    M,
+    N,
+    K,
+    nchunks,
+    n_groups,
+    n_base,
+    slot_base,
+    K_PAD: tl.constexpr,
     T: tl.constexpr,
 ):
     """Affine per-chunk partial sums of the middle dim, via one mma dot.
@@ -236,7 +245,9 @@ def mean_dim_mid_wide_partial_kernel(
 
 @libentry()
 @triton.jit
-def mean_dim_mid_wide_single_kernel(X, Out, M, N, K, K_PAD: tl.constexpr, T: tl.constexpr):
+def mean_dim_mid_wide_single_kernel(
+    X, Out, M, N, K, K_PAD: tl.constexpr, T: tl.constexpr
+):
     """Single-chunk wide path: N == T covers the whole reduction in one
     (m, g)-program, so the mma-dot partial is already the final sum and is
     stored directly to Out (scaled by 1/N) -- no partial buffer, no combine
@@ -372,9 +383,7 @@ def _mean_dim_mid_wide(x, M, N, K, dtype, out_shape):
     out = torch.empty(out_shape, dtype=dtype, device=x.device)
     if nchunks == 1 and nchA == 1:
         with torch_device_fn.device(x.device):
-            mean_dim_mid_wide_single_kernel[(M,)](
-                x, out, M, N, K, K_PAD=K_PAD, T=BN
-            )
+            mean_dim_mid_wide_single_kernel[(M,)](x, out, M, N, K, K_PAD=K_PAD, T=BN)
         return out
     spart = torch.empty(M * nchunks * K_PAD, dtype=torch.float32, device=x.device)
     with torch_device_fn.device(x.device):
@@ -419,7 +428,9 @@ def _mean_dim_mid_wide(x, M, N, K, dtype, out_shape):
                 CHUNK=triton.next_power_of_2(n_rem),
                 buffer_size_limit=2048,
             )
-        nch_groups = (nchunks + _MID_WIDE_COMB_MAX_UNROLL - 1) // _MID_WIDE_COMB_MAX_UNROLL
+        nch_groups = (
+            nchunks + _MID_WIDE_COMB_MAX_UNROLL - 1
+        ) // _MID_WIDE_COMB_MAX_UNROLL
         if nch_groups > 1:
             sp2 = torch.empty(
                 M * nch_groups * K_PAD, dtype=torch.float32, device=x.device
@@ -514,7 +525,9 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
             else:
                 out = torch.empty(out_shape, dtype=dtype, device=x.device)
                 BLOCK_K = (
-                    _MID_ONLINE_TILE_K if K >= _MID_ONLINE_TILE_K else triton.next_power_of_2(K)
+                    _MID_ONLINE_TILE_K
+                    if K >= _MID_ONLINE_TILE_K
+                    else triton.next_power_of_2(K)
                 )
                 grid = (M, triton.cdiv(K, BLOCK_K))
                 with torch_device_fn.device(x.device):

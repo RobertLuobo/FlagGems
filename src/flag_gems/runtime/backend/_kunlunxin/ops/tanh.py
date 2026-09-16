@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -35,7 +34,11 @@ def tanh_backward_flat_kernel(y_ptr, dy_ptr, out_ptr, BLOCK: tl.constexpr):
 
 @triton.jit
 def tanh_backward_flat_masked_kernel(
-    y_ptr, dy_ptr, out_ptr, n_elements, BLOCK: tl.constexpr,
+    y_ptr,
+    dy_ptr,
+    out_ptr,
+    n_elements,
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)

@@ -1,4 +1,3 @@
-
 import logging
 
 from .batch_norm import batch_norm

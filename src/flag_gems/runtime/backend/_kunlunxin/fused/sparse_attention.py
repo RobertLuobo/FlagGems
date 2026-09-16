@@ -1,9 +1,6 @@
-
 import torch
 import triton
 import triton.language as tl
-
-
 
 
 @triton.jit
@@ -44,9 +41,7 @@ def _sparse_attn_scores_kernel(
 
     offs_k = i_t * BLOCK_K + tl.arange(0, BLOCK_K)
     ks = tl.minimum(offs_k, topk - 1)
-    ids = tl.load(
-        topk_idxs + i_b * stride_idxb + i_m * stride_idxm + ks * stride_idxk
-    )
+    ids = tl.load(topk_idxs + i_b * stride_idxb + i_m * stride_idxm + ks * stride_idxk)
     valid = (offs_k < topk) & (ids >= 0)
     ids = tl.where(valid, ids, 0)
 
@@ -155,9 +150,7 @@ def _sparse_attn_gather_td_kernel(
         + offs_d[None, :] * stride_kvd
     )
 
-    tl.store(
-        GKV_TD + i_bm * (TP * D) + offs_t[:, None] * D + offs_d[None, :], v
-    )
+    tl.store(GKV_TD + i_bm * (TP * D) + offs_t[:, None] * D + offs_d[None, :], v)
 
 
 @triton.jit
@@ -190,7 +183,9 @@ def _sparse_attn_pv_kernel(
         vb = tl.load(v_base + (it * BT + offs_t)[:, None] * D + offs_v[None, :])
         acc = tl.dot(pb, vb, acc, out_dtype=tl.float32)
 
-    tl.store(O + (i_bm * AH + offs_h[:, None]) * D + offs_v[None, :], acc.to(tl.bfloat16))
+    tl.store(
+        O + (i_bm * AH + offs_h[:, None]) * D + offs_v[None, :], acc.to(tl.bfloat16)
+    )
 
 
 def sparse_attn_triton(

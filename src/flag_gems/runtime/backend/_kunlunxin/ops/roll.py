@@ -1,4 +1,3 @@
-
 """Kunlunxin(XPU) specialization of ``aten::roll``.
 
 The generic implementation gathers every output element with a runtime

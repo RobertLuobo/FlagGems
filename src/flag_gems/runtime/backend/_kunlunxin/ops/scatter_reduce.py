@@ -1,4 +1,3 @@
-
 import logging
 
 import triton
@@ -295,9 +294,21 @@ def _scatter_reduce_general_kernel(
     index,
     src,
     out,
-    s0, s1, s2, s3, s4,
-    i0, i1, i2, i3, i4,
-    r0, r1, r2, r3, r4,
+    s0,
+    s1,
+    s2,
+    s3,
+    s4,
+    i0,
+    i1,
+    i2,
+    i3,
+    i4,
+    r0,
+    r1,
+    r2,
+    r3,
+    r4,
     DIM: tl.constexpr,
     REDUCE: tl.constexpr,
     INCLUDE_SELF: tl.constexpr,
@@ -370,9 +381,9 @@ def _scatter_reduce_general_kernel(
     valid = valid_fp & (offsets < dim_size)
     indices = tl.load(index + index_base + offsets * index_stride, mask=valid, other=-1)
     selected = valid & (indices == destination)
-    values = tl.load(src + src_base + offsets * src_stride, mask=selected, other=0.0).to(
-        tl.float32
-    )
+    values = tl.load(
+        src + src_base + offsets * src_stride, mask=selected, other=0.0
+    ).to(tl.float32)
     self_value = tl.load(inp + output_offset).to(tl.float32)
     selected_count = tl.sum(selected.to(tl.int32), axis=0)
     if REDUCE == 0:
@@ -425,9 +436,21 @@ def _scatter_reduce_prod_general_kernel(
     index,
     src,
     out,
-    s0, s1, s2, s3, s4,
-    i0, i1, i2, i3, i4,
-    r0, r1, r2, r3, r4,
+    s0,
+    s1,
+    s2,
+    s3,
+    s4,
+    i0,
+    i1,
+    i2,
+    i3,
+    i4,
+    r0,
+    r1,
+    r2,
+    r3,
+    r4,
     DIM: tl.constexpr,
     INCLUDE_SELF: tl.constexpr,
 ):
@@ -644,9 +667,14 @@ def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
                 index,
                 src,
                 result,
-                outer_i, in_dim, inner_i,
-                outer_d, idx_dim, inner_d,
-                src_dim, src_inner,
+                outer_i,
+                in_dim,
+                inner_i,
+                outer_d,
+                idx_dim,
+                inner_d,
+                src_dim,
+                src_inner,
                 DIM=1,
                 INCLUDE_SELF=include_self,
                 isCloseVectorization=True,
@@ -658,9 +686,14 @@ def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
                 index,
                 src,
                 result,
-                outer_i, in_dim, inner_i,
-                outer_d, idx_dim, inner_d,
-                src_dim, src_inner,
+                outer_i,
+                in_dim,
+                inner_i,
+                outer_d,
+                idx_dim,
+                inner_d,
+                src_dim,
+                src_inner,
                 DIM=1,
                 REDUCE=_REDUCTIONS[reduce],
                 INCLUDE_SELF=include_self,

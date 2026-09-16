@@ -1,4 +1,3 @@
-
 import logging
 import math
 import os
@@ -11,9 +10,9 @@ from flag_gems.ops.zeros import zero_
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
+from ..utils.tle_copy import tle_copy
 from .cumsum import cumsum
 from .topk import _get_finfo_val, _get_iinfo_val, argsort
-from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +129,7 @@ def compute_global_hist_kernel(
                 arr = tl.load(arr_ptr + pid_m * n + n_offsets, mask=mask)
                 arr = convert_to_uint_preverse_order(arr, descending)
                 key = (arr >> bit_offset) & bfe_mask
-                matches = tl.where(
-                    mask, (bin_indices[:, None] == key), False
-                )
+                matches = tl.where(mask, (bin_indices[:, None] == key), False)
                 acc += matches
             local_sum = tl.sum(acc, axis=1)
             tl.atomic_add(
@@ -161,8 +158,6 @@ def sweep(
     k_bits: tl.constexpr,
     descending: tl.constexpr,
 ):
-
-
 
     pid = tl.program_id(0)
     pid_m = pid % m
@@ -206,12 +201,8 @@ def sweep(
         pack2 = inclusive_prefix_mask | (exclusive_prefix + local_sum)
         tl.store(status_ptr + status_offset, pack2, cache_modifier=".cg")
 
-        local_ex_cumsum = (
-            tl.cumsum(matches.to(tl.uint32), axis=0) - matches
-        )
-        ex_cumsum_in_bin = (
-            exclusive_prefix + local_ex_cumsum
-        )
+        local_ex_cumsum = tl.cumsum(matches.to(tl.uint32), axis=0) - matches
+        ex_cumsum_in_bin = exclusive_prefix + local_ex_cumsum
 
         ex_cumsum_bins = tl.load(
             excumsum_bins_ptr + pid_m * (n_passes * r) + pass_id * r + bin_index

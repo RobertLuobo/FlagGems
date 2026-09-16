@@ -1,4 +1,3 @@
-
 import logging
 
 import torch
@@ -538,8 +537,6 @@ def nll_loss2d_backward_flat_kernel(
     tl.store(inp_grad_ptrs, inp_grad)
 
 
-
-
 def nll_loss_forward(self, target, weight=None, reduction=1, ignore_index=-100):
     logger.debug("GEMS_KUNLUNXIN NLL_LOSS_FWD")
     assert self.ndim <= 2, "Invalid input ndim"
@@ -771,12 +768,8 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
                 )
             else:
                 nprog, tpp = _nll2d_partial_config(ntiles)
-                pout = torch.empty(
-                    (nprog,), dtype=torch.float32, device=self.device
-                )
-                pwgt = torch.empty(
-                    (nprog,), dtype=torch.float32, device=self.device
-                )
+                pout = torch.empty((nprog,), dtype=torch.float32, device=self.device)
+                pwgt = torch.empty((nprog,), dtype=torch.float32, device=self.device)
                 nll_loss2d_partial_reduce_kernel[(nprog, 1, 1)](
                     out,
                     wgt_buf,

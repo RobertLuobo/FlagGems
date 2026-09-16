@@ -443,8 +443,20 @@ def linalg_householder_product(A, tau):
         elif MP == _SWEEP_ROW:
             cc = _pick_cc(n)
             grid = (batch, triton.cdiv(n, cc))
-            args = (W, A3, tau2, k, n, m, WB, A3.stride(0), A3.stride(1),
-                    A3.stride(2), tau2.stride(0), tau2.stride(1))
+            args = (
+                W,
+                A3,
+                tau2,
+                k,
+                n,
+                m,
+                WB,
+                A3.stride(0),
+                A3.stride(1),
+                A3.stride(2),
+                tau2.stride(0),
+                tau2.stride(1),
+            )
             if cc == 1:
                 _fused_sweep_kernel[grid](*args, MP=MP)
             elif cc == 2:
@@ -476,13 +488,8 @@ def linalg_householder_product(A, tau):
             )
             _init_w_kernel[(batch, nb)](W, n, m, WB, BC=_LANES, MP=MP)
             for i in range(k - 1, -1, -1):
-                _dot_kernel[(batch, nb)](
-                    W, V[:, i], S, WB, VB, NP, BC=_LANES, MP=MP
-                )
-                _upd_kernel[(batch, nb)](
-                    W, S, U[:, i], WB, NP, VB, BC=_LANES, MP=MP
-                )
-        _out_kernel[(triton.cdiv(total, BT),)](OUT, W, total, m * n, n, WB, MP,
-                                                BT=BT)
+                _dot_kernel[(batch, nb)](W, V[:, i], S, WB, VB, NP, BC=_LANES, MP=MP)
+                _upd_kernel[(batch, nb)](W, S, U[:, i], WB, NP, VB, BC=_LANES, MP=MP)
+        _out_kernel[(triton.cdiv(total, BT),)](OUT, W, total, m * n, n, WB, MP, BT=BT)
 
     return OUT[:total].view(shape)

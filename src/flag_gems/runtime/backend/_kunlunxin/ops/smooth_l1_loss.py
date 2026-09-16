@@ -1,4 +1,3 @@
-
 import logging
 import os
 
@@ -10,6 +9,7 @@ from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
+
 from ..utils.block_size_utils import get_block_size_1d
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
@@ -98,8 +98,14 @@ def _smooth_backward_scalar(input, target, grad_output, beta):
 @libentry()
 @triton.jit(do_not_specialize=["grad_scale", "rcp_beta"])
 def _smooth_backward_scalar_clamp_kernel(
-    in0, in1, out, M, grad_scale, rcp_beta,
-    BLOCK: tl.constexpr, NEED_MASK: tl.constexpr,
+    in0,
+    in1,
+    out,
+    M,
+    grad_scale,
+    rcp_beta,
+    BLOCK: tl.constexpr,
+    NEED_MASK: tl.constexpr,
 ):
     pid = ext.program_id(0)
     off = pid * BLOCK + tl.arange(0, BLOCK)
@@ -143,7 +149,12 @@ def _loss_values(input, target, beta):
 @libentry()
 @triton.jit
 def _smooth_l1_loss_partial_sum_kernel(
-    inp, target, mid, M, beta: tl.constexpr, reduction: tl.constexpr,
+    inp,
+    target,
+    mid,
+    M,
+    beta: tl.constexpr,
+    reduction: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = ext.program_id(0)
@@ -210,7 +221,13 @@ def _smooth_l1_loss_reduce_fused(input, target, beta, reduction):
     os.environ["TRITONXPU_OTHER_SIM"] = "1"
     with torch_device_fn.device(input.device):
         _smooth_l1_loss_partial_sum_kernel[(mid_size, 1, 1)](
-            input, target, mid, M, beta, reduction, block_size,
+            input,
+            target,
+            mid,
+            M,
+            beta,
+            reduction,
+            block_size,
             buffer_size_limit=2048,
         )
         if mid_size == 1:
@@ -316,11 +333,17 @@ def smooth_l1_loss_backward(grad_output, input, target, reduction, beta: float):
             grad_scale /= input.numel()
         if beta == 0.0:
             return _l1_backward_scalar(input, target, grad_scale)
-        if input.shape == target.shape and input.is_contiguous() and target.is_contiguous():
+        if (
+            input.shape == target.shape
+            and input.is_contiguous()
+            and target.is_contiguous()
+        ):
             M = input.numel()
             out = torch.empty_like(input)
             with torch_device_fn.device(input.device):
-                _smooth_backward_scalar_clamp_kernel[(triton.cdiv(M, _SMOOTH_BWD_BLOCK),)](
+                _smooth_backward_scalar_clamp_kernel[
+                    (triton.cdiv(M, _SMOOTH_BWD_BLOCK),)
+                ](
                     input,
                     target,
                     out,

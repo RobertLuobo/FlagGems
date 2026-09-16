@@ -67,8 +67,6 @@ def _heur_block_m(args):
     return triton.next_power_of_2(max(block_m, 1))
 
 
-
-
 @triton.jit
 def reduce_all(a, b):
     return a and b

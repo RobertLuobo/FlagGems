@@ -234,15 +234,11 @@ def _amin_flat(inp, out, device):
                     amin_flat_chunk_kernel[(1, 1, 1)](
                         staged, mid[nfull : nfull + 1], TL, buffer_size_limit=2048
                     )
-            amin_flat_merge_kernel[(1, 1, 1)](
-                mid, out, nb, triton.next_power_of_2(nb)
-            )
+            amin_flat_merge_kernel[(1, 1, 1)](mid, out, nb, triton.next_power_of_2(nb))
         else:
             rows = numel // _FLAT_ROW_WIDTH
             res = numel - rows * _FLAT_ROW_WIDTH
-            bm = next(
-                (m for m in _FAST_BM_FP16 if rows % m == 0), _FAST_BM_FP16[0]
-            )
+            bm = next((m for m in _FAST_BM_FP16 if rows % m == 0), _FAST_BM_FP16[0])
             nb = rows + (1 if res else 0)
             mid = torch.empty((nb,), dtype=inp.dtype, device=device)
             amin_rows_kernel[(rows // bm, 1)](

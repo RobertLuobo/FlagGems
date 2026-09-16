@@ -1,4 +1,3 @@
-
 """Kunlunxin (XPU) override of ``aten::replication_pad3d_backward``.
 
 Performance / correctness notes (2026-09-10, device XPU 0):
@@ -113,9 +112,7 @@ def _replication_pad3d_backward_kernel(
             tl.where((yh_raw >= 0) & (yh_raw < OH), 1, 0),
         ),
     )
-    zd_raw = tl.where(
-        d == 0, 0, tl.where(d == D - 1, pad_front + D - 1, pad_front + d)
-    )
+    zd_raw = tl.where(d == 0, 0, tl.where(d == D - 1, pad_front + D - 1, pad_front + d))
     zd = tl.minimum(tl.maximum(zd_raw, 0), OD - 1)
     cnt_d = tl.where(
         d == 0,

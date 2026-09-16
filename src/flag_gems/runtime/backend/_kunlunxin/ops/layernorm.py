@@ -1,4 +1,3 @@
-
 import logging
 import math
 import os
@@ -198,7 +197,6 @@ def layer_norm_loop_kernel(
     tl.store(out_rstd_ptr + pid, rstd)
 
 
-
 ONESHOT_N_MAX = 8192
 
 
@@ -334,8 +332,6 @@ def layernorm_fwd_kernel(
         x_hat = (x - mean) * rstd
         y = x_hat * w + b
         tl.store(Y + (rindex + (rnumel * xindex)), y, rmask & xmask)
-
-
 
 
 _WB1D_BM = 128
@@ -544,19 +540,17 @@ def weight_bias_backward_finish_kernel(
         if PW is not None:
             accW = tl.zeros([C], dtype=tl.float32)
             for i in range(0, P):
-                w = tl.load(PW + i * N + cols, mask=cmask, other=0.0).to(
-                    tl.float32
-                )
+                w = tl.load(PW + i * N + cols, mask=cmask, other=0.0).to(tl.float32)
                 accW += tl.where(cmask, w, 0.0)
             tl.store(dW + cols, accW, mask=cmask)
         if PB is not None:
             accB = tl.zeros([C], dtype=tl.float32)
             for i in range(0, P):
-                b = tl.load(PB + i * N + cols, mask=cmask, other=0.0).to(
-                    tl.float32
-                )
+                b = tl.load(PB + i * N + cols, mask=cmask, other=0.0).to(tl.float32)
                 accB += tl.where(cmask, b, 0.0)
             tl.store(dB + cols, accB, mask=cmask)
+
+
 def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
     logger.debug("GEMS_KUNLUNXIN LAYER_NORM")
 
@@ -671,6 +665,7 @@ def layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
 
     return y, mean, rstd
 
+
 def layer_norm_backward(
     grad_out,
     input,
@@ -758,12 +753,16 @@ def layer_norm_backward(
     else:
         P = M // bm
         pw = (
-            torch.empty_strided((P, N), (N, 1), dtype=torch.float32, device=input.device)
+            torch.empty_strided(
+                (P, N), (N, 1), dtype=torch.float32, device=input.device
+            )
             if weight_grad is not None
             else None
         )
         pb = (
-            torch.empty_strided((P, N), (N, 1), dtype=torch.float32, device=input.device)
+            torch.empty_strided(
+                (P, N), (N, 1), dtype=torch.float32, device=input.device
+            )
             if bias_grad is not None
             else None
         )

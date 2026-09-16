@@ -21,7 +21,6 @@ config_ = CodeGenConfig(
 )
 
 
-
 @pointwise_dynamic(promotion_methods=[(0, "DEFAULT")], config=config_)
 @triton.jit
 def floor_func(x):
