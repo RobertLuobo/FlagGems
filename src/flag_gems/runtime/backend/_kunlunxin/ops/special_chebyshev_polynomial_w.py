@@ -1,10 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
 
 import logging
 
@@ -13,11 +6,6 @@ import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
-# Must use the vendor (XPU) pointwise_dynamic codegen: the generic
-# flag_gems.utils.pointwise_dynamic instantiates with
-# `self.config.balance_grid`, an attribute the _kunlunxin CodeGenConfig does
-# not define, so every case died at JIT-instantiation time (same fix as
-# igammac_ / lgamma / smooth_l1_loss / special_chebyshev_polynomial_v).
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)

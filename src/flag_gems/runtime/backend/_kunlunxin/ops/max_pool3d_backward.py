@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -36,7 +23,6 @@ def max_pool3d_backward_win_kernel(
     out_d,
     out_h,
     out_w,
-    # Pooling parameters
     kernel_d: tl.constexpr,
     kernel_h: tl.constexpr,
     kernel_w: tl.constexpr,
@@ -49,12 +35,9 @@ def max_pool3d_backward_win_kernel(
     dilation_d: tl.constexpr,
     dilation_h: tl.constexpr,
     dilation_w: tl.constexpr,
-    # Candidate-window bounds (compile-time upper bound of the candidate
-    # output count per dim: ceil(((k-1)*dil) / s) + 1)
     MAX_D: tl.constexpr,
     MAX_H: tl.constexpr,
     MAX_W: tl.constexpr,
-    # Tiling parameters
     BLOCK: tl.constexpr,
 ):
     """Backward kernel for 3-D max pooling (candidate-window gather).
@@ -206,14 +189,9 @@ def max_pool3d_backward(
 
     in_spatial = in_d * in_h * in_w
     n_nc = in_n * in_c
-    # Upper bound of the candidate output count per dim (see kernel docstring).
     max_d = ((kd - 1) * dd + sd - 1) // sd + 1
     max_h = ((kh - 1) * dh + sh - 1) // sh + 1
     max_w = ((kw - 1) * dw + sw - 1) // sw + 1
-    # 512 lanes / num_warps=4 for large planes; for tiny planes (spatial < 512)
-    # shrink the tile to the next power of two so the tail block does not waste
-    # most of its lanes (e.g. (32, 256, 2, 7, 7): 98 active lanes vs 512 -> the
-    # small tile is ~1.6x faster, all other shapes keep the 512-lane tile).
     if in_spatial >= 512:
         block = 512
     else:

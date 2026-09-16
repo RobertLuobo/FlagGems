@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """Kunlunxin (XPU) reflection_pad2d_backward.
 
@@ -120,14 +107,12 @@ def _reflection_pad2d_backward_kernel(
     col_l = tl.where(m_l, pad_l - w, col_c)
     col_r = tl.where(m_r, pad_l + 2 * W - 2 - w, col_c)
 
-    # 3 shared row bases (center / reflected-top / reflected-bottom)
     base = nc * (H + pad_t + pad_b) * OW
     r0 = base + row_c * OW
     rl = base + row_t * OW
     rr = base + row_b * OW
 
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
-    # center contribution: always valid, no mask
     acc += tl.load(go_ptr + r0 + col_c).to(tl.float32)
     acc += _load_grad(go_ptr, r0, col_l, m_l)
     acc += _load_grad(go_ptr, r0, col_r, m_r)

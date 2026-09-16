@@ -25,10 +25,6 @@ def span_for_slice(slice_n: int, block: int) -> int:
     return slice_n * (block // slice_n)
 
 
-# The tile loop inside the kernels is a tl.static_range, i.e. fully unrolled.
-# A span of one whole slice can be large, and past ~32 unrolled bodies the XPU
-# compiler gives up with `RuntimeError: Failed to tune buffer size.`, so the
-# tile size is grown (never shrunk) until the unroll factor is back in range.
 LOOP_CAP = 32
 BLOCK_CAP = 16384
 
@@ -53,12 +49,8 @@ def scatter_add_kernel_1(
     EXACT_SPAN: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    # Program pid owns exactly the linear range [block_start, block_start+SPAN).
     block_start = pid * SPAN
     if not EXACT_SPAN:
-        # Pre-computed scalar bound: a compound `(a) & (b)` mask is silently
-        # miscompiled on this backend, so the upper bound has to be folded into
-        # a single comparison.
         limit = tl.minimum(block_start + SPAN, n_elements)
     arange = tl.arange(0, BLOCK_SIZE)
     for loop_iter in tl.static_range(LOOP):
@@ -92,10 +84,8 @@ def generate_scatter_kernel(
     kernel_name: str,
     code: IndentedBuffer,
 ) -> IndentedBuffer:
-    # make the inlined function visible in the context
     code.newline()
 
-    # the autotune function
     code.writeline("def base_block(args):")
     with code.indent():
         code.writeline("if(flag_gems.vendor_name in ['metax', 'iluvatar']):")
@@ -105,15 +95,6 @@ def generate_scatter_kernel(
     code.newline()
     code.newline()
 
-    # Number of linear index elements owned by one program.  tl.atomic_add on
-    # this backend silently drops updates when the same output address is
-    # touched by more than one program, and duplicate index values can only
-    # alias inside one slice of prod(index.shape[dim:]) consecutive linear
-    # elements -> force the per-program span to a whole multiple of that slice.
-    # SLICE is a *specialized* runtime argument on purpose: libentry computes
-    # its cache key before the heuristics run, so anything the heuristics
-    # derive from it would otherwise be frozen on the first call in a process.
-    # Nothing here may depend on N, which is do_not_specialize (type-only key).
     code.writeline("def heur_span(args):")
     with code.indent():
         code.writeline("span = base_block(args)")
@@ -128,8 +109,6 @@ def generate_scatter_kernel(
     code.newline()
     code.newline()
 
-    # The tile loop is a fully unrolled tl.static_range; past ~32 bodies the XPU
-    # compiler fails with "Failed to tune buffer size", so grow the tile instead.
     code.writeline("def heur_block(args):")
     with code.indent():
         code.writeline("block = base_block(args)")
@@ -147,16 +126,12 @@ def generate_scatter_kernel(
     code.newline()
     code.newline()
 
-    # When SPAN is a whole multiple of BLOCK the LOOP tiles cover the program's
-    # range exactly, so the plain `offsets < N` mask is enough; only the ragged
-    # case needs the extra scalar upper bound.
     code.writeline("def heur_exact(args):")
     with code.indent():
         code.writeline("return heur_span(args) % heur_block(args) == 0")
     code.newline()
     code.newline()
 
-    # the decorators
     code.writeline("@libentry()")
     code.writeline("@triton.heuristics(")
     with code.indent():
@@ -177,7 +152,6 @@ def generate_scatter_kernel(
         f"{inp_stride_vars},{index_stride_vars},{src_stride_vars},{shape_vars}])"
     )
 
-    # signature
     code.writeline(f"def {kernel_name}(")
     with code.indent():
         if rank > 0:
@@ -208,21 +182,14 @@ def generate_scatter_kernel(
 
     code.writeline("):")
 
-    # Kernel Code
     with code.indent():
         code.writeline("pid = tl.program_id(0)")
-        # Program pid owns exactly the linear range [base, base + SPAN); the
-        # `< base + SPAN` half of the bound is what keeps two programs from ever
-        # touching the same output address when SPAN is not a multiple of BLOCK.
         code.writeline("base = pid * SPAN")
         code.writeline("if not EXACT_SPAN:")
         with code.indent():
-            # A compound `(a) & (b)` mask is silently miscompiled on this
-            # backend, so the upper bound is folded into one comparison.
             code.writeline("limit = tl.minimum(base + SPAN, N)")
         code.writeline("offsets = base + tl.arange(0, BLOCK)")
 
-        #   1. Calculate inp_offsets and idx_offsets
         code.writeline("for loop_iter in tl.static_range(LOOP):")
         with code.indent():
             code.writeline("if EXACT_SPAN:")
@@ -243,7 +210,6 @@ def generate_scatter_kernel(
                 if i != 0:
                     code.writeline(f"cur_idx = cur_idx // shape_{i}")
 
-            #   2. Use offsets to scatter
             code.writeline(
                 "cur_src = tl.load(src_strided + src_offsets, mask=mask, other=0)"
             )
@@ -264,7 +230,6 @@ def generate_scatter_kernel(
 
 
 def parameter_for_wrapper() -> str:
-    # src_strided, index, inp, out, dim, M, N
     parameters: List[str] = []
 
     parameters.append("src_strided")
@@ -297,14 +262,11 @@ def generate_destination_passing_wrapper(
         code.writeline("inp_size_dim = dim_size")
         code.writeline("stride_dim = dim_stride")
 
-        # Duplicate index values can only collide inside one slice of
-        # prod(index.shape[dim:]) consecutive linear elements.
         code.writeline("SLICE = 1")
         code.writeline("for _i in range(dim, len(index_shapes)):")
         with code.indent():
             code.writeline("SLICE *= index_shapes[_i]")
 
-        # kernel launch
         code.writeline("grid = lambda meta: (")
         with code.indent():
             code.writeline('triton.cdiv(N, meta["SPAN"]), ')
@@ -343,7 +305,6 @@ def generate_code(
     kernel_name: str,
     code: IndentedBuffer,
 ) -> IndentedBuffer:
-    # inputs: [src_strided, index, inp, out, dim, M, N]
     shape = inputs[1].shape
     rank = len(shape)
 
@@ -376,7 +337,6 @@ class ScatterFunction:
             with open(code_cache_dir() / file_name, "wt", encoding="utf-8") as f:
                 f.write(code.getvalue())
 
-            # load
             spec = importlib.util.spec_from_file_location(
                 f"_gen_module_rank_{key}_pid_{self.pid}",
                 f.name,
@@ -410,12 +370,6 @@ def scatter_add_2d_kernel(
     BLOCK: tl.constexpr,
     LOOP: tl.constexpr,
 ):
-    # Lean 2D kernel for the dim == ndim-1 && ndim == 2 case.
-    # pid0 = row -> no per-element div/mod (XPU friendly).
-    # One whole row is owned by exactly one program: a duplicate index can only
-    # alias inside a row, and this backend loses tl.atomic_add updates when two
-    # programs contend for the same output address, so the column axis must be
-    # walked by an in-kernel loop instead of a second grid axis.
     pr = tl.program_id(0)
     rowbase = pr.to(tl.int64) * idx_ncols
     srcbase = pr.to(tl.int64) * src_stride0
@@ -440,7 +394,6 @@ def scatter_add_0(inp, dim, index, src):
 
     src_strided = src.as_strided(index.shape, src.stride())
     dim = dim % inp.ndim
-    # Lean 2D fast path for the last-dim scatter (matches benchmark layout).
     if inp.ndim == 2 and dim == 1 and index.is_contiguous():
         idx_ncols = index.shape[1]
         src_stride0 = src_strided.stride(0)
@@ -504,9 +457,6 @@ def scatter_add_1(x, dim, index, src):
         index = dim_compress(index, dim)
 
     all_elem = max(x.numel(), index.numel())
-    # Rows of `index_dim_n` linear elements map onto one output row each, so a
-    # duplicate index can only alias inside such a row -> align the per-program
-    # span to a whole number of rows.
     BLOCK_SIZE = 256
     SPAN = span_for_slice(index_dim_n, BLOCK_SIZE)
     BLOCK_SIZE = block_for_span(SPAN, BLOCK_SIZE)
@@ -570,6 +520,5 @@ def scatter_add_(x, dim, index, src):
 
 def scatter_add(inp, dim, index, src):
     logger.debug("GEMS_KUNLUNXIN SCATTER_ADD")
-    # Non-inplace variant: out = inp (copied), then scatter-add src into it.
     out = inp.clone()
     return scatter_add_(out, dim, index, src)

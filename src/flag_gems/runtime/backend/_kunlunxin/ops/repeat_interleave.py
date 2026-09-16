@@ -31,11 +31,6 @@ def repeat_interleave_self_int(inp, repeats, dim=None, *, output_size=None):
                     -inp.ndim, inp.ndim - 1, dim
                 )
             )
-    # Non-contiguous inputs (e.g. sliced [::2] views) combined with the
-    # inserted 0-stride dimension are mis-lowered by TritonXPU as 1D-tile
-    # strided gathers (illegal memory access, IMA).  Materialize a
-    # C-contiguous copy so the kernel only handles unit-stride + 0-stride;
-    # contiguous inputs (incl. benchmark shapes) take the zero-copy path.
     if not inp.is_contiguous():
         inp = inp.contiguous()
     inp_shape = list(inp.shape)
@@ -128,14 +123,6 @@ def repeat_interleave_self_tensor_kernel(
     BLOCK_I: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # Input-side decomposition: one program handles one input row (o, i).
-    # The row is loaded ONCE and stored r_i times to the r_i consecutive
-    # output rows [start, start + r_i); start = cumsum[i] - r_i. This
-    # replaces the index-materialize + gather approach: the store side is
-    # moved r_i times anyway, but the LOAD side is done once per input row
-    # (outer*D loads of `inner` instead of rsum loads), and building the
-    # mapping needs only cumsum (no index tensor, no .item() sync beyond
-    # the single rsum host read).
     pid = ext.program_id(axis=0)
     if pid < outer * D:
         o = pid // D
@@ -204,8 +191,6 @@ def repeat_interleave_self_tensor(inp, repeats, dim=None, *, output_size=None):
         inner *= s
 
     if inner == 1:
-        # Indexed dim is the innermost: genuine per-element gather. Fall back
-        # to the index-select path (materialized index + vendor index_select).
         indices = repeat_interleave_tensor(repeats)
         return torch.index_select(inp, dim, indices)
 
@@ -214,9 +199,6 @@ def repeat_interleave_self_tensor(inp, repeats, dim=None, *, output_size=None):
     out_shape = inp_shape[:dim] + [rsum] + inp_shape[dim + 1 :]
     out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
 
-    # BLOCK_I: cap at 4096 (measured sweet spot on XPU); floor at 64 (narrow
-    # vector stores below 64 elements per instruction are unreliable in
-    # TritonXPU; masked path covers inner < 64).
     block_i = min(max(triton.next_power_of_2(inner), 64), 4096)
     need_mask = inner % block_i != 0
     grid = (outer * D,)

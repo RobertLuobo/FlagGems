@@ -1,52 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Kunlunxin (TritonXPU) specialization of aten::_embedding_bag_dense_backward.
-#
-# Why this override exists
-# ------------------------
-# The generic implementation (src/flag_gems/ops/_embedding_bag_dense_backward.py)
-# launches one program per (sample, D-block) and merges the per-sample row
-# contributions with ``tl.atomic_add``.  On TritonXPU that is both
-#
-#   * WRONG: ``tl.atomic_add`` silently drops updates whenever two programs hit
-#     the same address.  Because an embedding table row is normally referenced by
-#     several samples, this is the common case, not a corner case.  A CPU float64
-#     oracle shows 36/56 scenarios failing on HEAD, while the very same oracle is
-#     clean as soon as every index is unique.
-#   * SLOW: ``tl.atomic_add`` is globally serialised at a measured ~180 ns per
-#     element on this backend, so HEAD costs ~180 ns * num_samples * D
-#     (e.g. 191 ms for num_samples=4096, D=256).
-#
-# The override therefore removes atomics entirely.  It builds a CSR-like
-# "which samples belong to which weight row" structure with three cheap index
-# passes (count -> exclusive scan -> stable rank + permutation scatter) and then
-# has ONE program own ONE output row, accumulating in registers and issuing a
-# single store.  Every global access is either a stride-1 tile off a *scalar*
-# base (provable stride-1 => block DMA) or an in-bounds unmasked gather.
-#
-# Backend rules honoured here (see harness/meta notes):
-#   * no ``tl.atomic_add`` at all;
-#   * no ``other=`` on any load - out-of-range lanes are clamped to a legal
-#     address and gated afterwards with ``tl.where``;
-#   * every store is either full-width (>= 64 lanes, no mask) into an
-#     over-allocated buffer, or a discrete scatter to provably unique targets;
-#   * only 2D ``axis=1`` reductions, and only outside of any nested loop nest
-#     that carries the tile;
-#   * all tile widths are powers of two;
-#   * the fast-path eligibility test is pure metadata (shape/stride/dtype), so
-#     no gems operator is dispatched before the decision is taken.
 import logging
 
 import torch
@@ -57,17 +8,9 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
-# 2D probe tiles: 128 * 128 = 16384 elements (>= the 8192 minimum that keeps 2D
-# tiles out of the small-tile mis-lowering window, and both dims are powers of 2).
-# The row tile also has to be >= 64 lanes because every vector store on this
-# backend touches 64 contiguous elements regardless of the requested length.
 _ROWS_TILE = 128
 _SAMP_TILE = 128
-# The rank pass uses a [_RANK_TILE, _SAMP_TILE] tile; the two extents must differ
-# (see _ebdb_rank_kernel) and _SAMP_TILE must be a multiple of _RANK_TILE.
 _RANK_TILE = 64
-# Single-program exclusive scan window.  tl.cumsum is only trusted up to 8192
-# lanes on this backend, hence the num_weights ceiling for the fast path.
 _MAX_SCAN = 8192
 
 
@@ -83,9 +26,6 @@ def _ebdb_count_kernel(
     BW: tl.constexpr,
     NS: tl.constexpr,
 ):
-    # grid = (n_sample_tiles, n_row_blocks); no loop, so the [BW, 1] store never
-    # coexists with the [BW, NS] tile inside a loop body (that combination fails
-    # to lower: "'triton_xpu.convert_layout' op requires the same shape").
     tid = tl.program_id(0)
     rid = tl.program_id(1)
     rows = (rid * BW + tl.arange(0, BW))[:, None]
@@ -108,11 +48,6 @@ def _ebdb_tile_total_kernel(
     NWP: tl.constexpr,
     BW: tl.constexpr,
 ):
-    # One program per row-block: per-row total of the per-sample-tile counts.
-    # Load-only dynamic loop (bound derived through tl.max of a tile) plus a
-    # single store: a scalar-loaded bound with a 128-lane body or an in-loop
-    # store fails TritonXPUUnrollControl on this backend (see the comments in
-    # _ebdb_gather_flat_kernel), so mirror the gather kernels' structure.
     rid = tl.program_id(0)
     rows = rid * BW + tl.arange(0, BW)
     n_tiles = tl.max(tl.load(n_tiles_ptr + rows))
@@ -131,12 +66,6 @@ def _ebdb_tile_prefix_kernel(
     NWP: tl.constexpr,
     BW: tl.constexpr,
 ):
-    # One program per (sample-tile, row-block): exclusive-scan (along the tile
-    # axis) of the per-sample-tile counts.  Load-only dynamic loop (same
-    # tl.max-derived bound as _ebdb_tile_total_kernel) with a where-guarded
-    # accumulate plus a single store, matching the gather kernels that lower
-    # cleanly here.  Every load is in-bounds (u < n_tiles), so no clamping is
-    # needed; the guard only zeroes the contribution of later tiles.
     tid = tl.program_id(0)
     rid = tl.program_id(1)
     rows = rid * BW + tl.arange(0, BW)
@@ -171,16 +100,6 @@ def _ebdb_rank_kernel(
     TS: tl.constexpr,
     NS: tl.constexpr,
 ):
-    # One program per TS-sample block.  The cross-tile part of the stable rank
-    # comes from prefix_ptr (already produced by the count pass), so only the
-    # TS x NS intra-tile comparison is needed here - O(num_samples * NS) in total
-    # instead of O(num_samples^2).
-    #
-    # TS must differ from NS: when both sides of the outer product come from a
-    # tl.arange of the *same* length the backend tries to give one value two
-    # layouts and dies with "'triton_xpu.convert_layout' op requires the same
-    # shape for all operands and results".  NS == 2 * TS keeps the [TS, NS] tile
-    # at 8192 elements and keeps every TS-block inside a single count tile.
     pid = tl.program_id(0)
     s = (pid * TS + tl.arange(0, TS))[:, None]
     live = s < num_samples
@@ -197,8 +116,6 @@ def _ebdb_rank_kernel(
     row_safe = tl.where(good, iv, 0)
     base = tl.load(start_ptr + row_safe) + tl.load(prefix_ptr + tile * NWP + row_safe)
     pos = base + rank.to(tl.int32)
-    # Inactive / padded / out-of-range lanes are redirected to a per-lane unique
-    # scratch slot so that the scatter needs no mask and never aliases.
     dst = tl.where(good, pos, num_samples + s)
     tl.store(sorted_ptr + dst, s.to(tl.int32))
 
@@ -220,12 +137,6 @@ def _ebdb_gather_row_kernel(
     D: tl.constexpr,
     BD: tl.constexpr,
 ):
-    # One program owns one output row: the columns are a plain tl.arange, so the
-    # out store is a full BD-lane write.  The per-row scalars (start, counts and
-    # the indirections through sorted_ptr / o2b_ptr) are carried as BD-wide
-    # vectors with a tl.where guard: a dynamic loop whose body contains scalar
-    # loads fails TritonXPUUnrollControl (see _ebdb_gather_flat_kernel), so all
-    # loop-carried state is replicated per lane exactly like the flat kernel.
     row = tl.program_id(0)
     blk = tl.program_id(1)
     cols = blk * BD + tl.arange(0, BD)
@@ -382,7 +293,6 @@ def _fast_path_kind(
             return None
         if not maximum_indices.is_contiguous():
             return None
-        # nw * nb * D work; keep the (matrix-external) MAX path off huge sizes.
         if int(num_weights) * num_bags * dim > (1 << 27):
             return None
         return "max"
@@ -424,9 +334,6 @@ def _build_csr(indices, n_samples, num_weights, padding_idx):
         BW=_ROWS_TILE,
         NS=_SAMP_TILE,
     )
-    # n_samp_tiles as a device tile: the scan loops derive their bounds through
-    # tl.max of a tile load (the scalar-arg bound fails TritonXPUUnrollControl
-    # once n_samp_tiles > 1, i.e. n_samples > 128).
     n_tiles_buf = torch.full(
         (n_rows_pad,), n_samp_tiles, dtype=torch.int32, device=device
     )
@@ -446,8 +353,6 @@ def _build_csr(indices, n_samples, num_weights, padding_idx):
     )
     _ebdb_scan_kernel[(1,)](counts, start, TILE=n_rows_pad)
     n_rank_blocks = triton.cdiv(n_samples, _RANK_TILE)
-    # tail slots [n_samples, n_samples + n_rank_blocks * _RANK_TILE) are per-lane
-    # unique scratch for padded / out-of-range samples: the scatter needs no mask.
     order = torch.empty(
         n_samples + n_rank_blocks * _RANK_TILE, dtype=torch.int32, device=device
     )
@@ -467,9 +372,6 @@ def _build_csr(indices, n_samples, num_weights, padding_idx):
 
 
 def _generic_impl(*args):
-    # The generic FlagGems Triton implementation; used only as the structural
-    # fall-back for shapes outside the fast-path envelope.  It is still a
-    # FlagGems XPU Triton kernel - not a CPU / ATen / composite fall-back.
     from flag_gems.ops._embedding_bag_dense_backward import (
         _embedding_bag_dense_backward as _generic,
     )
@@ -541,14 +443,11 @@ def _embedding_bag_dense_backward(
 
     mode_mean = int(mode) == 1
     has_psw = per_sample_weights is not None
-    psw = per_sample_weights if has_psw else indices  # dummy pointer when unused
+    psw = per_sample_weights if has_psw else indices
     sgbf = bool(scale_grad_by_freq)
 
     block_d = _pow2_block(dim)
     if block_d is not None:
-        # One program owns one output row: the grad tile base ``bag * D`` is a
-        # scalar, the columns are a plain tl.arange, so the DMA is provably
-        # stride-1 and every store is a full BD >= 64 lane write with no mask.
         out = torch.empty((num_weights, dim), dtype=grad.dtype, device=device)
         grid = (num_weights, dim // block_d)
         _ebdb_gather_row_kernel[grid](

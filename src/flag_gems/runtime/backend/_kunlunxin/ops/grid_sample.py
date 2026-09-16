@@ -1,10 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
 
 import logging
 
@@ -12,7 +5,6 @@ import torch
 import triton
 import triton.language as tl
 
-# Backend registration replaces the top-level symbol; keep direct ops imports consistent.
 import flag_gems.ops as _general_ops
 
 logger = logging.getLogger(__name__)
@@ -20,24 +12,16 @@ logger = logging.getLogger(__name__)
 
 @triton.jit
 def _cubic_convolution1(x):
-    # Mirrors ATen upsample cubic_convolution1 with A = -0.75, including the
-    # exact Horner evaluation order so fp32 rounding matches the reference.
     return ((1.25 * x - 2.25) * x) * x + 1.0
 
 
 @triton.jit
 def _cubic_convolution2(x):
-    # Mirrors ATen upsample cubic_convolution2 with A = -0.75.
     return ((-0.75 * x + 3.75) * x - 6.0) * x + 3.0
 
 
 @triton.jit
 def _gs_load(ptr, mask, NEED_MASK: tl.constexpr):
-    # When the total element count is a multiple of BLOCK there is no tail
-    # block, so `mask` is provably all-true; the unmasked load path avoids
-    # the slower masked-memory codegen on XPU (HARNESS_SUMMARY 2.4). All
-    # indices fed to the unmasked load are already clamped into the input
-    # tensor while `mask` is all-true, so the addresses are always in-bounds.
     if NEED_MASK:
         return tl.load(ptr, mask=mask, other=0.0)
     else:
@@ -251,7 +235,6 @@ def _grid_sample_2d_kunlunxin_kernel(
         rev_y = 1.0 - frac_y
         x_base = floor_x.to(tl.int32) - 1
         y_base = floor_y.to(tl.int32) - 1
-        # ATen get_cubic_upsample_coefficients() argument order: t+1, t, 1-t, (1-t)+1
         weight_x_0 = _cubic_convolution2(frac_x + 1.0)
         weight_x_1 = _cubic_convolution1(frac_x)
         weight_x_2 = _cubic_convolution1(rev_x)
@@ -526,13 +509,6 @@ def grid_sample(
         total = output.numel()
         if total == 0:
             return output
-        # BLOCK=512 (2 output elements/thread) is the measured sweet spot for the
-        # benchmark matrix: it improves the medium shapes that dominate the
-        # dtype-equal aggregate (5D trilinear (2,8,16,16,16): 113us -> 91us;
-        # 4D bilinear (2,32,64,64): 285us -> 188us) with no regression on the
-        # small cases that have a torch baseline. BLOCK stays far below the
-        # BLOCK>=4096 range, which triggers a device-side kernel exception
-        # (NOC timeout) on this 3D kernel.
         block = 512
         _grid_sample_3d_kunlunxin_kernel[(triton.cdiv(total, block),)](
             output,
@@ -578,10 +554,6 @@ def grid_sample(
 
     mode_id = {"nearest": 0, "bilinear": 1, "bicubic": 2}[mode]
     padding_id = {"zeros": 0, "border": 1, "reflection": 2}[padding_mode]
-    # BLOCK=512 (2 output elements/thread) over BLOCK=256: 4D bicubic
-    # (2,32,64,64) 597us -> 536us, 4D bilinear 285us -> 188us, nearest
-    # (1,3,32,32) 8.9us -> 8.1us (all on the harness protocol). The tile split
-    # only changes the block shape; the numerics are bit-identical.
     block = 512
     _grid_sample_2d_kunlunxin_kernel[(triton.cdiv(total, block),)](
         output,

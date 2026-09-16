@@ -10,24 +10,12 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-# Windows with an exact integer input/output ratio are handled by a dedicated
-# row-reduction kernel (contiguous 2D tile loads + in-kernel axis-1 sum, no
-# per-lane integer division and no masked accumulate chain). The cap keeps the
-# fully-unrolled tile count bounded; beyond it the XPU backend's buffer-size
-# tuning fails on huge static unrolls (observed with a 57x57 window / 3249
-# unrolled iterations -> "Failed to tune buffer size").
 INT_KERNEL_MAX_UNROLL = 65536
 
 
 @libentry()
 @triton.jit
 def _adaptive_avg_pool2d_plane_kernel(input, output, HW, VEC: tl.constexpr):
-    # Full-plane average (output is 1x1). One program per (N*C) plane; the
-    # whole plane is read with contiguous chunked 1D loads (the only load
-    # pattern that reaches copy bandwidth on this backend) and reduced with a
-    # single 1D tl.sum -- no per-lane gathers and no huge static unroll, which
-    # is what made the 2D-tile path fail on large windows ("Failed to tune
-    # buffer size").
     program_id = ext.program_id(0)
     base = input + program_id * HW
     acc = tl.zeros((VEC,), dtype=tl.float32)
@@ -125,18 +113,13 @@ def adaptive_avg_pool2d(input, output_size):
     if output.numel() == 0:
         return output
 
-    output_rows = output.numel() // output_width  # N * C * OH programs
+    output_rows = output.numel() // output_width
     with torch_device_fn.device(input.device):
         if (
             output_height == 1
             and output_width == 1
             and input_contiguous.size(-1) > 0
         ):
-            # Full-plane average: the 2D-tile path below would fully unroll
-            # KH*KW*BKW elements (e.g. 224x224*256 rounds of work for a
-            # (1,64,224,224) input), which the XPU backend rejects with
-            # "Failed to tune buffer size". Use the contiguous plane-reduce
-            # kernel instead (also 4-18x faster on the measured matrix).
             planes = output.numel()
             _adaptive_avg_pool2d_plane_kernel[(planes,)](
                 input_contiguous,

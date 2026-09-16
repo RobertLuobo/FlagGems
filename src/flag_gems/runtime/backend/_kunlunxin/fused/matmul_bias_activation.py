@@ -1,31 +1,4 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-# Kunlunxin(XPU) backend override for the fused matmul+bias+ReLU operator.
-#
-# The generic `flag_gems.fused.matmul_bias_activation` kernel (BLOCK_K=32,
-# 1D bias broadcast `bias[None, :]`) fails to lower on XPU inside
-# `ConvertTritonSDNNToLLVM` (compile error, all shapes/dtypes fail).
-# This override reuses the structure proven in `_kunlunxin/ops/addmm.py`:
-#   256/128 tiles + GROUP_M swizzle, dtype-dependent BLOCK_SIZE_K (fp16 -> 256,
-#   bf16/fp32 -> 128), masked K-loop loads with other=0.0, fp32 accumulation.
-# The epilogue (bias 1D load + ReLU) is fused into the main kernel: earlier
-# binary/relu-on-fp32-tile epilogues crashed `ConvertTritonSDNNToLLVM`, but
-# `tl.maximum` after `tl.dot` lowers and is validated bit-identical (probe
-# harness/solution/matmul_bias_activation/probe_ab_fuse.py, 9 shapes x 3
-# dtypes vs fp64 reference). A separate relu pass is unnecessary and costs an
-# extra M*N read+write (e.g. ~17% on fp32 4096^2).
 
 import logging
 
@@ -55,7 +28,6 @@ def heur_block_n(args):
 
 
 def heur_block_k(args):
-    # The wrapper passes BLOCK_K_CHOICE (fp16 -> 256, else 128).
     if args.get("BLOCK_K_CHOICE", 128) == 256:
         return 256
     return 128
@@ -101,7 +73,6 @@ def matmul_bias_activation_kernel(
     pid = ext.program_id(0)
     grid_m = tl.cdiv(M, BLOCK_SIZE_M)
     grid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    # re-order program ID for better L2 reuse along the N dimension
     width = GROUP_M * grid_n
     group_id = pid // width
     group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
@@ -137,13 +108,7 @@ def matmul_bias_activation_kernel(
     bias = tl.load(i_ptr + offs_cn * stride_bias, mask=offs_cn < N, other=0.0)
 
     accumulator = accumulator + bias[None, :]
-    # Fused ReLU. NOTE: a ReLU (compare/abs/select) directly on the fp32 tile
-    # right after tl.dot used to crash the XPU compiler inside
-    # `ConvertTritonSDNNToLLVM`; `tl.maximum` now lowers correctly (validated
-    # bit-identical to the previous separate relu_kernel pass in
-    # harness/solution/matmul_bias_activation/probe_ab_fuse.py).
     accumulator = tl.maximum(accumulator, 0.0)
-    # Let tl.store convert to the output pointer dtype.
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 

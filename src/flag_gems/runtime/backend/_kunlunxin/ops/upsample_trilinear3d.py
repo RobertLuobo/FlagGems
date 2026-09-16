@@ -11,20 +11,6 @@ logger = logging.getLogger(__name__)
 device = device.name
 
 
-# NOTE (kunlunxin/XPU): row-grid decomposition -- one output row (OW) per
-# program -- instead of a flat 1D grid over all output elements. The flat
-# form forces a per-lane (vector) div/mod chain (ow, oh, od, nc) that the XPU
-# backend emulates with generic vector integer division; the row-grid moves
-# the (oh, od, nc) division into SCALAR per-program arithmetic, which
-# strength-reduces on the XPU compiler (see the emulated div/mod note in the
-# upsample family rpm). Geometry (OD/OH/OW/ID/IH/IW) stays tl.constexpr so
-# the scalar div/mod is scalarized into multiply+shift by the backend. The
-# 8 corner loads keep the same clamped-index + unmasked pattern as the
-# previous flat kernel (masked-memory path is penalized on XPU), so every
-# load is in-bounds for any decoded lane and only the tail store is masked
-# (ow < OW). The residual gap to torch is the XPU discrete-gather wall
-# (8 data-dependent neighbour loads), the same structural ceiling as
-# grid_sample / reflection_pad2d; torch runs a fused vendor kernel.
 @triton.jit
 def upsample_trilinear3d_kernel(
     ptr_o,
@@ -50,7 +36,6 @@ def upsample_trilinear3d_kernel(
     row = tl.program_id(axis=0)
     if not USE_INT32_IDX:
         row = row.to(tl.int64)
-    # Scalar (per-program) division/modulo -- cheap on XPU.
     oh = row % OH
     od = (row // OH) % OD
     nc = row // (OH * OD)
@@ -166,7 +151,6 @@ def upsample_trilinear3d(
         return out
 
     total_out = NC * OD * OH * OW
-    # One program per output row; BX = next power of two >= OW (OW = 1 works).
     BX = 1 << max(0, (OW - 1).bit_length())
     grid = (NC * OD * OH,)
     num_warps = min(8, max(1, BX // 64))

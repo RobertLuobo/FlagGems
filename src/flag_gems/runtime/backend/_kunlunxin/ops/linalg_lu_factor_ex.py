@@ -34,8 +34,6 @@ def _check_linalg_lu_factor_input(input, pivot):
     if not isinstance(pivot, bool):
         raise TypeError(f"pivot must be a bool, got {type(pivot)}")
     if not pivot:
-        # The vendor native primitive has no no-pivot LU either (its CPU
-        # fallback raises "LU without pivoting is not implemented on the CPU").
         raise NotImplementedError(
             "Kunlunxin linalg_lu_factor_ex does not support pivot=False: "
             "the vendor lu_factor_ex primitive rejects it and no XPU-safe "

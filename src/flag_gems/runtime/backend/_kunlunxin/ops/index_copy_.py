@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import torch
 import triton
 import triton.language as tl
@@ -139,9 +126,6 @@ def _index_copy_rank3(
 
 def _validate(inp, dim, index, src):
     assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
-    # Normalize negative dims (torch.index_copy accepts them) so the shape
-    # comparison below uses the relaxed index (mirrors the `dim %= inp.ndim`
-    # done by the callers after validation; the operation is idempotent).
     dim %= inp.ndim
     assert index.numel() == src.size(
         dim
@@ -153,8 +137,6 @@ def _validate(inp, dim, index, src):
         (inp.size(i) == src.size(i)) or i == dim for i in range(inp.ndim)
     ), "src.size(d) == self.size(d) for all dimensions d != dim"
     if index.numel() > 0:
-        # The bounds check is vacuous for an empty index, and the vendor `all`
-        # kernel crashes on a 0-element tensor (triton.cdiv(0, 0)).
         assert bool(
             ((0 <= index) & (index < inp.size(dim))).all()
         ), "0 <= index < self.size(dim)"
@@ -227,11 +209,6 @@ def index_copy_(inp, dim, index, src):
 
 def index_copy(inp, dim, index, src):
     _validate(inp, dim, index, src)
-    # Functional variant: clone the input with a lightweight Triton copy
-    # (avoids both the generic code-generated kernel, which produces wrong
-    # results on large 3-D shapes, and `aten::_copy_from`, whose registry
-    # dispatch costs ~0.2 ms/call under `use_gems`), then reuse the in-place
-    # path above.
     out = torch.empty_like(inp, memory_format=torch.contiguous_format)
     n_elements = inp.numel()
     if n_elements > 0:

@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 import math
@@ -30,19 +17,6 @@ logger = logging.getLogger(__name__)
 
 ModeResult = namedtuple("mode", ["values", "indices"])
 
-# ---------------------------------------------------------------------------
-# Kunlunxin mode: per-row stable radix sort (the proven vendor
-# radix_sort_low_mem from ops/sort.py, whose count/prefix/scatter kernels are
-# validated for every dtype on this backend, see the notes there) followed by
-# a linear scan over the sorted rows that reproduces ATen CPU tie semantics
-# (best run with strictly-greater count; index of the last run element).
-#
-# The previous private radix pipeline (_mode_radix_count/_mode_radix_scatter,
-# 16 x tl.cumsum unrolled) is NOT used: _mode_radix_scatter fails to lower in
-# the TritonXPU ConvertTritonXPUToLLVM pass for a large fraction of the
-# (dtype, N) configurations, so the rows are sorted with the one radix that
-# this backend can compile.
-# ---------------------------------------------------------------------------
 
 
 @libentry()
@@ -70,7 +44,6 @@ def _mode_sorted_rows_kernel(
         same_value = value == current_value
         current_count = tl.where(same_value, current_count + 1, 1)
         current_value = tl.where(same_value, current_value, value)
-        # ATen mode returns the last occurrence for the selected value.
         current_index = index
         better = current_count > best_count
         best_count = tl.where(better, current_count, best_count)
@@ -142,12 +115,6 @@ def _mode_impl(inp, dim, keepdim):
     flat_indices = indices.reshape(M)
 
     if dim != inp.ndim - 1:
-        # Materialise the movedim view with the native strided copy engine
-        # (same workaround as sort.py::sort_stable): the vendor `copy_`
-        # raises a device kernel exception for some transposed 2-byte shapes,
-        # and torch.movedim(...).reshape(M, N) may return a non-contiguous
-        # view (e.g. (256, 4096) with strides (1, 256) for (4096, 256) dim=0)
-        # while radix_sort_low_mem requires row-major contiguous input.
         view = torch.movedim(inp, dim, -1)
         rows = torch.empty((M, N), device=inp.device, dtype=inp.dtype)
         if not tle_copy(view, rows):
@@ -159,14 +126,8 @@ def _mode_impl(inp, dim, keepdim):
         with torch_device_fn.device(inp.device):
             _mode_fill_first[(M,)](rows, flat_values, flat_indices, RS=N, N=N)
     else:
-        # Stable LSB-first radix sort (16 bins / 4-bit passes) proven on this
-        # backend, see ops/sort.py::radix_sort_low_mem; returns the sorted
-        # rows together with the permutation that maps each sorted slot back to
-        # its original column (init via offsets % N inside the sort).
         sorted_v, sorted_i = radix_sort_low_mem(rows, 4, False)
         if sorted_v.dtype == torch.bfloat16:
-            # scan kernel comparisons on bf16 trip an MLIR scf.while type
-            # mismatch on XPU; promote to fp32 first (exact mapping)
             sorted_v = sorted_v.to(torch.float32)
         with torch_device_fn.device(inp.device):
             _mode_sorted_rows_kernel[(M,)](

@@ -1,40 +1,3 @@
-# Kunlunxin(XPU) backend override for ormqr.
-#
-# Why a vendor file at all: the generic implementation is not compilable on the
-# XPU/FlagTree backend. Empirically (probes on P800, 2026-08-20):
-#   1. tl.sum(..., axis=0) on 2D tiles -> hard compile error
-#      ("axis must not be 0 for 2D+ shapes").
-#   2. tl.trans / transposed (N,M)-tile loads -> ClusterLayoutAttr rank assert.
-#   3. Any masked 2D load feeding tl.dot -> TritonXPUVectorize crash.
-#   4. tl.dot with fp64 unsupported; scalar loads inside runtime loops are
-#      silently mis-compiled (every row loads the first value).
-#   5. 1D vectors wider than 64 lanes derived from strided pointer arithmetic
-#      silently return wrong values; more than one static `tl.reduce` chunk per
-#      iteration, or static unrolls beyond 64 lanes, hit backend pass crashes
-#      ("Failed to legalize tt.reduce" / TritonXPUMemoryCache).
-#
-# Design (probe-verified exact on P800): every reflector application uses 1D
-# vectors of width 64, a runtime row loop and a SINGLE static reduce per kernel
-# launch:
-#   - BR == 64 spans      : fused kernel (w per row + reflect in one pass).
-#   - wider spans         : per 64-lane chunk: one w-partial launch + one
-#                           update launch. w partials go to a fp32 scratch
-#                           whose rows are 64-aligned (2*WCOL wide: a hi/lo
-#                           double-double pair per chunk) so the update kernel
-#                           reads exact fp64 w values with one reduce per group.
-# All dot/update arithmetic accumulates in fp64 in-register (tl.sum on fp64 is
-# exact on this backend); only the final store casts to the storage dtype
-# (platform downgrades fp64 tensor allocations, so intermediates live in fp32
-# memory).
-# Both reflector sides share the same canonical trailing-columns form:
-#   - right mode: C @ (I - tau v v^T)
-#   - left  mode: (I - tau v v^T) @ C  ==  C^T @ (I - tau v v^T) applied by the
-#     same kernels on the transpose of a row-padded C.
-# v[0] == 1 is implicit in the packed reflector format; the storage diagonal
-# (which holds the reflector norm otherwise) is overwritten with 1.0 on a
-# private copy of the input. All out-of-range accesses are zero-padded
-# host-side. The Householder application order (left/right x transpose index
-# orders) is unchanged from the generic wrapper.
 import logging
 
 import torch
@@ -47,35 +10,8 @@ from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
-# Max safe 1D vector width on the XPU backend (probe-verified).
 _XPU_VEC = 64
 
-# ---------------------------------------------------------------------------
-# Fast "sweep" path (2026-08-30, XPU 7).
-#
-# Both reflector sides are row-independent once the work matrix is laid out
-# along the reflector direction:
-#   right mode: C <- C H(i) ... : every ROW of C evolves on its own,
-#               reflector direction = N.
-#   left  mode: C <- H(i) ... C : every COLUMN of C evolves on its own,
-#               reflector direction = M  (H is symmetric, so no transposed
-#               reduction is ever needed - the data dependency is
-#               single-direction in both modes).
-# So one program can own one work row, keep it in registers for the WHOLE
-# reflector sequence and reduce with a 1D -> scalar tl.sum. On TritonXPU a
-# runtime-bound loop may only contain a *1D* reduction (2D axis=0/axis=1
-# chains and loop-carried 2D tiles all fail to lower), which is exactly what
-# this shape gives. Total launches: 4, independent of k.
-#
-# Probe-verified compile envelope of _ormqr_sweep_kernel (XPU 7, 2026-08-30) -
-# NOT monotonic in the tile width, so only verified widths are whitelisted
-# (same envelope as _kunlunxin/ops/linalg_householder_product.py):
-#   fp32 accumulator: 64 OK, 128 OK, 256 FAIL, 512 FAIL, 1024 OK, 2048 OK,
-#                     4096 FAIL   ('uni_sram' <- TritonXPUUnrollControl)
-#   fp64 accumulator: 64 OK, 128 OK, >=256 FAIL ("'arith.mulf' op requires the
-#                     same type for all operands and results")
-# Reflector directions longer than the widest whitelisted width fall back to
-# the per-reflector kernels below.
 _SWEEP_WIDTHS = (64, 128, 1024, 2048)
 _SWEEP_ACC64_MAX = 128
 
@@ -233,26 +169,6 @@ def _ormqr_out_kernel(
     tl.store(OUT_ptr + f, tl.load(X_ptr + xoff))
 
 
-# ---------------------------------------------------------------------------
-# Fast single-launch sweep (2026-09-11, XPU 6) - mirrors the design that was
-# validated end-to-end on this platform by
-# _kunlunxin/ops/linalg_householder_product.py (PASS, dtype-balanced 2.77x).
-#
-# The previous sweep here needed 3 staging launches (init VU, pack X, sweep)
-# plus the out gather.  The work rows are still independent (one row of C for
-# right mode / one column of C for left mode), but now ONE program owns CC
-# work rows, keeps them in registers for the whole reflector sequence and
-# rebuilds v_i / tau_i on the fly from the packed geqrf input - so no V/U
-# staging, no pack launch, no _set_diag copy.  The only reduction is the
-# 1-D -> scalar tl.sum on the contiguous tile axis, which a runtime-bound loop
-# may wrap.  Total launches: 2, independent of k.
-#
-# The compile envelope of a CC-wide sweep on this platform is NOT monotonic in
-# the pad width and only MP = 128 has been fully exercised (see
-# linalg_householder_product), so the fast sweep is taken for LENGTH <= 128
-# (the whole functional-test matrix and the small benchmark shapes); longer
-# reflector directions keep the staged sweep / per-reflector paths below that
-# are already validated on this platform.
 _SWEEP_FAST_MP = 128
 
 
@@ -576,8 +492,6 @@ def _ormqr_sweep(input, tau, other, left, transpose):
     dev = other.device
     rev = (not transpose) if left else transpose
     total = B * M * N
-    # fast single-launch sweep (sibling-validated envelope: one program owns
-    # CC work rows, v_i/tau_i rebuilt on the fly; 2 launches total).
     if length <= _SWEEP_FAST_MP:
         cc = _ormqr_pick_cc(rows)
         X = torch.empty(B * rows * _SWEEP_FAST_MP, dtype=torch.float32, device=dev)
@@ -622,8 +536,6 @@ def _ormqr_sweep(input, tau, other, left, transpose):
             LP=_SWEEP_FAST_MP,
         )
         return OUT[:total].view(*other.shape)
-    # every element of V / U / X / OUT is written by the kernels below, so the
-    # buffers are deliberately uninitialised (no gems `zeros` launch).
     V = torch.empty(B * k * LP, dtype=torch.float32, device=dev)
     U = torch.empty(B * k * LP, dtype=torch.float32, device=dev)
     X = torch.empty(B * rows * LP, dtype=torch.float32, device=dev)
@@ -653,7 +565,6 @@ def _ormqr_sweep(input, tau, other, left, transpose):
         LEFT=left,
         LP=LP,
     )
-    # reflector order, identical to the per-reflector path below
     _ormqr_sweep_kernel[(B, rows)](
         X,
         V,
@@ -758,7 +669,7 @@ def _kunlunxin_w_one_kernel(
             tl.float64
         )
         w = tl.sum(crow64 * v64, axis=0, keep_dims=True)
-        wc = tl.sum(w, axis=0)  # fp64 scalar
+        wc = tl.sum(w, axis=0)
         wh = wc.to(tl.float32)
         wl = (wc - wh.to(tl.float64)).to(tl.float32)
         base = bid * s_wb + m * (WCOL * 2)
@@ -957,9 +868,6 @@ def ormqr(input, tau, other, left=True, transpose=False):
     two_d = C.dim() == 2
 
     if left:
-        # (I - tau v v^T) @ C == C^T @ (I - tau v v^T): run the canonical
-        # kernels on the transpose of a row-padded C. Reflector i covers
-        # rows [i, M) of C, so the reflector vector has length M.
         BR = _pad_len(int(M), _XPU_VEC)
         Nchunk = BR // _XPU_VEC
         V_pad_rows = M + 2 * BR
@@ -978,7 +886,7 @@ def ormqr(input, tau, other, left=True, transpose=False):
         C_slice = C_pad[:, :M, :]
         if not tle_copy(C_flat, C_slice):
             torch.ops.aten._copy_from(C_flat, C_slice, False)
-        C_t = C_pad.transpose(1, 2)  # (B, N, M + 2*BR)
+        C_t = C_pad.transpose(1, 2)
         s_cb, s_cm, s_cn = C_t.stride(0), C_t.stride(1), C_t.stride(2)
         s_vb, s_vm, s_vk = V_work.stride(0), V_work.stride(1), V_work.stride(2)
         s_tb = tau_flat.stride(0)
@@ -1007,7 +915,6 @@ def ormqr(input, tau, other, left=True, transpose=False):
         res = C_pad[:, :M, :]
         return res.squeeze(0) if two_d else res
     else:
-        # C @ (I - tau v v^T): reflector i covers trailing columns [i, N).
         BR = _pad_len(int(N), _XPU_VEC)
         Nchunk = BR // _XPU_VEC
         N_pad = N + 2 * BR

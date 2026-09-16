@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -29,11 +16,8 @@ def _osj_pipeline(
     rows = tl.arange(0, MP)
     ring = nw - 1
     half = nw // 2
-    msk = rows < MP  # store mask: on this backend unmasked vector stores write
-    # a fixed ~2KB window (the phantom lanes land in the memory block right
-    # above the tensor); the mask limits the store to the real MP rows.
+    msk = rows < MP
 
-    # 1. fill: B[r, c] = A[r, c] if r < m and c < n else 0 (scalar stores)
     for r in range(0, MP):
         for c in range(0, NW):
             val = 0.0
@@ -41,8 +25,6 @@ def _osj_pipeline(
                 val = tl.load(A_ptr + r * n + c)
             tl.store(B_ptr + r * NW + c, val)
 
-    # 2. cyclic one-sided Jacobi sweeps (flattened (sweep, s, j) schedule):
-    #    rotate column pair (p, q) so that their inner product becomes zero.
     for t in range(0, total):
         s = (t // half) % ring
         j = t % half
@@ -67,7 +49,6 @@ def _osj_pipeline(
         tl.store(B_ptr + p + rows * NW, c * ap - s_rot * aq, mask=msk)
         tl.store(B_ptr + q + rows * NW, s_rot * ap + c * aq, mask=msk)
 
-    # 3. U = B * diag(1/S) with S = ||B[:, j]|| (vector stores only)
     for j in range(0, nw):
         v = tl.load(B_ptr + j + rows * NW)
         sv = tl.sqrt(tl.sum(v * v))
@@ -85,8 +66,6 @@ def _osj_svd_impl(A, sweeps=12, full_matrices=False):
     NW = nw if (nw & (nw - 1)) == 0 else triton.next_power_of_2(nw)
     MP = triton.next_power_of_2(m)
 
-    # workspace (zero-padded) and U, both produced by the single pipeline
-    # kernel (one launch per batch element, grid (1,)).
     B = torch.empty((batch, MP, NW), device=dev, dtype=A.dtype)
     U = torch.empty((batch, MP, NW), device=dev, dtype=A.dtype)
     total = sweeps * (nw - 1) * (nw // 2)
@@ -105,10 +84,8 @@ def _osj_svd_impl(A, sweeps=12, full_matrices=False):
             num_stages=1,
         )
 
-    # S = column norms of B, computed on host (scalar-store workaround);
-    # the D2H copy is also the completion barrier for the pipeline kernel.
     Bc = B.cpu().double()
-    S = Bc.norm(dim=1).to(device=dev, dtype=A.dtype)  # (batch, NW)
+    S = Bc.norm(dim=1).to(device=dev, dtype=A.dtype)
 
     k = min(m, n)
     S_sorted, idx = torch.sort(S, dim=-1, descending=True)
@@ -116,7 +93,6 @@ def _osj_svd_impl(A, sweeps=12, full_matrices=False):
     idxg = idx.unsqueeze(1).expand(-1, MP, -1)
     U = torch.gather(U, 2, idxg)[:, :m, :k].contiguous()
 
-    # Vh = S^{-1} U^H A   (exact identity A = U diag(S) Vh when U orthonormal)
     UtA = torch.matmul(U.transpose(-2, -1), A)
     Vh = UtA * (1.0 / S_sorted).unsqueeze(-1)
 

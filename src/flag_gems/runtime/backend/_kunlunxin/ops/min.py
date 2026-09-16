@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 import math
@@ -20,7 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-# from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
@@ -30,46 +16,6 @@ from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
-# NOTE (kunlunxin/XPU): performance recipe (2026-08-17) follows the
-# amax/amin 2026-08-16 closure for the value-only paths and the argmin
-# 2026-08-11 "packed index" closure for the min.dim (values, indices) path:
-#   * masked loading uses `other=+inf` everywhere (NOT get_dtype_max), so
-#     all-+inf blocks stay +inf (tests/test_min.py::test_min_all_inf);
-#   * NEED_MASK constexpr fast 2D row-reduction: mask-free tiles when M and N
-#     both divide the picked [BLOCK_M, BLOCK_N] (skips the XPU masked-memory
-#     slow path);
-#   * the reduced dim is brought innermost with the native strided copy
-#     (`torch.ops.aten._copy_from`; flag_gems does not override _copy_from)
-#     instead of the slow gems `.contiguous()` override;
-#   * flat (dim=None) reduction = rows-of-8192 with the 2D tile kernel plus a
-#     staged 8192-wide mid reduce -- the HEAD staged `min_kernel_1` path
-#     (tl.reduce + combine_fn) stalls in the XPU compiler on the very first
-#     launch (probe: >10min on a 2-element tensor; matches the 2026-08-08 /
-#     2026-08-10 BLOCKED records), so the flat path is replaced entirely;
-#   * N == 1 identity: `_copy_from` for values + a zeros index tensor.
-# min.dim needs values AND indices. A per-element index-carrying reduce
-# (`tl.min(... return_indices=True)` or a packed (value, index) int64 word)
-# is ~15-20x slower than a value-only reduce on this XPU, so like argmin we
-# split it into three passes.  Two fast-path variants share the same
-# pass-2/pass-3 structure and differ only in the pass-1 tiling / part_val
-# layout; A/B picks the variant per shape (see _NEW_MIN_VR):
-#   1a. min_chunk_val_kernel (wide views, VR >= 65536): the (M2, N) matrix is
-#       a contiguous (M2*nc, CHUNK) reshape (CHUNK | N), so one amin-style
-#       reduce-OUTSIDE value-only row min over that view yields the per-chunk
-#       minima into 1-D part_val[r*nc + ic] (single tl.min per program
-#       instead of one tl.min per chunk, ~1.9x faster on (1024, 2^20));
-#   1b. min_split_kernel (narrow views, VERBATIM HEAD): one [BM, CHUNK] tile
-#       per chunk, column-major part_val[row + ic * M] -- faster than the
-#       merge-view form on (1024, 4096)/(4096, 4096)/(1024, 256);
-#   2. min_chunk_kernel / min_chunk_kernel_col: per-row min over the nc chunk
-#      minima (leftmost chunk wins ties on this XPU backend, matching torch
-#      "first minimal").
-#   3. min_scan_kernel / min_scan_kernel_col: re-read only the winning chunk,
-#      pack (order-preserving fp32 bit-map << 30) | column into an int64 and
-#      take the plain int64 min so the first minimal lane wins; NaN and +inf
-#      map above every finite value, exactly the XPU device-native fmin
-#      family semantics (amax/amin 2026-08-16 evidence; device native min
-#      ignores NaN, an all-NaN row yields NaN/value and index 0).
 
 _FULL_REDUCTION_BLOCK_SIZE = 8192
 _FAST_MIN_N = 64
@@ -77,24 +23,11 @@ _FAST_BN_FP16 = (1024, 256, 512, 128, 64)
 _FAST_BN_FP32 = (512, 256, 1024, 128, 64)
 _FAST_BM_FP16 = (128, 64, 32, 256, 512, 16, 8, 4, 2)
 _FAST_BM_FP32 = (64, 128, 32, 256, 512, 16, 8, 4, 2)
-# chunk-major view (pass 1) tile preference: a view row is one CHUNK-wide
-# block, so the load loop has CHUNK / BLOCK_N trips; 512 is the widest tile
-# that still pipelines (>= 2 trips) for the common CHUNK = 1024, 1024 only
-# appears as the single-trip last resort for very narrow views.
 _VIEW_BN_FP16 = (512, 256, 128, 64, 1024)
 _VIEW_BN_FP32 = (512, 256, 128, 64, 1024)
 _VIEW_BM_FP16 = (128, 64, 32, 256, 512, 16, 8, 4, 2)
 _VIEW_BM_FP32 = (64, 128, 32, 256, 512, 16, 8, 4, 2)
-# XPU compile guard: tiny [BLOCK_M, BLOCK_N] tiles (e.g. [64, 64]) fail the
-# TritonXPU `uni_sram` pass ("PassManager::run failed"). Only tiles with at
-# least this many lanes are routed to the mask-free row kernels; smaller
-# shapes fall back to the legacy masked kernel.
 _MIN_FAST_TILE_LANES = 8192
-# chunk-major view (min_chunk_val_kernel) pays off only when the view is wide
-# (>= 2^16 view rows, i.e. M2*nc >= 65536): A/B on one card shows the
-# merge-view form 1.9x faster than the HEAD split form at (1024, 2^20) but
-# 1.4-2.1x slower at (1024, 4096)/(4096, 4096)/(1024, 256), so narrower
-# views keep the HEAD min_split_kernel form verbatim.
 _NEW_MIN_VR = 65536
 
 
@@ -150,10 +83,6 @@ def min_split_kernel(
     BLOCK_CHUNK: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # Pass 1 (HEAD form, narrow chunk-major views; value-only f32 min,
-    # NaN/inf never win: same fmin family semantics as the XPU device-native
-    # min; see module note).  One [BLOCK_M, BLOCK_CHUNK] tile per chunk, the
-    # chunk minima are stored column-major at part_val[row + ic * M].
     pid = ext.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     inp = inp + rows.to(tl.int64) * N
@@ -184,12 +113,6 @@ def min_chunk_kernel_col(
     BLOCK_M: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    # Pass 2 (HEAD form): per row, argmin over the NC chunk minima (leftmost
-    # chunk wins ties on this XPU backend, matching the torch "first minimal"
-    # rule; NC is small, so return_indices is cheap).  part_val is
-    # column-major [chunk + M * row]; the fast path only runs when NC <= 1024
-    # -- an NC-walking loop with return_indices inside hits the XPU `tt.addptr`
-    # encoding miscompilation (one-shot tile only).
     pid = ext.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < M
@@ -217,17 +140,10 @@ def min_scan_kernel_col(
     BLOCK_M: tl.constexpr,
     BLOCK_CHUNK: tl.constexpr,
 ):
-    # Pass 3 (HEAD form, column-major part_val): re-read only the winning
-    # chunk per row and take the earliest lane equal to the chunk min.  The
-    # 1/NC data slice is packed into (ordered fp32 value << 30) | column
-    # words and reduced with a plain int64 min: the first minimal lane wins
-    # (torch tie rule), -0.0 sorts below +0.0, and NaN/+inf bits sort above
-    # every finite value so they never win (XPU fmin / device-native
-    # semantics; an all-NaN row falls back to index 0 and the NaN value).
     pid = ext.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < M
-    c = tl.load(best_c + rows)  # [BM] int32
+    c = tl.load(best_c + rows)
     base = rows.to(tl.int64) * N + c.to(tl.int64) * BLOCK_CHUNK
     cols = tl.arange(0, BLOCK_CHUNK)
     col_ok = cols[None, :] < (N - c * BLOCK_CHUNK)[:, None]
@@ -239,15 +155,9 @@ def min_scan_kernel_col(
     u = a.to(tl.int32, bitcast=True)
     neg = u < 0
     ordered = tl.where(neg, ~u, u ^ -2147483648)
-    # NOTE: the value/index word must use a 30-bit column shift (like the
-    # argmin scan kernel). A full 64-bit `<< 32` is miscompiled by the XPU
-    # backend (probed: the int64 min then picks wrong lanes); << 30 with
-    # BLOCK_CHUNK <= 8192 < 2^30 is correct on every probe.
     pack = ((ordered.to(tl.int64) & 0xFFFFFFFF) << 30) | cols.to(tl.int64)
     blk = tl.min(pack, axis=1)
     pos = (blk & 0x3FFFFFFF) + c.to(tl.int64) * BLOCK_CHUNK
-    # value of the winning lane: the chunk min computed by pass 1 (equal to
-    # the winning lane's value, incl. the XPU fmin NaN semantics).
     m = tl.load(part_val + rows.to(tl.int64) + c.to(tl.int64) * M, mask=row_mask)
     tl.store(out_val + rows.to(tl.int64), m, mask=row_mask)
     tl.store(out_idx + rows.to(tl.int64), pos, mask=row_mask)
@@ -277,7 +187,7 @@ def min_kernel_1(
 
 
 def heur_m_block_size(args):
-    return triton.next_power_of_2(triton.cdiv(args["M"], 12))  # cluster_num
+    return triton.next_power_of_2(triton.cdiv(args["M"], 12))
 
 
 def heur_n_block_size(args):
@@ -304,15 +214,11 @@ def min_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # Legacy masked (values, indices) kernel for the non-fast paths (small N,
-    # int dtypes). Preserved byte-for-byte from HEAD.
-    # set offset
     pid_m = ext.program_id(0)
     pid_k = ext.program_id(1)
     m_offset = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
 
     dtype = inp.type.element_ty
-    # you just cannot create a function that return a tl.dtype in triton lang
     acc_type = tl.float32 if dtype is tl.bfloat16 else dtype
     max_value = get_dtype_max(dtype)
     min_values = tl.full([BLOCK_M], dtype=acc_type, value=max_value)
@@ -347,18 +253,12 @@ def min_kernel_2d(
     BLOCK_N: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # Value-only 2D row reduction (flat rows-of-8192 / plain dim reduction).
     pid = ext.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     inp = inp + rows * N
     out = out + rows
     row_mask = rows < M
 
-    # Keep only a [BLOCK_M, 1] running accumulator and reduce each [BLOCK_M,
-    # BLOCK_N] block along N *inside* the loop (reduce-INSIDE; the only form
-    # that is numerically correct on this XPU -- see amax_kernel_2d notes).
-    # NEED_MASK=False compiles to a mask-free kernel (M and N both divide by
-    # the block sizes), avoiding the XPU masked-memory slow path entirely.
     acc = tl.full([BLOCK_M, 1], value=float("inf"), dtype=tl.float32)
     for off in range(0, N, BLOCK_N):
         cols = off + tl.arange(0, BLOCK_N)[None, :]
@@ -468,9 +368,6 @@ def _min_flat(inp, out, device):
             ),
             128,
         )
-    # exact (rows // bm) * bm rows run mask-free on the input directly; the
-    # leftover rows are copied into a padded [bm, block] buffer first so the
-    # same mask-free kernel covers them.
     rows_exact = (rows // bm) * bm
     mid = torch.empty((rows + (1 if res else 0),), dtype=inp.dtype, device=device)
     with torch_device_fn.device(device):
@@ -486,13 +383,6 @@ def _min_flat(inp, out, device):
                 buffer_size_limit=2048,
             )
         if rows > rows_exact:
-            # The leftover rows are copied into a fully-allocated padded
-            # [bm, block] buffer and reduced with a fully mask-free launch
-            # (M = bm covers the whole padded buffer; extra rows are the
-            # reduction identity and cannot win). The bm row-minima go to a
-            # scratch buffer first so the real mid output is never written
-            # out of bounds. (XPU masked tails read OOB and can also return
-            # wrong values -- backend limitation, see the module note.)
             tail_rows = rows - rows_exact
             tail_buf = torch.full(
                 (bm * block,), pad_val, dtype=inp.dtype, device=device
@@ -554,12 +444,6 @@ def min_chunk_val_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # Pass 1 (value-only f32 min, NaN/inf never win: same fmin family
-    # semantics as the XPU device-native min; see module note). The (M2, N)
-    # input is a contiguous (M2*nc, CHUNK) view; the loop tiles the CHUNK
-    # columns with the amin_rows reduce-OUTSIDE accumulation and a single
-    # tl.min per program (vs one tl.min per chunk before), and every chunk
-    # minimum is stored as part_val[view_row].
     pid = ext.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     rows_c = tl.where(rows < M, rows, M - 1)
@@ -584,13 +468,6 @@ def min_chunk_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    # Pass 2: per row, argmin over the NC chunk minima (leftmost chunk wins
-    # ties on this XPU backend, matching the torch "first minimal" rule;
-    # return_indices is cheap here because pass 2 only touches the nc
-    # per-row minima). part_val is chunk-major 1-D [row * NC + chunk]; a
-    # single [BLOCK_M, BLOCK_C] tile covers the whole NC (the fast path only
-    # runs when NC <= 1024 -- an NC-walking loop with return_indices inside
-    # hits the XPU `tt.addptr` encoding miscompilation).
     pid = ext.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < M
@@ -618,17 +495,10 @@ def min_scan_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_CHUNK: tl.constexpr,
 ):
-    # Pass 3: re-read only the winning chunk per row and take the earliest
-    # lane equal to the chunk min. The 1/NC data slice is packed into
-    # (ordered fp32 value << 32) | column words and reduced with a plain
-    # int64 min: the first minimal lane wins (torch tie rule), -0.0 sorts
-    # below +0.0, and NaN/+inf bits sort above every finite value so they
-    # never win (XPU fmin / device-native semantics; an all-NaN row falls
-    # back to index 0 and the NaN value).
     pid = ext.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < M
-    c = tl.load(best_c + rows)  # [BM] int32
+    c = tl.load(best_c + rows)
     base = rows.to(tl.int64) * N + c.to(tl.int64) * BLOCK_CHUNK
     cols = tl.arange(0, BLOCK_CHUNK)
     col_ok = cols[None, :] < (N - c * BLOCK_CHUNK)[:, None]
@@ -640,15 +510,9 @@ def min_scan_kernel(
     u = a.to(tl.int32, bitcast=True)
     neg = u < 0
     ordered = tl.where(neg, ~u, u ^ -2147483648)
-    # NOTE: the value/index word must use a 30-bit column shift (like the
-    # argmin scan kernel). A full 64-bit `<< 32` is miscompiled by the XPU
-    # backend (probed: the int64 min then picks wrong lanes); << 30 with
-    # BLOCK_CHUNK <= 8192 < 2^30 is correct on every probe.
     pack = ((ordered.to(tl.int64) & 0xFFFFFFFF) << 30) | cols.to(tl.int64)
     blk = tl.min(pack, axis=1)
     pos = (blk & 0x3FFFFFFF) + c.to(tl.int64) * BLOCK_CHUNK
-    # value of the winning lane: the chunk min computed by pass 1 (equal to
-    # the winning lane's value, incl. the XPU fmin NaN semantics).
     m = tl.load(
         part_val + rows.to(tl.int64) * (N // BLOCK_CHUNK) + c.to(tl.int64),
         mask=row_mask,
@@ -672,8 +536,6 @@ def min_dim(inp, dim=None, keepdim=False):
     out_index = torch.empty(shape_list, dtype=torch.int64, device=inp.device)
 
     if N == 1:
-        # min along a size-1 dim is the identity (value = input, index = 0) --
-        # the native strided copy engine instead of launching a kernel.
         with torch_device_fn.device(inp.device):
             if not tle_copy(inp, out_value):
                 torch.ops.aten._copy_from(inp, out_value, False)
@@ -684,11 +546,7 @@ def min_dim(inp, dim=None, keepdim=False):
         Min_out = namedtuple("min", ["values", "indices"])
         return Min_out(values=out_value, indices=out_index)
 
-    # ---- fast chunked three-pass path (floats only, N >= _FAST_MIN_N) ----
     if N >= _FAST_MIN_N and _is_fast_dtype(inp.dtype):
-        # chunk width (pass 3 scans the winning chunk in one [BM, CHUNK] tile,
-        # so CHUNK must be a power of two; the largest such divisor of N is
-        # used so nc stays small).
         CHUNK = (
             1024
             if N % 1024 == 0
@@ -696,16 +554,6 @@ def min_dim(inp, dim=None, keepdim=False):
         )
         M2 = M * K
         is_fp32 = inp.dtype == torch.float32
-        # (M2, N) is a contiguous (M2 * (N // CHUNK), CHUNK) reshape, so pass 1
-        # can run as an amin-style reduce-OUTSIDE value-only row min over that
-        # chunk-major view (row-major part_val[r*nc + ic]).  This merge-view
-        # form is only faster than the HEAD split reduce for wide views
-        # (VR >= _NEW_MIN_VR; e.g. (1024, 65536) and (1024, 2^20)); for
-        # narrower views the HEAD min_split_kernel form wins the A/B, so they
-        # keep it verbatim.  The fast path also needs enough rows (pass 2/3
-        # grids) and a single-tile pass 2 (NC <= 1024); flat 1-D shapes
-        # (M2 == 1) and >1024-chunk rows keep the legacy path (identical
-        # behavior to before).
         if CHUNK:
             nc = N // CHUNK
             VR = M2 * nc
@@ -713,9 +561,6 @@ def min_dim(inp, dim=None, keepdim=False):
                 tile = _pick_chunk_tile(VR, CHUNK, is_fp32)
                 if tile is not None:
                     block_m, block_n = tile
-                    # Bring the reduced dim innermost (same order as
-                    # dim_compress) and materialize with the native strided
-                    # copy (not gems contiguous).
                     perm = [d for d in range(inp.dim()) if d != dim] + [dim]
                     view = inp.permute(perm)
                     if view.is_contiguous():
@@ -778,15 +623,11 @@ def min_dim(inp, dim=None, keepdim=False):
                     Min_out = namedtuple("min", ["values", "indices"])
                     return Min_out(values=out_value, indices=out_index)
 
-        # HEAD split path (narrow chunk-major views, verbatim control flow):
-        # one [BLOCK_M, BLOCK_CHUNK] tile per chunk, column-major part_val.
         tile = _pick_fast_tile(M2, N, is_fp32)
         if tile is not None:
             block_m, block_n = tile
             grid_m = M2 // block_m
             need_mask = False
-            # Bring the reduced dim innermost (same order as dim_compress) and
-            # materialize with the native strided copy (not gems contiguous).
             perm = [d for d in range(inp.dim()) if d != dim] + [dim]
             view = inp.permute(perm)
             if view.is_contiguous():
@@ -839,19 +680,12 @@ def min_dim(inp, dim=None, keepdim=False):
             Min_out = namedtuple("min", ["values", "indices"])
             return Min_out(values=out_value, indices=out_index)
 
-    # ---- legacy path (unchanged HEAD behavior, incl. int dtypes) ----------
     inp = inp.contiguous()
 
     grid = lambda meta: (
         triton.cdiv(M, meta["BLOCK_M"]),
         K,
     )
-    # NOTE (kunlunxin/XPU): the `tl.min(..., return_indices=True)` argmin
-    # combine makes the `TritonXPUCoreTiling` pass emit incompatible `tt.reduce`
-    # slice orders (order=[0,1] value vs order=[1,0] index) for most 2D (K==1)
-    # tiles, which fails compilation ("out of resource: uni_sram /
-    # PassManager::run failed"). Closing core-tiling side-steps the buggy
-    # layout for the argmin reduce and compiles every shape/dtype.
     isCloseCoreTiling = True
     with torch_device_fn.device(inp.device):
         min_kernel[grid](

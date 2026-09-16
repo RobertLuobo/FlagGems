@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import sys
 
@@ -18,15 +5,14 @@ import torch
 import triton
 import triton.language as tl
 
-BS = 8192   # count/rank tile = rank buffer width (sum/cumsum safe block size)
-RANK_SUB = 512   # sub-tile width of the cumulative scan inside _bst_rank_kernel
-RANK_NSUB = BS // RANK_SUB   # number of sub-tiles per row buffer (16)
+BS = 8192
+RANK_SUB = 512
+RANK_NSUB = BS // RANK_SUB
 
 
 @triton.jit
 def _ord_i32(x):
     bits = x.to(tl.int32, bitcast=True)
-    # UNSIGNED-ascending int32 key: u(x) < u(y) (unsigned)  <=>  x < y
     return tl.where(x >= 0, bits | (-0x80000000), ~bits)
 
 
@@ -64,11 +50,6 @@ def _bst_rank_kernel(
     inputs, ranks, starts, ends, thrs,
     S: tl.constexpr, RB: tl.constexpr, SUB: tl.constexpr, NSUB: tl.constexpr,
 ):
-    # per-lane signed rank: +r for u > thr (r = 1..c1), -r for u == thr (r = 1..c2), 0 otherwise
-    # The cumulative scan is done in SUB-lane sub-tiles (SUB=512) with a running
-    # global total: an 8192-lane single tl.cumsum silently mis-computes on the
-    # XPU/flagtree backend (only ~512 lanes end up ranked; measured 2026-09-04 as
-    # test_bucket_sort_topk_large_scale at ~0.25-0.26 intersection).
     b = tl.program_id(0)
     s_base = inputs + b * S
     rank_base = ranks + b * RB
@@ -88,8 +69,6 @@ def _bst_rank_kernel(
         eq = (u == thr) & m
         cums_gt = tl.cumsum(gt.to(tl.int32), axis=0)
         cums_eq = tl.cumsum(eq.to(tl.int32), axis=0)
-        # signed rank: +r (gt) / -r (eq) / 0 (neither), via pure arithmetic
-        # (a nested tl.where as the stored value mis-pairs lanes on XPU)
         val = (cums_gt + prev_gt) * gt.to(tl.int32) - (cums_eq + prev_eq) * eq.to(tl.int32)
         tl.store(rank_base + offs, val, mask=m)
         prev_gt += tl.sum(gt.to(tl.int32), axis=0)
@@ -116,20 +95,6 @@ def _bst_fill_kernel(
         lane = offs + st
     c1 = tl.sum((rk > 0).to(tl.int32), axis=0)
     c2 = tl.sum((rk < 0).to(tl.int32), axis=0)
-    # NOTE(2026-09-04, R2): the loops are bounded by the *runtime* counts
-    # c1 / min(c2, K - c1) and the stores are unconditional. The previous
-    # implementation kept the loop up to K and masked the stores with
-    # value-derived predicates (mask=c1 > p / (q < c2) & (c1 + q < K)); on the
-    # XPU/flagtree backend such data-dependent store masks are silently
-    # dropped, so for rows shorter than K (c1 + c2 < K, e.g. the tail chunk of
-    # a large-scale variable-length row) the leftover slots [c1+c2, K) were
-    # written with v = sum((rk == p+1)*lane) = 0, i.e. a spurious duplicate of
-    # position 0. Those 0-entries (value == x[0], often a large value) entered
-    # the recursive candidate pool and evicted genuine top-K positions
-    # (observed intersection 0.49-0.78 instead of 1.0; e.g. n = 51911,
-    # K = 4096 -> 1337 spurious -> 2759/4096). c1 < K always holds (binary
-    # search invariant count(u > thr) < K), so min(c2, K - c1) >= 0 and the
-    # equal loop lowers to exactly the slots [c1, min(c1+c2, K)).
     for p in range(0, c1):
         v = tl.sum((rk == p + 1).to(tl.int32) * lane, axis=0)
         tl.store(scr + p, v)
@@ -142,7 +107,6 @@ def _bst_fill_kernel(
 
 @triton.jit
 def _bst_gather_vals_kernel(x, cidx, cval, K: tl.constexpr):
-    # cidx: (NCH*K,) global idx (0..S-1, -1 = invalid); cval: (NCH*K,) f32
     j = tl.program_id(0)
     off = j * K + tl.arange(0, K)
     idx = tl.load(cidx + off)
@@ -155,7 +119,6 @@ def _bst_gather_vals_kernel(x, cidx, cval, K: tl.constexpr):
 
 @triton.jit
 def _bst_map_idx_kernel(gmap, idx, out, N: tl.constexpr):
-    # out[j] = gmap[idx[j]]  (idx = positions, -1 -> -1)
     j = tl.program_id(0)
     off = j * 1024 + tl.arange(0, 1024)
     m = off < N
@@ -214,8 +177,6 @@ def _bst_rows(xv, st_val, en_val, n_val, K, out, gmap=None):
         en_c = torch.tensor([cst + cn], dtype=torch.int32, device=xv.device)
         n_c = torch.tensor([cn], dtype=torch.int32, device=xv.device)
         k_c = torch.tensor([min(K, cn)], dtype=torch.int32, device=xv.device)
-        # chunk candidates are POSITIONS in xv (no gmap); the composition happens
-        # via _bst_map_idx_kernel below.
         _bst_select(xv, st_c, en_c, n_c, k_c, K, cidx[j:j + 1])
     cflat = cidx.reshape(-1)
     M = nch * K
@@ -245,9 +206,6 @@ def bucket_sort_topk_xpu(inputs, starts, ends, topk):
     return out
 
 
-# ---------------------------------------------------------------------------
-# wiring: patch the direct-import entrypoint (mhc_pre-style self-install)
-# ---------------------------------------------------------------------------
 def _install():
     """Replace ``flag_gems.fused.DSA.bin_topk.bucket_sort_topk`` with the XPU
     implementation. The DSA bin_topk family is called via direct module

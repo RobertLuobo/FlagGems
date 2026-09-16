@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 from typing import Optional
@@ -24,17 +11,6 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
-# NOTE: config_ intentionally keeps the original is_scatter_slice=True +
-# buffer_size_limit=512 + isCloseOffsetAnalysis=True for the STRIDED
-# copy_slice path.  Experimenting with the copy-family recipe
-# (buffer_size_limit=4096, isCloseVectorization=False, kunlunAutoGrid=True,
-# unroll_num=8) here made large rank-4 strided copies (e.g. contiguous() of a
-# 16M-element [::2] view) pathological: test_contiguous
-# [dtype3-shape3] went from 15.4s (pre-fix) to >900s (timeout), because the
-# 1d-tile codegen then widens to next_pow2(numel/12) lanes for the strided
-# gather.  All large-contiguous speedups below come from _copy_flat_kernel,
-# which is config-independent, so the strided path keeps the proven original
-# config.
 config_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),
@@ -45,10 +21,6 @@ config_ = CodeGenConfig(
 )
 
 
-# @pointwise_dynamic(is_tensor=(True,), promotion_methods=[(0, "DEFAULT")])
-# @triton.jit
-# def copy(src):
-#     return src
 
 
 @pointwise_dynamic(
@@ -146,7 +118,6 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
     if not isinstance(src, torch.Tensor):
         raise TypeError("src must be a Tensor")
 
-    # this is the same as PyTorch's check
     if dst._is_zerotensor():
         raise RuntimeError("ZeroTensors are immutable. Call clone() before copy_.")
     if src._is_zerotensor():
@@ -170,13 +141,6 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
     _validate_triton_copy(dst, src)
     logger.debug("GEMS_KUNLUNXIN COPY_")
 
-    # Fast path: torch.broadcast_shapes() routes through torch._refs /
-    # symbolic-shape guards and costs ~30us per call on the XPU stack, which
-    # dominates small copies.  A same-shape compare + Tensor.expand is
-    # equivalent (expand raises the same "size of tensor a ... must match
-    # size of tensor b ..." RuntimeError when not broadcastable); the slow
-    # broadcast_shapes call is kept only for the error branch to reproduce
-    # torch's exact compatibility message.
     if src.shape != dst.shape:
         try:
             src.expand(dst.shape)
@@ -189,9 +153,6 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
                 f"The broadcast shape {broadcast_shape} does not match destination shape {tuple(dst.shape)}"
             ) from None
     if dst.numel() == 0:
-        # Empty copy is a no-op (broadcast compatibility was already validated
-        # above); the previous aten::copy_.default.redispatch re-entry is not
-        # needed on any backend.
         return dst
 
     logger.debug("GEMS_KUNLUNXIN COPY_")
@@ -229,11 +190,6 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
             "copy_ from float8_e8m0fnu only supports float8_e8m0fnu and contiguous float32 destinations on Kunlunxin"
         )
 
-    # Contiguous, same-dtype, non-aliasing copy: bounded-tile flat block-DMA is
-    # measurably faster than both the multi-dim pointwise path (its per-lane
-    # i0*s0 + i1*s1 gather + wide 12-CTA tile is ~2.8x slower and fails to
-    # vectorize bool) and the 1d variant.  Non-contiguous / broadcast / mixed
-    # dtype / aliasing copies keep the strided pointwise kernel below.
     if (
         not aliases
         and expanded_src.is_contiguous()
@@ -242,13 +198,6 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
     ):
         n_elements = expanded_src.numel()
         item_size = expanded_src.element_size()
-        # Unify 1B/2B/4B element dtypes onto an int32(4B) view: 4B load/store
-        # measures ~830-860 GB/s vs ~505-530 GB/s for raw element loads (the
-        # byte-wide path), and is bit-exact (no value reinterpretation).
-        # Requires 4B-aligned storage and a byte-total divisible by 4;
-        # otherwise fall back to the raw element-wise kernel below.  The
-        # reshape+view host-side work (~3.4us) only pays off on large copies,
-        # so small tensors keep the raw path.
         if (
             item_size <= 4
             and (n_elements * item_size) % 4 == 0
@@ -256,9 +205,6 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
             and expanded_src.data_ptr() % 4 == 0
             and dst.data_ptr() % 4 == 0
         ):
-            # reshape(-1) first: Tensor.view(dtype) requires the last dim's
-            # byte-size to divide 4, which non-flat shapes (e.g. (20,320,15)
-            # fp16) would violate; flattening a contiguous tensor is free.
             src_view = expanded_src.reshape(-1).view(torch.int32)
             dst_view = dst.reshape(-1).view(torch.int32)
             n32 = src_view.numel()

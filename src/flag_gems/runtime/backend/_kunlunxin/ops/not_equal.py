@@ -14,13 +14,6 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# tle.raw fast path for the tensor-vs-scalar not_equal compare (P800 xpu3,
-# cluster C payload in ne_raw.xpu). torch.ne and torch.not_equal are the same
-# IEEE != compare; the payload streams the input once per core with pipelined
-# GM2LM/LM2GM DMA and compares with the hardware vector intrinsics, with the
-# same memory footprint as the ATen reference. See ne_raw.xpu for the full
-# analysis. Mirrors the sibling lt/greater payloads (lt_raw.xpu / gt_raw.xpu).
 try:
     import triton.experimental.tle as tle
 
@@ -30,14 +23,9 @@ except ImportError:
     _TLE_OK = False
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_NCLUSTER = 12  # P800 (xpu3): one Triton program == one cluster of 64 cores
-# Payload scalars are i32 (do_not_specialize); guard the byte range.
+_NCLUSTER = 12
 _RAW_MAX_ELEMS = 2**31 - 1
-# Must match CHUNK_BYTES in ne_raw.xpu (the chunk-grid partition contract).
 _RAW_CHUNK_BYTES = 2048
-# Below this element count the op is launch-bound and the bare pointwise
-# scalar kernel (single launch, no extra host work) is fine; the payload wins
-# from ~64K elements up (same crossover as the lt/greater payloads).
 _SMALL_SCALAR_LIMIT = 65536
 
 _RAW_TYPE_CODE = {
@@ -81,7 +69,6 @@ def _scalar_bits(B, dtype):
     """
     if dtype == torch.float32:
         return int(torch.tensor(B, dtype=torch.float32).view(torch.int32).item())
-    # fp16 / bf16: the payload only reads the low 16 bits.
     return int(torch.tensor(B, dtype=dtype).view(torch.int16).item())
 
 
@@ -102,9 +89,6 @@ def _raw_not_equal_scalar(A, B):
     esz = A.element_size()
     s_bits = _scalar_bits(B, A.dtype)
     out = torch.empty(A.shape, dtype=torch.bool, device=A.device)
-    # partition by payload chunks (CHUNK_BYTES/esz elements each): every
-    # program and core gets whole chunks so all GM2LM/LM2GM transfers are
-    # CHUNK_BYTES-aligned in global memory.
     chunk_elems = _RAW_CHUNK_BYTES // esz
     total_chunks = (M + chunk_elems - 1) // chunk_elems
     per = (total_chunks + _NCLUSTER - 1) // _NCLUSTER

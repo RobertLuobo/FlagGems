@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -41,12 +28,12 @@ def _grouped_mm_dense_kernel(
     A,
     B,
     C,
-    tile_row,  # (T,) int32 global row start of each complete m-tile
-    tile_g,  # (T,) int32 group index of each complete m-tile
+    tile_row,
+    tile_g,
     K,
     N,
     stride_ak,
-    NT: tl.constexpr,  # cdiv(N, BLOCK_N)
+    NT: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -88,7 +75,7 @@ def _grouped_mm_tail_kernel(
     A,
     B,
     C,
-    offs,  # (G,) int32 cumulative group ends
+    offs,
     M_total,
     K,
     N,
@@ -118,7 +105,7 @@ def _grouped_mm_tail_kernel(
         rk = tl.arange(0, BLOCK_K)
         ld_m = rm_local < mg
         rm = offs_prev + rm_local
-        rm_w = rm % M_total  # garbage rows wrap to [0, BM); mask drops them
+        rm_w = rm % M_total
         A_ptrs = A + (rm_w[:, None] * stride_ak + rk[None, :])
         B_ptrs = B + g.to(tl.int64) * (K * N) + (rk[:, None] * N + rn[None, :])
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -181,11 +168,9 @@ def group_mm(A: torch.Tensor, B: torch.Tensor, offs: torch.Tensor) -> torch.Tens
     if num_groups == 0:
         return A.new_empty(M, N)
 
-    # one host sync for all group boundaries (same as before)
     offs_cpu = offs.detach().cpu()
     offs_l = offs_cpu.tolist()
 
-    # tile shapes: BK/BN must divide K/N so the K/N loads never need a mask
     if K % 256 == 0:
         BK_T = 256
     elif K % 128 == 0:
@@ -202,7 +187,6 @@ def group_mm(A: torch.Tensor, B: torch.Tensor, offs: torch.Tensor) -> torch.Tens
         return _vendor_loop_group_mm(A, B, offs, num_groups, offs_cpu, M, N)
     BM_T = 256
 
-    # build the complete-tile map (host-side; G <= 64 so the cost is trivial)
     tile_row = []
     tile_g = []
     s = 0

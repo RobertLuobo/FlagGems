@@ -1,16 +1,3 @@
-# Copyright 2026, The FlagOS Contributors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """Kunlunxin unfold_copy override.
 
 unfold_copy(input, dimension, size, step) is the copy variant of
@@ -59,8 +46,6 @@ _BLOCK = 1024
 def _unfold_copy_kernel(
     inp, out, outer, D, inner, L, size, step, numel, BLOCK: tl.constexpr
 ):
-    # out[o, w, c, k] = inp[o, w*step + k, c]  (row-major input).
-    # out is contiguous: linear index = ((o*L + w)*inner + c)*size + k.
     pid = ext.program_id(axis=0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < numel
@@ -122,9 +107,6 @@ def unfold_copy(input, dimension, size, step):
     size = int(size)
     step = int(step)
 
-    # Validate/replicate all Torch-visible errors, in the same order as the
-    # native op (dim range -> size <= dim_size -> step > 0), without building
-    # the as_strided view.
     ndim = input.ndim
     if ndim == 0:
         dim = 0
@@ -161,7 +143,6 @@ def unfold_copy(input, dimension, size, step):
 
     n_windows = (dim_size - size) // step + 1
     if ndim == 0:
-        # Native 0-dim unfold flattens to 1-D: shape (n_windows * size,).
         out_shape = (n_windows * size,)
         outer = 1
         inner = 1

@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """Kunlunxin backend override for ``linalg_svdvals``.
 
@@ -60,11 +47,8 @@ def _osj_svals_pipeline(A_ptr, B_ptr, m, n, nw, total, MP: tl.constexpr, NW: tl.
     rows = tl.arange(0, MP)
     ring = nw - 1
     half = nw // 2
-    msk = rows < MP  # store mask: on this backend unmasked vector stores write
-    # a fixed ~2KB window (the phantom lanes land in the memory block right
-    # above the tensor); the mask limits the store to the real MP rows.
+    msk = rows < MP
 
-    # 1. fill: B[r, c] = A[r, c] if r < m and c < n else 0 (scalar stores)
     for r in range(0, MP):
         for c in range(0, NW):
             val = 0.0
@@ -72,8 +56,6 @@ def _osj_svals_pipeline(A_ptr, B_ptr, m, n, nw, total, MP: tl.constexpr, NW: tl.
                 val = tl.load(A_ptr + r * n + c)
             tl.store(B_ptr + r * NW + c, val)
 
-    # 2. cyclic one-sided Jacobi sweeps (flattened (sweep, s, j) schedule):
-    #    rotate column pair (p, q) so that their inner product becomes zero.
     for t in range(0, total):
         s = (t // half) % ring
         j = t % half
@@ -98,7 +80,6 @@ def _osj_svals_pipeline(A_ptr, B_ptr, m, n, nw, total, MP: tl.constexpr, NW: tl.
         tl.store(B_ptr + p + rows * NW, c * ap - s_rot * aq, mask=msk)
         tl.store(B_ptr + q + rows * NW, s_rot * ap + c * aq, mask=msk)
 
-    # (no U = B * diag(1/S) step: svdvals only needs S = ||B[:, j]||)
 
 
 def _osj_svals_impl(A, sweeps=12):
@@ -111,8 +92,6 @@ def _osj_svals_impl(A, sweeps=12):
     NW = nw if (nw & (nw - 1)) == 0 else triton.next_power_of_2(nw)
     MP = triton.next_power_of_2(m)
 
-    # workspace (zero-padded) produced by the single pipeline kernel
-    # (one launch per batch element, grid (1,)).
     B = torch.empty((batch, MP, NW), device=dev, dtype=A.dtype)
     total = sweeps * (nw - 1) * (nw // 2)
     for b in range(batch):
@@ -121,15 +100,10 @@ def _osj_svals_impl(A, sweeps=12):
             num_warps=1, num_stages=1,
         )
 
-    # S = column norms of B, computed on host (scalar-store workaround);
-    # the D2H copy is also the completion barrier for the pipeline kernel.
     Bc = B.cpu().double()
-    S = Bc.norm(dim=1).numpy()  # (batch, NW)
+    S = Bc.norm(dim=1).numpy()
 
     k = min(m, n)
-    # Descending sort on the host: the norms already live there, and the rows
-    # are short (pow2 NW), so a device round-trip + Triton radix sort (the
-    # vendor-registered torch.sort) would be pure overhead.
     S_sorted = np.sort(S, axis=-1)[:, ::-1][:, :k]
     S_sorted = torch.from_numpy(np.ascontiguousarray(S_sorted)).to(
         device=dev, dtype=A.dtype
@@ -158,7 +132,6 @@ def linalg_svdvals(A: torch.Tensor, driver: str = None) -> torch.Tensor:
         A = A.contiguous()
 
     if A.dim() not in (2, 3):
-        # Flatten extra batch dims (the pipeline loops over one batch axis).
         orig_shape = A.shape
         m, n = orig_shape[-2:]
         k = min(m, n)

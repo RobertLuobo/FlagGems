@@ -11,16 +11,8 @@ from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-# Largest matrix supported by this implementation.  Tested shapes go up to
-# 32x32; each elimination step costs one kernel launch on this backend, and
-# the flat tile of one program is capped at _MAX_BLK lanes, so n <= 32 keeps
-# the whole factorization inside the single-program-per-step path.
 _MAX_MATRIX_SIZE = 32
-# Row pitch of the working buffer: vector stores on this backend always cover
-# 64 contiguous elements and ignore their mask, so a 64-lane pitch keeps every
-# store inside the row it addresses.
 _MIN_LDA = 64
-# Upper bound on the flat tile of one program (validated by linalg_det).
 _MAX_BLK = 4096
 
 

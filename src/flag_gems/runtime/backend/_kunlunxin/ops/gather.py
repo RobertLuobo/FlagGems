@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import importlib
 import logging
@@ -45,28 +32,6 @@ def generate_imports(code: IndentedBuffer) -> IndentedBuffer:
     return code
 
 
-# ---------------------------------------------------------------------------
-# Fast path (int32-safe sizes, index.numel() < 2**31):
-#
-# The index tensor is contiguous and flattened to (M, N) with
-# N = index.shape[-1].  For element (m, j) of that flat view (j = the last
-# axis coordinate, m = the coordinates of the remaining leading axes):
-#
-#   out_addr(m, j) = idx_addr(m, j) = m * N + j          (contiguous DMA)
-#   inp_addr(m, j) = base(m) + j * stride_last + idx(m, j) * stride_dim
-#
-# where base(m) = sum_{i < rank-1, i != dim} digit_i(m) * inp_stride_i and
-# digit_i(m) are the mixed-radix digits of m with radices index.shape[0..r-2],
-# and stride_last = inp.stride(rank-1) (0 when dim == rank-1 so the j term
-# vanishes -- the 'dim' axis is driven entirely by idx * stride_dim).
-#
-# The per-row base is a [BLOCK_M] int32 vector computed once per program
-# (rank-1 constexpr div/mod ops), and every per-element address is a plain
-# int32 multiply-add -- no per-element int64 div/mod chains, no int64 offset
-# tile materialization.  index/out traffic is contiguous block DMA (stride-1);
-# only the data-dependent inp load remains a discrete gather (XPU structural
-# ceiling).
-# ---------------------------------------------------------------------------
 
 
 def generate_gather_kernel(
@@ -108,7 +73,6 @@ def generate_gather_kernel(
         code.writeline("rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)")
         code.writeline("cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)")
 
-        # per-row base over the leading axes 0..rank-2 (excluding the gather dim)
         if rank > 1:
             code.writeline("cur = rows")
             code.writeline("base = tl.zeros((BLOCK_M,), dtype=tl.int32)")
@@ -121,10 +85,6 @@ def generate_gather_kernel(
         if rank == 1:
             code.writeline("base = tl.zeros((BLOCK_M,), dtype=tl.int32)")
 
-        # Always-masked path: the XPU backend produced illegal-access crashes
-        # for unmasked small-tile gathers and PassManager failures for some
-        # narrow masked variants; the always-masked formulation is proven
-        # stable across the tiny/mid-size matrix and costs ~1% on big tiles.
         code.writeline("mask = (rows < M)[:, None] & (cols < N)[None, :]")
         code.writeline("cur_index = tl.load(index + offsets, mask=mask, other=0)")
         code.writeline(
@@ -141,7 +101,6 @@ def generate_gather_kernel(
 
 
 def parameter_for_wrapper() -> str:
-    # inp, out, index, dim, stride_dim, inp_dim_size, M, N
     parameters: List[str] = []
 
     parameters.append("inp")
@@ -170,16 +129,11 @@ def generate_gather_wrapper(
         code.writeline("index_shapes = list(index.shape)")
         code.writeline("inp_strides = list(inp.stride())")
 
-        # Bounded tile: BLOCK_N up to 4096, BLOCK_M mirrors the proven
-        # cdiv(M, 12) heuristic (cap 8).  Keeping BLOCK_M == 1 for small M is
-        # mandatory: wider [BM, BN] tiles with BM ~ 2-4 and narrow BN trigger
-        # XPU backend illegal-access / PassManager failures on tiny shapes.
         code.writeline("BLOCK_N = builtins.min(triton.next_power_of_2(N), 4096)")
         code.writeline(
             "BLOCK_M = builtins.min(triton.next_power_of_2(triton.cdiv(M, 12)), 8)"
         )
 
-        # kernel launch
         code.writeline("grid = lambda meta: (")
         with code.indent():
             code.writeline('triton.cdiv(M, meta["BLOCK_M"]),')
@@ -216,7 +170,6 @@ def generate_code(
     kernel_name: str,
     code: IndentedBuffer,
 ) -> IndentedBuffer:
-    # inputs: inp, out, index, dim, stride_dim, stride_last, M, N
     shape = inputs[2].shape
     rank = len(shape)
 
@@ -249,7 +202,6 @@ class GatherFunction:
             with open(cache_dir() / file_name, "wt", encoding="utf-8") as f:
                 f.write(code.getvalue())
 
-            # load
             spec = importlib.util.spec_from_file_location(
                 f"_gen_module_rank_{key}_pid_{self.pid}",
                 f.name,
@@ -298,7 +250,6 @@ def gather(inp, dim, index, out=None, sparse_grad=False):
         stride_last = inp.stride(index.ndim - 1) if dim != index.ndim - 1 else 0
         _gather_func(inp, out, index, dim, stride_dim, stride_last, M, N)
     else:
-        # int64 fallback path for gigantic (>= 2^31 elements) tensors.
         inp_strided = restride_dim(inp, dim, index.shape)
         _gather_func_legacy(
             inp_strided, out, index, dim, stride_dim, inp_dim_size, M, N
@@ -306,11 +257,6 @@ def gather(inp, dim, index, out=None, sparse_grad=False):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Legacy generated kernel (int64 offsets, unbounded shapes).  Kept only as the
-# fallback for index/input sizes >= 2^31 where the int32 fast path could
-# overflow.  Never used by the standard test/benchmark matrix.
-# ---------------------------------------------------------------------------
 
 
 def generate_gather_legacy_kernel(
@@ -556,27 +502,9 @@ def _gather_backward_sum_kernel(
     BLOCK_INDEX: tl.constexpr,
     LOOP: tl.constexpr,
 ):
-    # Output-centric, atomic-free gather_backward: every output position is
-    # owned by exactly one lane, and the contribution of all index elements
-    # along the gather dim is accumulated in registers via a masked
-    # compare-select-sum.  Work is O(output.numel() * index.shape[dim]), which
-    # is why we only use it when index.shape[dim] is small (<= 512); the huge
-    # shapes go through the atomic scatter kernel instead.
-    #
-    # The index tensor is contiguous **int32** (the host converts it once;
-    # index values are < 2^31 by dispatch, and 4-byte loads halve the
-    # dominant load traffic).  Output position `oo` decomposes (row-major,
-    # d0/d1/d2 are the output shapes padded with 1) into per-axis
-    # coordinates x0..x2; the coordinate on `dim` is `n` and the other
-    # coordinates give the base offset of the corresponding "line" of index
-    # elements via i_t{0,1,2} (index strides, padded with 1).  The
-    # contributing index elements are at base + j * i_t{dim}.
     pid = tl.program_id(0)
     oo = pid * BLOCK_OUTPUT + tl.arange(0, BLOCK_OUTPUT)
     ov = oo < total
-    # Clamp the ov-false lanes so every load offset stays in-bounds: the XPU
-    # backend hardware-faults on out-of-bounds masked reads (NOC exceptions).
-    # `total - 1` is safe because total >= 1 here (empty results return early).
     cur = tl.minimum(oo, total - 1)
     n = tl.zeros((BLOCK_OUTPUT,), dtype=tl.int32)
     base = tl.zeros((BLOCK_OUTPUT,), dtype=tl.int32)
@@ -614,18 +542,11 @@ def _gather_backward_sum_kernel(
     for jt in range(0, LOOP):
         j = jt * BLOCK_INDEX + tl.arange(0, BLOCK_INDEX)
         jm = j < S
-        # Clamp j for the jm-false lanes so all load offsets stay in-bounds
-        # (again: the XPU backend hardware-faults on OOB masked reads).
-        # Clamping the *scalar* j (not the 2D offset) keeps the affine
-        # offset decomposition intact, so contiguity/vectorization is
-        # preserved (a 2D tl.minimum on `off` costs ~2.3x).
         jc = tl.minimum(j, S - 1)
         m = ov[:, None] & jm[None, :]
         off = base[:, None] + jc[None, :] * sdim
         gi = tl.load(index + off, mask=m, other=0)
         gv = tl.load(grad + off, mask=m, other=0.0).to(tl.float32)
-        # Explicit mask + tl.where before the sum (the XPU backend loses
-        # >8192-lane tree-reduction masks; see known public defect).
         acc += tl.sum(tl.where(m & (gi == n[:, None]), gv, 0.0), axis=1)
     tl.store(output + oo, acc, mask=ov)
 
@@ -653,17 +574,6 @@ def _gather_backward_scatter_kernel(
     BLOCK: tl.constexpr,
     LOOP: tl.constexpr,
 ):
-    # Index-centric gather_backward: for every (contiguous) index element,
-    # scatter-add its grad onto the output position indexed by the value.
-    # Work is O(index.numel()) instead of O(output.numel() * index.shape[dim]).
-    #
-    # Duplicate index values can only alias inside one "slice" of
-    # prod(index.shape[dim:]) consecutive linear elements, so one program owns
-    # exactly one slice: every possible address conflict stays program-local
-    # (cross-program tl.atomic_add conflicts are silently dropped on this
-    # backend).  `iter_off` is the position within the slice and is what the
-    # mask must test; `offs` (the full flat position) feeds the axis
-    # decomposition so the outer coordinates are recovered.
     base = tl.program_id(0).to(tl.int32) * SLICE
     ar = tl.arange(0, BLOCK)
     for i in tl.static_range(LOOP):
@@ -699,8 +609,6 @@ def _gather_backward_scatter_kernel(
 
 
 def _gather_backward_scatter(grad, self, dim, index_contiguous, result):
-    # Linear-time fast path (offset sizes < 2^31); fp16/bf16 accumulate in
-    # fp32 (same precision as the legacy sum kernel).
     ndim = self.ndim
     index_shape = list(index_contiguous.shape)
     N = index_contiguous.numel()
@@ -713,7 +621,6 @@ def _gather_backward_scatter(grad, self, dim, index_contiguous, result):
         BLOCK *= 2
     LOOP = (SLICE + BLOCK - 1) // BLOCK
 
-    # output is freshly zero-allocated, so its strides are the row-major ones
     o_s = [1] * 3
     for k in range(ndim - 1, -1, -1):
         o_s[k] = 1 if k == ndim - 1 else o_s[k + 1] * self.shape[k + 1]
@@ -770,16 +677,8 @@ def gather_backward(grad, self, dim, index, sparse_grad):
         return result
 
     if self.numel() >= 2**31 or index_contiguous.numel() >= 2**31:
-        # int64 legacy path: correct but O(output.numel() * index.shape[dim]);
-        # only reachable for gigantic (>= 2^31 elements) tensors.
         return _gather_backward_legacy(grad, self, dim, index_contiguous, result)
 
-    # The generic legacy kernel handles any rank but is slow (int64 + tiny
-    # tiles).  The atomic scatter kernel (this backend's per-element
-    # tl.atomic_add is globally serialized at ~110ns) only wins when the
-    # gather dim is large.  Measured crossover of the atomic-free
-    # output-centric sum kernel vs the atomic scatter kernel is at
-    # index.shape[dim] ~= 700, so use the sum kernel for small dim sizes.
     if index_contiguous.shape[dim] <= 512 and self.ndim <= 3:
         return _gather_backward_sum(grad, self, dim, index_contiguous, result)
 
@@ -787,7 +686,6 @@ def gather_backward(grad, self, dim, index, sparse_grad):
 
 
 def _gather_backward_sum(grad, self, dim, index_contiguous, result):
-    # Atomic-free output-centric path (index.shape[dim] <= 512, ndim <= 3).
     ndim = self.ndim
     index_shape = list(index_contiguous.shape)
     index_strides = list(index_contiguous.stride())
@@ -798,17 +696,9 @@ def _gather_backward_sum(grad, self, dim, index_contiguous, result):
     out_shapes = list(self.shape) + pad
     idx_strides = index_strides + pad
 
-    # Single proven tile: (BO=64, BI=512, nw=4).  The earlier "small-S"
-    # config (BO=64, BI=256, nw=2) deterministically raises a hardware NOC
-    # idle-timeout (error 299) on fp16/bf16 inputs for every shape/dim
-    # tested (2D and 3D, 9/9 shapes), so it is unusable for a dtype-generic
-    # kernel; (64, 512, 4) is clean on the full test/benchmark matrix.
     BO, BI, nw = 64, 512, 4
     LOOP = (S + BI - 1) // BI
 
-    # int32 index: 4-byte loads halve the dominant load traffic; index
-    # values fit in int32 (numel < 2^31 by dispatch), and the expansion
-    # costs ~index.numel()*4B of one-time copy, negligible vs the kernel.
     index32 = index_contiguous.to(torch.int32)
 
     _gather_backward_sum_kernel[(triton.cdiv(total, BO),)](

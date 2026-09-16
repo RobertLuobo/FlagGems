@@ -1,20 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Kunlunxin (XPU) override of bucketize.
-#
-# Root cause: the generic binary-search kernel
-# (flag_gems/ops/bucketize.py) trips the XPU MLIR backend:
-#   error: 'arith.addi' op requires the same type for all operands
-#   -> PassManager::run failed / OutOfResources.
-# The mixed-width int arithmetic inside the `(lo + hi) // 2` binary search
-# does not lower on XPU (62 fp16/bf16/fp32 + int32 + boundary cases fail).
-#
-# Fix: replace the binary search with a straight linear scan over the
-# boundaries (they are tiny -- <= 32 in the suite and sorted ascending).
-# For each boundary we accumulate a `tl.where` count; no mixed-int divide,
-# no data-dependent loop bound, so XPU codegen is happy.
-#   right=False : idx = #{ b : b <  v }
-#   right=True  : idx = #{ b : b <= v }
 import logging
 
 import torch
@@ -26,13 +9,7 @@ from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-# Boundaries are tiny (5 in the benchmark, <= 32 in the suite). Pass them as
-# scalar kernel args so the grid loop body never issues a gm2lm for them.
 _SMALL_N_BOUNDARIES = 8
-# Memoized host copies of the boundaries for the scalar-arg kernel. Keyed by
-# (data_ptr, numel, dtype); the value keeps the tensor alive (the ptr cannot be
-# reused while cached) and stores tensor._version so in-place mutations of the
-# boundaries between calls are still re-read. Bounded to 64 entries.
 _boundary_cache = {}
 
 
@@ -164,9 +141,6 @@ def bucketize(input, boundaries, *, out_int32=False, right=False):
     boundaries = boundaries.contiguous()
 
     if n_boundaries <= _SMALL_N_BOUNDARIES:
-        # Scalar fast path: boundaries become kernel scalar args, so the
-        # per-boundary tl.load + tl.where chain of the pointer kernel is
-        # replaced by straight-line compares (no per-element global loads).
         block_size, num_warps, need_mask = _pick_block_config(n_elements)
         grid = (triton.cdiv(n_elements, block_size), 1, 1)
         host_bounds = list(_host_boundaries(boundaries))

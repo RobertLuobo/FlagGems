@@ -24,13 +24,6 @@ config_ = CodeGenConfig(
 
 @triton.jit
 def _fmod(x, y):
-    # x, y are fp32. Use the XPU native fmodf extern (xpu::fmodf, exact C
-    # fmod semantics: x - trunc(x/y)*y, correctly rounded). The previous
-    # implementation went through fp64 division, which is emulated on XPU
-    # (measured ~10x slower on (4096,4096) fp32: 18.1ms vs 1.75ms). The
-    # single-instruction extern also removes the fp32-quotient trunc
-    # boundary hazard of an int-cast trunc implementation (off-by-one
-    # quotient when x/y is within 1 ulp of an integer).
     return xpu.fmod(x, y)
 
 

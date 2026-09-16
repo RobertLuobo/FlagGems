@@ -1,45 +1,4 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-# Kunlunxin (XPU) override of pairwise_distance.
-#
-# Why a vendor override exists: the generic implementation
-# (src/flag_gems/ops/pairwise_distance.py) is numerically unreliable on XPU:
-#   * [BLOCK_M, BLOCK_D] 2D tile + axis-1 reduction miscompiles (rows >= 8 come
-#     out wrong / noisy), which breaks the max/min (p=inf/-inf) kernels and
-#     small-width bf16 rows;
-#   * masked loads (mask=..., other=0.0) do not honour `other`: false lanes may
-#     read out-of-bounds memory and the garbage participates in tl.sum. The
-#     generic split-K tail block then pollutes (1, 10000000) sums (p in 0/1/2,
-#     NaN for general p) and small-D bf16 rows;
-#   * [1]-shaped accumulator tensors / [1]-block stores miscompile on XPU
-#     (probe-verified) - only scalar (0-d) values are safe for stores;
-#   * per-kernel live tiles must stay within the uni_sram budget
-#     (~2048-4096 fp32 lanes total; 4096-lane mid loads + tail piece loads
-#     together blow it up).
-#
-# This override only uses exact in-bounds UNMASKED loads, 1D reductions and
-# scalar (0-d) accumulation:
-#   * D <= 2048: one program per row; the row is covered by up to 4 binary
-#     power-of-two "pieces" plus a short scalar loop for the remainder.
-#   * D > 2048: a chunk kernel (grid (N, cdiv(D, 2048)), 2048-lane unmasked
-#     tiles) writes fp32 per-chunk partials; a tail kernel (grid (N,)) reduces
-#     the %-remainder with pieces into one extra partial; a mid-reduce kernel
-#     combines partial groups of 2048 when needed; a final kernel reduces the
-#     (zero/+-inf identity padded) partial buffer and applies the p-norm
-#     finalization. Non-power-of-two remainders never touch masked memory
-#     paths.
 
 import logging
 import math
@@ -51,38 +10,29 @@ import triton.language as tl
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 
-# x ** p is decomposed as exp2(p * log2(x)): tl_extra_shim.pow is too heavy
 exp2 = tl_extra_shim.exp2
 log2 = tl_extra_shim.log2
 logger = logging.getLogger(__name__)
 
-# Chunk width for the D axis. 2048 lanes keeps the fp32 tl.sum rounding well
-# inside the fp32 rtol budget (1.3e-6) for the whole split-K chain and fits the
-# XPU per-kernel live-tile budget.
 _BLOCK_D = 2048
-# Max power-of-two pieces covering a non-power-of-two remainder (D % _BLOCK_D
-# or D <= _BLOCK_D). Remainder beyond the pieces is <= 15 lanes and is
-# accumulated with a short scalar loop.
 _MAX_PIECES = 4
-# Max tl.sum lane count in mid/final reductions (uni_sram budget safe point).
 _MID_BLOCK = 2048
 
-# MODE: 0=p2, 1=p1, 2=p0, 3=inf, 4=-inf, 5=general
 
 
 @triton.jit
 def _pd_mode_reduce(diff, p_scalar, MODE: tl.constexpr):
-    if MODE == 0:  # p == 2
+    if MODE == 0:
         return tl.sum(diff * diff)
-    elif MODE == 1:  # p == 1
+    elif MODE == 1:
         return tl.sum(diff)
-    elif MODE == 2:  # p == 0: nonzero count
+    elif MODE == 2:
         return tl.sum((diff != 0).to(tl.float32))
-    elif MODE == 3:  # inf
+    elif MODE == 3:
         return tl.max(diff)
-    elif MODE == 4:  # -inf
+    elif MODE == 4:
         return tl.min(diff)
-    else:  # general p (exp2/log2 decomposition)
+    else:
         return tl.sum(exp2(p_scalar * log2(diff)))
 
 
@@ -110,16 +60,14 @@ def _pd_finalize(acc, p_scalar, MODE: tl.constexpr):
 def _pd_piece_sum(
     x1_ptr,
     x2_ptr,
-    base,  # row start + optional tail start offset
+    base,
     eps,
     p_scalar,
     MODE: tl.constexpr,
-    S: tl.constexpr,  # uniform piece width (power of two)
-    NP: tl.constexpr,  # number of uniform pieces (offset i * S)
-    NSCALAR: tl.constexpr,  # scalar-loop remainder lanes
+    S: tl.constexpr,
+    NP: tl.constexpr,
+    NSCALAR: tl.constexpr,
 ):
-    # Pure scalar (0-d) accumulation: [1]-vectors miscompile on XPU. Piece
-    # loads are all the SAME width (mixed-width tiles blow uni_sram).
     acc = 0.0
     if NP >= 1:
         a = tl.load(x1_ptr + base + tl.arange(0, S)).to(tl.float32)
@@ -168,13 +116,6 @@ def _pd_piece_sum(
             acc, _pd_mode_reduce(tl.abs(a - b + eps), p_scalar, MODE), MODE
         )
     if NSCALAR > 0:
-        # Real loop (scf.for) instead of static unrolling: large remainders
-        # (e.g. T = 1664 = 3*512 + 128 in the split-K tail) would unroll
-        # hundreds of scalar iterations and blow the TritonXPU tuner budget
-        # ("Failed to tune buffer size"). Accumulation order is unchanged.
-        # Loop-locals use fresh names: the piece branches above own `a`/`b`
-        # as vector-typed values, which would clash with scalar reassignment
-        # inside an scf.for loop.
         for j in tl.range(NSCALAR):
             sa = tl.load(x1_ptr + base + NP * S + j).to(tl.float32)
             sb = tl.load(x2_ptr + base + NP * S + j).to(tl.float32)
@@ -222,16 +163,8 @@ def _pd_small_kernel(
     tl.store(out_ptr + pid, _pd_finalize(acc, p_scalar, MODE))
 
 
-# Multi-row variant of _pd_small_kernel: ROWS independent rows per program to
-# cut the program count (and therefore the launch overhead) when N is large
-# but D is small (launch-bound regime, e.g. (10000, 1) / (10000, 256)). Each
-# row is processed exactly as in _pd_small_kernel; rows are independent so the
-# loads pipeline across the ROWS iterations.
 _ROWS = 8
-# Route to _pd_small_multi_kernel only in the launch-bound regime: many
-# independent small-D rows (e.g. (10000, 1) / (10000, 256)).
 _MULTI_MIN_N = 1024
-# Flat elementwise block for the D == 1 path (_pd_d1_kernel).
 _D1_BLOCK = 1024
 
 
@@ -262,13 +195,6 @@ def _pd_small_multi_kernel(
             tl.store(out_ptr + row, _pd_finalize(acc, p_scalar, MODE))
 
 
-# D == 1: every row is a single element, so all p-norms collapse to
-# |x1 - x2 + eps| (p == 0 counts non-zeros: 1.0 for every lane since
-# eps > 0 makes |x1 - x2 + eps| > 0 except a measure-zero set handled by the
-# comparison). A single flat elementwise pass over the N rows replaces the
-# per-row reduction kernel, which measured ~90x slower (row-serial latency).
-# Loads use a clamped index so no masked (possibly OOB) load is ever emitted;
-# the store mask only discards valid load results.
 @libentry()
 @triton.jit
 def _pd_d1_kernel(
@@ -286,11 +212,7 @@ def _pd_d1_kernel(
     a = tl.load(x1_ptr + safe).to(tl.float32)
     b = tl.load(x2_ptr + safe).to(tl.float32)
     d = tl.abs(a - b + eps)
-    if MODE == 2:  # p == 0: nonzero count of a 1-element row.  Count the
-        # reference condition |a - b + eps| != 0 exactly (a - b != -eps, which
-        # also covers the a == b tie case: |eps| != 0).  d is computed in fp32
-        # after an exact fp16/bf16 -> fp32 conversion, so the comparison is
-        # exact for those dtypes.
+    if MODE == 2:
         d = (d != 0).to(tl.float32)
     tl.store(out_ptr + off, d, mask=off < N)
 
@@ -421,7 +343,7 @@ def _piece_args(t):
     """
     if t <= 0:
         return 0, 0, 0
-    best = (0, 0)  # (coverage, S)
+    best = (0, 0)
     S = 512
     while S > 0:
         n = t // S
@@ -446,8 +368,6 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
         x2 = x2.contiguous()
     D = x1.shape[-1]
 
-    # Empty feature dim: torch returns 0 for finite p; inf/-inf have no identity
-    # element over an empty reduction and torch raises.
     if D == 0:
         if p == float("inf") or p == float("-inf"):
             raise RuntimeError(
@@ -490,9 +410,6 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
                 MID = D // 4096
                 T = D - MID * 4096
             P = MID + (1 if T > 0 else 0)
-            # Padded lanes must hold the MODE identity so unmasked partial
-            # reductions stay correct: 0.0 for sums/counts, -inf for max,
-            # +inf for min.
             if mode == 3:
                 pad = -float("inf")
             elif mode == 4:
@@ -503,8 +420,6 @@ def pairwise_distance(x1, x2, p=2.0, eps=1e-6, keepdim=False):
             if stride > _MID_BLOCK:
                 stride = triton.cdiv(P, _MID_BLOCK) * _MID_BLOCK
             mid = torch.full((N * stride,), pad, device=x1.device, dtype=torch.float32)
-            # max/min reductions are exact at any width: use 4096-lane chunks
-            # to halve the program count for the p=inf/-inf paths.
             chunk_block = 4096 if mode in (3, 4) else _BLOCK_D
             _pd_chunk_kernel[(N, MID)](
                 x1,

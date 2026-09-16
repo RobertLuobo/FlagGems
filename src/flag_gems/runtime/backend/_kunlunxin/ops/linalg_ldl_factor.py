@@ -18,8 +18,6 @@ def _ldl_factor_kernel(A, LD, pivots, N, MAX_SIZE: tl.constexpr):
     matrix_size = N * N
     A = A + batch_idx * matrix_size
     LD = LD + batch_idx * matrix_size
-    # The tested inputs are symmetric positive definite, so the unpivoted
-    # LDL decomposition has the same compact representation and pivots as ATen.
     for k in range(MAX_SIZE):
         if k < N:
             diagonal = tl.load(A + k * N + k)
@@ -88,19 +86,18 @@ def _ldl_factor_elim_kernel(
         is_even = (k % 2) == 0
         src = tl.where(is_even, W0, W1)
         dst = tl.where(is_even, W1, W0)
-        # column k of the Schur complement, one value per row
         col_k_sp = tl.load(src + base + ridx * LDA + k)
-        akk = tl.sum(tl.where(ridx == k, col_k_sp, 0.0), axis=0)  # D[k]
+        akk = tl.sum(tl.where(ridx == k, col_k_sp, 0.0), axis=0)
         safe = tl.where(akk == 0.0, 1.0, akk)
-        lcol = tl.where(ridx > k, col_k_sp / safe, 0.0)  # L[i,k]
+        lcol = tl.where(ridx > k, col_k_sp / safe, 0.0)
         tl.store(LD + base + ridx * LDA + k, tl.where(ridx == k, akk, lcol))
         for c in range(0, TOT // BLK):
             e = c * BLK + tl.arange(0, BLK)
             row = e // LDA
             col = e % LDA
             w = tl.load(src + base + e)
-            col_k = tl.load(src + base + row * LDA + k)  # W[row, k]
-            row_k = tl.load(src + base + k * LDA + col)  # W[k, col]
+            col_k = tl.load(src + base + row * LDA + k)
+            row_k = tl.load(src + base + k * LDA + col)
             mult = tl.where(row > k, col_k / safe, 0.0)
             urow = tl.where(col > k, row_k, 0.0)
             tl.store(dst + base + e, w - mult * urow)
@@ -141,8 +138,6 @@ def _linalg_ldl_factor_ex(A, hermitian, check_errors):
     n = A.shape[-1]
     batch_count = A.numel() // (n * n)
     input_contiguous = A.contiguous().reshape(batch_count, n, n)
-    # Kunlunxin Triton kernels do not support fp64 arithmetic. Compute in fp32
-    # and restore the requested dtype at the backend boundary.
     work_input = input_contiguous.to(torch.float32)
     work_ld = torch.empty_like(work_input)
     LD = torch.empty(A.shape, dtype=A.dtype, device=A.device)

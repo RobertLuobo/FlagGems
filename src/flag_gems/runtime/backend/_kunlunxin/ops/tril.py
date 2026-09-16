@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -132,20 +119,6 @@ def _tril_flat_inplace_kernel(
     N,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # In-place tril_ over a contiguous top-row prefix of one matrix.
-    #
-    # The old 2D-tile kernel (`offs_m * N + offs_n` addressing) is NOT proven
-    # contiguous by XPU OffsetAnalysis and degrades to discrete access
-    # (~1-3 GB/s, e.g. [4096,4096] took ~14ms, [10000,65536] ~543ms). The 1D-flat
-    # form (scalar-base + stride-1 arange) is provably contiguous -> block DMA.
-    # Same win as the triu.py rewrite (~10x on large shapes).
-    #
-    # pid_b pre-offsets the base pointer by pid_b * MN (a scalar), so each matrix
-    # in a batch is handled by its own grid column while the inner offsets stay a
-    # stride-1 arange. Only the first `active_total = active_rows * N` elements of
-    # each matrix are visited: rows at/below the diagonal are fully kept and never
-    # touched (true in-place). Offsets stay within [0, MN) so `off // N` is exact
-    # even for the batched case (no `% MN` needed).
     pid = tl.program_id(0)
     pid_b = tl.program_id(1)
     base = pid_b * MN
@@ -264,25 +237,6 @@ def _tril_strided_out_tile_kernel(
     tl.store(out_ptr + offs_n * STRIDE_N, result, mask=mask)
 
 
-# ---------------------------------------------------------------------------
-# Flat/per-row out-of-place kernels (performance paths).
-#
-# On this XPU/triton, 2D-tiled kernels (`offs_m * N + offs_n` indexing) are not
-# proven contiguous by OffsetAnalysis and degrade to discrete access (1-3 GB/s,
-# e.g. [1024,1024] fp16 took ~3ms, [64,512,512] ~17ms, [100,65536,100] ~396ms).
-# The winning primitive is the 1D-flat kernel (scalar base + stride-1 arange ->
-# block DMA) with per-row recovery via integer divide, plus a per-row kernel
-# for wide N that drops the per-element div/mod. NEED_MASK is a constexpr so
-# always-true masks vanish (masked-memory path is slow on this XPU). Same
-# pattern as triu.py, which PASSed on XPU 5.
-#
-# Native `_copy_from` (aten::_copy_from is NOT registered by flag_gems -> always
-# dispatches to the vendor kernel) is used for the all-kept bottom band and the
-# keep-everything edge case: under use_gems, `copy_(input)` redispatch through
-# the gems copy_ kernel, which is ~1400x slower than the vendor copy
-# ([10000,65536] fp16 1.4ms -> ~1.96s), and `zero_` (= gems memset) is only
-# competitive when full > 1M elements (heavy fixed ~77us below that).
-# ---------------------------------------------------------------------------
 
 
 @triton.jit
@@ -295,8 +249,6 @@ def _tril_flat2d_kernel(
     BLOCK_SIZE: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # Single matrix (or a contiguous top-row prefix of one): no `% MN`.
-    # Offsets stay in [0, M*N) so row = offset // N is exact.
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     rows = offsets // N
@@ -324,9 +276,6 @@ def _tril_flat_batched_kernel(
     BLOCK_SIZE: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # Many small matrices: one pass with `% MN` folding the flat offset into
-    # one matrix; preferred over the per-matrix 2D grid when MN is tiny
-    # (else the 2D grid is launch-bound on this XPU).
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     matrix_offsets = offsets % MN
@@ -354,10 +303,6 @@ def _tril_flat_batchgrid_kernel(
     BLOCK_SIZE: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # grid = (tiles_per_matrix, batch). pid_b pre-offsets the base pointer by
-    # pid_b * MN (scalar), inner offsets stay a stride-1 arange and `N` is
-    # constexpr. For large matrices this beats the `% MN` variant (runtime
-    # division per element).
     pid = tl.program_id(0)
     pid_b = tl.program_id(1)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -386,31 +331,6 @@ def _tril_wide_scalar_kernel(
     BPR_MASK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Wide power-of-two N: one program covers one BLOCK_SIZE-wide column slice
-    # of a single row, so the keep predicate degenerates to `lane <= s` with a
-    # *scalar* s -- no per-element row/col recovery at all. The XPU backend
-    # emits a real integer division for `offsets // N` (even for a power-of-two
-    # constexpr N), and on these very wide shapes it dominates: isolated
-    # [10000,65536] at BLOCK 16384, fp16 16.18ms (divide) / 12.83ms (shift) /
-    # 8.18ms (this kernel); fp32 18.37 / 14.57 / 10.18; bf16 21.79 / 18.01 /
-    # 13.68.
-    #
-    # grid = (M * BPR, batch) with BPR = N // BLOCK_SIZE (power of two), so
-    # BLOCK_SIZE always divides N, no element mask is needed, and offsets stay
-    # inside matrix `pid_b`.
-    #
-    # `MN` must stay `tl.constexpr` and the batch base must be a *separate*
-    # pointer term. Folding a runtime `pid_b * MN` into the offset tensor makes
-    # XPU OffsetAnalysis lose stride-1 and the access degrades to discrete:
-    # measured in the official benchmark, [10000,65536] took 1980ms (~1.3 GB/s)
-    # instead of ~8ms.
-    #
-    # NOTE: a uniform three-way branch on `s` (store-only memset for fully
-    # zeroed slices, plain copy for fully kept slices) is measurably faster
-    # again on fp16 ([10000,65536] 5.06ms) but *fails to compile* for fp32 /
-    # bf16 / int32 -- `TritonXPUUnrollControl` aborts with the misleading
-    # `OutOfResources: uni_sram` wrapper (reproduced at N=16384 for all three
-    # dtypes). Do not reintroduce the branch.
     pid = tl.program_id(0)
     pid_b = tl.program_id(1)
     lane = tl.arange(0, BLOCK_SIZE)
@@ -435,16 +355,6 @@ def _tril_flat_pow2_kernel(
     BLOCK_SIZE: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # Power-of-two N: recover row/col with a shift and a mask instead of the
-    # integer divide/remainder used by `_tril_flat_batchgrid_kernel`. The XPU
-    # triton backend emits a real division for `offsets // N` even when N is a
-    # power-of-two constexpr, and that division dominates this memory-bound
-    # kernel (isolated, [4096,4096]: fp16 425us -> 222us, fp32 494us -> 288us,
-    # bf16 572us -> 364us; [1024,1024] fp16 34us -> 23us).
-    #
-    # grid = (tiles_of(active_total), batch); `pid_b * MN` is a scalar base so
-    # the inner offsets stay a stride-1 arange. `active_total` is MN for a full
-    # matrix and `band_lo * N` for a band prefix.
     pid = tl.program_id(0)
     pid_b = tl.program_id(1)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -472,12 +382,6 @@ def _tril_band_batchgrid_kernel(
     BLOCK_SIZE: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # Batched band prefix: grid = (tiles_of(active_total), batch). Only the
-    # first `active_total = band_lo * N` elements of every matrix are visited;
-    # rows [band_lo, M) are entirely at/below the diagonal and are handled by
-    # the native vendor strided copy instead. `pid_b * MN` is a scalar base so
-    # the inner offsets stay a stride-1 arange (block DMA), and offsets stay
-    # inside matrix `pid_b` (offsets < active_total <= MN).
     pid = tl.program_id(0)
     pid_b = tl.program_id(1)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -506,9 +410,6 @@ def _tril_row2d_kernel(
     BLOCK_N: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # One program per row (grid = M*BATCH for the full matrix, or `num_rows`
-    # band rows for the band prefix). `row = pid % M` is one mod PER PROGRAM;
-    # each row streams its N columns as contiguous BLOCK_N chunks (block DMA).
     pid = tl.program_id(0)
     row = pid % M
     base = pid * N
@@ -531,9 +432,6 @@ def _tril_zero_flat_kernel(
     BLOCK_SIZE: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    # Store-only memset for small outputs: GEMS zero_() has a heavy fixed cost
-    # (~77us) even for tiny tensors, while a single small flat store launch is
-    # ~25us. For >1M elements zero_() wins again (bulk vendor memset).
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     if NEED_MASK:
@@ -545,18 +443,12 @@ def _tril_zero_flat_kernel(
 
 _BLOCK_SIZE = 16384
 _ROW_N_THRESHOLD = 2048
-# Above this width a single matrix is handled by the wide uniform-branch
-# kernel (power-of-two N) instead of the per-row / flat kernels.
 _FLAT_WIDE_N = 8192
 _SMALL_TOTAL_ZERO = 1 << 20
 _BAND_MIN_TOTAL = 1 << 20
 
 
 def _vendor_copy_from(src: torch.Tensor, dst: torch.Tensor):
-    # aten::_copy_from is not registered by flag_gems -> dispatches straight to
-    # the vendor native copy (fast), unlike copy_() which redispatch to the
-    # gems kernel under use_gems (catastrophically slower on this XPU).
-    # tle dma (TMA/DSA) is preferred where it can express the copy.
     if not tle_copy(src, dst):
         torch.ops.aten._copy_from(src, dst)
     return dst
@@ -648,7 +540,6 @@ def _launch_v2_rows(
     num_rows: int,
     num_warps: int = 4,
 ):
-    # Per-row kernel; `num_rows` rows are covered (full matrix or band prefix).
     M, N = input.shape[-2:]
     block_n = min(triton.next_power_of_2(N), _BLOCK_SIZE)
     need_mask = N % block_n != 0
@@ -687,8 +578,6 @@ _WIDE_SCALAR_BLOCK = _BLOCK_SIZE
 
 
 def _use_wide_scalar(N: int):
-    # Power-of-two N of at least one full block, so BPR = N // BLOCK >= 1 and
-    # every program covers exactly one row slice.
     return _is_power_of_2(N) and N > _FLAT_WIDE_N and N >= _WIDE_SCALAR_BLOCK
 
 
@@ -784,9 +673,6 @@ def _launch_v2_band(
     diagonal: int,
     band_lo: int,
 ):
-    # Rows [band_lo, M) are entirely at/below the diagonal -> pure copy via
-    # the native vendor path. Only the band prefix [0, band_lo*N) needs the
-    # tril kernel.
     M, N = input.shape[-2:]
     batch = input.numel() // (M * N)
     total = band_lo * N
@@ -797,15 +683,6 @@ def _launch_v2_band(
             if band_lo < M and input.data_ptr() != out.data_ptr():
                 _vendor_copy_from(input[band_lo:], out[band_lo:])
             return out
-        # Batched (>1): the kept bottom rows of every matrix form a gap-bearing
-        # view (`input[..., band_lo:, :]` keeps a band_lo-row hole per matrix
-        # -> not contiguous) and the vendor strided copy of it is ~3.4x slower
-        # than a full contiguous-src copy (isolated, [100,65536,100] fp16:
-        # 4.74ms vs 1.40ms). Copy the full matrix first (no-op when out aliases
-        # input), then let the band kernel rewrite the [0, band_lo) prefix as
-        # the last writer: kept cells keep the copied input values, strict
-        # upper cells become 0. Correct because the band kernel runs after the
-        # copy, so it can never be overwritten.
         if band_lo < M and input.data_ptr() != out.data_ptr():
             _vendor_copy_from(input, out)
         if total > 0:
@@ -820,11 +697,6 @@ def _launch_v2_band(
         if band_lo < M and input.data_ptr() != out.data_ptr():
             _vendor_copy_from(input[band_lo:], out[band_lo:])
         return out
-    # Batched (>1): same as the power-of-two case above -- full vendor copy
-    # first (contiguous src, ~3.4x faster than the gap-bearing kept-rows view),
-    # then the band kernel rewrites the [0, band_lo) prefix of every matrix.
-    # The old gap-view `_copy_from(input[..., band_lo:, :], out[..., band_lo:, :])`
-    # measured 3.3-4.0x slower on [100,65536,100]/[1000,8192,100].
     if band_lo < M and input.data_ptr() != out.data_ptr():
         _vendor_copy_from(input, out)
     if total > 0:
@@ -896,9 +768,6 @@ _TINY_BATCHED_TILE_MIN_BATCH = 128
 
 
 def _use_wide_exact_row(M: int, N: int, batch: int):
-    # One exact-row program covers one matrix row with BLOCK_N == N.  Use it for
-    # wide power-of-two rows where it avoids the flat kernel's div/mod indexing,
-    # but require enough row programs to keep occupancy reasonable.
     if N < _WIDE_EXACT_ROW_MIN_N or N > _WIDE_EXACT_ROW_MAX_N or not _is_power_of_2(N):
         return False
 
@@ -1038,12 +907,6 @@ def _launch_exact_diag0_tile(
 
 
 _INPLACE_FLAT_BLOCK = 8192
-# Pow2 shift/mask only pays off once the band is large enough to amortize the
-# bigger blocks / different warp count of the shared `_launch_v2_pow2` path.
-# Below this (measured [10000,256] 65K elements, [64,64] 4K) the div kernel is
-# equal or better and the swap is within the launch-floor noise band; at/above
-# it every shape measured faster ([64,512,512] 262K: 1.6-1.9x, [4096,4096]
-# 16.7M: 1.6-1.8x). Must stay < 261632 (active of [64,512,512] at diag=0).
 _INPLACE_POW2_MIN_TOTAL = 1 << 17
 
 
@@ -1058,22 +921,11 @@ def _launch_tril_inplace_contiguous(
     if input.numel() == 0:
         return input
 
-    # Rows [active_rows, M) sit entirely at/below the diagonal -> fully kept,
-    # nothing to zero. Only the first `active_rows` rows of each matrix contain
-    # strict-upper elements that must be zeroed.
     active_rows = min(M, max(0, N - 1 - diagonal))
     if active_rows == 0:
         return input
 
     if _is_power_of_2(N) and active_rows * N >= _INPLACE_POW2_MIN_TOTAL:
-        # Power-of-two N: share the proven `_tril_flat_pow2_kernel` (shift/mask
-        # row/col recovery) used by the out variants -- the XPU triton backend
-        # emits a real division for `offsets // N` even when N is a pow2
-        # constexpr, and that division dominates this memory-bound kernel
-        # (isolated [4096,4096] fp32: ~0.46ms -> ~0.29ms, [10000,65536] fp16:
-        # ~21.6ms -> ~12.8ms). In-place aliasing (in_ptr == out_ptr) is fine:
-        # kept cells are rewritten with their loaded values and strict-upper
-        # cells become 0; `active_rows` restricts the pass to the band.
         return _launch_v2_pow2(
             input, input, int(diagonal), active_rows=active_rows
         )
@@ -1219,17 +1071,12 @@ def _launch_tril(input: torch.Tensor, out: torch.Tensor, diagonal: int):
         return out
 
     if diagonal <= -M:
-        # Everything zeros out. GEMS zero_() has a heavy fixed cost (~77us);
-        # a small flat store-only launch is cheaper below ~1M elements.
         if total <= _SMALL_TOTAL_ZERO:
             _launch_v2_zero(out)
         else:
             out.zero_()
         return out
     if diagonal >= N - 1:
-        # Everything is kept: pure copy. Use the native vendor copy (fast);
-        # gems copy_() under use_gems is ~1000x slower on this XPU. When out
-        # aliases input there is nothing to write.
         if input.data_ptr() != out.data_ptr():
             _vendor_copy_from(input, out)
         return out
@@ -1237,42 +1084,19 @@ def _launch_tril(input: torch.Tensor, out: torch.Tensor, diagonal: int):
     input_to_use = input if input.is_contiguous() else input.contiguous()
     batch = input_to_use.numel() // (M * N)
 
-    # Band split: rows [band_lo, M) are entirely at/below the diagonal -> pure
-    # copy (vendor native). Only the band prefix [0, band_lo*N) needs the
-    # masking kernel. Gated on the band being a small fraction of the matrix
-    # and total being large enough for the extra launch to pay off. Batched
-    # tensors are covered too: the kept bottom rows of all matrices form one
-    # regular strided view that `aten::_copy_from` moves in a single call.
     band_lo = min(M, max(0, N - 1 - diagonal))
     if band_lo < M and band_lo * N <= (M * N) // 4 and total >= _BAND_MIN_TOTAL:
         _launch_v2_band(input_to_use, out, diagonal, band_lo)
         return out
 
     if _use_wide_scalar(N):
-        # Wide power-of-two N (single or batched): scalar-compare kernel.
-        # NOTE: this replaces the old `_launch_flat` / `_tril_flat_kernel`
-        # path, which was not only slower but *numerically wrong* on this XPU:
-        # it relied on `tl.load(..., mask=mask & keep, other=0.0)` to zero the
-        # strict-upper part, and `other=` is not honoured here (it also
-        # corrupts the masked-in lanes). Measured against a CPU oracle at
-        # c92be13f4: [1000,65536] fp16 diag=0 -> 65035491/65536000 elements
-        # wrong, maxdiff 5.9 (same for fp32/bf16/int32, and for [1000,16384]).
         return _launch_v2_wide_scalar(input_to_use, out, diagonal)
 
     if _is_power_of_2(N) and not (batch > 1 and M * N <= 4096):
-        # Power-of-two N: shift/mask row-col recovery instead of the integer
-        # divide. Replaces `_launch_exact_row` / `_launch_v2_rows` /
-        # `_launch_v2_flat` / `_launch_v2_flat_batchgrid` for these shapes
-        # (isolated measurements in the kernel docstring). Very small batched
-        # matrices keep the `% MN` single-pass kernel, which is launch-bound
-        # rather than divide-bound.
         return _launch_v2_pow2(input_to_use, out, diagonal)
 
     if batch == 1:
         if _use_wide_exact_row(M, N, batch):
-            # Pre-existing exact per-row kernel (2D grid, unmasked pow2 rows):
-            # fastest measured on this XPU for wide pow2 single matrices
-            # ([4096,4096] fp32 ~0.38ms vs ~0.49ms for the flat variants).
             return _launch_exact_row(
                 input_to_use,
                 out,
@@ -1283,10 +1107,7 @@ def _launch_tril(input: torch.Tensor, out: torch.Tensor, diagonal: int):
             _launch_v2_rows(input_to_use, out, diagonal, num_rows=M)
             return out
         return _launch_v2_flat(input_to_use, out, diagonal)
-    # Batched
     if M * N <= 4096:
-        # Many tiny matrices: the % MN single pass beats a 2D grid
-        # (launch-bound otherwise on this XPU).
         return _launch_v2_flat_batched(input_to_use, out, diagonal)
     _launch_v2_flat_batchgrid(input_to_use, out, diagonal)
     return out
@@ -1322,10 +1143,6 @@ def tril_(input: torch.Tensor, diagonal: int = 0):
 
 _ZC_BLOCK = 8192
 _ZC_RPC = 8
-# copy+zero fast path is beneficial when the matrix is large (the launch_tril
-# masked kernel is ~4-45x slower than a store-only zero pass there); small
-# batched matrices keep the legacy path (their zero pass is launch-bound).
-# Sliced layouts with M < 8 have only M rows -> a handful of stores -> fast.
 _ZC_MIN_TOTAL = 1 << 21
 _ZC_SLICE_M = 8
 
@@ -1403,7 +1220,7 @@ def _launch_tril_out_copied_zero(input: torch.Tensor, out: torch.Tensor, diagona
     Keeps the legacy path for batched-small shapes (zero pass is launch-bound
     there) and for any aliasing/irregular layout (safety first)."""
     M, N = input.shape[-2:]
-    transposed = out.transpose(-2, -1).is_contiguous()  # dense storage [B, N, M]
+    transposed = out.transpose(-2, -1).is_contiguous()
     if transposed:
         dense = True
     elif out.stride(-1) == 1:
@@ -1414,18 +1231,15 @@ def _launch_tril_out_copied_zero(input: torch.Tensor, out: torch.Tensor, diagona
     if M * N < _ZC_MIN_TOTAL and not (dense is False and M < _ZC_SLICE_M):
         return False
     if _tensors_may_overlap(input, out):
-        # input must be fully read before any write to out (legacy contract).
         return False
     total = input.numel()
-    if total >= (1 << 31):  # int32 offset safety in the kernels
+    if total >= (1 << 31):
         return False
 
     batch = total // (M * N)
     if transposed:
-        # storage row (b, j) -> zero [0, min(j - diag, M)); rows j <= diag are
-        # all-kept (or nonexistent for diag < 0).
         if diagonal >= 0:
-            nj = N - 1 - diagonal  # > 0 because diagonal < N - 1 here
+            nj = N - 1 - diagonal
             joff = diagonal + 1
         else:
             nj = N
@@ -1490,26 +1304,9 @@ def tril_out(input: torch.Tensor, diagonal: int = 0, *, out: torch.Tensor = None
             _vendor_copy_from(input, out)
         return out
 
-    # Copy-first + store-only-zero-upper fast path (see
-    # `_launch_tril_out_copied_zero`): vendor native strided copy fills the
-    # whole output, then a store-only kernel zeroes the strict-upper region.
-    # Only taken when it provably beats the legacy path and out/input do not
-    # overlap (aliasing goes through the tmp-based path, which reads input
-    # fully before any write to out).
     if _launch_tril_out_copied_zero(input, out, int(diagonal)):
         return out
 
-    # NOTE: the strided 2D-tile out kernel (`_launch_tril_strided_out`) is
-    # 10-50x slower than the fast contiguous path on this XPU (its
-    # `offs_m * N + offs_n` indexing is not proven contiguous by the XPU
-    # OffsetAnalysis and degrades to discrete access; measured on fp16:
-    # [1024,1024] transposed 1.13ms, [10000,65536] sliced ~735ms). Rerouting
-    # every non-contiguous out through a contiguous temp (the same flat/row
-    # kernels tril() uses) + the vendor native strided copy (aten::_copy_from,
-    # not registered by flag_gems -> dispatches to the vendor engine) is
-    # ~25-50x faster: [1024,1024] T 45us, [4096,4096] T 0.50ms,
-    # [10000,65536] T 14.9ms, [100,65536,100] T 18.2ms. Safe wrt aliasing:
-    # input is fully read into tmp before any write to out.
     tmp = _empty_contiguous_like(input)
     _launch_tril(input, tmp, int(diagonal))
     _vendor_copy_from(tmp, out)

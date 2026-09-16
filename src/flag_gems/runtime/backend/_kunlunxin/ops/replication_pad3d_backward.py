@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """Kunlunxin (XPU) override of ``aten::replication_pad3d_backward``.
 
@@ -104,7 +91,6 @@ def _replication_pad3d_backward_kernel(
     h = (offs // W) % H
     w = offs % W
 
-    # ---- output group [xw, xw + cnt_w) for input column w ----
     xw_raw = tl.where(w == 0, 0, tl.where(w == W - 1, pad_left + W - 1, pad_left + w))
     xw = tl.minimum(tl.maximum(xw_raw, 0), OW - 1)
     cnt_w = tl.where(
@@ -116,7 +102,6 @@ def _replication_pad3d_backward_kernel(
             tl.where((xw_raw >= 0) & (xw_raw < OW), 1, 0),
         ),
     )
-    # ---- output group [yh, yh + cnt_h) for input row h ----
     yh_raw = tl.where(h == 0, 0, tl.where(h == H - 1, pad_top + H - 1, pad_top + h))
     yh = tl.minimum(tl.maximum(yh_raw, 0), OH - 1)
     cnt_h = tl.where(
@@ -128,7 +113,6 @@ def _replication_pad3d_backward_kernel(
             tl.where((yh_raw >= 0) & (yh_raw < OH), 1, 0),
         ),
     )
-    # ---- output group [zd, zd + cnt_d) for input depth d ----
     zd_raw = tl.where(
         d == 0, 0, tl.where(d == D - 1, pad_front + D - 1, pad_front + d)
     )

@@ -1,35 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Kunlunxin (XPU) override of col2im.
-#
-# Root cause: the generic 2D-tiled col2im kernel
-# (flag_gems/ops/col2im.py) uses `triton.autotune` over BLOCK_H/BLOCK_W with
-# multiple num_stages, plus a 2D `(BLOCK_H, BLOCK_W)` accumulator and a
-# runtime `h_num % stride_h / h_num // stride_h` computed BEFORE masking
-# invalid contributions. On kunlunxin XPU this combination miscompiles
-# for configs with stride>1/padding>0/dilation>1 -- baseline 12F/3P with
-# max abs diff ~512.5 (100% mismatch on the affected configs).
-#
-# Fix: replace with a flat, output-position-parallel kernel modeled on the
-# reflection_pad3d override. Each program handles one 1D BLOCK of output
-# elements. Decode (n, c, h, w) via div/mod (all non-negative). Loop kh, kw
-# with tl.static_range and accumulate gathers into a fp32 accumulator.
-# All arithmetic on valid contributions is over non-negative indices, so
-# `h_num % stride_h` and `h_num // stride_h` are safe.
-#
-# Performance notes (measured on kunlunxin XPU, fp16):
-#  * The largest per-op cost is the data-dependent load address
-#    (l_h*L_w + l_w): A/B tests show a kernel with identical decode/valid
-#    work but a compile-time-affine load address is ~2x (stride 1) to
-#    ~17-28x (stride 2) faster than loading at the computed index.
-#    => when stride is 1 the index is the affine `w + (pad - kw*dil)`
-#    (constexpr stride => `x // 1` folds away), so the loaders see a
-#    register-offset load (no division), which is the fastest path.
-#  * ACCUMULATED trade: `tl.load` with `other=0.0` forces a scalarized
-#    masked path on this backend; loading UNMASKED at an index clamped
-#    into bounds (then `tl.where(valid, v, 0.0)`) is 15-25% faster.
-#  * num_warps/BLOCK/CodeGenConfig(buffer_size_limit, isCloseVectorization)
-#    have no measurable effect; BLOCK=1024 + num_warps=1 is kept.
 import logging
 from typing import List
 
@@ -71,11 +39,8 @@ def col2im_kernel_flat(
     pid = tl.program_id(axis=0)
     o = pid * BLOCK + tl.arange(0, BLOCK)
     mask = o < total_out
-    # Clamp the lane index so the tail program never issues an out-of-bounds
-    # address (the loads below are unmasked; the store keeps `mask`).
     o_s = tl.minimum(o, total_out - 1)
 
-    # Decode flat -> (n, c, h, w)
     n_idx = o_s // CHW_out
     rem = o_s % CHW_out
     c_idx = rem // HW_out
@@ -91,9 +56,6 @@ def col2im_kernel_flat(
 
     for kh in tl.static_range(0, kernel_h):
         if stride_h == 1:
-            # l_h is affine in h: `x // 1` folds, so the load addresses stay
-            # register-affine (fast path). Clamp into [0, L_h) for the
-            # unmasked load; the h_ok mask re-zeroes invalid lanes.
             l_h = h_i + (padding_h - kh * dilation_h)
             h_ok = (l_h >= 0) & (l_h < L_h)
             l_h_s = tl.maximum(l_h, 0)
@@ -121,9 +83,6 @@ def col2im_kernel_flat(
             c_k = c_idx * KHW + kh * kernel_w + kw
             in_offset = n_base + c_k * L_all + l_h_s * L_w + l_w_s
 
-            # Unmasked load: both index operands are clamped into bounds.
-            # XPU may ignore `other` on masked loads, so force invalid
-            # lanes to 0 with an explicit where instead.
             v = tl.load(input_ptr + in_offset)
             v = tl.where(h_ok & w_ok, v, 0.0)
             acc += v.to(tl.float32)

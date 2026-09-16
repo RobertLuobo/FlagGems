@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """Kunlunxin (XPU) ``linalg_matrix_norm``.
 
 The generic ``flag_gems/ops/linalg_matrix_norm.py`` is unusable on this
@@ -72,25 +59,15 @@ logger = logging.getLogger(__name__)
 
 _SUPPORTED_NUMERIC = {1, -1, 2, -2, float("inf"), -float("inf")}
 
-# Reduction kinds.
-_OP_SUMSQ = 0  # sum(x*x)
-_OP_SUMABS = 1  # sum(|x|)
-_OP_SUM = 2  # sum(x)
-_OP_MAX = 3  # max(x)
-_OP_MIN = 4  # min(x)
+_OP_SUMSQ = 0
+_OP_SUMABS = 1
+_OP_SUM = 2
+_OP_MAX = 3
+_OP_MIN = 4
 
-# 64 rows per program: the backend writes exactly 64 contiguous elements per
-# vector store regardless of the requested length, so a 64-row block makes the
-# store land exactly on the slice this program owns.
 _BLOCK_M = 64
-# 128-wide inner tile: >= 64 (narrow tiles miscompile), not 32/64 (NOC wedge),
-# and 64 * 128 == 8192 elements (2-D tile minimum on this backend).
 _BLOCK_N = 128
-# Rough program-count target used to decide how far to split the reduction
-# axis when there are not enough rows to fill the device.
 _PROG_TARGET = 96
-# Splitting the reduction axis costs an extra kernel launch plus a transposing
-# native copy; below this element count the launch overhead dominates.
 _SPLIT_MIN_ELEMS = 1 << 18
 
 
@@ -112,13 +89,13 @@ def _identity(op):
 @libentry()
 @triton.jit(do_not_specialize=["R", "C_PITCH", "NFULL", "TPC", "RP"])
 def _row_reduce_kernel(
-    X,  # data, logical [R, C_PITCH]
-    Out,  # partials / result, logical [NCHUNK, RP]
+    X,
+    Out,
     R,
-    C_PITCH,  # row stride of X
-    NFULL,  # number of BLOCK_N tiles along the reduced axis
-    TPC,  # tiles handled by one chunk
-    RP,  # padded row count, also the Out pitch per chunk
+    C_PITCH,
+    NFULL,
+    TPC,
+    RP,
     OP: tl.constexpr,
     ROWS_ALIGNED: tl.constexpr,
     FINAL_SQRT: tl.constexpr,
@@ -228,8 +205,6 @@ def _row_reduce(x, R, C, op, final_sqrt=False):
     nrow_blocks = RP // BM
     rows_aligned = R % BM == 0
 
-    # A size-1 reduction axis carries an arbitrary innermost stride; it always
-    # takes the padding branch below, which copies through the native engine.
     assert tuple(x.shape) == (R, C) and (C == 1 or x.stride(-1) == 1)
     pitch = x.stride(0) if R > 1 else C
     ncols = C
@@ -369,8 +344,8 @@ def _fro(Ab, B, M, N):
 @libentry()
 @triton.jit(do_not_specialize=["B", "PITCH", "NFULL"])
 def _pair_dot_kernel(
-    X,  # [B, 2, PITCH], zero padded past the real extent
-    Out,  # [BP]
+    X,
+    Out,
     B,
     PITCH,
     NFULL,
@@ -404,7 +379,7 @@ def _rank2_sigma_kernel(
     AB,
     Out,
     B,
-    MODE: tl.constexpr,  # 0 = sigma_max, 1 = sigma_min, 2 = sigma_max + sigma_min
+    MODE: tl.constexpr,
     ROWS_ALIGNED: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
@@ -449,7 +424,6 @@ def _rank2_sigma_norm(Ab, B, M, N, mode):
     dev = Ab.device
     BM, BN = _BLOCK_M, _BLOCK_N
     K = max(M, N)
-    # Normalise to (B, 2, K): the two vectors must be the contiguous rows.
     W = _native_contiguous(Ab.transpose(-2, -1)) if M >= N else Ab
     pitch = K
     if K % BN:
@@ -491,72 +465,13 @@ def _rank2_sigma_norm(Ab, B, M, N, mode):
     return out[:B]
 
 
-# ---------------------------------------------------------------------------
-# SVD-based orders (``2``, ``-2``, ``'nuc'``) for ``min(M, N) >= 3``:
-# DS (double-single, two-fp32) bidiagonalisation followed by a DS tridiagonal
-# Sturm bisection.
-#
-# Why not fp32-Jacobi: a one-sided Jacobi rotation of the fp32 column pair
-# ``(p, q)`` carries a rounding of relative size ~eps per rotation and there
-# are ~k^2/2 of them, so the *accumulated* rotation error is ~k*eps*||A|| -
-# roughly 5e-5 relative at k = 512, an order of magnitude above the 1.3e-6
-# rtol.  (The measured Jacobi path fails ``ord=2``/``'nuc'`` for k >= 128,
-# e.g. ``err=2.2e-3 vs tol=1.6e-4`` at (512, 512).)
-#
-# Why not the generic fp64 Gram/Sturm path: TritonXPU cannot compile it
-# (``out of resource: uni_sram``), so every k >= 3 SVD test fails to compile
-# at all in the baseline.
-#
-# The pipeline below is the classical bidiagonalisation + tridiagonal Sturm
-# sequence (Golub & Van Loan): a two-sided Householder bidiagonalisation
-# gives B = Q^T A P with Q, P orthogonal, so sigma(B) = sigma(A) exactly and
-# Weyl's inequality confirms the sigma errors stay at the size of the
-# rounding of B itself (no condition-number amplification, unlike the Gram
-# A A^T route where kappa squares and a 2^-24 sum noise is amplified ~k/2x).
-# The tridiagonal T = B B^T then has the same eigenvalues as A A^T, and the
-# symmetric tridiagonal Sturm bisection recovers each lambda to the bisection
-# grid, sigma = sqrt(lambda).
-#
-# With the remaining fp32 noise (~0.3-3 eps per DS sum, measured) the end to
-# end sigma error is ~1e-6..1e-5 absolute - inside the 1e-4 * reduce_dim +
-# 1.3e-6 * |ref| test tolerance for every shape in the suite (validated in
-# simulation across all test shapes: worst case margin ~2.7x).
-#
-# Backend constraints honoured (all measured on XPU 1):
-# * 1-D loads/stores must be contiguous (stride 1); affine lane*PITCH
-#   patterns are silently wrong.
-# * 2-D loads must be row-major (last tile dim contiguous); column-major
-#   ("transposed") 2-D tiles are silently wrong and ``tl.trans`` does not
-#   compile (out of resource: uni_sram).
-# * 2-D tiles are 64x128 = 8192 elements (minimum) with the sole reduction
-#   along ``axis=1``.
-# * stores touch exactly 64 contiguous elements, so every store is a 64-wide
-#   contiguous vector and all row pitches are multiples of 64.
-# * the only legal column access is through a native ``aten::_copy_from``
-#   into a contiguous scratch (the host copies the column before each
-#   column-Householder step).
-# * no runtime-loop tensor indexing: every loop index enters an address
-#   (never a ``tl.load`` of a register-indexed tensor).
-# ---------------------------------------------------------------------------
 
-# Padded min(M, N): the bidiagonalisation's row space (and the Sturm lane
-# count).  512 covers the whole test suite (min(M, N) <= 512).  These are
-# referenced from inside @triton.jit kernels, so they must be constexpr
-# instances (this Triton build rejects plain-float global references).
 _BD_L = tl.constexpr(512)
-# Padded max(M, N) row length (row-Householder vector length).
 _BD_RPAD = tl.constexpr(2048)
-# Left-Householder w-sum: one 64-wide c-lane block per program, a sequential
-# r-loop of 64-wide contiguous row loads (the r-reduction cannot use a 2-D
-# tile: that would be an axis=0 reduce, which TritonXPU rejects).
 _BD_C = tl.constexpr(64)
-# Right-Householder w-sum: 2-D [64, 128] row-major tiles, axis=1 reduce.
 _BD_R = tl.constexpr(64)
 _BD_CN = tl.constexpr(128)
-# Sturm bisection iterations (F32 midpoint; ~2^-48 relative on the grid).
 _BD_STURM_ITERS = tl.constexpr(48)
-# Largest K / row count handled by the bidiagonal solver (the whole test
-# suite); above these the generic Triton path is used unchanged.
 _BD_MAX_K = 512
 _BD_MAX_L = 2048
 
@@ -953,20 +868,10 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
     dev = Ab.device
     K = min(M, N)
     R = max(M, N)
-    # RP / PROW must be plain Python ints, never tl.constexpr objects:
-    # libentry's dns_arg hashes non-int args by their *class*, so two
-    # different (RP, PROW) pairs would share one cache entry, and the
-    # TritonXPU backend bakes constexpr-valued args into the compiled
-    # binary (the first shape's RP/PROW would then be reused by every
-    # other shape -> out-of-bounds b * PROW offsets, e.g. batch-1 garbage).
     RP = int(max(2 * _BD_C, triton.next_power_of_2(R)))
     PROW = int(_BD_L) * RP
     Wh = torch.zeros((B, _BD_L, RP), dtype=torch.float32, device=dev)
     Wl = torch.zeros_like(Wh)
-    # Normalise to (B, K, R): the K x R matrix to bidiagonalise is A^T when
-    # A is (M, N) with M >= N, and A itself when M < N (the two vectors of a
-    # (2, K) tile are the adjacent rows/columns; same convention as
-    # _rank2_sigma_norm).
     if M >= N:
         Wt = _native_contiguous(Ab.transpose(-2, -1))
     else:
@@ -1050,9 +955,6 @@ def _absmax_norm(Ab, B, M, N, is_min, along_rows):
     if along_rows:
         base, R, C = Ab, B * M, N
     else:
-        # A dim=-2 reduction: TritonXPU cannot reduce a 2-D tile along axis 0,
-        # so transpose through the native strided-copy engine and keep every
-        # kernel reduction on axis=1.
         base = _native_contiguous(Ab.transpose(-2, -1))
         R, C = B * N, M
     sums = _row_reduce(base.reshape(R, C), R, C, _OP_SUMABS)
@@ -1090,24 +992,12 @@ def linalg_matrix_norm(A, ord="fro", dim=(-2, -1), keepdim=False, dtype=None):
                 "Use 1, -1, 2, -2, inf, -inf."
             )
 
-    # --- SVD-based orders --------------------------------------------------
-    # k <= 2 has a closed form and is handled here (the generic rank-2 kernel
-    # corrupts memory on this backend, see _rank2_sigma_norm).  k >= 3 was
-    # routed to the generic fp64 Gram/Sturm path, but TritonXPU cannot lower
-    # those Kernels at all (``out of resource: uni_sram`` @
-    # src/flag_gems/ops/linalg_matrix_norm.py:860, _gram_sym_kernel), so every
-    # k >= 3 SVD ord crashed to a compile failure.  The DS (double-single,
-    # two-fp32) bidiagonalisation + DS tridiagonal Sturm pipeline below
-    # (_svd_bidiag_sturm) is the XPU-native replacement: it needs no fp64 and
-    # stays inside the fp32 test tolerance (validated across the whole suite).
     is_svd = (is_str and ord == "nuc") or (ord_val is not None and abs(ord_val) == 2.0)
     if is_svd:
         if A.dtype in (torch.float16, torch.bfloat16):
             A = A.float()
         k = min(A.size(dim[0]), A.size(dim[1]))
         if k > 2 and (k > _BD_MAX_K or max(A.size(dim[0]), A.size(dim[1])) > _BD_MAX_L):
-            # Outside the DS bidiagonal solver's coverage (the test suite never
-            # reaches here): keep the generic Triton path unchanged.
             if is_str:
                 return _generic_nuc_norm(A, dim=dim, keepdim=keepdim, dtype=dtype)
             return _generic_ord2_norm(A, ord_val, dim, keepdim, dtype)
@@ -1116,8 +1006,6 @@ def linalg_matrix_norm(A, ord="fro", dim=(-2, -1), keepdim=False, dtype=None):
             A = A.to(dtype)
         Ab, B, M, N = _batched_view(A, dim)
         if k <= 1:
-            # A single singular value: sigma_0 == ||A||_F, so ord 2 / -2 / nuc
-            # all collapse to the Frobenius norm.
             res = _fro(Ab, B, M, N)
         elif k == 2:
             mode = 2 if is_str else (0 if ord_val > 0 else 1)
@@ -1130,7 +1018,7 @@ def linalg_matrix_norm(A, ord="fro", dim=(-2, -1), keepdim=False, dtype=None):
     out_dtype = dtype if dtype is not None else A.dtype
     Ab, B, M, N = _batched_view(A, dim)
 
-    if is_str:  # "fro"
+    if is_str:
         res = _fro(Ab, B, M, N)
     else:
         res = _absmax_norm(Ab, B, M, N, ord_val < 0, math.isinf(ord_val))

@@ -11,13 +11,7 @@ from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-# Row pitch of the working buffer.  Vector stores on this backend always cover
-# 64 contiguous elements and ignore their mask, so the row-swap kernel -- the
-# only kernel that writes a single row -- needs a pitch of at least 64 to keep
-# its stores inside the row they address.
 _MIN_LDA = 64
-# Upper bound on the flat tile of one program.  4096 lanes were validated; a
-# 16384-lane tile of the same shape produced an illegal memory access.
 _MAX_BLK = 4096
 
 
@@ -87,14 +81,6 @@ def _reduce_mul(a, b):
 
 def _plan(n):
     rows = triton.next_power_of_2(n)
-    # The 64-lane pitch is only required by the row-swap kernel, which is the
-    # only kernel that writes a single row.  When the whole matrix fits in one
-    # program (nblk == 1, no swap kernel) the pitch can be N: the working
-    # vector shrinks from rows*64 lanes to N*N lanes, and the reductions that
-    # dominate each step cost proportionally less.  TOT stays a multiple of 64
-    # so full-vector stores stay aligned (n % 8 == 0).  n = 8 is excluded: a
-    # 64-lane tile with this pitch was measured 2x slower than the 512-lane
-    # tile (short-stride gather bank conflicts).
     if n >= 16 and n % 8 == 0 and n * n <= _MAX_BLK:
         lda = n
     else:
@@ -188,7 +174,6 @@ def _det_step_kernel(W, DG, N, K, LDA: tl.constexpr, TOT: tl.constexpr):
     row = e // LDA
     col = e % LDA
     w = tl.load(W + base + e)
-    # column K of the (pre-swap) matrix, one value per row
     ridx = tl.arange(0, LDA)
     col_k_sp = tl.load(W + base + ridx * LDA + K)
     cand = tl.where((ridx >= K) & (ridx < N), tl.abs(col_k_sp), -1.0)
@@ -303,7 +288,6 @@ def _det_elim_kernel(W0, W1, OUT, N, LDA: tl.constexpr, TOT: tl.constexpr, BLK: 
         is_even = (k % 2) == 0
         src = tl.where(is_even, W0, W1)
         dst = tl.where(is_even, W1, W0)
-        # column K of the (pre-swap) matrix, one value per row
         col_k_sp = tl.load(src + base + ridx * LDA + k)
         cand = tl.where((ridx >= k) & (ridx < N), tl.abs(col_k_sp), -1.0)
         best = tl.max(cand, axis=0)
@@ -329,8 +313,6 @@ def _det_elim_kernel(W0, W1, OUT, N, LDA: tl.constexpr, TOT: tl.constexpr, BLK: 
 
 
 def _launch_det(A_work, out, batch_count, n, dtype, device):
-    # n == 4: closed-form cofactor expansion, one launch, no working buffer
-    # at all (immune to the backend's in-kernel store->load reordering).
     if n == 4:
         with torch_device_fn.device(device):
             _det4_kernel[(batch_count,)](
@@ -339,12 +321,6 @@ def _launch_det(A_work, out, batch_count, n, dtype, device):
         return
 
     rows, lda, tot, blk, nblk = _plan(n)
-    # n >= 32: whole elimination in ONE launch (double-buffered in-kernel
-    # k-loop, validated exact for TOT >= 1024 lanes on this backend).  Only
-    # for batch_count >= 2: a single-program launch hits a pathological
-    # codegen (measured ~45ms for n=32), and the multi-chunk n>=128 shapes
-    # serialize their chunk loop at small batch counts, so they stay on the
-    # launch-per-step path below.
     if n >= 32 and batch_count >= 2 and nblk == 1:
         work0 = torch.empty(batch_count * tot, dtype=dtype, device=device)
         work1 = torch.empty(batch_count * tot, dtype=dtype, device=device)

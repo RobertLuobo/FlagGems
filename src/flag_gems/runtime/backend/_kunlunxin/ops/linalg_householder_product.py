@@ -1,16 +1,3 @@
-# Copyright 2026, The FlagOS Contributors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """Kunlunxin (XPU) linalg_householder_product.
 
 The general implementation (``src/flag_gems/ops/linalg_householder_product.py``)
@@ -82,35 +69,14 @@ logger = logging.getLogger(__name__)
 
 _SUPPORTED_DTYPES = (torch.float32, torch.float64)
 
-# Widest padded row a single reduction tile may span (validated on this
-# platform for the 64 x MP shape used here).
 _MAX_ROW = 8192
 
-# Every vector store writes exactly 64 contiguous elements on this backend, so
-# 64 is the granularity of every buffer row and of the c-tile.
 _LANES = 64
 
-# A square tile feeding a 2-D reduce OOMs uni_sram, and a 32-wide tile that is
-# both read and written in one kernel comes back wrong.  The reduction axis is
-# therefore padded to at least 128 while the c axis stays at 64.
 _MIN_ROW = 128
 
-# Padded row length for which the single-launch sweep is validated.
-#
-# ``_fused_sweep_*_kernel`` keeps ``CC`` output columns in registers and walks
-# all reflectors inside the kernel, so it replaces ``2k`` launches with one;
-# on the benchmark matrix that is ~1.5x - 4x faster than torch (see
-# ``_pick_cc``).  Its compile envelope is however NOT monotonic in the tile
-# width: measured on this platform MP = 128, 1024 and 2048 build while
-# MP = 256, 512 and 4096 all die with ``uni_sram PassManager::run failed``
-# inside ``TritonXPUUnrollControl``, and neither ``unroll_num`` nor
-# ``buffer_size_limit`` nor ``num_warps`` moves that boundary.  Since
-# 1024/2048 building is not something that can be extrapolated from, only the
-# fully exercised MP = 128 is taken.
 _SWEEP_ROW = 128
 
-# Flat output is produced in chunks of 256 elements (4 x 64-lane stores), which
-# measures ~20 us faster than 64-element chunks on the large benchmark shapes.
 _OUT_BT = 256
 
 
@@ -145,9 +111,6 @@ def _p2(x):
     return 1 << (max(1, int(x)) - 1).bit_length()
 
 
-# ---------------------------------------------------------------------------
-# W[c, r] = Q[r, c] initialised to the first N columns of the identity.
-# ---------------------------------------------------------------------------
 @libentry()
 @triton.jit
 def _init_w_kernel(
@@ -166,10 +129,6 @@ def _init_w_kernel(
     tl.store(W + b * WB + c[:, None] * MP + r[None, :], val)
 
 
-# ---------------------------------------------------------------------------
-# V[i, r] = v_i[r]  and  U[i, r] = tau_i * v_i[r].  Only used by the per-step
-# fallback path; the sweep path rebuilds both on the fly from A and tau.
-# ---------------------------------------------------------------------------
 @libentry()
 @triton.jit
 def _init_v_kernel(
@@ -205,11 +164,6 @@ def _init_v_kernel(
     tl.store(U + off, v * t)
 
 
-# ---------------------------------------------------------------------------
-# Per-step fallback (m > 128): S[c] = W[c, :] . v_i, then W[c, :] -=
-# S[c] * (tau_i * v_i).  Two launches per reflector, driven from the host
-# because a dynamic loop may not wrap a 2-D reduction.
-# ---------------------------------------------------------------------------
 @libentry()
 @triton.jit
 def _dot_kernel(
@@ -225,8 +179,6 @@ def _dot_kernel(
     b = tl.program_id(0)
     c = tl.program_id(1) * BC + tl.arange(0, BC)
     r = tl.arange(0, MP)
-    # the operand that is contiguous along the reduction axis must be loaded
-    # first and multiplied from the left, otherwise the reduce is wrong.
     t = tl.load(W + b * WB + c[:, None] * MP + r[None, :])
     vt = tl.load(VI + b * VB + r[None, :] + c[:, None] * 0)
     tl.store(S + b * SB + c, tl.sum(t * vt, axis=1))
@@ -253,18 +205,6 @@ def _upd_kernel(
     tl.store(W + off, tl.load(W + off) - st * ut)
 
 
-# ---------------------------------------------------------------------------
-# Whole sweep for CC output columns, kept in registers.
-#
-# One program owns columns c0..c0+CC-1 of Q, i.e. rows c0..c0+CC-1 of W, so the
-# reduction is a plain 1-D -> scalar tl.sum and the reflector loop can live
-# inside the kernel: the rule that forbids a dynamic loop around a reduction
-# only bites for 2-D reductions.  v_i and tau_i are rebuilt from A / tau on the
-# fly, so no staging buffer and no read of W back: there is no read/write
-# aliasing and no need to materialise the identity first.  A lane indexed
-# c0+j >= n never leaves the q registers (the initialiser and the store are
-# unmasked by design; rows n..NP-1 of W are written with zeros and never read).
-# ---------------------------------------------------------------------------
 @libentry()
 @triton.jit
 def _fused_sweep_kernel(
@@ -429,14 +369,6 @@ def _fused_sweep_cc8_kernel(
     tl.store(W + b * WB + (c0 + 7) * MP + r, q7)
 
 
-# ---------------------------------------------------------------------------
-# Transpose back into a flat, contiguous output.
-#
-# A transposing STORE would write its own values correctly and corrupt an
-# unrelated allocation, so the transpose is done on the LOAD side: every
-# program writes one _OUT_BT-element contiguous chunk of the flat result and
-# gathers the values it needs from W.
-# ---------------------------------------------------------------------------
 @libentry()
 @triton.jit
 def _out_kernel(

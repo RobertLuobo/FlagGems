@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 from typing import Any, Optional
@@ -25,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def heur_tile_m(args):
-    return triton.cdiv(args["M"], 12)  # cluster_num
+    return triton.cdiv(args["M"], 12)
 
 
 def heru_tile_n(args):
@@ -46,24 +33,6 @@ def dreglu_kernel(
     TILES_PER_CTA: tl.constexpr,
     ONE_TILE: tl.constexpr,
 ):
-    # XPU-specialized dreglu: 1D flattened "pair" kernel.
-    #
-    # The 2D (BLOCK_M x BLOCK_N) tiling of the generic kernel is pathological on
-    # this backend: the XPU CoreTiling pass collapses the block to a single row
-    # and serializes the BLOCK_M rows one by one, and the grad_output pointer
-    # arithmetic is inferred as a discrete gather (offsetState=-1 / stride=-1),
-    # which at large shapes drives latency from ~0.4ms (TE) to 8.5ms.
-    #
-    # Instead we iterate over the M*N "pairs" (one pair per grad_output element,
-    # each producing the a-half and b-half of one grad_input row). Resolving the
-    # row with tid // N keeps every load/store on wide contiguous ranges:
-    #   * grad_output is contiguous (N per row),
-    #   * input a-half / b-half are contiguous N-elements per row,
-    # so the backend emits full-width block DMA instead of row-serialized tiles.
-    # grid = (12,) with the fixed-tile / grid-stride pattern used by the other
-    # XPU pointwise kernels (copysign_, special_erfinv, native_dropout_backward).
-    # Masked lanes are clamped to index 0 so out-of-range tail-tile addresses are
-    # never dereferenced (the masked store discards them anyway).
     pid = tl.program_id(0)
     if ONE_TILE:
         tid = pid * TILE + tl.arange(0, TILE)
@@ -215,7 +184,6 @@ def _pick_reglu_pair_tile(dtype, M, N_OUT):
         return 512 if N_OUT <= 64 else 1024
     if dtype == torch.float16:
         return 1024 if N_OUT <= 1024 else 16384
-    # fp32
     if N_OUT > 1024:
         return 8192
     return 2048 if M >= 65536 else 1024
@@ -253,16 +221,13 @@ def _pick_reglu_config(dtype, M, N_OUT):
                 return 1, 4096, 8
             else:
                 return 1, 2048, 8
-        # fp16 large rows: BLOCK_N>=2048 compile-flaky -> keep BN1024
         return 8, 1024, 4
     if N_OUT <= 64:
         if M < 256:
-            # e.g. (64,64): bm1_bn1024 wins in A/B
             return 1, 1024, 4
         if dtype == torch.float32:
             return 8, 1024, 4
         return 8, 512, 4
-    # 64 < N_OUT < 2048 (or M < 1024): many-rows -> bm16, else bm1
     return (16, 1024, 4) if M >= 8192 else (1, 1024, 4)
 
 
@@ -277,8 +242,6 @@ def reglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
         )
     N_OUT = last_dim // 2
     if input_tensor.numel() == 0:
-        # Must be checked before computing M: a zero-size last dim (e.g.
-        # shape (4, 0) or (0,)) makes numel // last_dim a division by zero.
         output_shape = (*shape[:-1], N_OUT)
         return torch.empty(
             output_shape, device=input_tensor.device, dtype=input_tensor.dtype
@@ -288,10 +251,6 @@ def reglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
     output_2d = torch.empty(
         (M, N_OUT), device=input_tensor.device, dtype=input_tensor.dtype
     )
-    # 1D pair kernel for every N_OUT: the 2D tiling is pathological on this
-    # backend (row-serialized tiles, launch/over-read bound; fp16 BLOCK_N>=2048
-    # does not compile; bf16 BLOCK_N>=2048 silently mis-lowers). See
-    # `reglu_pair_kernel` / `_pick_reglu_pair_tile`.
     tile = _pick_reglu_pair_tile(input_tensor.dtype, M, N_OUT)
     num_tasks = M * N_OUT
     reglu_pair_kernel[(triton.cdiv(num_tasks, tile),)](
@@ -324,7 +283,6 @@ def _pick_dreglu_config(dtype, M, N):
     """
     f16 = dtype == torch.float16
     f32 = dtype == torch.float32
-    # --- large rows: N >= 2048 ---
     if N >= 2048:
         if f16:
             if N >= 65536:
@@ -343,35 +301,24 @@ def _pick_dreglu_config(dtype, M, N):
         if N == 4096:
             return 1, 4096, 8
         return 4, 2048, 4
-    # --- tiny rows: N <= 64 ---
     if N <= 64:
         if N == 1:
             if M <= 1024:
                 return (8, 64, 4) if f32 else (16, 64, 8)
-            # M >= 2048: fp16/bf16 (32,64,4) 0.621ms; fp32 tuned (6,32) 0.612ms
             return (6, 32, 4) if f32 else (32, 64, 4)
         if N == 16:
             if M <= 1024:
-                # fp32 (1,1024) 0.164ms beats 2D tiles under official do_bench
                 return (1, 1024, 4) if f32 else (4, 256, 4)
-            # M >= 2048: fp32 (8,1024) 0.637ms; f16/bf16 4x256 0.737/0.731ms
             return (8, 1024, 4) if f32 else (4, 256, 4)
         if N == 32:
-            # M=64 micro-case (official probe3): f16 1x256 21.9us, f32 1x1024
-            # 15.7us, bf16 1x1024 18.3us
             return (1, 1024, 4) if f32 else ((1, 256, 4) if f16 else (1, 1024, 4))
         return (8, 256, 4)
-    # --- mid rows: 64 < N <= 1024 ---
     if f16:
         if M >= 32768:
-            # (64,512,512): tuned (342,2048) = 6.42ms is best known
             return 342, 2048, 4
         return 1, 2048, 8
     if M >= 32768:
-        # (64,512,512): launch/lane-bound, tuned (8,1024) fp32 / (1,1024) bf16
         return (8, 1024, 4) if f32 else (1, 1024, 4)
-    # probe3 (official do_bench): fp32 1x1024 165.7us @M=1024, 8x1024
-    # 641.9us @M=4096; bf16 1x1024 201.9/791.2us
     if f32:
         return (8, 1024, 4) if M > 1024 else (1, 1024, 4)
     return 1, 1024, 4

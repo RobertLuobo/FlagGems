@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -24,34 +11,9 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-# ---- design notes (Kunlunxin XPU, 2026-08-21) -------------------------------
-# prod = multiply-reduction.
-# * Flat (dim=None): rows-of-8192 main pass with the 2-D row kernel (few wide
-#   programs, mask-free), pow2-decomposed unmasked tail chunks (XPU masked-tail
-#   loads are unreliable -> never mask), staged fp32/idtree. 8192-lane reduce is
-#   the reliable width on this backend.
-# * dim path: reduced axes are moved innermost via `permute(order)`; the
-#   physical reorder uses the native strided-copy engine
-#   (`torch.ops.aten._copy_from`, flag_gems never overrides it) instead of the
-#   slow gems `.contiguous()`; then a [BLOCK_M, BLOCK_N] 2D row kernel reduces
-#   the innermost N (reduce-INSIDE accumulate in fp32).
-# * TREE16 (2026-08-21, XPU 4): fp16 was ~5.5x slower per element than fp32
-#   because of the per-element fp16->fp32 conversion before the tree
-#   (measured: flat 2^30 fp16 14.2ms vs fp32 3.9ms). Keeping the in-tile
-#   reduce tree in fp16 (native width) and converting only the per-chunk
-#   [BM,1] partial to fp32 recovers the speed (2^30 fp16: 13.7ms -> 2.5ms,
-#   ~800 GB/s effective) with no meaningful precision loss (fp16 input
-#   quantization dominates; verified equal to the fp32-tree on fp16 data).
-#   fp16 native trees are limited to BLOCK_N <= 512 (>=1024 lanes -> uni_sram
-#   OOM on this backend); bf16 keeps the fp32 tree (bf16 native trees
-#   miscompile in TritonXPUDtypeConvert -> OutOfResources at any width).
-# * N == 1 (all reduced dims of size 1): identity -> native `_copy_from`.
-# * N == 0: product over an empty dim = 1 -> fill.
-# * ints: accumulate in the input width (wrap-around like torch.prod) since fp32
-#   accumulation saturates to inf for large int products.
 
-_REDUCE_BLOCK = 8192  # reliable single-load tl.reduce width
-_TREE16_BLOCK = 512  # max fp16-native reduce width (larger -> uni_sram OOM)
+_REDUCE_BLOCK = 8192
+_TREE16_BLOCK = 512
 _FAST_BN_FP16 = (1024, 256, 512, 128, 64, 32, 16)
 _FAST_BN_FP32 = (512, 256, 1024, 128, 64, 32, 16)
 _FAST_BM_FP16 = (128, 64, 32, 256, 16, 8, 4, 2, 1)
@@ -78,13 +40,10 @@ def _pick_fast_tile(M, N, is_fp32):
 
 
 def _tree16(dt):
-    # fp16 native-width reduce tree; bf16/fp32 keep the fp32 tree
     return dt == torch.float16
 
 
 def _work_dtype(dt):
-    # floats: fp32 partials; ints: int64 (torch.prod promotes int inputs to
-    # int64 and returns the exact int64 product, not the wrapped input width)
     return torch.float32 if dt.is_floating_point else torch.int64
 
 
@@ -101,27 +60,17 @@ def prod_row2d(
     ACC32: tl.constexpr,
     TREE16: tl.constexpr = False,
 ):
-    # Map the program id to its rows and pre-offset the base pointer so the
-    # inner `inp + cols` access is proven contiguous by OffsetAnalysis.
     pid = ext.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     inp = inp + rows * N
     out = out + rows
     row_mask = rows < M
 
-    # reduce-INSIDE accumulation: each [BLOCK_M, BLOCK_N] block is reduced over
-    # N (axis=1) first, then multiplied into a [BLOCK_M, 1] accumulator. This
-    # is the only form that is numerically reliable on this XPU (the
-    # reduce-OUTSIDE variant with a persistent tile miscompiles for bf16 with
-    # masked tails). NEED_MASK=False compiles to a fully mask-free kernel.
-    # TREE16 keeps the in-tile tree in fp16 (only [BM,1] partials converted to
-    # fp32); the fp16->fp32 per-element convert is the fp16 slowdown on XPU.
     if ACC32:
         acc = tl.full([BLOCK_M, 1], value=1.0, dtype=tl.float32)
         for off in range(0, N, BLOCK_N):
             cols = off + tl.arange(0, BLOCK_N)[None, :]
             if TREE16:
-                # fp16 native tile tree (BLOCK_N <= 512); partial converted
                 if NEED_MASK:
                     mask = row_mask and (cols < N)
                     a = tl.load(inp + cols, mask, other=1.0)
@@ -138,10 +87,6 @@ def prod_row2d(
                 blk = tl.reduce(a, axis=1, combine_fn=reduce_mul)[:, None]
                 acc = acc * blk
     else:
-        # int path: torch.prod promotes any int input to int64 and computes
-        # the exact product in int64 (wrapping only in int64); the per-input
-        # width must NOT wrap (e.g. int8 rows of -648 wrap to 120 in int8
-        # but torch returns -648 in int64).
         acc = tl.full([BLOCK_M, 1], value=1, dtype=tl.int64)
         for off in range(0, N, BLOCK_N):
             cols = off + tl.arange(0, BLOCK_N)[None, :]
@@ -161,7 +106,6 @@ def prod_row2d(
 @libentry()
 @triton.jit
 def prod_mid_block(inp, mid, BLOCK: tl.constexpr, ACC32: tl.constexpr):
-    # one PID per BLOCK (<= 8192) contiguous unmasked chunk -> partial
     pid = ext.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     if ACC32:
@@ -175,7 +119,6 @@ def prod_mid_block(inp, mid, BLOCK: tl.constexpr, ACC32: tl.constexpr):
 @libentry()
 @triton.jit
 def prod_tailk(inp, out, START, WIDTH: tl.constexpr, ACC32: tl.constexpr):
-    # exact pow2 slice [START, START+WIDTH) -> fully in-bounds, no mask
     offs = START + tl.arange(0, WIDTH)
     if ACC32:
         v = tl.load(inp + offs).to(tl.float32)
@@ -188,13 +131,6 @@ def prod_tailk(inp, out, START, WIDTH: tl.constexpr, ACC32: tl.constexpr):
 @libentry()
 @triton.jit
 def prod_final_mask(inp, out, n, WIDTH: tl.constexpr, ACC32: tl.constexpr):
-    # Single-launch final stage for the staged partial products: the leading
-    # `n` lanes are masked (identity 1.0 / 1 for the padded tail) so the
-    # whole product fits one masked load+reduce instead of the previous
-    # torch.full + _copy_from + prod_final chain (measured ~4.6x faster,
-    # 27.5us -> 6.0us for n=129; WIDTH <= 8192 stays inside the reliable
-    # masked-reduce width on this backend).  Also used when n == WIDTH
-    # (mask is compile-time all-true, same speed as the unmasked kernel).
     offs = tl.arange(0, WIDTH)
     mask = offs < n
     if ACC32:
@@ -206,8 +142,6 @@ def prod_final_mask(inp, out, n, WIDTH: tl.constexpr, ACC32: tl.constexpr):
 
 
 def _bm_tail(tr):
-    # largest power of two dividing tr (> 0): a tail block of this height is
-    # fully in-bounds, so the tail launch stays mask-free.
     b = 1
     while tr % (b * 2) == 0:
         b *= 2
@@ -227,13 +161,8 @@ def prod_dim_chunk(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # program (c, mb): partial[rows, C0 + c] = prod(inp[rows, B0 + c*CHUNK : B0 + (c+1)*CHUNK]).
-    # inp is [R, N] row-major; the host guarantees every row block is fully
-    # in-bounds (two-level row split), so the kernel is 100% mask-free.
     c = ext.program_id(0)
     mb = ext.program_id(1)
-    # keep the tile index in i32: i64 tensor index arithmetic OOMs the
-    # uni_sram budget on this backend (rows*N <= 2^31 is enforced by the host)
     rows = (mb * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int32)[:, None]
     inp = inp + rows * N + B0 + c * CHUNK
     acc = tl.full([BLOCK_M, 1], value=1.0, dtype=tl.float32)
@@ -255,8 +184,6 @@ def prod_dim_single(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # single-chunk (C == 1) variant: the whole reduction fits one chunk, so
-    # store straight into `out` (implicit f32 -> out dtype cast).
     mb = ext.program_id(1)
     rows = (mb * BLOCK_M + tl.arange(0, BLOCK_M)).to(tl.int32)[:, None]
     inp = inp + rows * N
@@ -323,13 +250,8 @@ def _prod_flat(inp, out, device):
             tile = _pick_fast_tile(rows, block, is_fp32)
             bm = tile[0] if tile else 2
             if tree16:
-                bn = _TREE16_BLOCK  # fp16 native trees: BN <= 512
+                bn = _TREE16_BLOCK
             else:
-                # BN=512 for every non-TREE16 flat path (measured 2026-09-11):
-                # at BN=1024 the XRE codegen for the fp32 partial store
-                # degrades ~5x (bf16 flat 2^30: 13.4ms vs 2.3ms at BN=512;
-                # fp32 flat 2^30: 22.4ms vs 3.6ms).  bm stays from
-                # _pick_fast_tile (divides rows); 512 is the reliable width.
                 bn = 512
             chunks = _pow2_decomp(res) if res else []
             mid = torch.empty((rows + len(chunks),), dtype=wdt, device=device)
@@ -371,7 +293,6 @@ def _prod_flat(inp, out, device):
 def prod(inp, *, dtype=None):
     logger.debug("GEMS_KUNLUNXIN PROD")
     if dtype is None:
-        # torch.prod promotes integer inputs to int64 (exact product)
         dtype = torch.int64 if not inp.dtype.is_floating_point else inp.dtype
     numel = inp.numel()
     out = torch.empty([], dtype=dtype, device=inp.device)
@@ -415,16 +336,12 @@ def prod_dim(inp, dim=None, keepdim=False, *, dtype=None):
             out = torch.squeeze(out, d)
         return out
     if N == 1:
-        # reduce over a size-1 dim is the identity
         with torch_device_fn.device(inp.device):
             torch.ops.aten._copy_from(inp, out, False)
         if not keepdim:
             out = torch.squeeze(out, d)
         return out
 
-    # Move the reduced dim innermost (same order as dim_compress) and make it
-    # contiguous with the native strided-copy engine instead of gems'
-    # `.contiguous()` (which is ~1000x slower for big transposes).
     order = [i for i in range(inp.dim()) if i != d] + [d]
     view = inp.permute(order)
     if view.is_contiguous():
@@ -438,16 +355,13 @@ def prod_dim(inp, dim=None, keepdim=False, *, dtype=None):
     out_flat = out.reshape(rows)
     is_fp32 = dtype == torch.float32
     acc32 = dtype.is_floating_point
-    # TREE16 is only used on the flat path: the dim path is launch/latency
-    # bound and the fp16 native trees with the 512-lane cap measurably
-    # regress mid-size rows (e.g. (1024,4096)/(1024,1048576) fp16).
     tree16 = False
     with torch_device_fn.device(inp.device):
         tile = _pick_fast_tile(rows, N, is_fp32)
         if tile is not None and (not tree16 or N % _TREE16_BLOCK == 0):
             bm, bn = tile
             if tree16:
-                bn = _TREE16_BLOCK  # fp16 native trees: BN <= 512
+                bn = _TREE16_BLOCK
             prod_row2d[(max(rows // bm, 1), 1)](
                 src,
                 out_flat,

@@ -53,7 +53,6 @@ logger = logging.getLogger(__name__)
 
 MAX_MATRIX_SIZE = 64
 
-# (1 + sqrt(17)) / 8, the Bunch-Kaufman pivot test constant (float64).
 _ALPHA = (1.0 + 17.0**0.5) / 8.0
 
 
@@ -91,8 +90,6 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     T0 = tl.load(W + base + e)
     T = T0
 
-    # If the previous step (K-1) was a 2x2 pivot (PIV[K-1] < 0), K is the
-    # second half of that block: LAPACK advances K by kstep, so it is a no-op.
     prevk = tl.maximum(K - 1, 0)
     is_prev2x2 = (K > 0) & (tl.load(PIV + b * N + prevk) < 0)
 
@@ -102,7 +99,6 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     ridx = tl.arange(0, LDA)
     rcl = tl.where(ridx < NR, ridx, 0)
 
-    # ---------- pivot test ----------
     colk = tl.load(W + base + rcl * LDA + K)
     cand = tl.where((ridx > K) & (ridx < N), tl.abs(colk), 0.0)
     colmax = tl.max(cand, axis=0)
@@ -134,8 +130,6 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     kk = K + kstep - 1
     two = kstep == 2
 
-    # ---------- partial interchange (LAPACK DSYTF2, lower triangle) ----------
-    # W[row, kk] / W[row, kp] / W[kp, row] (row-gathered and transposed).
     ckk_r = tl.load(W + base + rowc * LDA + kk)
     ckp_r = tl.load(W + base + rowc * LDA + kp)
     rkp_r = tl.load(W + base + kp * LDA + rowc)
@@ -154,7 +148,6 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     G = tl.where((row == kp) & (col > kk) & (col < kp), ckk_c, G)
     G = tl.where((row == kk) & (col == kk), d_kp, G)
     G = tl.where((row == kp) & (col == kp), d_kk, G)
-    # kstep==2 extra: A[K+1,K] <-> A[kp,K]  (kk == K+1)
     a_kpK = tl.load(W + base + kp * LDA + K)
     a_kkK = tl.load(W + base + kk * LDA + K)
     G = tl.where((row == kk) & (col == K) & two, a_kpK, G)
@@ -166,12 +159,6 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     rkp_c = tl.load(W + base + kp * LDA + colc)
     a_kp_kk = tl.load(W + base + kp * LDA + kk)
 
-    # x = column K of the interchanged matrix (row-gathered), xc = same
-    # but col-gathered (for the symmetric outer product).
-    #   kstep==1 (kk == K):  row>kp -> A[row,kp]; row==kp -> A[kp,kk];
-    #     row==kk -> A[kp,kp]; kk<row<kp -> A[kp,row]; else A[row,K]
-    #   kstep==2 (kk == K+1): column K is not interchanged except rows kk/kp:
-    #     row==kk -> A[kp,K]; row==kp -> A[K+1,K]; else A[row,K]
     x = tl.where(row > kp, tl.where(two, ck_r, ckp_r),
           tl.where(row == kp, tl.where(two, a_kkK, a_kpK),
           tl.where(row == kk, tl.where(two, a_kpK, d_kp),
@@ -180,9 +167,6 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
           tl.where(col == kp, tl.where(two, a_kkK, a_kpK),
           tl.where(col == kk, tl.where(two, a_kpK, d_kp),
           tl.where(col > kk, tl.where(two, ck_c, rkp_c), ck_c))))
-    # x1 = column kk of the interchanged matrix (row-gathered):
-    #   row>kp -> A[row,kp]; row==kp -> A[kp,kk] (unchanged by the interchange);
-    #   row==kk -> A[kp,kp]; kk<row<kp -> A[row,kp]; else A[row,K+1]
     x1 = tl.where(row > kp, ckp_r,
           tl.where(row == kp, a_kp_kk,
           tl.where(row == kk, d_kp,
@@ -192,11 +176,7 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
           tl.where(col == kk, d_kp,
           tl.where(col > kk, ckp_c, ck1_c))))
 
-    # ---------- update ----------
-    # G[K,K]: kstep1 -> d_kp if K == kk; kstep2 -> W[K,K] (never interchanged).
     g_KK = tl.where(two, tl.load(W + base + K * LDA + K), d_kp)
-    # d21 = A'[K+1, K] after the kstep==2 interchange == A[kp, K];
-    #       equals A[K+1, K] when kp == kk (no interchange).
     d21 = a_kpK
     d21s = tl.where(d21 == 0.0, 1.0, d21)
 
@@ -207,14 +187,14 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     T1 = tl.where(upd1 & act1, G - d11 * x * xc, G)
     T1 = tl.where(live & (col == K) & (row > K) & act1, x * d11, T1)
 
-    d11v = tl.sum(tl.where(ridx == kp, colkp_l, 0.0), axis=0)  # G[kk,kk]
+    d11v = tl.sum(tl.where(ridx == kp, colkp_l, 0.0), axis=0)
     d11v = d11v / d21s
     d22 = g_KK / d21s
     t = 1.0 / (d11v * d22 - 1.0)
     d21u = t / d21s
-    w1 = d21u * (d11v * x - x1)   # for the fill (row-gathered)
+    w1 = d21u * (d11v * x - x1)
     w2 = d21u * (d22 * x1 - x)
-    w1c = d21u * (d11v * xc - x1c)  # for the submatrix (col-gathered)
+    w1c = d21u * (d11v * xc - x1c)
     w2c = d21u * (d22 * x1c - xc)
     upd2 = live & (row > K + 1) & (col > K + 1)
     T2 = tl.where(upd2 & act2, G - x * w1c - x1 * w2c, G)
@@ -224,9 +204,6 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     T = tl.where(two, T2, T1)
     T = tl.where(is_prev2x2, T0, T)
     tl.store(W + base + e, T)
-    # LD output keeps only the lower triangle (L + D blocks; strict upper
-    # zeroed in-kernel -- replaces the host-side torch.tril; masked stores are
-    # not honored on this backend, so the mask is folded into the value).
     tl.store(LD + base + e, tl.where(col > row, 0.0, T))
 
     kp_val = tl.where(kstep == 1, kp + 1, -(kp + 1))
@@ -271,8 +248,6 @@ def ldl_factor_ex(A, hermitian=False, check_errors=False):
     n = A.shape[-1]
     batch_count = A.numel() // (n * n)
     input_contiguous = A.contiguous().reshape(batch_count, n, n)
-    # Kunlunxin Triton kernels do not support fp64 arithmetic; factorize in
-    # fp32 and restore the requested dtype at the backend boundary.
     work_input = input_contiguous.to(torch.float32)
     lda, tot = _plan(n)
     W = torch.zeros(batch_count, n, lda, dtype=torch.float32, device=A.device)
@@ -282,8 +257,6 @@ def ldl_factor_ex(A, hermitian=False, check_errors=False):
     pivots = torch.empty(batch_count, n, dtype=torch.int32, device=A.device)
     info = torch.zeros(batch_count, dtype=torch.int32, device=A.device)
 
-    # The Bunch-Kaufman step size is data dependent, so the step loop lives on
-    # the host; steps that land on the second half of a 2x2 block are no-ops.
     for K in range(n):
         _dsytf2_step_kernel[(batch_count,)](
             Wf,

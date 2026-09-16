@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -22,26 +9,10 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
 from flag_gems.utils import triton_lang_extension as ext
 
-# The accuracy test asserts on the generic logger name; native_layer_norm.py
-# does the same thing for the same reason.
 logger = logging.getLogger("flag_gems.ops.native_group_norm")
 rsqrt = tl_extra_shim.rsqrt
 
 
-# One program per (n, group).  A group is `group_size` channels x HW
-# CONTIGUOUS elements, so both the reduction and the affine write can live in
-# the SAME program: the flat 1D reduce over [base, base + group_size*HW) keeps
-# mean/rstd in registers and the normalize walks the group ONE CHANNEL AT A
-# TIME (`GROUP_SIZE` is constexpr so the channel loop unrolls statically),
-# loading a SCALAR weight/bias per channel -> contiguous HW block DMA, no
-# per-element `idx // HW` gather.
-#
-# groupnorm.py splits these two phases into two @libentry kernels, which costs
-# a second launch of the SAME grid (N*group).  These shapes are launch bound
-# (grid=128 costs ~65us of the ~135us total), so folding the phases into one
-# kernel removes half of that, and for fp16/bf16 it also removes the fp32
-# mean/rstd scratch pair: mean/rstd never round-trip through memory, so there
-# is no precision loss on reload and no second store.
 @libentry()
 @triton.jit(do_not_specialize=["eps"])
 def native_group_norm_kernel(
@@ -120,14 +91,6 @@ def native_group_norm(input, weight, bias, N, C, HxW, group, eps=1e-05):
     rstd = torch.empty((N, group), dtype=input.dtype, device=input.device)
 
     grid = (N * group,)
-    # On XPU the per-iteration pipeline cost dominates: measured per-shape
-    # block sweep shows 64-512 lane tiles are 2-10x slower than 1K-8K lane
-    # tiles even when the extra lanes are fully masked off (the simulator
-    # tolerates masked OOB lanes far better than issuing many narrow
-    # iterations).  Size the tile from the group element count
-    # (group_size * HxW) instead of HxW alone, keep it in [1024, 8192]:
-    # 8192 is the largest tl.sum that stays correct without explicit
-    # mask+where (ONESHOT_N_MAX), and >= 1024 avoids the narrow-tile cliff.
     num_elements = group_size * HxW
     block_hw = min(8192, max(1024, triton.next_power_of_2(num_elements)))
     with torch_device_fn.device(input.device):

@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -23,62 +10,18 @@ from flag_gems.runtime import torch_device_fn
 logger = logging.getLogger(__name__)
 
 
-# Kunlunxin (XPU) override of replication_pad2d_backward /
-# replication_pad2d_backward.grad_input.
-#
-# Correctness notes (2026-08-21, device XPU 5):
-# - The generic implementation splits interior / edge regions and uses
-#   `tl.atomic_add` for the edge cells. On XPU both are unreliable:
-#     1. `tl.atomic_add` silently DROPS updates (non-deterministic lost
-#        updates; observed one missing row contribution per cell, moving
-#        between runs), and
-#     2. masked loads with `other=0.0` read REAL memory for masked lanes, so
-#        "(c < cnt) & mask" loads leak neighboring values into the sum.
-#   => this implementation is ATOMIC-FREE and MASKED-LOAD-FREE in the
-#   accumulation path. Every grad_input cell is written by exactly ONE
-#   program, from a disjoint, complete partition of grad_output:
-#     Fast path (non-negative pads, H>1 and W>1):
-#       - bulk kernel: interior rows 1..H-2, ALL columns [0, W): 1:1 copies
-#         gi[1+ih, iw] = go[pt+1+ih, pl+iw] (the "direct" term).
-#       - row edge kernel: target rows 0 and H-1 (full width): bounded 2D
-#         fold of row group [0, pt+1) / [pt+H-1, OH) x column group G_c(iw).
-#       - col edge kernel: target cols 0 and W-1 for rows 1..H-2: full
-#         column group fold [0, pl+1) / [pl+W-1, OW) of row pt+ih; this
-#         recomputes the same value the bulk wrote for those cells (the
-#         direct term is the group's extreme element), so the duplicate
-#         writer is idempotent and the result is deterministic even without
-#         an ordering guarantee between the kernels.
-#     Fold groups: G_c(iw) = [0, pl+1) (iw==0), [pl+W-1, OW) (iw==W-1),
-#     {pl+iw} otherwise (empty if outside [0, OW)); row groups are mirrored
-#     with pt/pb/OH. The same formulas handle negative padding (crop) in the
-#     fallback path (bulk mapping would shift under crops).
-#   - Slow/edge path (H==1 or W==1 or any negative pad): two-pass fold
-#     (colfold then rowfold) with the identical group semantics.
-#   - Loop loads always use clamped in-bounds offsets plus a register-level
-#     `tl.where(sel, v, 0)` select: no masked-load result ever feeds a sum.
-# - All accumulation is fp32 in registers (loads `.to(tl.float32)`), and the
-#   store auto-casts to the output dtype, so fp16/bf16 results round once
-#   from fp32, matching the reference opmath. There is no fp32 intermediate
-#   buffer and no extra cast pass.
-# - Performance note: on the XPU backend the (row, col) decomposition of a
-#   per-lane flat offset is extremely slow (measured 10-20x), while a
-#   per-PROGRAM decomposition (only scalar integer ops) plus an affine lane
-#   offset is fast. This kernel therefore keeps ALL index arithmetic scalar
-#   except the final affine `iw = arange(BLOCK)` (1D blocks of 1024 lanes are
-#   ~10x faster per lane than 128-lane blocks). Unmasked stores are ~6x
-#   faster than masked ones, so the mask is dropped when W % BLOCK == 0.
 @triton.jit
 def _replication_pad2d_backward_bulk_kernel(
     go_ptr,
     gi_ptr,
     OW,
     W,
-    H_2,  # H - 2
+    H_2,
     pt,
     pl,
-    OHW,  # OH * OW
-    HW,  # H * W
-    CPW: tl.constexpr,  # chunks per row
+    OHW,
+    HW,
+    CPW: tl.constexpr,
     NEED_MASK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -107,20 +50,14 @@ def _replication_pad2d_backward_bulk_contig_kernel(
     gi_ptr,
     OW,
     W,
-    H_2,  # H - 2
+    H_2,
     pt,
     pl,
-    OHW,  # OH * OW
-    HW,  # H * W
-    total,  # H_2 * W (per channel)
+    OHW,
+    HW,
+    total,
     BLOCK: tl.constexpr,
 ):
-    # grid = (NC, cdiv(H_2 * W, BLOCK)). The interior of every channel is a
-    # contiguous run of H_2 * W scalars in gi (rows 1..H-2), so the STORE is
-    # a pure affine `base + arange`; the (row, col) decomposition via
-    # per-lane division happens only on the (cheap) LOAD side. On the XPU
-    # backend a non-affine per-lane store index is ~20x slower, while a
-    # non-affine load index is nearly free.
     nc = tl.program_id(0)
     c = tl.program_id(1)
     off = c * BLOCK + tl.arange(0, BLOCK)
@@ -147,9 +84,6 @@ def _replication_pad2d_backward_row_edge_kernel(
     MAXG: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # grid = (NC, 2, cdiv(W, BLOCK)); rid 0 -> row 0, rid 1 -> row H-1.
-    # All index decomposition is scalar (per-program); only iw is a lane
-    # vector, so no per-lane integer division is emitted.
     nc = tl.program_id(0)
     rid = tl.program_id(1)
     cg = tl.program_id(2)
@@ -192,7 +126,7 @@ def _replication_pad2d_backward_col_edge_kernel(
     gi_ptr,
     OW,
     W,
-    H_2,  # H - 2
+    H_2,
     pt,
     pl,
     pr,
@@ -201,8 +135,6 @@ def _replication_pad2d_backward_col_edge_kernel(
     MAXG: tl.constexpr,
     P: tl.constexpr,
 ):
-    # grid = (NC, 2, cdiv(H-2, P)); cid 0 -> col 0, cid 1 -> col W-1.
-    # Per-program scalar decomposition; lanes = interior rows (affine).
     nc = tl.program_id(0)
     cid = tl.program_id(1)
     rg = tl.program_id(2)
@@ -237,7 +169,7 @@ def _replication_pad2d_backward_colfold_kernel(
     pl,
     pr,
     OH,
-    total,  # NC * OH * W
+    total,
     MAXG: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -280,7 +212,7 @@ def _replication_pad2d_backward_rowfold_kernel(
     pt,
     pb,
     OH,
-    total,  # NC * H * W
+    total,
     MAXG: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -370,12 +302,8 @@ def _replication_pad2d_backward_impl(
     HW = H * W
     with torch_device_fn.device(x.device):
         if H == 1 or W == 1:
-            # Degenerate spatial dim: fold one axis with a vendor reduction
-            # and the other with a single-pass fold kernel (loop-free: the
-            # generic row-group fold blows the XPU static_range stack when a
-            # group spans the whole padded dimension).
             if W == 1 and H > 1:
-                t = go.sum(dim=-1)  # (NC, OH): fold the padded W axis
+                t = go.sum(dim=-1)
                 _replication_pad2d_backward_rowfold_kernel[
                     (triton.cdiv(NC * H * 1, 256),)
                 ](
@@ -391,7 +319,7 @@ def _replication_pad2d_backward_impl(
                     BLOCK=256,
                 )
             elif H == 1 and W > 1:
-                t2 = go.sum(dim=2)  # (NC, OW): fold the padded H axis
+                t2 = go.sum(dim=2)
                 _replication_pad2d_backward_colfold_kernel[
                     (triton.cdiv(NC * 1 * W, 256),)
                 ](
@@ -406,12 +334,9 @@ def _replication_pad2d_backward_impl(
                     MAXG=max(pl + 1, pr + 1, 1),
                     BLOCK=256,
                 )
-            else:  # H == 1 and W == 1: everything collapses to one cell
+            else:
                 gi.fill_(go.sum())
         elif pl < 0 or pr < 0 or pt < 0 or pb < 0:
-            # Negative padding (crop): the bulk-identity mapping shifts, so
-            # the generic two-pass fold is used (the bulk/edge split assumes
-            # pad >= 0).
             maxg_col = max(pl + 1, pr + 1, 1)
             maxg_row = max(pt + 1, pb + 1, 1)
             cf = torch.empty(NC, OH, W, device=x.device, dtype=torch.float32)
@@ -442,19 +367,6 @@ def _replication_pad2d_backward_impl(
                 BLOCK=256,
             )
         else:
-            # Fast path: 1:1 bulk copy (unmasked when possible) + bounded
-            # edge folds, single-writer cells.
-            #
-            # Blocks are fixed to 1024 lanes (the measured sweet spot on the
-            # XPU backend; 128-lane programs are ~10x slower per lane) and
-            # all index decomposition is scalar. For W <= 512 the interior
-            # rows of a channel are a contiguous run in gi, so the contig
-            # kernel keeps the STORE purely affine (per-lane division only on
-            # the cheap load side); measured ~4-13x faster than the row-wise
-            # kernel for W in [32, 256] and within noise for W >= 512, while
-            # the row-wise kernel wins for W >= 640 (no per-lane division).
-            # Edge kernels use a 3D grid (NC, 2, chunks) so the per-lane
-            # offset stays purely affine.
             maxg = max(pt + 1, pb + 1, pl + 1, pr + 1, 1)
             BLOCK = 1024
             h2 = H - 2

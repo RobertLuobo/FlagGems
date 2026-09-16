@@ -14,29 +14,6 @@ from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
-# Kunlunxin amin (mirrors amax with the sign flipped max -> min, +inf identity;
-# NaN propagation identical to torch.amin).
-#
-# 2026-09-10 performance closure (XPU sweeps on the full benchmark shape set):
-#   - The previous fast path accumulated a [BLOCK_M, 1] running accumulator and
-#     called tl.min(axis=1) inside the loop (reduce-INSIDE); the per-iteration
-#     row reduce costs ~2x the elementwise tl.minimum of the sum-validated
-#     reduce-OUTSIDE pattern (same tile [128, 1024] measured 305us vs 159us on
-#     (1024, 65536) fp16).  The dim fast path now uses `amin_rows_kernel`
-#     (reduce-OUTSIDE, clamped rows, fully unmasked loads - the exact pattern
-#     validated for _sum_row_full_kernel), with per-N tile rules from the sweep:
-#       N >= 2^20 : [8, 8192]  fp16 / [4, 8192]  fp32   (2.5-3.1x on 1M-wide rows)
-#       N >= 2^16 : [128, 1024] fp16 / [32, 1024] fp32  (1.4-1.6x on 64K-wide rows)
-#       otherwise  : [128, bn]  fp16 / [64, bn]  fp32   (bn = 512/1024/... divide N)
-#   - The flat (dim=None) path uses exact 32768-lane unmasked chunks (documented
-#     exact point with buffer_size_limit=2048, cf. nansum) for numel < 2^26 and a
-#     row-8192 2-stage for huge numel (32768-lane chunking degrades at ~2^30
-#     elements: 32K programs vs 1K wide programs).
-#   - The masked fallback (shapes no unmasked tile covers: N % 16 != 0 or
-#     M % BM != 0) is `amin_rows_masked_kernel` (one program per row, 1-D
-#     loads): the previous [BM, BN] 2-D masked form miscompiles on this XPU
-#     for non-divisible shapes (see the kernel docstring), so it was replaced
-#     rather than kept (2026-09-10).
 
 _FULL_REDUCTION_BLOCK_SIZE = 8192
 
@@ -142,17 +119,6 @@ def amin_flat_merge_kernel(mid, out, np, NLANES: tl.constexpr):
     tl.store(out, tl.min(a))
 
 
-# Master-free fast-path tile preferences (XPU sweeps, 2026-09-10):
-#   fp16/bf16: [BLOCK_M=8, BLOCK_N=8192] at >= 1M-wide rows (1024x1048576:
-#              1822us vs the old 4675us); [BLOCK_M=128, BLOCK_N=1024] at
-#              64K..1M (1024x65536: 159us vs 305us); [128, 512/1024/256...]
-#              below.
-#   fp32:      [4, 8192] at >= 1M-wide rows (2655us vs 8018us); [32, 1024] at
-#              64K..1M (201us vs 436us); [64, 512] below (1024x4096:
-#              37us vs 43us).
-# The fast path only triggers when both M and N divide by the picked tiles
-# (the whole reduction is mask-free); everything else keeps the old masked
-# path unchanged.
 _FAST_BN_FP16 = (1024, 512, 256, 128, 64, 32, 16)
 _FAST_BN_FP32 = (512, 1024, 256, 128, 64, 16, 32)
 _FAST_BM_FP16 = (128, 64, 32, 16, 8, 4, 2)
@@ -242,8 +208,6 @@ def _amin_flat(inp, out, device):
             )
             return
         if numel < _FLAT_CHUNK_MAX_NUMEL:
-            # Exact 32768-lane unmasked chunks (documented exact point with
-            # buffer_size_limit=2048, cf. nansum) + single masked merge.
             nfull = numel // _FLAT_CHUNK
             tail = numel - nfull * _FLAT_CHUNK
             nb = nfull + (1 if tail else 0)
@@ -262,8 +226,6 @@ def _amin_flat(inp, out, device):
                         triton.next_power_of_2(tail),
                     )
                 else:
-                    # Stage the (>8192) tail into a zero-padded 2^K buffer so
-                    # the chunk kernel stays fully unmasked.
                     TL = triton.next_power_of_2(tail)
                     staged = torch.zeros((TL,), dtype=inp.dtype, device=device)
                     src_tail = inp[nfull * _FLAT_CHUNK :]
@@ -276,10 +238,6 @@ def _amin_flat(inp, out, device):
                 mid, out, nb, triton.next_power_of_2(nb)
             )
         else:
-            # Huge numel (>= 2^26): row-8192 2-stage.  The 32768-lane chunk
-            # design launches numel/32768 programs (32K at 1G elements) which
-            # is slower than kb-wide programs of the row kernel (measured
-            # 16.8ms vs 2.9ms at 2^30 elements).
             rows = numel // _FLAT_ROW_WIDTH
             res = numel - rows * _FLAT_ROW_WIDTH
             bm = next(
@@ -349,9 +307,6 @@ def amin(inp, dim=None, keepdim=False):
         M = inp.numel() // N
 
         if N == 1:
-            # Every reduced dim has size 1: amin over it is the identity. Use the
-            # native strided-copy engine (flag_gems does not override
-            # `_copy_from`) instead of launching a reduction kernel at all.
             out = torch.empty(shape, dtype=dtype, device=inp.device)
             with torch_device_fn.device(inp.device):
                 if not tle_copy(inp, out):
@@ -360,9 +315,6 @@ def amin(inp, dim=None, keepdim=False):
                 out = out.squeeze(dim=dim)
             return out
 
-        # Reorder so the reduced dims are innermost (same order as
-        # dim_compress), then make it contiguous with the native strided-copy
-        # engine instead of the much slower gems `.contiguous()` override.
         dim_i = inp.dim()
         stride = inp.stride()
         batch_dim = [i for i in range(dim_i) if i not in dim]
@@ -437,17 +389,9 @@ def amin_(inp, dim=None, keepdim=False):
                 buffer_size_limit=2048,
             )
             amin_kernel_2[(1, 1)](mid, out, mid_size, block_mid, buffer_size_limit=2048)
-        # NOTE (XPU): Tensor.copy_ on this torch_xmlir XPU build does NOT
-        # broadcast a size-1 (or 0-dim) src to a larger `inp`; it only
-        # flatten-copies the first numel(src) elements (leaving the rest of
-        # `inp` untouched, corrupting the inplace result).  `out.reshape(inp.shape)`
-        # also raises on size-1 -> larger shapes.  Expand first so src already has
-        # inp.shape (a stride-0 view), then copy_ is a plain same-shape copy.
         inp.copy_(out if out.shape == inp.shape else out.expand_as(inp))
         return inp
     else:
         result = amin(inp, dim=dim, keepdim=True)
-        # See note above: expand the (reduced-size-1) result to inp.shape before
-        # the inplace copy, since XPU copy_ does not broadcast.
         inp.copy_(result if result.shape == inp.shape else result.expand_as(inp))
         return inp

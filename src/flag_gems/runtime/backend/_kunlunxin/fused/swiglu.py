@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 from typing import Any, Optional
@@ -92,16 +79,13 @@ def _pick_swiglu_config(dtype, M, N_OUT):
                 return 1, 4096, 8
             else:
                 return 1, 2048, 8
-        # fp16 large rows: BLOCK_N>=2048 compile-flaky -> keep BN1024
         return 8, 1024, 4
     if N_OUT <= 64:
         if M < 256:
-            # e.g. (64,64): bm1_bn1024 wins in A/B
             return 1, 1024, 4
         if dtype == torch.float32:
             return 8, 1024, 4
         return 8, 512, 4
-    # 64 < N_OUT < 2048 (or M < 1024): many-rows -> bm16, else bm1
     return (16, 1024, 4) if M >= 8192 else (1, 1024, 4)
 
 
@@ -301,7 +285,6 @@ def _pick_dswiglu_config(dtype, M, N):
     """
     f16 = dtype == torch.float16
     f32 = dtype == torch.float32
-    # --- large rows: N >= 2048 ---
     if N >= 2048:
         if f16:
             if N >= 65536:
@@ -320,7 +303,6 @@ def _pick_dswiglu_config(dtype, M, N):
         if N == 4096:
             return 1, 4096, 8
         return 8, 2048, 4
-    # --- tiny rows: N <= 64 ---
     if N <= 64:
         if N == 1:
             if M <= 1024:
@@ -333,7 +315,6 @@ def _pick_dswiglu_config(dtype, M, N):
         if N == 32:
             return (1, 1024, 4) if f32 else ((1, 1024, 4) if f16 else (8, 512, 4))
         return (8, 256, 4)
-    # --- mid rows: 64 < N <= 1024 ---
     if f16:
         if M >= 32768:
             return 32, 512, 4

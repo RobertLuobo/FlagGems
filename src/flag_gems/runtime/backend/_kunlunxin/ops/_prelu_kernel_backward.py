@@ -74,11 +74,9 @@ def _prelu_kernel_backward(*args, **kwargs):
 
     ndim = x.dim()
     if weight.numel() == 1:
-        # Scalar weight: kernel-argument fast path, see module docstring.
         return _prelu_kernel_backward_scalar_func(grad_output, x, float(weight))
     if ndim == 0:
         raise AssertionError("Non-scalar weight provided for a 0-dim input.")
-    # Weight matches the last dimension (per-channel PReLU): [C] -> [1, 1, C].
     C = x.shape[-1]
     if weight.numel() != C:
         raise AssertionError(

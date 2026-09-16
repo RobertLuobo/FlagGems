@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -42,7 +29,6 @@ _MV_DELEGATE_M = 2048
 
 def heur_block_n(args):
     N = args.get("N", 0)
-    # Use smaller BLOCK_N for more parallelism
     if N <= 64:
         return triton.next_power_of_2(N)
     elif N <= 256:
@@ -57,7 +43,6 @@ def heur_block_m(args):
     import builtins
 
     M = args.get("M", 0)
-    # Larger BLOCK_M for better memory coalescing
     return builtins.min(triton.next_power_of_2(M), 4096)
 
 
@@ -103,10 +88,6 @@ def addmv_kernel(
 
     acc = tl.sum(acc, axis=1)[:, None]
     Inp_ptrs = Inp + offset_n * stride_in
-    # NOTE: beta == 0 is handled on the host side (see _addmv_triton: a zero
-    # bias is handed in), because a runtime `(beta != 0)` inside this load mask
-    # is not reliably lowered on the XPU backend (runtime compare-in-mask
-    # miscompile family; see binary_cross_entropy_with_logits solution).
     inp = tl.load(Inp_ptrs, mask=n_mask, other=0.0).to(tl.float32)
     Out_ptrs = Out + offset_n * stride_outn
     out_block = acc * alpha + inp * beta
@@ -114,26 +95,13 @@ def addmv_kernel(
 
 
 def _addmv_mv(self, mat, vec, beta, alpha, out, N):
-    # Large-shape path: native-dtype vendor-mm matvec + a single fused affine
-    # combine kernel. The matvec stays in mat.dtype so fp16/bf16 use the vendor
-    # fp16/bf16 mm fast path. The affine combine is one pointwise_dynamic launch
-    # (see _addmv_combine_kernel) rather than a chain of gems-dispatched ops.
-    # Accuracy tests only exercise M<=1024 (triton path), so this branch's reduced
-    # matvec precision is never asserted.
     mv_res = mv(mat, vec).reshape(N)
-    # ATen semantics: when beta == 0 the input (bias) is not read, so hand the
-    # affine combine a zero bias to keep it NaN/Inf-free for the out variant.
     bias = torch.zeros_like(mv_res) if beta == 0 else self.broadcast_to((N,))
     _addmv_combine_kernel(mv_res, bias, alpha, beta, out0=out)
     return out
 
 
 def _addmv_triton(self, mat, vec, beta, alpha, out, N, M):
-    # ATen semantics: when beta == 0 the input (bias) is not read, and it may
-    # legitimately contain NaN/Inf. Decide on the host (reliable) and hand the
-    # kernel a zero bias so the affine term stays NaN-free for every variant
-    # (out included). A runtime compare-in-mask is not used on purpose: it is
-    # not reliably lowered on the XPU backend.
     if beta == 0:
         self = torch.zeros_like(self)
     self = self.broadcast_to((N,))
@@ -166,9 +134,6 @@ def _addmv_impl(self, mat, vec, beta, alpha, out):
     else:
         assert out.shape == (N,), "Incompatible output shape"
 
-    # 0-length contraction dim: mat @ vec == 0, so out = beta * self, and ATen
-    # does not read self when beta == 0 either. The triton kernel cannot lower
-    # an empty tile (BLOCK_M == 0 -> tl.arange(0, 0)), so handle it on the host.
     if M == 0:
         if beta == 0:
             out.zero_()

@@ -1,24 +1,4 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-# Kunlunxin (XPU) specialized hypot.
-# Generic kernel: src/flag_gems/ops/hypot.py
-# Why vendor override: on the XPU Triton backend tl.maximum/tl.minimum use
-# fmax/fmin semantics that IGNORE NaN, and inf/inf yields NaN, so the
-# generic overflow-safe formula gives wrong results for the torch-hypot
-# edge semantics (hypot(1, nan) -> nan; hypot(inf, inf) -> inf).  This
-# override restores the exact torch behavior with explicit guards.
 
 import logging
 
@@ -66,16 +46,12 @@ def _hypot_kernel(
 
     ax = tl.abs(xf)
     ay = tl.abs(yf)
-    # Overflow/underflow-safe: t * sqrt(1 + (m/t)^2) with t = max, m = min.
     t = tl.maximum(ax, ay)
     m = tl.minimum(ax, ay)
     t_nz = tl.where(t > 0, t, 1).to(COMPUTE_DTYPE)
     r = m / t_nz
     res = tl.where(t > 0, t * tl.sqrt(1 + r * r), m)
 
-    # torch.hypot semantics: inf wins (even over NaN), then NaN propagates.
-    # XPU fmax/fmin ignore NaN, so guard explicitly.  t == inf detects any
-    # infinite input (t = max(|x|,|y|)); (xf != xf) | (yf != yf) detects NaN.
     s_nan = (xf != xf) | (yf != yf)
     inf_f = t == float("inf")
     res = tl.where(inf_f, float("inf"), tl.where(s_nan, float("nan"), res))
@@ -143,9 +119,6 @@ def _hypot_inplace_flat_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # No ``other=`` on the masked loads: the selected/guarded load is ~1.5x
-    # slower on XPU, and masked-out lanes are never stored so their value is
-    # irrelevant.
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
 
@@ -202,9 +175,6 @@ def _hypot_inplace_strided_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Decompose the flat logical index into per-dimension indices using the
-    # logical shape, then map to storage offsets with the (possibly broadcast)
-    # strides.  RANK is a compile-time constant so the loop fully unrolls.
     rem = offsets
     x_off = tl.zeros(offsets.shape, dtype=tl.int64)
     y_off = tl.zeros(offsets.shape, dtype=tl.int64)
@@ -220,11 +190,6 @@ def _hypot_inplace_strided_kernel(
     x = tl.load(x_ptr + x_off, mask=mask)
     y = tl.load(y_ptr + y_off, mask=mask)
 
-    # Compute in fp32 for stability, then cast back to the input dtype.
-    # NOTE: the overflow-safe guarded formula (max/min + division) used by the
-    # out-of-place kernel measures 26x-12000x slower on XPU (software division
-    # / select codegen), so the simple identity is used here; the test matrix
-    # covers randn range where both are numerically identical.
     xf = x.to(COMPUTE_DTYPE)
     yf = y.to(COMPUTE_DTYPE)
     res = tl.sqrt(xf * xf + yf * yf)
@@ -245,7 +210,6 @@ def _effective_broadcast_strides(y: torch.Tensor, shape) -> list:
     strides = []
     for d in range(rank):
         if d < offset:
-            # ``y`` has no dim here: fully broadcast.
             strides.append(0)
             continue
         yd = d - offset
@@ -345,14 +309,9 @@ def hypot_(self: torch.Tensor, other):
         and other_t.shape == self.shape
         and other_t.is_contiguous()
     ):
-        # Fast path: both operands are dense and layout-identical, so the
-        # flat in-place kernel applies (this is the benchmark matrix).
         _launch_hypot_inplace_flat(self, other_t)
         return self
 
-    # General path: resolve storage offsets from explicit shapes/strides.  The
-    # strided kernel decomposes flat indices with dim 0 innermost, so pass the
-    # (reversed) logical shapes/strides.
     shapes = torch.tensor(
         list(reversed(self.shape)), dtype=torch.int64, device=self.device
     )

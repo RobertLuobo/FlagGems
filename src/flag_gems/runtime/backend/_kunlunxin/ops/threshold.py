@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -31,7 +18,7 @@ config_ = CodeGenConfig(
     buffer_size_limit=4096,
     isCloseVectorization=False,
     kunlunAutoGrid=True,
-    unroll_num=4,  # PROBE-CANDIDATE unroll4 (baseline unroll8); revert if not strictly better
+    unroll_num=4,
 )
 
 
@@ -45,9 +32,6 @@ def threshold_kernel(self, threshold, value):
         d = (self - threshold) * big
         m = tl.minimum(1.0, tl.maximum(0.0, d))
         return self * m + value * (1.0 - m)
-    # f32 fma form v + (x - v)*m: one extra rounding on the m==1 path
-    # (|err| <= 6e-8 in f32, far inside RESOLUTION), but measurably faster
-    # than the two-term form on fp32/bf16.
     d = (self - threshold) * 1.0e30
     m = tl.minimum(1.0, tl.maximum(0.0, d))
     return value + (self - value) * m

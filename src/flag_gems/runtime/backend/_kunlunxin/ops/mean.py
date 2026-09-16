@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import builtins
 import logging
@@ -19,7 +6,6 @@ import torch
 import triton
 import triton.language as tl
 
-# from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import dim_compress, libentry
 from flag_gems.utils import triton_lang_extension as ext
@@ -55,8 +41,6 @@ def mean(inp, *, dtype=None):
     if dtype is None:
         dtype = inp.dtype
     if M == 0:
-        # torch.mean of an empty tensor is 0/0 = NaN; the flat kernel below
-        # cannot handle a zero trip count.
         return torch.full([], float("nan"), dtype=dtype, device=inp.device)
     BLOCK_SIZE = get_block_size_1d(M, inp.element_size())
     out = torch.empty([], dtype=dtype, device=inp.device)
@@ -68,49 +52,12 @@ def mean(inp, *, dtype=None):
 _TILE_BUDGET = 32768
 _N_WIDE = 8192
 
-# Mid-dim (K>1) reduction tunables. The reduction cuts the strided middle
-# axis of [M, N, K], so three strategies are used (2-D tiles and in-loop
-# tl.sum / tl.reshape are rejected or miscompiled by this backend):
-#  - small K (<= _MID_CHUNK_K_MAX) with large N (> _MID_CHUNK_N_MIN): the
-#    two-kernel chunked path (JCHUNK-wide strided gathers are dense when
-#    consecutive j are only a few elements apart).
-#  - float32 with 32 < K <= 1024: the wide path (mean_dim_mid_wide_*), one
-#    program per (m, chunk) reducing a [T, K_PAD] tile with one fp32
-#    ``dot(ones[1, T], B)`` (the mma pipeline loads the B-tile through SRAM,
-#    ~970 GB/s vs ~31 GB/s for the old CHUNK-unrolled 64-lane adds).  Only
-#    *affine* (completely unmasked) T x K_PAD loads keep that rate - any
-#    mask/min in the load makes the backend emit narrow loads AND the loaded
-#    tile is then miscompiled into garbage (dot kernels: even an all-true
-#    mask miscompiles).  The OOB risk (k-pad lanes of the very last element
-#    when K_PAD > K) is avoided by leaving row N-1 to a small clamped tail
-#    kernel.  fp16/bf16 wide loads are ~17 GB/s (no better than the online
-#    kernel), so those keep the online path.
-#  - otherwise (or non-float32): the serial online kernel below with 128-wide
-#    block-DMA loads (in-loop lane widths above 128 overflow uni_sram at
-#    TritonXPUUnrollControl on this backend; fp16/bf16 accumulate in fp32
-#    in-kernel via cdtype).
 _MID_ONLINE_TILE_K = 128
 _MID_CHUNK_JCHUNK = 4096
 _MID_CHUNK_K_MAX = 32
 _MID_CHUNK_N_MIN = 512
-# Wide path tunables.  The partial sums are computed with a single
-# [1, T] @ [T, K_PAD] fp32 tl.dot per program: the mma pipeline loads the
-# B-tile through SRAM (measured ~970 GB/s at [2048, 64] / [256, 1024] vs
-# ~31 GB/s for the old CHUNK-unrolled 64-lane adds, whose load width was
-# the dominant bandwidth factor on this backend).  The B-tile is capped at
-# _MID_WIDE_TILE_BYTES (2^20): [512, 1024] = 2MB fails triton-legalize
-# (uni_sram out of resources) while [2048, 64] = 512KB and [256, 1024] =
-# 1MB compile, so the SRAM budget is ~1MB per B-tile.
 _MID_WIDE_TILE_BYTES = 1 << 20
 _MID_WIDE_BN_MAX = 2048
-# The clamped 1-D tail kernel unrolls its rows; the unroll count (CHUNK) is
-# the stack limiter on this backend: CHUNK <= 64 compiles for every K_PAD
-# (64 x 512 = 32K lanes OK, 32 x 1024 = 32K lanes OK) while CHUNK = 128
-# fails even at 128 x 64 = 8K lanes ("Failed to tune buffer size"), i.e. the
-# envelope is NOT lane-based.  K_PAD x CHUNK stays within the lane guard too
-# (for K_PAD = 1024 that caps CHUNK at 32).  The affine tail group size is
-# chosen so the remaining rows (the clamped tail) are at most
-# _MID_WIDE_TAIL_REM.
 _MID_WIDE_TILE = 32768
 _MID_WIDE_TAIL_REM = 64
 _MID_WIDE_COMB_MAX_UNROLL = 64
@@ -118,8 +65,8 @@ _MID_WIDE_COMB_MAX_UNROLL = 64
 
 def _block_n(N):
     if N > _N_WIDE:
-        return builtins.min(triton.next_power_of_2(N), 2048)  # wide for large N
-    return builtins.min(triton.next_power_of_2(N), 512)  # tall-friendly otherwise
+        return builtins.min(triton.next_power_of_2(N), 2048)
+    return builtins.min(triton.next_power_of_2(N), 512)
 
 
 def heur_n_block_size(args):
@@ -128,15 +75,11 @@ def heur_n_block_size(args):
 
 def heur_m_block_size(args):
     block_n = _block_n(args["N"])
-    block_m = triton.next_power_of_2(triton.cdiv(args["M"], 12))  # cluster_num
+    block_m = triton.next_power_of_2(triton.cdiv(args["M"], 12))
     return builtins.min(block_m, builtins.max(_TILE_BUDGET // block_n, 1))
 
 
 @libentry()
-# @triton.autotune(
-#     configs=runtime.get_tuned_config("mean"),
-#     key=["M", "N"],
-# )
 @triton.heuristics(
     values={
         "BLOCK_M": heur_m_block_size,
@@ -152,7 +95,6 @@ def mean_dim_kernel(X, Mean, M, N, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr)
       kernelParams[2] = M,    kernelParams[3] = N  (runtime scalars)
       kernelConsts[4] = BLOCK_M (constexpr), kernelConsts[5] = BLOCK_N (constexpr)
     """
-    # Map the program id to the row of X it should compute.
     pid = ext.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
     X = X + pid * N
     Mean = Mean + pid
@@ -246,7 +188,7 @@ def mean_dim_mid_combine_kernel(Sum, Out, nchunks, stride, N, TILE_C: tl.constex
     kernel; invalid slots read the in-bounds element nchunks-1 and are
     replaced with 0.0 in registers.
     """
-    pid = ext.program_id(0)  # m * K + k
+    pid = ext.program_id(0)
     c_offsets = tl.arange(0, TILE_C)
     c_mask = c_offsets < nchunks
     c = tl.minimum(c_offsets, nchunks - 1)
@@ -411,20 +353,10 @@ def _mean_dim_mid_wide(x, M, N, K, dtype, out_shape):
     """
     K_PAD = triton.next_power_of_2(K)
     BN = builtins.min(_MID_WIDE_BN_MAX, _MID_WIDE_TILE_BYTES // (K_PAD * 4))
-    # Start of the tail chunk: every full chunk that cannot read past the end
-    # of X.  When K_PAD > K a K_PAD-wide row load of the very last row would
-    # be OOB, so the last row always goes to the tail kernel.
     nA = (N // BN) * BN if K_PAD == K else ((N - 1) // BN) * BN
     nchA = nA // BN
     n_tail = N - nA
-    # Affine (dot) tail rows: everything except the rows handed to the
-    # clamped 1-D tail.  When K_PAD > K the last row must stay clamped (its
-    # pad lanes are OOB); otherwise the whole tail can be affine.
     n_a = n_tail if K_PAD == K else n_tail - 1
-    # Largest power-of-two group size (T <= BN) whose clamped remainder fits
-    # the 1-D tail envelope (n_rem <= _MID_WIDE_TAIL_REM and
-    # n_rem * K_PAD <= _MID_WIDE_TILE).  T = 32 always fits (n_rem < 32 +
-    # T/2), so the loop is guaranteed to terminate.
     T_TAIL = BN
     n_tail_groups = 0
     while T_TAIL >= 32:
@@ -439,9 +371,6 @@ def _mean_dim_mid_wide(x, M, N, K, dtype, out_shape):
     nchunks = nchA + n_tail_groups + (1 if n_rem > 0 else 0)
     out = torch.empty(out_shape, dtype=dtype, device=x.device)
     if nchunks == 1 and nchA == 1:
-        # One chunk covered entirely by the main kernel (N == BN, K_PAD == K):
-        # the mma-dot partial is already the final sum, so store it directly
-        # (the two combine launches cost ~0.4 ms on this backend at large M).
         with torch_device_fn.device(x.device):
             mean_dim_mid_wide_single_kernel[(M,)](
                 x, out, M, N, K, K_PAD=K_PAD, T=BN
@@ -574,31 +503,15 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
             x = x.contiguous()
             out_shape = shape[:dim0] + [1] + shape[dim0 + 1 :]
             if N == 1:
-                # N=1: mean over a size-1 dim is the identity (same as the
-                # historic N==1 fast path; no dim_compress here, so this is a
-                # zero-copy view / dtype cast only).
                 out = x.to(dtype=dtype).reshape(out_shape)
                 if not keepdim:
                     out = out.squeeze(dim=dim0)
                 return out
             if x.dtype == torch.float32 and K > 32 and K <= 1024:
-                # f32: the wide path, one affine [1, T] @ [T, K_PAD] dot per
-                # group (mma pipeline, ~970 GB/s at T=2048/K_PAD=64) + a
-                # tiny combine.  Only the value-verified envelope is routed
-                # here: K <= 32 (K_PAD=32 is silently miscompiled) and
-                # K > 1024 (K_PAD>=2048 tail hang) stay on the other paths.
                 out = _mean_dim_mid_wide(x, M, N, K, dtype, out_shape)
             elif K <= _MID_CHUNK_K_MAX and N > _MID_CHUNK_N_MIN:
-                # Small K + large N: the JCHUNK-wide strided gather of the
-                # chunked path is dense (consecutive j lanes are K elements
-                # apart), so one pass reads x once (replaces the old
-                # torch.bmm(ones, x) fast path with a pure-Triton reduction).
                 out = _mean_dim_mid_chunked(x, M, N, K, dtype, out_shape)
             else:
-                # Serial online kernel with 128-wide block-DMA loads; the
-                # kernel accumulates in fp32 (cdtype) for every input dtype
-                # (f16/bf16 wide loads are ~17 GB/s here, no better than
-                # this path, so they stay online).
                 out = torch.empty(out_shape, dtype=dtype, device=x.device)
                 BLOCK_K = (
                     _MID_ONLINE_TILE_K if K >= _MID_ONLINE_TILE_K else triton.next_power_of_2(K)
@@ -611,7 +524,6 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
             if not keepdim:
                 out = out.squeeze(dim=dim0)
             return out
-    # ------------------------------------------------------------------------
 
     x = dim_compress(x, dim)
     N = 1
@@ -620,33 +532,25 @@ def mean_dim(x, dim, keepdim=False, *, dtype=None):
         shape[i] = 1
     M = x.numel() // N if N > 0 else 0
 
-    # Reducing over an empty (size-0) dimension means 0/0 = NaN for every
-    # output element, matching torch's reference behavior.
     if N == 0:
         out = torch.full(shape, float("nan"), dtype=dtype, device=x.device)
         if not keepdim:
             out = out.squeeze(dim)
         return out
 
-    # No output rows at all: the result is empty, no computation needed.
     if M == 0:
         out = torch.empty(shape, dtype=dtype, device=x.device)
         if not keepdim:
             out = out.squeeze(dim)
         return out
 
-    # Edge case: M=1 means all dims are reduced → global mean over N elements.
-    # mean_dim XPU API does not support M=1.
     if M == 1:
-        scalar_out = mean(x, dtype=dtype)  # 0-d tensor
+        scalar_out = mean(x, dtype=dtype)
         out = scalar_out.reshape(shape)
         if not keepdim:
             out = out.squeeze(dim)
         return out
 
-    # Edge case: N=1 means reducing a trivial (size-1) dimension.
-    # mean of 1 element = that element; just copy with dtype conversion.
-    # mean_dim XPU API does not support N=1.
     if N == 1:
         out = x.to(dtype=dtype).reshape(shape)
         if not keepdim:

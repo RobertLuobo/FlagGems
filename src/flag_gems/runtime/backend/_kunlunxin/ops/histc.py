@@ -1,38 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Kunlunxin (XPU) override of histc.
-#
-# Root cause (2026-08-16, XPU 7):
-#  - The generic implementation counts via masked `tl.atomic_add`
-#    (histc_kernel_simple): masked atomic-add silently drops ~1% of updates
-#    on XPU, and masked `other=` loads read real out-of-range memory into
-#    the reduction, so many fp32 cases come out wrong.
-#  - The previous Kunlunxin override avoided atomics (one program per bin,
-#    each streaming the whole input) but still used masked loads with
-#    `other=nan`: out-of-bounds lanes are not trustworthy on this backend
-#    (torn real reads), so small shapes produced wrong histograms (e.g.
-#    returned F on the (64,) test nodes).
-#  - tl.histogram is not supported by the XPU backend (PassManager::run
-#    failed at make_llir even for a minimal kernel) and unmasked
-#    tl.atomic_add is both incorrect (2x-20x overcount) and pathologically
-#    slow (~14M atomics/s) on this backend, so a single-pass histogram
-#    cannot be built from Triton primitives here.
-#
-# Fix: deterministic per-bin counting with no masked memory anywhere.
-#  Every lane lands on a clamped in-bounds offset; out-of-range / NaN /
-#  OOB lanes are zeroed by an integer ok-multiplier (the count_nonzero
-#  clamp+mult pattern).  bins <= 100 in the test/benchmark matrix so the
-#  extra passes over the data are cheap and, crucially, exact.
-# Perf (2026-09-10): stream tile raised 1024 -> up to 8192 lanes (largest
-#  of {8192, 4096, 2048, 1024} dividing n).  On XPU the per-bin kernel is
-#  streaming-bound (100 passes over the whole input) and 8192 is the
-#  measured sweet spot (~1.20x over 1024 across the benchmark shapes;
-#  16384/32768 give no further gain and 32768 exceeds the 8192-lane tl.sum
-#  safety boundary).  The tail (clamped gather) path is ~15x slower per
-#  lane than streaming, so the tile is only raised when n is an exact
-#  multiple; otherwise the old 1024+tail path runs unchanged.  Total is
-#  still far below 1.0x of torch, so this remains a "source retained, not
-#  accepted" candidate.
 import logging
 
 import torch
@@ -57,9 +22,6 @@ def histc_bin_main_kernel(
     max_val,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # One program per bin over the contiguous part only (n_main is a
-    # multiple of BLOCK_SIZE): pure contiguous loads, no masks, no clamped
-    # (gather) addresses, so full streaming bandwidth is kept.
     b = ext.program_id(0)
     inv_scale = bins / (max_val - min_val)
     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.int32)
@@ -67,7 +29,6 @@ def histc_bin_main_kernel(
         offs = start + tl.arange(0, BLOCK_SIZE)
         v = tl.load(inp_ptr + offs).to(tl.float32)
         idx = tl.floor((v - min_val) * inv_scale).to(tl.int32)
-        # elements exactly at max_val belong to the last bin
         idx = tl.where(v == max_val, bins - 1, idx)
         in_range = ((v >= min_val) & (v <= max_val)).to(tl.int32)
         hit = (idx == b).to(tl.int32) * in_range
@@ -88,9 +49,6 @@ def histc_bin_tail_kernel(
     max_val,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Tail (< one BLOCK_SIZE) with clamped offsets + ok-multiplier
-    # (masked `other=` values are not reliable on this backend).  Only the
-    # tail tile ever gathers, so the main pass keeps contiguous streaming.
     b = ext.program_id(0)
     inv_scale = bins / (max_val - min_val)
     offs = off + tl.arange(0, BLOCK_SIZE)
@@ -103,7 +61,6 @@ def histc_bin_tail_kernel(
     in_range = ((v >= min_val) & (v <= max_val)).to(tl.int32)
     hit = (idx == b).to(tl.int32) * in_range * ok
     total = tl.sum(hit)
-    # add to the main pass result (single program per bin, no race)
     prev = tl.load(out_ptr + b)
     tl.store(out_ptr + b, total.to(tl.float32) + prev)
 
@@ -118,9 +75,6 @@ def histc_range_kernel(
     TILE: tl.constexpr,
     GRID: tl.constexpr,
 ):
-    # mask-free grid-stride min/max; clamped lanes duplicate the last
-    # element, which does not change the min/max. Avoids the gem min/max
-    # path whose 2D variant wedges this device (66250 kernel exception).
     pid = ext.program_id(0)
     last = n - 1
     mmin = tl.full((TILE,), float("inf"), dtype=tl.float32)
@@ -201,9 +155,6 @@ def histc(inp, bins=100, min=0, max=0):
     if min_val == max_val:
         out = torch.zeros(bins, dtype=inp.dtype, device=inp.device)
         count = ((inp == min_val) & ~torch.isnan(inp)).sum().item()
-        # torch's CPU reference places all-equal data at bin = bins // 2
-        # (write via the native strided-copy engine; the gem copy_ does not
-        # support scalar-element assignment on Kunlunxin)
         ones = torch.full((1,), count, dtype=inp.dtype, device=inp.device)
         torch.ops.aten._copy_from(ones, out[bins // 2 : bins // 2 + 1], False)
         return out
@@ -214,11 +165,6 @@ def histc(inp, bins=100, min=0, max=0):
     if n_elements == 0:
         return out
 
-    # Largest tile in {8192, 4096, 2048, 1024} that divides n: keeps the
-    # whole input on the contiguous streaming path (no tail gather), which
-    # is ~15x faster per lane than the clamped tail path.  Falls back to
-    # the historical 1024 layout (main + tail) when n has no such divisor
-    # (e.g. n=10000): the tail kernel only ever sees n_tail < 1024.
     BLOCK_SIZE = 1024
     for _bs in (8192, 4096, 2048, 1024):
         if n_elements % _bs == 0:

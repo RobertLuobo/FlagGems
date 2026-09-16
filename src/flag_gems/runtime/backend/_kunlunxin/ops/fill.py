@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -66,10 +53,6 @@ def fill_scalar(input, value):
 
 
 def fill_scalar_out(input, value, *, out=None):
-    # The generic ops/fill.py fill_scalar_out routes through a NO-config
-    # pointwise kernel whose store is judged discrete (lm2gm offsetState=-1) on
-    # XPU -> ~0.002-0.003 speedup on large shapes. Reuse the kunlunxin-tuned
-    # fill_scalar_func (prefer_1d_tile) so the write is a contiguous block DMA.
     logger.debug("GEMS_KUNLUNXIN FILL_SCALAR_OUT")
     if out is None:
         return fill_scalar(input, value)
@@ -93,8 +76,6 @@ def fill_tensor(input, value):
 
 @triton.jit
 def _fill_tensor_out_kernel(out_ptr, n_elements, value, BLOCK_SIZE: tl.constexpr):
-    # 纯 store、不加载 input。value 传 Python 标量（会被 specialize 成编译期常量），
-    # tl.full 才会被优化成 memset；若传 runtime 0-dim 张量，tl.full 会物化大中间量。
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
@@ -106,10 +87,6 @@ def _fill_tensor_out_kernel(out_ptr, n_elements, value, BLOCK_SIZE: tl.constexpr
 
 
 def fill_tensor_out(input, value, *, out=None):
-    # fill.Tensor_out 用单个 0-dim `value` 填充 `out`，语义等价于 fill.Scalar_out。
-    # 通用 ops/fill.py 走 fill_tensor_func（`return value`）在 XPU 上会 0-dim 标量逐元素
-    # 读，打散 block DMA。这里用专用 _fill_tensor_out_kernel：不加载 input、tl.full 保证
-    # 向量化、value 读成 Python 标量让编译期常量折叠成 memset。
     logger.debug("GEMS_KUNLUNXIN FILL_TENSOR_OUT")
     if out is None:
         return fill_tensor(input, value)
@@ -119,9 +96,6 @@ def fill_tensor_out(input, value, *, out=None):
         )
     N = volume(input.shape)
     if N == 0:
-        # Empty tensor: next_power_of_2(cdiv(0, 12)) == 0 would make
-        # tl.arange(0, 0) fail to compile; fill of an empty tensor is a
-        # no-op (matches torch native), so return out directly.
         return out
     grid_fn = (12, 1, 1)
     block_size = triton.next_power_of_2(triton.cdiv(N, 12))

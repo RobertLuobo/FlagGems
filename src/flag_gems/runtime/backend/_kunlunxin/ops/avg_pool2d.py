@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -396,12 +383,6 @@ def avg_pool2d_forward_flat_constexpr_kernel(
     divisor_override,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Flat layout over (n, c, h, w) with the pooling geometry as constexpr so
-    # the per-lane decomposition and window math compile to cheap ALU (no
-    # runtime integer division) and the collect addresses stay affine.
-    # Loads are made unconditional (clamped index, only the outer tail mask)
-    # with value-level tl.where selects; masked loads with compound i1
-    # conditions are a slow path on the XPU backend.
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     output_mask = offsets < numel
 
@@ -600,9 +581,6 @@ def avg_pool2d_backward_flat_kernel(
     divisor_override,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Flat layout over (n, c, h, w) with the pooling geometry as constexpr so
-    # the per-lane decomposition and window math compile to cheap ALU (no
-    # runtime integer division) and the gather addresses stay affine.
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     input_mask = offsets < numel
 
@@ -659,8 +637,6 @@ def avg_pool2d_backward_flat_kernel(
             )
             divisor = tl.where(divisor == 0, 1.0, divisor)
 
-            # Unconditional in-bounds load (clamped index) + value-level select;
-            # masked loads with compound i1 conditions are a slow path on XPU.
             c_h_out = tl.minimum(tl.maximum(h_out, 0), out_h - 1)
             c_w_out = tl.minimum(tl.maximum(w_out, 0), out_w - 1)
             grad_out_ptr = grad_output_base_ptr + c_h_out * out_w + c_w_out
@@ -696,16 +672,6 @@ def avg_pool2d_backward_tap_kernel(
     divisor_override,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Folded-window variant of avg_pool2d_backward_flat_kernel. Instead of
-    # iterating the full (kernel_h x kernel_w) static window (9 taps for
-    # k3s2p1, most of which are masked out), iterate only the ceil(k/s) x
-    # ceil(k/w) taps that can ever be valid:
-    #   h_num = h_in + padding_h; h_base = h_num // stride_h
-    #   h_rem = h_num - h_base * stride_h; kh = h_rem + jh * stride_h
-    #   h_out = h_base - jh                      (jh in [0, ceil(k/stride)))
-    # This is a bijection over the (kh, h_out) pairs of the plain kernel, so
-    # the same effective tap set with the same divisor semantics; only the
-    # guaranteed-invalid taps are dropped (9 -> 4 for k3s2p1).
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     input_mask = offsets < numel
 
@@ -762,9 +728,6 @@ def avg_pool2d_backward_tap_kernel(
             )
             divisor = tl.where(divisor == 0, 1.0, divisor)
 
-            # Unconditional in-bounds load (clamped index) + value-level
-            # select; masked loads with compound i1 conditions are a slow
-            # path on XPU.
             c_h_out = tl.minimum(tl.maximum(h_out, 0), out_h - 1)
             c_w_out = tl.minimum(tl.maximum(w_out, 0), out_w - 1)
             grad_out_ptr = grad_output_base_ptr + c_h_out * out_w + c_w_out
@@ -794,13 +757,6 @@ def avg_pool2d_backward(
         raise ValueError("divisor_override cannot be zero")
 
     grad_output = grad_output.contiguous()
-    # The tap kernel stores every element of grad_input (the store mask is the
-    # full numel), so the zero-fill of zeros_like is redundant work (one extra
-    # full-tensor write + one extra launch on the backward path).  empty_like
-    # matches the ATen contract for a fully-written buffer.  Keep the input
-    # contiguous as well: zeros_like/empty_like preserve input strides, while
-    # the kernel writes the flat (contiguous) layout, so a non-contiguous
-    # input must be normalized first (same as the forward path).
     input = input.contiguous()
 
     kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w = _parse_pool_params(

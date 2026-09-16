@@ -19,13 +19,6 @@ def _fractional_max_pool2d_forward_kernel(
     indices_ptr,
     random_samples_ptr,
     numel,
-    # Flat 1-D layout over (n, c, oh, ow). All pooling geometry is constexpr so
-    # the per-lane decomposition compiles to cheap ALU, gather addresses stay
-    # affine and @libentry caches one kernel per shape. Taps are loaded
-    # unconditionally (the fractional window always lies fully inside the input:
-    # start in [0, in - k]), and only the store tail is masked. The interval
-    # formula and strict-> first-window-wins semantics are preserved verbatim
-    # from the previous per-output-element kernel so indices match ATen exactly.
     input_channels: tl.constexpr,
     input_height: tl.constexpr,
     input_width: tl.constexpr,
@@ -203,11 +196,6 @@ def _fractional_max_pool2d_backward_gather_kernel(
     iop = indices_ptr + nc * out_per_nc
 
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
-    # Rolled loops (compile-time constant bounds), not tl.static_range: the
-    # XPU unroll control pass (TritonXPUUnrollControl) fails with uni_sram
-    # OOR when the candidate box is fully unrolled.  Loads are clamped (never
-    # masked) so they stay inside the (n, c) plane; the active mask only
-    # gates the accumulation.
     for oh in range(0, MAX_H):
         o_h = oh_lo + oh
         h_ok = (o_h <= oh_hi) & (o_h < out_h)
@@ -295,9 +283,6 @@ def fractional_max_pool2d(
         (input_width - kernel_width) / (output_width - 1) if output_width > 1 else 0.0
     )
     numel = output.numel()
-    # 128 lanes is the largest tile this kernel compiles at on XPU; below
-    # 64 * 128 outputs the 64-lane tile wins because the masked tail is a
-    # smaller share of the launch (same heuristic as adaptive_max_pool2d).
     block_size = 128 if numel >= 8192 else 64
     grid = (triton.cdiv(numel, block_size),)
     with torch_device_fn.device(input.device):
@@ -345,15 +330,6 @@ def fractional_max_pool2d_backward(
     out_per_nc = output_height * output_width
     in_hw = input_height * input_width
     n_out = grad_output.numel()
-    # Fast path: alpha = (in - k) / (out - 1) >= k in both dims (out == 1 is a
-    # single window per dim, trivially fine) -- see the scatter kernel
-    # docstring: the k-wide pool windows are then pairwise disjoint, every
-    # output's argmax index is distinct and the non-atomic scatter is exact
-    # and O(n_out).  The scatter kernel writes only the n_out argmax
-    # positions, so every other input position must still read 0 (ATen
-    # semantics) -- zeros_like, same as the proven adaptive scatter fast path.
-    # Otherwise fall back to the bounded gather (which writes every input
-    # position, no pre-zeroing needed: it can use empty_like).
     scatter_h = (output_height == 1) or (
         input_height - kernel_height >= kernel_height * (output_height - 1)
     )
@@ -378,13 +354,6 @@ def fractional_max_pool2d_backward(
                 buffer_size_limit=2048,
             )
         else:
-            # Candidate-box bounds are shape-derived only (see gather kernel
-            # docstring): inv_alpha = 1 / alpha with alpha = (in - k) / (out - 1).
-            # out == 1 (or in == k) makes alpha 0, in which case the only
-            # candidate is o = 0 (clamped start = in - k), handled by
-            # inv_alpha = 0.  The compile-time scan bound is the per-lane
-            # worst-case candidate count (k + 1) / alpha + 5, clamped to
-            # [1, out].
             inv_alpha_h = (
                 (output_height - 1) / (input_height - kernel_height)
                 if input_height > kernel_height
@@ -404,10 +373,6 @@ def fractional_max_pool2d_backward(
                 min(output_width, int(math.ceil((kernel_width + 1) * inv_alpha_w)) + 6),
             )
             n_elems = input.numel()
-            # The gather kernel writes every input position (one lane per
-            # input element, single masked store covering [0, n_elems)), so
-            # no pre-zeroing is needed: empty_like skips the vendor
-            # zeros-kernel launch (bitwise-identical output).
             grad_input = torch.empty_like(input)
             _fractional_max_pool2d_backward_gather_kernel[
                 (triton.cdiv(n_elems, 128),)

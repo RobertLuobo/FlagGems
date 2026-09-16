@@ -1,7 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
 
 import torch
 import triton
@@ -22,13 +18,6 @@ def _te_rmsnorm_bwd_dx_1d_kernel(
     C: tl.constexpr,
     NEED_TAIL: tl.constexpr,
 ):
-    # 1D per-row dX (grid=(M,)): every load/store is a [C] block (block DMA),
-    # no 2D [R, C] tile.  The 2D-tile variant saturates at ~35-125GB/s on this
-    # backend (see the layernorm backward note: 2D tiles 20-60x slower than
-    # 1D row blocks); the per-row layout keeps the row-sum (c1) as a [C]
-    # elementwise accumulator + one 1D tl.sum (1D reduces are legal on XPU;
-    # only 2D axis=0 reduces and [C, R] transposed loads are not).
-    # Needs two passes (c1 before dx), so x/dz are re-read in pass 2.
     pid = tl.program_id(0)
     row = pid * N
     rsigma = tl.load(rsigma_ptr + pid).to(tl.float32)
@@ -79,11 +68,6 @@ def _te_rmsnorm_bwd_dgamma_kernel(
     BM: tl.constexpr,
     C: tl.constexpr,
 ):
-    # Validated XPU pattern for dW/dgamma (verbatim structure of
-    # _kunlunxin/ops/layernorm.py::weight_bias_backward_1d_kernel): 1D [C]
-    # column-vector loads with an M-loop, grid = (cdiv(N, C), cdiv(M, BM)).
-    # 2D tiles are avoided entirely: a [R, C] tile needs an axis=0 reduce
-    # (rejected by the XPU legalizer) and a [C, R] transposed load miscompiles.
     n0 = tl.program_id(0) * C
     mi = tl.program_id(1)
     m0 = mi * BM
@@ -120,8 +104,6 @@ def _te_rmsnorm_bwd_dgamma_reduce_kernel(
 
 
 def _dgamma_bm_size(M):
-    # rows per dgamma program: largest divisor of M <= _DGM_BM_MAX (so the
-    # M-loop never masks OOB row reads under the M % BM == 0 contract); min 1.
     block = min(M, _DGM_BM_MAX)
     while block > 1 and M % block != 0:
         block //= 2
@@ -132,44 +114,25 @@ _DGM_BM_MAX = 128
 
 
 def _ln_bwd_col_size(N):
-    # chunk width for the 1D backward kernels: largest power of 2 <= min(N, 8192)
-    # (tl.arange must stay pow2; > 8192 lanes is a 1D defect on this backend).
     cap = min(N, 8192)
     return 1 << (cap.bit_length() - 1)
 
 
-# --- te_rmsnorm_fwd (TE-aligned rmsnorm forward), XPU-local fast paths ---------
-# The generic ``flag_gems.ops.te_rmsnorm`` fwd kernels cannot be used on XPU:
-#   * ``rmsnorm_fwd_kernel`` launches one block of ``next_power_of_2(N)`` lanes;
-#     for N in [16384, 32768] (the fused path up to 65536 // itemsize) that
-#     exceeds the 8192-lane limit and the XPU backend miscompiles it (measured
-#     max|err| 4.9 fp32 at (16, 16384) / 15.2 fp16 at (1024, 32768)).
-#   * the vendor ``rms_norm`` tile2d kernel rounds ``(x * rrms)`` to the output
-#     dtype *before* multiplying by w (double rounding); on fp16/bf16 that
-#     exceeds the test rtol (fp16 1e-3 / bf16 0.016, measured 3.9e-3 / 3.1e-2),
-#     and its [TILE_M, 8192] tile (admitted by the rms_norm 65536-element
-#     budget) crashes the XPU vectorizer (llvm::cast<ClusterLayoutAttr> assert).
-# The two kernels below mirror the validated vendor rms_norm structure (2D
-# unmasked row-tile for N <= 4096; per-row chunked two-pass otherwise) but
-# compute entirely in fp32 and round once at the store, matching the torch /
-# TE reference exactly.
-_FWD_TILE_N_MAX = 4096  # XPU vectorize miscompiles 2D tiles wider than 4096 cols
-_FWD_TILE_ELEMS = 65536  # [TILE_M, N] fp32 tile element budget (proven on XPU)
-_FWD_ROW_BLOCK = 64 * 128  # 8192: max lanes per 1D block (the >8192-lane defect)
+_FWD_TILE_N_MAX = 4096
+_FWD_TILE_ELEMS = 65536
+_FWD_ROW_BLOCK = 64 * 128
 
 
 @triton.jit
 def _te_rmsnorm_fwd_tile2d_kernel(
-    Y,  # output
-    INV_RMS,  # per-row inverse rms
-    X,  # input
-    W,  # weight
+    Y,
+    INV_RMS,
+    X,
+    W,
     eps: tl.constexpr,
-    TILE_M: tl.constexpr,  # rows per program (M % TILE_M == 0 guaranteed)
-    N: tl.constexpr,  # number of columns (normalized dim), used as tile width
+    TILE_M: tl.constexpr,
+    N: tl.constexpr,
 ):
-    # Unmasked [TILE_M, N] row-tile (M % TILE_M == 0), single-rounding:
-    # y = (x * rrms * w) computed in fp32, rounded once at the store.
     pid = tl.program_id(0)
 
     n_off = tl.arange(0, N)
@@ -190,23 +153,19 @@ def _te_rmsnorm_fwd_tile2d_kernel(
 
 @triton.jit
 def _te_rmsnorm_fwd_row_kernel(
-    Y,  # output
-    INV_RMS,  # per-row inverse rms
-    X,  # input (one row per program)
-    W,  # weight
-    N,  # number of columns (normalized dim)
+    Y,
+    INV_RMS,
+    X,
+    W,
+    N,
     eps,
     BLOCK: tl.constexpr,
-    NEED_MASK: tl.constexpr,  # whether N is not a multiple of BLOCK
+    NEED_MASK: tl.constexpr,
 ):
-    # Per-row two-pass chunked kernel (N > _FWD_TILE_N_MAX or no TILE_M
-    # candidate).  [BLOCK]-lane 1D chunks only (BLOCK <= 8192): the 2D
-    # [*, BLOCK] tile form is what miscompiles on XPU for BLOCK > 4096.
     pid = tl.program_id(0)
     X += pid * N
     Y += pid * N
 
-    # Pass 1: sum of squares (fp32 accumulate), chunks never exceed BLOCK.
     sum_sq = tl.zeros([BLOCK], dtype=tl.float32)
     for off in range(0, N, BLOCK):
         cols = off + tl.arange(0, BLOCK)
@@ -220,7 +179,6 @@ def _te_rmsnorm_fwd_row_kernel(
     rrms = 1.0 / tl.sqrt(var + eps)
     tl.store(INV_RMS + pid, rrms)
 
-    # Pass 2: normalize and scale, single rounding at the store.
     for off in range(0, N, BLOCK):
         cols = off + tl.arange(0, BLOCK)
         if NEED_MASK:
@@ -277,16 +235,11 @@ def te_rmsnorm_fwd(
     """
     del sm_margin
     if zero_centered_gamma:
-        # Reference adds in fp32 (weight.to(f32) + 1.0); adding in fp16/bf16
-        # loses the low bits (1.0 + 0.05 rounds to 1.0 in bf16, ULP = 2^-8),
-        # which exceeds the fp16/bf16 test rtol.
         weight = weight.to(torch.float32) + 1.0
     N = input.shape[-1]
     x = input.contiguous()
     M = x.numel() // N
     w = weight.contiguous()
-    # empty_strided: `torch.empty` is intercepted by the gems empty op and
-    # recompiled per call on this XPU (~95-100ms/call, see rms_norm fix).
     y = torch.empty_strided(x.size(), x.stride(), dtype=x.dtype, device=x.device)
     rsigma = torch.empty_strided((M,), (1,), dtype=torch.float32, device=x.device)
 
@@ -328,17 +281,8 @@ def te_rmsnorm_bwd(
     dx = torch.empty_like(x_2d)
     dgamma = torch.empty_like(gamma)
 
-    # dX: per-row 1D two-pass kernel (grid=(M,)).  Every load/store is a [C]
-    # 1D block (block DMA); the 2D [R, C] tiled variant saturates at ~35-125
-    # GB/s on this backend while per-row 1D reaches the raw memory ceiling
-    # (~700 GB/s, measured on the layernorm backward rewrite).  C is capped at
-    # 8192 lanes (the >8192-lane 1D defect, see _FWD_ROW_BLOCK) and the
-    # N % C tail is masked.
     bc = _ln_bwd_col_size(N)
 
-    # dgamma: two-stage (partial column sums, then 1D reduce) so the M-loop is
-    # split across cdiv(M, BM) programs; single-program M-loop would serialize
-    # all rows (measured ~2 orders of magnitude slower at (1024, 2048)).
     bm = _dgamma_bm_size(M)
     p = M // bm
     dgamma_partial = torch.empty((p, N), dtype=torch.float32, device=x.device)
@@ -407,10 +351,6 @@ def _patch_generic_wrapper():
                 _generic_module.te_rmsnorm_bwd = te_rmsnorm_bwd
             if hasattr(_generic_module, "te_rmsnorm_fwd"):
                 _generic_module.te_rmsnorm_fwd = te_rmsnorm_fwd
-        # ``from .te_rmsnorm import ...`` in the ops package __init__ binds the
-        # *generic* functions as the package attributes, so
-        # ``flag_gems.ops.te_rmsnorm_{bwd,fwd}`` must be re-bound to this
-        # backend implementation as well.
         import flag_gems.ops as _ops
 
         if hasattr(_ops, "te_rmsnorm_bwd"):

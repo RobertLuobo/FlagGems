@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -138,20 +125,6 @@ def bitwise_xor_scalar_(A, B):
 
 def bitwise_xor_scalar_tensor(A, B):
     logger.debug("GEMS_KUNLUNXIN BITWISE_XOR_SCALAR_TENSOR")
-    # int32-word packing fast path for bool (4:1) / int16 (2:1), mirroring
-    # the (verified) bitwise_xor_scalar_ in-place recipe above: on XPU a byte
-    # / 16-bit load-store pays a heavy per-byte penalty, while 4 bools (or 2
-    # int16s) fit one int32 word whose bytes / 16-bit lanes are uniformly
-    # XOR-ed with the replicated scalar (bool takes the low bit of the
-    # two's-complement scalar, int16 the low 16 bits -- both match torch's
-    # Scalar_Tensor variant, which keeps the tensor dtype, see also
-    # bitwise_or_scalar_tensor). Out-of-place: the XOR-ed int32 words go to a
-    # freshly allocated tensor, which is then viewed back to B's dtype/shape.
-    # Gating (via _packed_scalar / _word_view): the bool lane only packs for a
-    # Python *bool* scalar (a Python int with a bool tensor type-promotes to
-    # Long in torch), int16 packs for in-range int/bool scalars; anything else
-    # (non-contiguous, tail bytes per row, 0-dim/empty, int32/int64) falls
-    # back to the generic scalar kernel.
     pack = _packed_scalar(B, A)
     if pack is not None:
         word_val, denom = pack

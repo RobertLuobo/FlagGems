@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -30,15 +17,8 @@ _INT_VIEW = {2: torch.int16, 4: torch.int32, 8: torch.int64}
 def _copysign_inplace_kernel(
     A, B, num_tasks, TILE: tl.constexpr, TILES_PER_CTA: tl.constexpr, ONE_TILE: tl.constexpr
 ):
-    # Operates on integer views of the operands (see wrapper): pure sign-bit
-    # manipulation, out = (|a| bits) | (sign bit of b). The generic pointwise
-    # path promotes bf16/f16 inputs to fp32 and crashes in
-    # TritonXPUDtypeConvert ("cannot bitcast size 32 to 16"); integer views
-    # keep every access same-width and also avoid the fp abs/where cost.
     ity = A.type.element_ty
     num_bits: tl.constexpr = ity.primitive_bitwidth
-    # signed-safe constants: the sign-bit-only value is -(1<<(w-1));
-    # clear_mask = all bits except the sign bit.
     sign_mask: tl.constexpr = -(1 << (num_bits - 1))
     clear_mask: tl.constexpr = (1 << (num_bits - 1)) - 1
 

@@ -1,25 +1,4 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
 
-# NOTE: hand-written flat-1D kernels instead of the pointwise_dynamic codegens.
-#  - The generic codegen (512-tile) was the baseline's slow path (~0.77x average:
-#    per-element integer-division indexing + always-true predicated access).
-#  - The vendor codegen (kunlunAutoGrid) derives an unbounded 1D tile
-#    tile = next_power_of_2(cdiv(numel, 12)): (16,128,64,1280) and (4096,4096)
-#    land on 2^24 entries and deterministically hang the device (NOC idle
-#    timeout, observed 2026-09-08 on XPU 5; same red-zone hazard as
-#    special_chebyshev_polynomial_w_out recorded the same day).
-#  - Masked loads must NOT pass `other=` (mis-lowered on this backend: a handful
-#    of interior lanes return `other`/zero -> U_n(0) garbage; the sibling
-#    generic codegen also omits `other`).  Masked-off lanes load garbage but are
-#    never stored (store is masked), which is safe.
-# Math: U_0=1, U_1=2x, U_k=2x*U_{k-1}-U_{k-2}, selected per element by the
-# (integer, guard-validated [0,5]) degree n; computed in fp32.
 
 import logging
 
@@ -53,8 +32,8 @@ def _chebyshev_polynomial_u_tensor_n_kernel(
         n_f32 = tl.load(n_ptr + offs).to(tl.float32)
     x_f32 = x.to(tl.float32)
 
-    ukm2 = x_f32 * 0.0 + 1.0  # U_0
-    ukm1 = 2.0 * x_f32  # U_1
+    ukm2 = x_f32 * 0.0 + 1.0
+    ukm1 = 2.0 * x_f32
     result = tl.where(n_f32 < 0.5, ukm2, ukm1)
 
     for k in tl.static_range(2, 6):
@@ -86,8 +65,6 @@ def _chebyshev_polynomial_u_scalar_n_kernel(
         x = tl.load(x_ptr + offs)
     x_f32 = x.to(tl.float32)
 
-    # n_idx is a compile-time constant (guard guarantees [0, 5]); the branch is
-    # resolved at compile time, so there is no runtime degree selection at all.
     if n_idx == 0:
         result = x_f32 * 0.0 + 1.0
     elif n_idx == 1:
@@ -101,7 +78,7 @@ def _chebyshev_polynomial_u_scalar_n_kernel(
     elif n_idx == 4:
         t = x_f32 * x_f32
         result = (16.0 * t - 12.0) * t + 1.0
-    else:  # n_idx == 5
+    else:
         t = x_f32 * x_f32
         result = (32.0 * t - 32.0) * t * x_f32 + 6.0 * x_f32
 
@@ -139,7 +116,6 @@ def special_chebyshev_polynomial_u(x, n):
     x = x.contiguous()
 
     if isinstance(n, torch.Tensor):
-        # Range guard on a CPU copy (avoid dispatching back into gems lt/gt).
         n_ref = n.detach().to("cpu", dtype=torch.int32)
         n_min = int(n_ref.amin().item())
         n_max = int(n_ref.amax().item())
@@ -153,9 +129,6 @@ def special_chebyshev_polynomial_u(x, n):
             f"got values in [{n_min}, {n_max}]"
         )
 
-    # torch.special.chebyshev_polynomial_u broadcasts n over x; the flat 1:1
-    # kernels index n 1:1 with x, so materialize the (guard-validated, full
-    # shape) broadcast before launching.  Same-shape n stays a no-op.
     if isinstance(n, torch.Tensor) and n.shape != x.shape:
         n = torch.broadcast_to(n, x.shape).contiguous()
 

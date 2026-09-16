@@ -1,61 +1,3 @@
-# Copyright 2026, The FlagOS Contributors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-# Kunlunxin(XPU) backend implementation of linalg_solve_triangular.
-#
-# The general implementation (flag_gems/ops/linalg_solve_triangular.py) is not
-# usable on the XPU backend:
-#   1. `_small_diag_kernel_notle` (n<=16) returns zeros for every row after
-#      the first (per-row `tl.debug_barrier()` + global INV buffer round-trip
-#      is miscompiled on XPU).
-#   2. `_kslice_trsm_kernel_notle` (16<n<=512) crashes at LLIR compile time
-#      ("src1Type.getShape()[0] != 1" in TritonSDNNToLLVM): its update phase
-#      uses tl.dot with a K_SLICE=8 operand (M)x32@32x8; the XPU MMA lowering
-#      does not support dot-N < 16.
-#   3. The XPU device has no native fp64: arithmetic on fp64 tensors is
-#      silently carried out in fp32 (measured), so the 1e-6 residual bound of
-#      test_residual_f64 can never be met with a plain fp32-path kernel. The
-#      kernel below emulates double precision with double-single
-#      (error-compensated fp32 hi/lo pairs).
-#
-# The kernel avoids every known XPU trap (verified empirically):
-#   * no tl.dot (XPU MMA crashes for small N),
-#   * no tl.sum at all (masked-lane reductions read adjacent memory),
-#   * no 3-D tl.sum, no tl.trans, no value broadcast of 1-D tiles into 2-D
-#     (they fail the TritonXPU passes),
-#   * no tl.debug_barrier inside loops,
-#   * no register-vector accumulator seeded by tl.zeros (XPU miscompiles the
-#     cross-iteration carry; the accumulator is seeded by the loaded RHS row),
-#   * no multi-CTA k-slices: concurrent CTAs writing disjoint columns of the
-#     same rows corrupt each other's observed write-read ordering on XPU; the
-#     RHS is processed one slice per launch (host-sequenced), each a single
-#     CTA of width <= KS_SLICE lanes,
-#   * no masks at all: a slice's lane width always equals the slice width.
-#
-# The substitution dot product over the already-solved window is a serial
-# scalar-j chain of K-vectors (one lane per RHS column) - the load/store
-# pattern proven on XPU by linalg_ldl_solve.
-#
-# Upper-triangular solves are reduced to lower solves on the host by flipping
-# rows and columns of A and B (P A P lower when A upper); the kernel only
-# implements the lower substitution.
-#
-# For fp32 with n >= 2 the solve is dispatched to a blocked tl.dot sweep
-# (see _solve_tri_dot below): the one-CTA serial substitution above is
-# O(n^3) launches-bound and ~30x slower than torch at n=512; the dot sweep
-# uses the Neumann factorization of the unit triangular factor and was
-# measured at 0.8x-1.5x torch on every benchmark shape.
 
 import logging
 
@@ -69,7 +11,7 @@ from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
-KS_SLICE = 64  # max RHS-column slice width (single-CTA lane width)
+KS_SLICE = 64
 
 
 @libentry()
@@ -133,9 +75,6 @@ def _trsm_slice_xpu_kernel(
                 al = tl.load(Al_ptr + abase + row * rsa + j)
                 xh = tl.load(Bh_ptr + bbase + j * csb + cc, mask=cm, other=0.0)
                 xl = tl.load(Bl_ptr + bbase + j * csb + cc, mask=cm, other=0.0)
-                # Dekker exact split of the product: ph + pl == ah*xh + al*xh
-                # + ah*xl + al*xl to ~2^-48 (no fma dependency; a plain
-                # re-subtraction (ah*xh - ph) is CSE-folded to 0 by XPU)
                 sp = 8193.0
                 ca = ah * sp
                 ab = ca - ah
@@ -151,7 +90,6 @@ def _trsm_slice_xpu_kernel(
                     + (ahh * xhl + ahl * xhh)
                     + (ahl * xhl + ah * xl + al * xh + al * xl)
                 )
-                # two-sum subtraction (carry into the lo part)
                 s = acc_h - ph
                 acc_l = (acc_h - s) - ph + acc_l + pl
                 acc_h = s
@@ -165,7 +103,6 @@ def _trsm_slice_xpu_kernel(
             if not UNIT:
                 dh = tl.load(Ah_ptr + abase + row * rsa + row)
                 dl = tl.load(Al_ptr + abase + row * rsa + row)
-                # division q for double-single: q1 + refinement step
                 q1 = out_h / dh
                 ph = q1 * dh
                 pl = tl.fma(q1, dh, -ph) + q1 * dl
@@ -281,25 +218,6 @@ def _trsm_diag_xpu_kernel(
         tl.store(B_ptr + bbase + row * csb + cc, acc, mask=cm)
 
 
-# ---------------------------------------------------------------------------
-# Dot-based Neumann sweep (fp32, n >= 2; see the module comment above).
-#
-# A = D (I + M) with M = D^-1 (A - D) the strictly-triangular part, nilpotent
-# (M^k = 0 for k >= BSB).  Because
-#     (I - M)(I + M)(I + M^2)(I + M^4)...(I + M^(2^(NF-1))) = I - M^(2^NF)
-# and 2^NF >= BSB, the inverse of an BSB x BSB diagonal block is
-#     A_blk^-1 = (I - M)(I + M^2)(I + M^4)...(I + M^(2^(NF-1))) D^-1.
-# Per diagonal block j the host launches, in order:
-#   launch 1  _trsm_m_square_kernel : M[k] = (D^-1 A_blk - I)^(2^k), k=0..NST-1
-#   launch 2  _trsm_m_apply_kernel  : x_j = (prod of factors) (D^-1 B_blk)
-#   launch 3  _trsm_window_dot_kernel: B[r] -= A[r, j] x_j for every r > j
-#             (one (r, k-slice) CTA per dot; (r, s) writes are disjoint =>
-#              no RMW race).  x_j is read-only there: it was produced by
-#              launch 2 in an earlier, host-ordered launch.
-# The B column count is padded to a multiple of KS and the ragged tail block
-# (n % BSB != 0) is loaded with masks, so every tile is exactly BSB x KS - the
-# host pays no padding allocation (a torch.zeros+eye pad measured ~70us/call).
-# ---------------------------------------------------------------------------
 
 
 @libentry()
@@ -565,7 +483,6 @@ def _solve_tri_dot(A_view, B_view, unitriangular, upper, n, k, batch, orig_shape
     csb = kpad
     nb = (n + bs - 1) // bs
     pad = (n % bs != 0)
-    # one slot per stored power (max nst <= 6); Ms is a per-batch scratch
     Ms = torch.empty((batch, 6, bs, bs), dtype=dtype, device=device)
     msa = bs * bs
     msa_b = 6 * msa
@@ -610,8 +527,6 @@ def _solve_tri_dot(A_view, B_view, unitriangular, upper, n, k, batch, orig_shape
                 num_warps=8,
             )
         else:
-            # bs=64: 6 static dot sites in one kernel fail the XPU pipeliner;
-            # apply (M^0..M^2) and (M^3..M^5) in two launches.
             _trsm_m_apply_kernel[(batch * nslices,)](
                 A_view,
                 Ms,
@@ -698,7 +613,6 @@ def _solve_tri(A, B, unitriangular, upper):
     """Solve A X = B with A triangular (A, B contiguous)."""
     n, k = A.shape[-1], B.shape[-1]
     if n == 1:
-        # scalar solve x = b / a (n=1: the 1-lane kernel fails to LLVM-translate)
         if not unitriangular:
             inv = (1.0 / A[..., 0, 0]).reshape(-1)
             X = B.reshape(-1, k) * inv[:, None]
@@ -716,15 +630,8 @@ def _solve_tri(A, B, unitriangular, upper):
     B_view = B.reshape(batch, n, k)
 
     rsa = A_view.stride(1)
-    # Pad the RHS column count to a multiple of KS_SLICE: a partial tail
-    # slice (masked lanes) corrupts the surrounding buffer on XPU, so every
-    # slice launch uses the full KS_SLICE lane width with an all-true mask.
     kpad = ((k + KS_SLICE - 1) // KS_SLICE) * KS_SLICE
     nslices = kpad // KS_SLICE
-    # One launch for the whole (batch x slice) grid: column slices are
-    # independent solves, so they run concurrently on separate XPU programs
-    # (measured 3.8x at nslices=4).  Host-side per-slice launches were the
-    # previous shape and serialised everything.
     grid = (batch * nslices,)
     if is_fp64:
         Ah, Al, Bh0, Bl0 = _expand_fp64_inputs(A_view, B_view)
@@ -763,29 +670,10 @@ def _solve_tri(A, B, unitriangular, upper):
             if not tle_copy(B_view, Bp[:, :, :k]):
                 torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
         if n % 16 == 0 and n >= 64:
-            # Blocked TRSM (measured 2026-09-10, XPU card 6): the serial
-            # substitution sweep is O(n^2) straight-line iterations per slice
-            # and is latency-bound (every load exposes the full memory
-            # latency; unroll4 gains ~8%).  The blocked variant replaces the
-            # O(n^2) rows' worth of window subtractions by a tl.dot GEMM
-            # (_trsm_window_dot_kernel: a single dot + store, which IS
-            # compilable on TritonXPU - unlike the Neumann pow/apply kernels
-            # below, whose loop-carried dot results fail the sdnn.dma UniSRAM
-            # check) and keeps only a 16x16 diagonal substitution in the
-            # serial kernel.  0.33x -> 0.40x on the benchmark matrix
-            # (n=512: 42.5ms -> 5.8ms; n=64: 0.95ms -> 0.69ms).
-            #
-            # Only whole blocks (n % 16 == 0) are allowed: a ragged block
-            # would need masked loads at negative offsets for UPPER sweeps
-            # (mrow = N - (J0+c+2)*BSB < 0), and XPU masked loads do not
-            # protect against negative offsets - they read adjacent memory.
             bs = 16
             nb = n // bs
             for j in range(nb):
                 if j:
-                    # B[block j:] -= A[block j:, block j-1] @ X[block j-1]
-                    # (X of block j-1 was solved by the previous iteration;
-                    # host-ordered launches => kernel-order visibility)
                     _trsm_window_dot_kernel[(batch * (nb - j) * nslices,)](
                         A_view,
                         Bp,
@@ -912,18 +800,11 @@ def linalg_solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=
     A = A.contiguous()
     B = B.contiguous()
 
-    # RHS batch broadcast: B's batch dims broadcast against A's batch dims
-    # (e.g. unbatched B with batched A). The result takes the broadcast shape.
     batch_shape = torch.broadcast_shapes(A.shape[:-2], B.shape[:-2])
     if B.shape[:-2] != batch_shape:
         B = B.expand(batch_shape + B.shape[-2:]).contiguous()
 
     if upper:
-        # Backward substitution is done inside the kernel (UPPER=True); the
-        # host must NOT materialise P A P / P b: the gems-registered `flip`
-        # kernel faults (KL_XID_KERNEL_EXCEPTION / status=700) for a 512x512
-        # fp32 last-dim flip, which is exactly the A shape of
-        # test_large_n_f64[dtype0-True-1-512].
         X = _solve_tri(A, B, unitriangular, True)
     else:
         X = _solve_tri(A, B, unitriangular, False)

@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import operator
 
@@ -132,14 +119,6 @@ def _nonzero_static_fill_tail_kernel(
     pid = tl.program_id(0)
     rows = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     valid_count = tl.minimum(tl.load(count_ptr), size)
-    # Rows below valid_count hold real indices and must not be touched; they
-    # are redirected to the scratch area at [size, ...).  Every lane stores
-    # unconditionally (no masked stores on this backend) and redirected lanes
-    # collide on the same scratch value, which is benign.  Note: the
-    # (selected, lhs, rhs) select form of this where miscompiles on XPU for
-    # BLOCK_SIZE >= 128 (the first lanes are treated as if below valid_count
-    # regardless of the actual count), so the destination is computed with
-    # pure arithmetic instead of tl.where.
     keep = (rows >= valid_count).to(tl.int64)
     destination = (
         (size + (rows % BLOCK_SIZE)) * (1 - keep) + rows * keep
@@ -203,7 +182,6 @@ def _nonzero_static_multiblock_write_kernel(
         flags = tl.load(x_ptr + linear, mask=mask, other=0) != 0
     valid = (linear < numel) & flags
     local_rank = tl.cumsum(valid.to(tl.int32), axis=0) - 1
-    # exclusive prefix of the block (prefix is the inclusive cumsum)
     prefix = tl.load(prefix_ptr + pid) - tl.load(counts_ptr + pid)
     selected = valid & (prefix + local_rank < size)
     destination = tl.where(
@@ -276,9 +254,6 @@ def _multiblock_nonzero_static(input, size, fill_value, out):
     )
     counts = torch.empty((num_blocks,), device=input.device, dtype=torch.int64)
     shape = tuple(input.shape) + (1,) * (6 - ndim)
-    # Single-program scan; keep the scan width tied to the actual block count
-    # so small-multiblock inputs do not pay a fixed 1024-lane scan (measured
-    # +0.43ms on the 1D 1M/256K cells with a fixed 1024).
     scan_size = 1 << (num_blocks - 1).bit_length()
     with torch_device_fn.device(input.device):
         _nonzero_static_multiblock_count_kernel[(num_blocks,)](
@@ -327,10 +302,6 @@ def _small_nonzero_static(input, size, fill_value, out):
         return None
 
     if numel == 0:
-        # Empty input: the scan kernel would operate on an all-false mask
-        # (offsets < 0), which this backend dead-code-eliminates together with
-        # the count store, leaving the workspace uninitialized.  The result is
-        # trivially all fill_value, so fill it directly without scan.
         if out is None:
             return torch.full(
                 (size, ndim), fill_value, dtype=torch.int64, device=input.device
@@ -346,8 +317,6 @@ def _small_nonzero_static(input, size, fill_value, out):
     else:
         x = source
 
-    # The fill kernel redirects rows [0, valid_count) to the scratch area at
-    # [size, size+_FILL_BLOCK_SIZE), so the workspace must cover it.
     workspace = torch.empty(
         (size + max(block_size, _FILL_BLOCK_SIZE), ndim),
         device=input.device,

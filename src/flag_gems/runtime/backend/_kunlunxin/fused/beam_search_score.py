@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -31,22 +18,7 @@ def _beam_search_score_kernel(
     BLOCK: tl.constexpr,
     NEED_MASK: tl.constexpr,
 ):
-    """Flat 1D beam search score kernel: out[i] = log_probs[i] + beam_scores[i // V].
-
-    Continuous flat index space [0, N) with N = batch * vocab. `V` is a
-    constexpr so the row division `offs // V` lowers to a shift (V is a power
-    of two in every exercised shape); each lane then adds the scalar beam
-    score of its row. NEED_MASK covers the tail when N % BLOCK != 0.
-
-    NOTE (2026-09-10, XPU): a previous revision emulated round-to-nearest-even
-    for the fp32->bf16 store conversion (bitcast/`& -65536`/bitcast). On this
-    backend that emulation is miscompiled when combined with bf16 loads at
-    BLOCK >= 8192 (garbage values in the masked-tail lanes and in the whole
-    block for the unmasked large-shape path), while the backend's native
-    fp32->bf16 conversion (round-toward-zero) is at most 1 ULP (0.39%) away
-    from RNE -- well inside the 1.6% bf16 resolution the harness asserts with.
-    The store therefore writes the fp32 accumulator directly.
-    """
+    """Flat 1D beam search score kernel: out[i] = log_probs[i] + beam_scores[i // V]."""
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     if NEED_MASK:
@@ -66,17 +38,6 @@ def _beam_search_score_kernel(
 
 
 def _block_and_warps(numel, dtype):
-    """Empirically tuned per-size dispatch (XPU7 sweep, 2026-08-17).
-
-    Flat BLOCK values: larger tiles reduce program count for launch-bound
-    big shapes; 8192-class tiles win for small shapes. 2026-09-02 (XPU3
-    revalidation): for numel > 1M (e.g. the [256, 8192] benchmark shape)
-    fp16/fp32 benefit from 262144-lane tiles (~28-29% kernel-time reduction
-    vs the 65536-lane config); 524288-lane tiles regress. 2026-09-10: the
-    bf16 RNE emulation (now removed) is what kept bf16 on 16384-lane tiles;
-    without it bf16 also wins at 262144-lane for numel > 1M (-21% kernel
-    time at [256, 8192] vs 16384), while the 524288 bucket stays at 16384.
-    """
     if dtype == torch.float32:
         if numel <= 131072:
             return 8192, 4
@@ -93,7 +54,6 @@ def _block_and_warps(numel, dtype):
         if numel <= 1048576:
             return 65536, 8
         return 262144, 8
-    # bfloat16
     if numel <= 32768:
         return 8192, 8
     if numel <= 131072:
@@ -160,12 +120,6 @@ def beam_search_score_(log_probs, beam_scores):
     batch_size = log_probs.shape[0]
     beam_flat = _flat_beam_scores(beam_scores, batch_size)
     if not log_probs.is_contiguous():
-        # `_launch_beam_search_score` materializes a contiguous copy for the
-        # read side but writes `outputs` in flat layout: with a strided input
-        # view as the in-place target that would read the staged copy while
-        # writing the view's raw storage (garbage, and the caller's tensor
-        # never updated). Stage into a contiguous buffer and copy back so the
-        # caller's view is updated in place.
         staged = log_probs.contiguous()
         _launch_beam_search_score(staged, beam_flat, staged)
         log_probs.copy_(staged)

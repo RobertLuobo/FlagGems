@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -30,10 +17,6 @@ NUM_CLUSTERS = 12
 
 
 def _pick_block(n_elements):
-    # Bucket the tile to a power of two in [MIN_BLOCK, MAX_BLOCK] so the kernel
-    # compiles at most ~5 times total (no per-shape recompilation / IR
-    # explosion) while still splitting small/medium tensors across the 12 XPU
-    # clusters instead of running on 1-2 programs.
     target = triton.next_power_of_2(max(1, triton.cdiv(n_elements, NUM_CLUSTERS)))
     return max(MIN_BLOCK, min(MAX_BLOCK, target))
 

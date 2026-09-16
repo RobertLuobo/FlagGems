@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License. 
 import logging
 import os
 
@@ -25,8 +12,6 @@ from flag_gems.fused.mhc.hc_head_fused_kernel import (
 
 logger = logging.getLogger(__name__)
 
-# exact-tile sizes: for the official matrix (H in {1280,2560,4096,7168},
-# hc_mult in {2,4}): 4*H % 1024 == 0 and 2*H % 512 == 0.
 _PART_BLOCK = {2: 512, 4: 1024}
 _ROW_BLOCK_MAX = 8192
 _T_MAX = 128
@@ -34,18 +19,14 @@ _T_MAX = 128
 
 @triton.jit
 def _sqrsum_partials_kernel(
-    residual_ptr,  # (N, K) bf16, contiguous
-    part_ptr,  # (N, T) f32, T = cdiv(K, B)
-    columns,  # runtime K
+    residual_ptr,
+    part_ptr,
+    columns,
     B: tl.constexpr,
     T: tl.constexpr,
     ALIGNED: tl.constexpr,
 ):
-    """Exact per-token tile squares (grid (N, cdiv(K, B))).
-
-    ALIGNED == True (K % B == 0, the official-matrix path) compiles to the
-    unmasked block DMA; otherwise the tail tile is masked (contiguous access).
-    """
+    """Exact per-token tile squares (grid (N, cdiv(K, B)))."""
     pid_n = tl.program_id(0)
     pid_t = tl.program_id(1)
     offs = pid_t * B + tl.arange(0, B)
@@ -60,11 +41,11 @@ def _sqrsum_partials_kernel(
 
 @triton.jit
 def _head_mix_kernel(
-    part_ptr,  # (N, T) f32
-    mixes_ptr,  # (N, HC) f32
-    hc_scale_ptr,  # (1,) f32
-    hc_base_ptr,  # (HC,) f32
-    pre_mix_ptr,  # (N, HC) f32
+    part_ptr,
+    mixes_ptr,
+    hc_scale_ptr,
+    hc_base_ptr,
+    pre_mix_ptr,
     T: tl.constexpr,
     K: tl.constexpr,
     rms_eps,
@@ -87,21 +68,14 @@ def _head_mix_kernel(
 
 @triton.jit
 def _weighted_row_kernel(
-    residual_ptr,  # (N, HC*H) bf16, contiguous
-    pre_mix_ptr,  # (N, HC) f32
-    out_ptr,  # (N, H) bf16
+    residual_ptr,
+    pre_mix_ptr,
+    out_ptr,
     H: tl.constexpr,
     HC: tl.constexpr,
     B: tl.constexpr,
 ):
-    """Weighted sum of the HC residual rows (masked, no reduction).
-
-    NOTE: the load address must stay the plain ``k * H + offs`` expression.
-    Any ``tl.where`` on the index (e.g. clamping masked lanes to 0) defeats
-    the compiler's contiguity analysis on XPU and turns the block DMA into a
-    ~22x slower discrete gather (measured 34.86ms -> 1.59ms at
-    n=4096 H=4096 HC=4 for this kernel alone).
-    """
+    """Weighted sum of the HC residual rows (masked, no reduction)."""
     pid = tl.program_id(0)
     offs = tl.arange(0, B)
     m = offs < H
@@ -127,11 +101,7 @@ def hc_head_fused_kernel(
     hc_eps: float,
     hc_mult: int,
 ) -> torch.Tensor:
-    """HC head fused kernel (kunlunxin / XPU specialized).
-
-    Same interface and semantics as
-    `flag_gems.fused.mhc.hc_head_fused_kernel.hc_head_fused_kernel`.
-    """
+    """HC head fused kernel (kunlunxin / XPU specialized)."""
     assert hs_flat.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -159,7 +129,6 @@ def hc_head_fused_kernel(
     B = _PART_BLOCK.get(HC, 512)
     T = (K + B - 1) // B
     if T > _T_MAX:
-        # pathological shape: keep upstream behavior
         return _general_hc_head_fused_kernel(
             hs_flat, fn, hc_scale, hc_base, out, hidden_size, rms_eps, hc_eps, hc_mult
         )
@@ -167,14 +136,8 @@ def hc_head_fused_kernel(
     residual_c = hs_flat.contiguous()
     out_c = out if out.is_contiguous() else torch.empty_like(out)
 
-    # No host-side zero-padding of the flattened K dim: the sqrsum kernel masks
-    # the tail tile (ALIGNED constexpr keeps the exact-tile common path
-    # unmasked) and the vendor mm pads un-aligned K internally, so the previous
-    # ``torch.nn.functional.pad`` round-trips are unnecessary (and are an ATen
-    # fallback).  Pad columns were all-zero; dropping them is bit-identical.
     x2d = residual_c.reshape(num_tokens, K)
 
-    # 1) rms sqrsum partials (exact tiles, masked tail for K % B != 0)
     part = torch.empty(num_tokens, T, dtype=torch.float32, device=hs_flat.device)
     _sqrsum_partials_kernel[(num_tokens, T)](
         x2d,
@@ -187,12 +150,10 @@ def hc_head_fused_kernel(
         num_stages=1,
     )
 
-    # 2) mixes via vendor f32 mm (numerically identical to the reference)
     from flag_gems.runtime.backend._kunlunxin.ops.mm import mm as _gems_mm
 
     mixes = _gems_mm(x2d.to(torch.float32), fn.t())
 
-    # 3) rsqrt + sigmoid -> pre_mix
     pre_mix = torch.empty(num_tokens, HC, dtype=torch.float32, device=hs_flat.device)
     _head_mix_kernel[(num_tokens,)](
         part,
@@ -209,7 +170,6 @@ def hc_head_fused_kernel(
         num_stages=1,
     )
 
-    # 4) weighted sum of the HC residual rows
     row_block = min(triton.next_power_of_2(H), _ROW_BLOCK_MAX)
     _weighted_row_kernel[(num_tokens,)](
         residual_c,
@@ -227,25 +187,15 @@ def hc_head_fused_kernel(
     return out
 
 
-# ────────────────────────────── wiring ──────────────────────────────
 
 
 def _use_general_for_ab():
-    """A/B escape hatch: set FLAGGEMS_XPU_HC_HEAD_GENERAL=1 to force the
-    general implementation (used only for baseline measurement / ablation)."""
+    """A/B escape hatch (FLAGGEMS_XPU_HC_HEAD_GENERAL=1 forces the general impl)."""
     return os.environ.get("FLAGGEMS_XPU_HC_HEAD_GENERAL", "0") == "1"
 
 
 def _install():
-    """Wire the XPU implementation into the direct-import entrypoint.
-
-    The mhc fused family is called via direct module import
-    (`from flag_gems.fused.mhc.hc_head_fused_kernel import
-    hc_head_fused_kernel`) in both tests/test_mhc_ops.py and
-    benchmark/test_mhc.py, so the normal SpecOpRegistrar namespace swap can
-    not reach it. Replace the attribute on the already-imported module
-    (loaded during `import flag_gems`).
-    """
+    """Find and replace the mhc entrypoint attribute (direct-import family)."""
     if _use_general_for_ab():
         return
     import sys
@@ -258,32 +208,11 @@ def _install():
 
 
 def _ensure_vllm_collect_works():
-    """Neutralize the vllm site-packages import-hook collection crash (XPU env).
-
-    Measured 2026-09-10: vllm 0.20.0's ``vllm_xpu._C`` extension links a
-    bf16 ``speculative_multi_latent_attention`` symbol that the installed
-    ``torch_xmlir/libxpu_flash_attention.so`` (Sep-3 build) does not export
-    (``ImportError: undefined symbol ... xfa3 ... bfloat16 ...``).
-    ``vllm/kernels`` therefore fails to import, and vllm's custom import hook
-    (``vllm_custom_import_hook.py`` ~line 303) wraps that inner failure with
-    ``assert False``.  As a result
-    ``from vllm.model_executor.layers.mhc import _hc_head_fused_kernel`` in
-    tests/test_mhc_ops.py (L33-40) / benchmark/test_mhc.py (L22-28) raises
-    ``AssertionError`` instead of the ``ImportError`` their ``except
-    ImportError`` guards expect, killing pytest collection (0 collected).
-
-    The tests do not need vllm for ``hc_head_fused_kernel``: the vllm-side
-    ``_hc_head_fused_kernel`` reference does not exist in this vllm build
-    (missing attribute -> plain ImportError -> ``HAS_VLLM=False`` -> the
-    ``vs_vllm`` cases skip, matching the 2026-09-04 baseline).  Pre-seeding
-    the two broken extension modules lets the vllm package import complete
-    so the guards take their native (skipping) ImportError path; the real
-    extension is loaded instead when this environment is healthy.
-    """
+    """Neutralize the vllm site-packages import-hook collection crash (XPU env)."""
     try:
-        import vllm_xpu._C  # noqa: F401
+        import vllm_xpu._C
 
-        return  # healthy environment: the real extension loads
+        return
     except Exception:
         pass
     import sys

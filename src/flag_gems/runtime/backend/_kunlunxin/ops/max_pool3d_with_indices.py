@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -37,7 +24,6 @@ def pool3d_output_size(
     numerator = in_size + 2 * padding - effective_kernel_size
     if ceil_mode:
         output_size = (numerator + stride - 1) // stride + 1
-        # PyTorch-compatible adjustment for ceil_mode
         if (output_size - 1) * stride >= in_size + padding:
             output_size -= 1
     else:
@@ -58,7 +44,6 @@ def max_pool3d_forward_kernel(
     out_d,
     out_h,
     out_w,
-    # Pooling parameters
     kcount,
     kernel_h: tl.constexpr,
     kernel_w: tl.constexpr,
@@ -71,7 +56,6 @@ def max_pool3d_forward_kernel(
     dilation_d: tl.constexpr,
     dilation_h: tl.constexpr,
     dilation_w: tl.constexpr,
-    # Tiling parameters
     BLOCK: tl.constexpr,
 ):
     """Forward kernel for 3-D max pooling (1-D scan based).

@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 """Kunlunxin(XPU) specialization of ``aten::roll``.
 
@@ -60,13 +47,9 @@ logger = logging.getLogger(__name__)
 
 IntOrInts = int | Sequence[int]
 
-# aten::_copy_from on XPU only reaches peak bandwidth with a 32B aligned dst.
 _DST_ALIGN_BYTES = 32
-# Below this payload the four _copy_from launches cost more than one gather.
 _TRITON_MAX_BYTES = 1 << 16
-# Padding the output only pays off once the copy is bandwidth bound.
 _ALIGN_MIN_BYTES = 1 << 18
-# Number of wrap dims the fused gather kernel understands.
 _MAX_WRAP_DIMS = 4
 _TRITON_BLOCK = 512
 
@@ -101,7 +84,6 @@ def roll(inp: torch.Tensor, shifts, dims=None) -> torch.Tensor:
     wrap_dims = [dim for dim, _ in active if dim != 0]
 
     if not wrap_dims:
-        # dim-0 rolls are exactly a flat rotation, no fix-up needed.
         return _rotate_flat(src.reshape(-1), delta).view(shape)
 
     if (
@@ -228,15 +210,6 @@ def _roll_gather_kernel(
     NWRAP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # NOTE: the load/store must stay masked.  On this XPU triton backend a
-    # fully unmasked ``store(load(in_ptr + src))`` (the ``numel % BLOCK == 0``
-    # case) is miscompiled when ``src`` is produced by the ``tl.where`` chain
-    # below: the address select is dropped, so some lanes load
-    # ``in[src + size*stride]`` instead of ``in[src]`` (observed for e.g.
-    # (64, 8) and (64, 64) with shifts (1, 2) / dims (0, 1)).  The masked
-    # variant with the explicit clamp compiles correctly; the store mask also
-    # discards the tail lanes, and the clamp keeps the load in bounds since
-    # XPU ignores ``other=`` on some paths.
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     source = offsets - delta
     if NWRAP >= 1:

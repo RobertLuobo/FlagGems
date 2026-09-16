@@ -1,35 +1,4 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-# Kunlunxin (XPU) override of gcd / gcd_ / gcd_out.
-#
-# Perf root cause & fix (see harness/solution/performance/gcd_out_xpu7_20260816.md
-# and gcd_out_xpu1_20260816.md):
-#   1. Euclidean modulo loop now runs entirely in int32 lane math (int16 `%`
-#      is emulated on this backend); values fit: 16-bit magnitudes <= 32768,
-#      int32 abs(INT32_MIN) wraps to itself - both handled by keeping
-#      INT_MIN lanes on their native value (torch bit-exact C-modulo sign
-#      chain, e.g. gcd(INT16_MIN, 6) == -2, gcd(81, INT16_MIN) == -1).
-#   2. Iteration caps: 24 for int8/int16 (worst 23 steps, fib(23)=28657),
-#      48 for int32 (worst 46), 96 for int64.
-#   3. num_warps=8 is the dominant XPU lever (BLOCK=128 / nw1 -> nw8:
-#      ~25ms -> ~4.3ms at 16.7M elements, measured idle-window); plain
-#      launch (no buffer_size_limit / isCloseVectorization); BLOCK>=256
-#      does not compile (uni_sram 2KB pass limit for loop-carried values).
-#   4. `out=` path writes directly into the provided tensor when it is
-#      dtype/shape/contiguity compatible with the promoted result,
-#      skipping the extra copy pass.
 import logging
 
 import torch
@@ -40,24 +9,10 @@ from flag_gems.ops.gcd import _materialize_inputs
 
 logger = logging.getLogger(__name__)
 
-# Euclidean worst case (consecutive Fibonacci inputs): ~1.44*log2(max)+C.
-# 8-bit:   max steps 10 (fib(11)=89 <= 127, fib(12)=144 > 127)
-# 16-bit:  max steps 23 (fib(23)=28657 <= 32767) -> 24
-# 32-bit:  max steps 46 (fib(46)=1.8e9 <= 2^31-1) -> 48
-# 64-bit:  max steps ~93 -> 96
 _ITERS_32 = 48
 _ITERS_64 = 96
 _ITERS = {torch.int8: 24, torch.int16: 24, torch.int32: _ITERS_32}
 
-# Chunked no-mask fast path: each program handles NCHUNK * BLOCK lanes with
-# NO tail-mask (caller guarantees numel % (BLOCK*NCHUNK) == 0).  On this
-# backend the masked load/store path is measurably slower than the unmasked
-# one (~10-27% at >= 64K elements), and fewer programs reduce launch overhead.
-# Same math as the masked kernel (INT_MIN lanes keep their native value,
-# fixed-iteration Euclid).  Below _FAST_MIN_NUMEL the chunked kernel serializes
-# 8 chunks per program and loses to the 8x-more-parallel masked kernel
-# (measured: at 1K-16K elements fast is 1.05x-2.0x SLOWER), so the masked
-# kernel is kept for small tensors.
 _GCD_BLOCK = 128
 _GCD_NCHUNK = 8
 _GCD_FAST_MIN_NUMEL = 65536
@@ -80,8 +35,6 @@ def gcd_kernel_32(
     y = tl.load(y_ptr + offsets, mask=mask, other=0)
     xi = x.to(tl.int32)
     yi = y.to(tl.int32)
-    # All gcd math in int32 (full-speed XPU lane ops). INT_MIN lanes keep
-    # their native value (see module docstring); others run on abs.
     a0 = tl.where(xi == MINV, xi, tl.abs(xi))
     b0 = tl.where(yi == MINV, yi, tl.abs(yi))
     for _ in range(ITERS):
@@ -137,8 +90,6 @@ def gcd_kernel_64(
     mask = offsets < n_elements
     x = tl.load(x_ptr + offsets, mask=mask, other=0)
     y = tl.load(y_ptr + offsets, mask=mask, other=0)
-    # INT64_MIN lanes keep their signed value; everything else runs on
-    # the abs value (C-modulo sign propagation, torch bit-exact).
     a0 = tl.where(x == MINV, x, tl.abs(x))
     b0 = tl.where(y == MINV, y, tl.abs(y))
     for _ in range(ITERS):
@@ -200,11 +151,6 @@ def _launch_gcd(lhs, rhs, out):
     kernel, fast_kernel, iters, minv, block, num_warps = _kernel_meta(out.dtype)
     chunk = block * _GCD_NCHUNK
     if numel >= _GCD_FAST_MIN_NUMEL and numel % chunk == 0:
-        # Unmasked chunked path: fewer programs + no tail-mask (measured
-        # faster on this backend for large numel).  Caller guarantees
-        # divisibility; _launch_gcd is the only entry, so in-place aliasing
-        # (A as both source and dest for gcd_) stays safe (each chunk is
-        # fully loaded before its store, chunks are disjoint).
         grid = (triton.cdiv(numel, chunk),)
         fast_kernel[grid](
             lhs,
@@ -249,8 +195,6 @@ def gcd(self, other, *, out=None):
         and out.is_contiguous()
         and out.device == lhs.device
     ):
-        # Direct-write into the provided out tensor: skips the extra
-        # copy pass (the copy itself is a slow BLOCK-128 kernel here).
         _launch_gcd(lhs.reshape(-1), rhs.reshape(-1), out.reshape(-1))
         return out
     result = torch.empty_like(lhs, dtype=promoted_dtype)
@@ -271,14 +215,9 @@ def gcd_out(lhs, rhs, *, out=None):
 def gcd_(A, B):
     lhs, rhs, promoted_dtype = _materialize_inputs(A, B)
     if A.is_contiguous() and A.dtype == promoted_dtype:
-        # In-place direct write: the kernel loads x/y block-wide before
-        # storing, so aliasing A as both source and destination is safe,
-        # and the extra copy pass (a slow BLOCK-128 flag-triton copy_,
-        # ~equal to the kernel itself at 16.7M elements) is eliminated.
         _launch_gcd(lhs.reshape(-1), rhs.reshape(-1), A.reshape(-1))
         return A
     flat_out = torch.empty(lhs.numel(), dtype=promoted_dtype, device=A.device)
     _launch_gcd(lhs.reshape(-1), rhs.reshape(-1), flat_out)
-    # Use the native copy engine, not the gems copy_ override (dispatch loop).
     torch.ops.aten._copy_from(flat_out.view(A.shape), A, False)
     return A

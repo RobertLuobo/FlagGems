@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -70,10 +57,8 @@ def normal_distribution(shape, device, *, generator=None, out=None):
     if out is None:
         out = torch.empty(shape, device=device, dtype=torch.float32)
     N = volume(shape)
-    # grid_fn = lambda meta: (triton.cdiv(N, meta["BLOCK"] * UNROLL),)
     cluster_num = 12
     BLOCK_SIZE = min(triton.next_power_of_2(triton.cdiv(N, cluster_num * UNROLL)), 1024)
-    # BLOCK_SIZE = min(triton.next_power_of_2(triton.cdiv(N, cluster_num * UNROLL)), triton.cdiv(32768, UNROLL))
     grid_fn = triton.cdiv(N, BLOCK_SIZE * UNROLL)
 
     increment = triton.cdiv(N, UNROLL)
@@ -114,20 +99,6 @@ def normal_(self, mean=0, std=1, *, generator=None):
     shape = self.shape
     device = self.device
     N = volume(shape)
-    # Fused single-kernel path: generate the standard normal sample and apply
-    # ``val * std + mean`` inside the same kernel, writing the final value
-    # directly to ``self``.  The previous two-kernel implementation (randn
-    # fill + separate pointwise transform) paid an extra full read+write pass
-    # over the buffer (3N element moves instead of N), which is the dominant
-    # cost for this op.
-    #
-    # Masked stores are much slower than unmasked ones on the XPU backend
-    # (predicated stores cannot be vectorized; measured ~29 GB/s unmasked vs
-    # ~19 GB/s masked on the same kernel).  When the element count is an exact
-    # multiple of the per-CTA tile (BLOCK * UNROLL) no store needs a mask at
-    # all, so a constexpr ``FULL`` specialization is launched that emits plain
-    # unmasked stores.  The masked variant is only taken when a partial tail
-    # tile exists (e.g. the functional-test shape 20x320x15).
     cluster_num = 12
     BLOCK_SIZE = min(triton.next_power_of_2(triton.cdiv(N, cluster_num * UNROLL)), 1024)
     grid_fn = triton.cdiv(N, BLOCK_SIZE * UNROLL)

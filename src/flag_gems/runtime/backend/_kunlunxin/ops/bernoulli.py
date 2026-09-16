@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -26,10 +13,6 @@ from flag_gems.utils.random_utils import (
 
 logger = logging.getLogger(__name__)
 
-# XPU triton fork defaults to 10 philox rounds; 5 rounds is statistically
-# equivalent (KS/autocorrelation/oracle checks) and ~2x cheaper in ALU, which is
-# the dominant cost for these memory-light kernels. Same choice as the
-# exponential_ fix on this backend.
 PHILOX_ROUNDS = 5
 UNROLL = 4
 BLOCK = 1024
@@ -47,10 +30,6 @@ def bernoulli_kernel(
     BLOCK: tl.constexpr,
     ROUNDS: tl.constexpr,
 ):
-    # Main path: the first NMAIN programs each process BLOCK*4 consecutive
-    # elements that are fully in-bounds (NMAIN*BLOCK*4 == N for the callers
-    # that use the branchless kernel; for the combined kernel the main branch
-    # only covers the full blocks). No masks -> contiguous block DMA.
     philox_seed = philox_seed.to(tl.int64)
     philox_offset = philox_offset.to(tl.int64)
     i4 = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -88,11 +67,6 @@ def bernoulli_kernel_with_tail(
     BLOCK: tl.constexpr,
     ROUNDS: tl.constexpr,
 ):
-    # Single-launch kernel: pids [0, NMAIN) run the branchless 4-wide path on
-    # fully-in-bounds blocks; the last pid runs a per-element masked path over
-    # the tail [NMAIN*BLOCK*4, N). The per-element masked load/store pattern is
-    # the one proven reliable on this backend (the 4-wide mixed-mask store
-    # drops in-range lanes of a partially out-of-range block).
     philox_seed = philox_seed.to(tl.int64)
     philox_offset = philox_offset.to(tl.int64)
     pid = tl.program_id(0)
@@ -166,25 +140,7 @@ def bernoulli(self, *, generator=None):
     with torch_device_fn.device(device):
         block_elems = BLOCK * UNROLL
         nmain = N // block_elems
-        # XPU codegen defect (XRE status 719, "A kernel exception has
-        # occurred"): the phase-2 branchless kernel below, at fp32, is
-        # compiled with all four 16-element (64-byte) lm2gm stores sharing
-        # ONE local staging buffer (LLIR: 4x `lm2gm_v3(..., %66, 0, 64)`
-        # with only mfence between a store into %66 and the next). The
-        # async lm2gm copy races with the next store into the reused buffer
-        # and the device raises a kernel exception on EVERY fp32 launch
-        # with N % (BLOCK*UNROLL) == 0 (reproduced from N=4096 to
-        # N=655,360,000; fp16/bf16 use 32-byte transfers, allocate 4
-        # separate buffers and are unaffected). The single-launch
-        # bernoulli_kernel_with_tail below wraps the identical main path in
-        # `if pid < NMAIN`, which lets the allocator use 4 separate staging
-        # buffers (verified in the same LLIR dump) and is the
-        # production-proven path for fp32 (every non-exact N already goes
-        # through it and passes clean). Route fp32 through it as well; for
-        # exact multiples the last program degenerates to a fully-masked
-        # no-op tail.
         if self.dtype == torch.float32 or N % block_elems != 0:
-            # branchless full blocks + in-kernel per-element masked tail
             bernoulli_kernel_with_tail[(nmain + 1,)](
                 out,
                 self,
@@ -197,7 +153,6 @@ def bernoulli(self, *, generator=None):
                 num_warps=NUM_WARPS,
             )
         else:
-            # all blocks fully in-bounds -> branchless kernel
             bernoulli_kernel[(nmain,)](
                 out,
                 self,

@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -30,7 +17,7 @@ def _adaptive_max_pool2d_backward_gather_kernel(
     grad_output_ptr,
     indices_ptr,
     grad_input_ptr,
-    n_elems,  # in_n * in_c * in_h * in_w
+    n_elems,
     in_h,
     in_w,
     out_h,
@@ -61,9 +48,6 @@ def _adaptive_max_pool2d_backward_gather_kernel(
     iop = indices_ptr + nc * out_per_nc
 
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
-    # Rolled loops (compile-time constant bounds), not tl.static_range: the
-    # XPU unroll control pass (TritonXPUUnrollControl) fails with uni_sram
-    # OOR when the candidate box is fully unrolled for large ratios.
     for oh in range(0, MAX_H):
         o_h = h_min + oh
         h_ok = o_h < h_max
@@ -133,8 +117,6 @@ def adaptive_max_pool2d_backward(
         grad_input = torch.zeros_like(self)
         return grad_input.squeeze(0) if input_is_3d else grad_input
 
-    # Exact division on both dims: each input position belongs to exactly one
-    # adaptive window, so the scatter fast path below is race-free.
     exact = (in_h % out_h == 0) and (in_w % out_w == 0)
 
     with torch_device_fn.device(self.device):

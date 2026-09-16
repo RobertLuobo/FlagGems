@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -23,40 +10,8 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
-# acos(x) fast path: replace the XPU software atan2/acosf external calls
-# (measured ~0.12-0.13x torch on the official unary matrix) with a pure
-# polynomial in the stable region.
-#
-#   acos(x)  = 2 * asin(sqrt((1-|x|)/2))          for x >= 0
-#            = pi - acos(-x)                       for x < 0
-#
-# With t = (1-|x|)/2 in [0, 0.5] and s = sqrt(t), asin(s)/s = P(t) with P
-# analytic on [0, 0.5]; P is an LSQ fit (degree 8 in t) whose fp32 Horner
-# evaluation keeps |acos(x) - acos_ref| <= 3.8e-5 on the full fp32 domain
-# [-1, 1] (fp32 simulation, no-FMA assumption), comfortably inside the test
-# tolerance (atol 1e-4 + rtol 1.3e-6 * |ref|). NaN/Inf semantics: |x| > 1
-# makes t < 0, sqrt(t) yields NaN which propagates through the (single)
-# where-chain exactly like torch; NaN input also propagates (comparisons are
-# false but the arithmetic stays NaN).
-# Coeffs (fp32-rounded, Horner order high -> low):
-#   [0.99959993, 0.19823363, -0.72389036, 9.49576759, -60.525768,
-#   222.85160828, -470.57415771, 530.01574707, -246.59942627]
 MIN_BLOCK = 2048
-# unroll 8 beats 16 on the official matrix: (4096,4096) 0.532 vs 0.585 ms,
-# [1024,4096] 0.140 vs 0.153 ms, [1024,65536] 2.09 vs 2.36 ms (fp32, XPU2
-# wall-clock, same process A/B). Verified in a per-stable subprocess sweep:
-# everything else (block/warp/buffer buckets) is within noise.
 UNROLL_NUM = 8
-# In-place path only (acos_ / arccos_): the read-modify-write aliasing of
-# x_ptr == out_ptr makes the deep unroll counter-productive. Measured on the
-# official unary matrix (XPU2, same-process A/B, 4096x4096 / [1024,4096] /
-# [1024,65536]):
-#   fp16 : u2 0.479 / 0.125 / 1.884 ms  vs  u8 0.561 / 0.147 / 2.206 ms
-#   fp32 : u2 0.455 / 0.120 / 1.792 ms  vs  u8 0.514 / 0.137 / 2.021 ms
-#   bf16 : u4 0.566 / 0.148 / 2.232 ms  vs  u8 0.628 / 0.165 / 2.446 ms
-#          (bf16 u2 lands at 0.615 / 0.160 / 2.433 ms, i.e. worse than u4)
-# The out-of-place path keeps UNROLL_NUM = 8 because it was tuned with that
-# value and is shared with acos / arccos.
 INPLACE_UNROLL_NUM = 2
 INPLACE_UNROLL_NUM_BF16 = 4
 BUFFER_SIZE_LIMIT = 8192
@@ -64,17 +19,6 @@ IS_CLOSE_MEMORY_ASYNC = False
 
 
 def _pick_block(n_elements):
-    # Bucket the tile into a few unmasked sizes + 1 masked fallback so the
-    # kernel compiles at most ~4 times total. Unmasked runs when the shape
-    # divides the tile exactly (masked memory path on XPU costs ~2x).
-    # Measured in-place on the official matrix (XPU2, same-process A/B):
-    #   n=16384  : 2048/4w masked 5.9us beats 16384/8w unmasked 10.6us (a
-    #              single 8-warp CTA is launch/parallelism limited; 8 CTAs x
-    #              4 warps wins)
-    #   n=65536  : 8192/4w unmasked 7.9us beats 32768/8w unmasked 15.9us
-    #   n=262144 : 8192/4w unmasked 14.3us beats 32768/8w unmasked 16.0us
-    #   n>=1M    : 32768/8w unmasked remains the sweet spot (32+ CTAs;
-    #              8192/4w measured worse on 4194304/16777216/67108864).
     if n_elements <= 16384:
         return 2048, 4, True
     if n_elements <= 262144 and n_elements % 8192 == 0:
@@ -89,7 +33,6 @@ def _pick_block(n_elements):
 @triton.jit
 def _acos_body(x):
     t = 0.5 - 0.5 * tl.abs(x)
-    # |x| > 1 makes t < 0 -> rsqrt(NaN) -> NaN propagates out, matching torch.
     s = t * xpu.rsqrt(t + 1e-30)
     p = -493.19885254
     p = p * t + 1060.03149414
@@ -101,7 +44,6 @@ def _acos_body(x):
     p = p * t + 0.39646727
     p = p * t + 1.99919987
     y = s * p
-    # acos(x) = y (x>=0) / pi - y (x<0); m = 1 iff x<0 (min/max, no select).
     m = tl.minimum(1.0, tl.maximum(0.0, -x * 8.50705917e37))
     return m * 3.1415927 + (1.0 - 2.0 * m) * y
 
@@ -118,9 +60,6 @@ def acos_kernel(
     mask = offset < n_elements
     x = tl.load(x_ptr + offset, mask=mask, other=0).to(tl.float32)
     t = 0.5 - 0.5 * tl.abs(x)
-    # |x| > 1 makes t < 0 -> sqrt(NaN) -> NaN propagates out, matching torch.
-    # XPU lowers compound boolean expressions ((x>=a) & (x<=b)) to a very slow
-    # non-vectorized path; relying on sqrt of a negative is faster and exact.
     s = tl.sqrt(t)
     p = -246.59942627
     p = p * t + 530.01574707

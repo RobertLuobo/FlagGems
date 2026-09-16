@@ -32,10 +32,6 @@ def log10(A):
 
 
 def log10_(A):
-    # ATen in-place log10_ is only valid for floating-point tensors; native
-    # torch (CPU: "result type Float can't be cast to the desired output type
-    # Long"; XPU/xdnn: [NOT IMPLEMENTED]) raises for integral inputs, while
-    # writing back the float log10 into an int tensor would silently truncate.
     if not A.is_floating_point():
         raise TypeError(f"log10_ does not support dtype {A.dtype}")
     log10_func(A, out0=A)

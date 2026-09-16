@@ -9,36 +9,9 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
-# SELU(x) = scale * (max(0, x) + min(0, alpha * (exp(x) - 1)))
-#         = scale * where(x > 0, x, alpha * (exp(x) - 1))
-# i.e. elu(x, alpha, scale, input_scale=1).
-#
-# 2026-08-19 perf closure (task #285). The previous override (tuned
-# pointwise_dynamic 512-lane tile, exp.py recipe) is launch/ALU-bound on XPU
-# for mid/large N (fp16 [4096,4096] 0.627ms vs torch 0.210ms). Probe sweep
-# (/tmp/selu_xpu1_probe/): contiguous unmasked flat tiles beat it 2-4x on
-# small shapes and ~1.25x/1.0x on fp16/fp32 big shapes; bf16 flat is slower
-# than the pointwise path for numel >= 8M (bfloat16 pack/unpack cost), so
-# bf16-big keeps the pointwise kernel. Numerics identical in both kernels:
-# fp32 staging + min-clamped exp argument (no overflow on x>0) + quantized
-# store; masked tail only via NEED_MASK constexpr when not divisible.
-#
-# 2026-09-11 batch3 selu_ closure. The math above is written in the
-# tl.where(x>0, ...) form, which the XPU backend lowers to a slow select
-# sequence (~2x ALU-bound regression on mid/large N: fp16 16M 476us, fp32
-# 16M 520us). Rewriting the identical algebra as
-# scale * (max(0,x) + min(alpha*(exp(min(x,0))-1), 0)) lowers to fmin/fmax
-# (2x faster: fp16 16M -> 236us, fp32 16M -> 284us) while staying bit-identical
-# on randn inputs and exact on +-0 / +-inf (see harness/solution/selu_/).
-# With the fmin/fmax form the bf16 pack/unpack penalty disappears and the flat
-# path now beats the pointwise tile on bf16 big shapes too (16M: 330us vs
-# 582us), so the _BF16_BIG_NUMEL exception was removed and all contiguous
-# inputs use the flat kernel. The pointwise path is retained for
-# non-contiguous inputs only.
 _ALPHA = tl.constexpr(1.6732632423543772848170429916717)
 _SCALE = tl.constexpr(1.0507009873554804934193349852946)
 
-# ---- pointwise_dynamic path (non-contiguous only) ----
 config_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),
@@ -59,7 +32,6 @@ def selu_func(x):
     return _SCALE * tl.where(x_fp32 > 0, x_fp32, _ALPHA * (tl.exp(x_fp32) - 1.0))
 
 
-# ---- flat path: uncovered contiguous blocks, masked tail only ----
 _TIERS = (
     (16384, 2048, 4),
     (262144, 8192, 8),
@@ -84,9 +56,7 @@ def selu_flat_kernel(
         x = tl.load(A + offsets)
 
     x_f32 = x.to(tl.float32)
-    x_neg = tl.minimum(x_f32, 0.0)  # clamp exp arg to avoid overflow on x>0
-    # fmin/fmax form: ~2x faster than tl.where-select on XPU, bit-identical
-    # on randn and exact on +-0/+-inf (see header comment).
+    x_neg = tl.minimum(x_f32, 0.0)
     y = _SCALE * (
         tl.maximum(x_f32, 0.0)
         + tl.minimum(_ALPHA * (tl.exp(x_neg) - 1.0), 0.0)
@@ -106,9 +76,6 @@ def _pick_tier(numel):
 
 
 def _use_flat(A):
-    # 2026-09-11: with the fmin/fmax math the flat kernel wins on bf16 big
-    # shapes too (16M: 0.93x vs 0.53x pointwise), so all contiguous inputs
-    # use the flat kernel; the pointwise tile serves non-contiguous only.
     return A.is_contiguous()
 
 

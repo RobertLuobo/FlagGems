@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 
@@ -308,20 +295,14 @@ def _scatter_reduce_general_kernel(
     index,
     src,
     out,
-    s0, s1, s2, s3, s4,  # self shape, rank-padded to 5 with 1s
-    i0, i1, i2, i3, i4,  # index shape, rank-padded to 5 with 1s
-    r0, r1, r2, r3, r4,  # src shape, rank-padded to 5 with 1s
+    s0, s1, s2, s3, s4,
+    i0, i1, i2, i3, i4,
+    r0, r1, r2, r3, r4,
     DIM: tl.constexpr,
     REDUCE: tl.constexpr,
     INCLUDE_SELF: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # Output-centric scan (the only correct non-atomic pattern on this
-    # platform).  index/src may be smaller than self on ANY axis: an output
-    # position p can only receive a source when p_d < index.shape[d] for all
-    # d != DIM (the source's non-dim coords must equal p's), and the source
-    # stripe is read with SRC's own strides -> the (outer, dim, inner)
-    # shared-z flattening is insufficient, so decode the full multi-index.
     output_offset = tl.program_id(0).to(tl.int64)
     rem = output_offset
     c0 = rem // (s1 * s2 * s3 * s4)
@@ -399,7 +380,6 @@ def _scatter_reduce_general_kernel(
         if INCLUDE_SELF:
             reduced += self_value
     elif REDUCE == 1:
-        # prod: dynamic while loop (no tl.static_range -> no IR blow-up)
         reduced = 1.0
         offset = 0
         while offset < dim_size:
@@ -580,11 +560,6 @@ def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
             "Kunlunxin scatter_reduce supports at most 65536 source elements along dim"
         )
 
-    # Generalize every supported rank (1D..5D) by decomposing the shape along
-    # `dim` as (outer, dim, inner) and lowering onto the generic 3D kernels
-    # (DIM=1): index/src sizes come from index.shape while self keeps its own
-    # (outer, dim, inner) sizes; the kernels mask `x < index_size0` /
-    # `z < index_size2` so index may be smaller than self outside `dim`.
     outer_d = 1
     for s in index.shape[:dim]:
         outer_d *= s
@@ -599,10 +574,6 @@ def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
     inner_i = 1
     for s in inp.shape[dim + 1 :]:
         inner_i *= s
-    # index may be smaller than src on any axis (doc contract:
-    # index.size(d) <= src.size(d) for all d), so the 3D kernels must index
-    # src with SRC's own (dim, inner) strides, not index's; otherwise src
-    # elements are read at wrong offsets whenever index.shape != src.shape.
     src_dim = src.shape[dim]
     src_inner = 1
     for s in src.shape[dim + 1 :]:
@@ -625,11 +596,6 @@ def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
             )
         return result
 
-    # The (outer, dim, inner) shared-z kernels below index src/index with
-    # flat (x, s, z) offsets, which is only a valid multi-index when the
-    # non-dim axes of index/src align exactly with self's (otherwise the
-    # digit decomposition mixes).  Fall back to the rank-aware general
-    # kernels when index/src are smaller than self on any non-dim axis.
     aligned = all(
         index.shape[d] == src.shape[d] == inp.shape[d]
         for d in range(inp.ndim)

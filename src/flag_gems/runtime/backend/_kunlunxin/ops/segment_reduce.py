@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import logging
 import math
@@ -30,9 +17,6 @@ _NPU_BLOCK_SIZE = 256
 _UNIFORM_FAST_PATH_MIN_NUMEL = 1 << 20
 _UNIFORM_KERNEL_MAX_SEGMENT_LENGTH = 256
 _UNIFORM_LENGTHS_CACHE = {}
-# Validation of `lengths` (negative / row-sum checks) needs two device->host
-# syncs; the result only depends on the lengths tensor and data.size(axis), so
-# it is cached like _UNIFORM_LENGTHS_CACHE to make those syncs cold-path only.
 _LENGTHS_VALID_CACHE = {}
 _SUPPORTED_REDUCES = ("sum", "mean", "max", "min", "prod")
 _SUPPORTED_DATA_DTYPES = (
@@ -63,9 +47,6 @@ def _get_uniform_kernel_config(device, inner_size):
 def _get_uniform_backward_tile_config(device, inner_size, reduce, dtype):
     if device.type == "npu":
         return 1, 16 if inner_size > 1 else 1
-    # NOTE: a (4, 256) tile is not supported for f16/bf16 prod on TritonXPU:
-    # TritonXPUUnrollControl fails with "out of resource: uni_sram" at compile
-    # time. (4, 64) compiles and is correct.
     return 4, 64 if inner_size > 1 else 1
 
 
@@ -217,15 +198,6 @@ def _segment_reduce_uniform_other_backward_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    # NOTE: 2D tile (rows x inner) with a dynamic (scf.for) loop over the
-    # segment.
-    # - A 3D (rows x segment x inner) tile is NOT supported by this
-    #   TritonXPU backend: the TritonXPULegalize pass fails with
-    #   "out of resource: uni_sram" for even a tiny 3D block.
-    # - A statically-unrolled (tl.static_range) loop over the segment blows
-    #   the XPU ELF stack budget ("Failed to tune buffer size") for segment
-    #   lengths around 256; a dynamic loop keeps the code size independent of
-    #   the segment length.
     pid_m = tle.program_id(0)
     pid_k = tle.program_id(1)
     data_dtype = data.dtype.element_ty
@@ -268,11 +240,6 @@ def _segment_reduce_uniform_other_backward_kernel(
             grad_value / counter.to(compute_dtype),
             grad_value,
         )
-        # Store with the segment mask and a value pre-guarded by `match`:
-        # storing a loop-invariant value under a data-dependent mask is
-        # mis-compiled by TritonXPU (stores land at wrong offsets); guarding
-        # the value with tl.where(match, ..., 0.0) under the plain segment
-        # mask is compiled correctly.
         for pos in range(0, segment_length):
             data_offsets = base_offsets + pos * inner_size
             values = tl.load(data + data_offsets, mask=mask, other=0.0).to(
@@ -469,10 +436,6 @@ def _segment_reduce_uniform_forward_kernel(
     has_nan = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.int1)
     nan_value = tl.zeros((BLOCK_M, BLOCK_K), dtype=compute_dtype)
 
-    # Dynamic (scf.for) loop over the segment: a tl.static_range unroll blows
-    # the XPU ELF stack budget ("Failed to tune buffer size") for segment
-    # lengths around 256, so the iteration count must not affect code size;
-    # every iteration is < segment_length because that is the loop bound.
     for pos in range(0, segment_length):
         block_mask = mask
         data_offsets = base_offsets + pos * inner_size
@@ -529,13 +492,6 @@ def _segment_reduce_uniform_lengths(data, reduce, lengths, axis):
         return output
     total_rows = _prod(lengths.shape)
 
-    # The inner1 kernel's 1d tile (BLOCK_N = next_pow2(segment_length)) is
-    # only valid for short segments, so the inner1 fast path keeps the
-    # _UNIFORM_KERNEL_MAX_SEGMENT_LENGTH gate.  The generic uniform forward
-    # kernel loops over the segment with a dynamic (scf.for) bound and is
-    # correct for any length, so long uniform segments run it directly instead
-    # of the previous torch.squeeze/sum/mean/amax/amin/prod fallback (removed:
-    # it was an ATen detour and its segment_length == 1 branch was dead code).
     if segment_length <= _UNIFORM_KERNEL_MAX_SEGMENT_LENGTH and inner_size == 1:
         block_m = 4 if data.device.type == "npu" else 32
         block_n = min(
@@ -565,9 +521,6 @@ def _segment_reduce_uniform_lengths(data, reduce, lengths, axis):
         segment_length > _UNIFORM_KERNEL_MAX_SEGMENT_LENGTH
         and data.device.type == "npu"
     ):
-        # npu keeps the previous conservative fallback to the generic path for
-        # long segments (the forward kernel below is only validated on
-        # cuda/kunlunxin backends).
         return None
 
     block_m, block_k = _get_uniform_kernel_config(data.device, inner_size)
@@ -721,10 +674,6 @@ def _segment_reduce_forward_kernel(
     segment_length = segment_end - segment_start
 
     acc = tl.full((), INITIAL_VALUE, dtype=compute_dtype)
-    # Dynamic (scf.for) block loop bounded by the *local* segment length: a
-    # tl.static_range unroll over the whole reduce axis faults on TritonXPU
-    # (illegal memory access at ~56+ unrolled 1024-wide blocks), so the
-    # iteration count must not affect code size.
     num_blocks = (segment_length + BLOCK_SIZE - 1) // BLOCK_SIZE
     if IS_PROD:
         for block_idx in range(0, num_blocks):
@@ -848,10 +797,6 @@ def _segment_reduce_backward_kernel(
         grad_value = tl.load(grad + pid).to(compute_dtype)
         output_value = tl.load(output + pid).to(compute_dtype)
 
-        # Dynamic (scf.for) block loop bounded by the *local* segment length:
-        # a tl.static_range unroll over the whole reduce axis faults on
-        # TritonXPU (illegal memory access at ~56+ unrolled 1024-wide
-        # blocks), so the iteration count must not affect code size.
         num_blocks = (segment_length + BLOCK_SIZE - 1) // BLOCK_SIZE
 
         if IS_SUM or IS_MEAN:
@@ -913,9 +858,6 @@ def _segment_reduce_backward_kernel(
                     tl.where(output_is_nan, values != values, values == output_value)
                     & mask
                 )
-                # Also guard the value (see the uniform variant): a data-
-                # dependent store mask with a loop-invariant value is mis-
-                # compiled by TritonXPU.
                 tl.store(
                     grad_input + data_offsets,
                     tl.where(match, store_value, 0.0),
@@ -1032,12 +974,6 @@ def _segment_reduce_backward_element_kernel(
 
     if IS_MAX_OR_MIN:
         counter = tl.full((), 0, dtype=tl.int32)
-        # Dynamic scan over the segment (bounded by segment_end): a static
-        # unroll over the whole reduce axis blows up the kernel for long
-        # axes (TritonXPU faults / explodes at 56+ unrolled 1024-wide
-        # blocks, and O(axis) unroll even compiles for minutes). Note a
-        # `while` loop is also rejected by TritonXPULegalize ("out of
-        # resource: uni_sram"), so use a dynamic scf.for loop.
         segment_length = segment_end - segment_start
         for segment_rel in range(0, segment_length):
             segment_offset = segment_start + segment_rel

@@ -62,9 +62,6 @@ import triton.language.extra.xpu.libdevice as xpu
 
 logger = logging.getLogger(__name__)
 
-# Unmasked/masked tile buckets (same family policy as asin.py/erfc.py): the
-# masked memory path on XPU costs ~2x, so run unmasked whenever n divides the
-# tile; tiny shapes are launch-bound and use the small masked kernel.
 UNROLL_NUM = 8
 BUFFER_SIZE_LIMIT = 8192
 IS_CLOSE_MEMORY_ASYNC = False
@@ -85,15 +82,13 @@ def _pick_block(n_elements):
 @triton.jit
 def _erfinv_body(xf):
     q = xf * xf
-    # w = -log(1 - q): exact small-q series + min/max-ramped blend to the
-    # (accurate, but 1-q-quantized) log -- see module docstring.
     w_s = q * (1.0 + q * (0.5 + q * (0.33333334 + q * (0.25 + q * 0.2))))
     w_l = -tl.log(1.0 - q)
     m = tl.minimum(1.0, q * 512.0)
     w = w_s + m * (w_l - w_s)
     rw = xpu.rsqrt(w + 1e-30)
-    sq = xpu.rsqrt(rw * rw)  # = sqrt(w) (0 at w=0 via the bias; +inf at w=+inf)
-    sgn = xf * xpu.rsqrt(q + 1e-30)  # sign(x) (preserves +-0)
+    sq = xpu.rsqrt(rw * rw)
+    sgn = xf * xpu.rsqrt(q + 1e-30)
     p = 5.8653229565e-06
     p = p * w + -6.0857197758e-05
     p = p * w + -3.0229410106e-04
