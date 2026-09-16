@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .bmm import bmm
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,7 +94,7 @@ def _osj_svd_impl(A, sweeps=12, full_matrices=False):
     idxg = idx.unsqueeze(1).expand(-1, MP, -1)
     U = torch.gather(U, 2, idxg)[:, :m, :k].contiguous()
 
-    UtA = torch.matmul(U.transpose(-2, -1), A)
+    UtA = bmm(U.transpose(-2, -1), A)
     Vh = UtA * (1.0 / S_sorted).unsqueeze(-1)
 
     if full_matrices:
