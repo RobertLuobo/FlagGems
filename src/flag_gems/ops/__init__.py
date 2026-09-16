@@ -593,7 +593,7 @@ from flag_gems.ops.linalg_lu_factor_ex import (
     linalg_lu_factor_ex_out,
 )
 from flag_gems.ops.linalg_matrix_exp import linalg_matrix_exp, linalg_matrix_exp_out
-from flag_gems.ops.linalg_matrix_norm import linalg_matrix_norm
+from flag_gems.ops.linalg_matrix_norm import linalg_matrix_norm, linalg_matrix_norm_out
 from flag_gems.ops.linalg_matrix_power import (
     linalg_matrix_power,
     linalg_matrix_power_out,
@@ -619,6 +619,7 @@ from flag_gems.ops.linalg_solve_triangular import (
 )
 from flag_gems.ops.linalg_svd import linalg_svd
 from flag_gems.ops.linalg_svdvals import linalg_svdvals
+from flag_gems.ops.linalg_tensorinv import linalg_tensorinv, linalg_tensorinv_out
 from flag_gems.ops.linalg_vander import linalg_vander
 from flag_gems.ops.linalg_vecdot import linalg_vecdot, linalg_vecdot_out
 from flag_gems.ops.linear import linear
@@ -704,6 +705,7 @@ from flag_gems.ops.multi_margin_loss import (
     multi_margin_loss_backward_out,
     multi_margin_loss_out,
 )
+from flag_gems.ops.multilabel_margin_loss_forward import multilabel_margin_loss_forward
 from flag_gems.ops.multinomial import multinomial
 from flag_gems.ops.multiply import multiply
 from flag_gems.ops.multiply_ import multiply_
@@ -760,6 +762,7 @@ from flag_gems.ops.ones_like import ones_like
 from flag_gems.ops.ormqr import ormqr
 from flag_gems.ops.pad import constant_pad_nd, pad
 from flag_gems.ops.pad_sequence import pad_sequence
+from flag_gems.ops.padded_dense_to_jagged_forward import _padded_dense_to_jagged_forward
 from flag_gems.ops.pairwise_distance import pairwise_distance
 from flag_gems.ops.pdist import pdist
 from flag_gems.ops.per_token_group_quant_fp8 import (
@@ -931,6 +934,10 @@ from flag_gems.ops.special_hermite_polynomial_h import special_hermite_polynomia
 from flag_gems.ops.special_i0e import special_i0e, special_i0e_out
 from flag_gems.ops.special_i1 import special_i1, special_i1_out
 from flag_gems.ops.special_i1e import special_i1e, special_i1e_out
+from flag_gems.ops.special_laguerre_polynomial_l import (
+    special_laguerre_polynomial_l,
+    special_laguerre_polynomial_l_out,
+)
 from flag_gems.ops.special_legendre_polynomial_p import special_legendre_polynomial_p
 from flag_gems.ops.special_log1p import special_log1p, special_log1p_out
 from flag_gems.ops.special_log_ndtr import special_log_ndtr
@@ -1022,6 +1029,7 @@ from flag_gems.ops.topk_w8a16_fp8 import topk_w8a16_fp8
 from flag_gems.ops.trace import trace
 from flag_gems.ops.trace_backward import trace_backward
 from flag_gems.ops.transpose import transpose
+from flag_gems.ops.transpose_copy import transpose_copy
 from flag_gems.ops.tril import tril, tril_, tril_out
 from flag_gems.ops.triu import triu, triu_
 from flag_gems.ops.true_divide import true_divide, true_divide_tensor
@@ -1171,6 +1179,7 @@ __all__ = [
     "_nested_view_from_buffer_copy",
     "_nested_view_from_jagged",
     "_nested_view_from_jagged_copy",
+    "_padded_dense_to_jagged_forward",
     "_pdist_backward",
     "_pdist_forward",
     "_prelu_kernel",
@@ -1700,6 +1709,7 @@ __all__ = [
     "linalg_matrix_exp",
     "linalg_matrix_exp_out",
     "linalg_matrix_norm",
+    "linalg_matrix_norm_out",
     "linalg_matrix_power",
     "linalg_matrix_power_out",
     "linalg_matrix_rank",
@@ -1719,6 +1729,8 @@ __all__ = [
     "linalg_solve_triangular_out",
     "linalg_svd",
     "linalg_svdvals",
+    "linalg_tensorinv",
+    "linalg_tensorinv_out",
     "linalg_vander",
     "linalg_vecdot",
     "linalg_vecdot_out",
@@ -1818,6 +1830,7 @@ __all__ = [
     "multi_margin_loss_backward",
     "multi_margin_loss_backward_out",
     "multi_margin_loss_out",
+    "multilabel_margin_loss_forward",
     "multinomial",
     "multiply",
     "multiply_",
@@ -2074,6 +2087,8 @@ __all__ = [
     "special_i1_out",
     "special_i1e",
     "special_i1e_out",
+    "special_laguerre_polynomial_l",
+    "special_laguerre_polynomial_l_out",
     "special_legendre_polynomial_p",
     "special_log1p",
     "special_log1p_out",
@@ -2165,6 +2180,7 @@ __all__ = [
     "trace",
     "trace_backward",
     "transpose",
+    "transpose_copy",
     "tril",
     "tril_",
     "tril_out",
