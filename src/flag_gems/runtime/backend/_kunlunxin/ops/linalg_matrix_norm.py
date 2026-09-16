@@ -24,6 +24,9 @@ _OP_MIN = 4
 
 _BLOCK_M = 64
 _BLOCK_N = 128
+# `_BLOCK_M * _BLOCK_N` is a multiple of this, so a padded buffer sized in whole
+# row blocks is exactly covered by the flat grid of `_pad_rows_kernel`.
+_PAD_BLOCK = 1024
 _PROG_TARGET = 96
 _SPLIT_MIN_ELEMS = 1 << 18
 
@@ -122,55 +125,59 @@ def _row_reduce_kernel(
 
 
 @libentry()
-@triton.jit(do_not_specialize=["R", "C", "XPITCH", "PITCH"])
+@triton.jit(do_not_specialize=["R", "C", "XPITCH", "NCOLS"])
 def _pad_rows_kernel(
     X,
     PAD,
     R,
     C,
     XPITCH,
-    PITCH,
+    NCOLS,
     IDENT: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     """Write ``X`` into the first ``C`` columns of ``PAD``, ``IDENT`` after.
 
     The copy engine cannot express this destination -- ``tle_copy`` writes runs
     back to back, and once ``C`` reaches 1 the only run left is a single element
-    with the row pitch as its stride -- so the padding step fills the buffer
-    with a kernel instead.  Doing both in one launch is what lets
+    with the row pitch as its stride -- so the padding step lays the buffer down
+    with a kernel instead.  Filling and scattering in one launch is what lets
     ``_row_reduce`` keep its unmasked loads.
 
-    Indexing is clamped rather than masked, like ``_row_reduce_kernel``: rows
-    past ``R - 1`` rewrite the last row with the values already in it, and the
-    clamped column keeps the read inside ``X`` (an unclamped column past ``C``
-    would read the next row).
+    One flat block, with the row recovered by division: giving the *stored*
+    index a row clamp makes the store non-affine, which costs 5x here (365us vs
+    32us for an 8x128 buffer) while the flat form is already at the launch
+    floor.  Rows and columns past the source are clamped rather than masked --
+    out-of-range rows rewrite the tail of ``PAD``, which the reduction never
+    reads, and the clamped column keeps every read inside ``X``.
     """
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = offs // NCOLS
+    col = offs - row * NCOLS
 
-    r = tl.minimum(rows, R - 1)
-    c = tl.minimum(cols, C - 1)
+    r = tl.minimum(row, R - 1)
+    c = tl.minimum(col, C - 1)
 
-    val = tl.load(X + r[:, None] * XPITCH + c[None, :])
-    val = tl.where(cols[None, :] < C, val, IDENT).to(val.dtype)
-    tl.store(PAD + r[:, None] * PITCH + cols[None, :], val)
+    val = tl.load(X + r * XPITCH + c)
+    val = tl.where(col < C, val, IDENT).to(val.dtype)
+    tl.store(PAD + offs, val)
 
 
 def _pad_rows(x, pad, R, C, pitch, ident):
-    """Materialise ``x`` into the first ``C`` columns of the ``pad`` buffer."""
-    ncols = pad.shape[1]
-    _pad_rows_kernel[(triton.cdiv(R, _BLOCK_M), triton.cdiv(ncols, _BLOCK_N))](
+    """Materialise ``x`` into the first ``C`` columns of the ``pad`` buffer.
+
+    ``pad`` must be sized in whole ``_BLOCK_M`` row blocks -- the caller passes
+    ``RP`` -- so the flat grid divides it exactly and no block is left unfilled.
+    """
+    _pad_rows_kernel[(pad.numel() // _PAD_BLOCK,)](
         x,
         pad,
         R,
         C,
         pitch,
-        ncols,
+        pad.shape[1],
         IDENT=ident,
-        BLOCK_M=_BLOCK_M,
-        BLOCK_N=_BLOCK_N,
+        BLOCK=_PAD_BLOCK,
     )
 
 
@@ -219,7 +226,9 @@ def _row_reduce(x, R, C, op, final_sqrt=False):
     ncols = C
     if C % BN:
         ncols = triton.cdiv(C, BN) * BN
-        pad = torch.empty((R, ncols), dtype=x.dtype, device=dev)
+        # Whole row blocks, so `_pad_rows_kernel`'s flat grid covers the buffer
+        # exactly and needs no mask.
+        pad = torch.empty((RP, ncols), dtype=x.dtype, device=dev)
         _pad_rows(x, pad, R, C, pitch, _identity(op))
         x = pad
         pitch = ncols

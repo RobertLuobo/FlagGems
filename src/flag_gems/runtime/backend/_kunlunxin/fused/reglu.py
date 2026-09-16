@@ -119,7 +119,7 @@ def reglu_pair_kernel(
     num_tasks,
     N_OUT: tl.constexpr,
     TILE: tl.constexpr,
-): 
+):
     pid = tl.program_id(0)
     tid = pid * TILE + tl.arange(0, TILE)
     mask = tid < num_tasks
@@ -130,7 +130,7 @@ def reglu_pair_kernel(
     tl.store(output_ptr + tid, (gate * x_b).to(input_ptr.type.element_ty), mask=mask)
 
 
-def _pick_reglu_pair_tile(dtype, M, N_OUT): 
+def _pick_reglu_pair_tile(dtype, M, N_OUT):
     if dtype == torch.bfloat16:
         return 512 if N_OUT <= 64 else 1024
     if dtype == torch.float16:
@@ -140,7 +140,7 @@ def _pick_reglu_pair_tile(dtype, M, N_OUT):
     return 2048 if M >= 65536 else 1024
 
 
-def _pick_reglu_config(dtype, M, N_OUT): 
+def _pick_reglu_config(dtype, M, N_OUT):
     if N_OUT >= 2048 and M >= 1024:
         if dtype == torch.float32:
             if N_OUT >= 65536:
@@ -200,7 +200,7 @@ def reglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
     return output_2d.view(output_shape)
 
 
-def _pick_dreglu_config(dtype, M, N): 
+def _pick_dreglu_config(dtype, M, N):
     f16 = dtype == torch.float16
     f32 = dtype == torch.float32
     if N >= 2048:
@@ -249,7 +249,7 @@ def dreglu(
     input_tensor: torch.Tensor,
     quantizer: Optional[Any] = None,
 ) -> torch.Tensor:
-    logger.debug("GEMS DREGLU")
+    logger.debug("GEMS_KUNLUNXIN DREGLU")
     shape = input_tensor.shape
     if shape[:-1] != grad_output.shape[:-1] or shape[-1] != 2 * grad_output.shape[-1]:
         raise ValueError(

@@ -117,7 +117,7 @@ def linalg_svd(A, full_matrices=True, *, driver=None):
     Returns ``(U, S, Vh)`` with ``A = U @ diag(S) @ Vh``.  Only ``float32``
     is supported (matches the generic ``linalg_svd`` contract).
     """
-    logger.debug("GEMS LINALG_SVD (kunlunxin)")
+    logger.debug("GEMS_KUNLUNXIN LINALG_SVD")
     if A.dtype != torch.float32:
         raise TypeError(f"linalg_svd only supports float32 input, got {A.dtype}")
     return _osj_svd_impl(A, full_matrices=full_matrices)

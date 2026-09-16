@@ -27,15 +27,20 @@ def _ugt(a, b):
 
 @triton.jit
 def _bst_count_kernel(
-    inputs, starts, ends, cands, cnts, S: tl.constexpr, BS: tl.constexpr
+    inputs, starts, ends, thrs, cnts, k_eff, bit, S: tl.constexpr, BS: tl.constexpr
 ):
+    """Count elements >= (thr | (1 << bit)) per row, then update thrs in
+    place: thrs[b] = (cnt >= k_eff[b]) ? cand : thrs[b].  Fuses the host-side
+    ``cands = thrs | (one << bit)`` and ``torch.where`` of the bitwise
+    radix-select loop into one kernel."""
     b = tl.program_id(0)
     s_base = inputs + b * S
     start = tl.load(starts + b).to(tl.int32)
     end = tl.load(ends + b).to(tl.int32)
     n = end - start
     TS = tl.cdiv(n, BS)
-    cand = tl.load(cands + b)
+    thr = tl.load(thrs + b)
+    cand = thr | (1 << bit)
     cnt = 0
     for t in range(TS):
         offs = t * BS + tl.arange(0, BS)
@@ -44,6 +49,7 @@ def _bst_count_kernel(
         u = _ord_i32(x)
         cnt += tl.sum((m & _uge(u, cand)).to(tl.int32), axis=0)
     tl.store(cnts + b, cnt)
+    tl.store(thrs + b, tl.where(cnt >= tl.load(k_eff + b), cand, thr))
 
 
 @triton.jit
@@ -152,13 +158,20 @@ def _bst_select(x, starts, ends, n, k_eff, K, out, gmap=None):
     Bb = x.shape[0]
     thrs = torch.zeros(Bb, dtype=torch.int32, device=x.device)
     cnts = torch.empty(Bb, dtype=torch.int32, device=x.device)
-    one = torch.tensor(1, dtype=torch.int32, device=x.device)
     for bit in range(31, -1, -1):
-        cands = thrs | (one << bit)
         _bst_count_kernel[(Bb,)](
-            x, starts, ends, cands, cnts, x.shape[1], BS, num_warps=4, num_stages=1
+            x,
+            starts,
+            ends,
+            thrs,
+            cnts,
+            k_eff,
+            bit,
+            x.shape[1],
+            BS,
+            num_warps=4,
+            num_stages=1,
         )
-        thrs = torch.where(cnts >= k_eff, cands, thrs)
     ranks = torch.zeros(Bb, BS, dtype=torch.int32, device=x.device)
     _bst_rank_kernel[(Bb,)](
         x,

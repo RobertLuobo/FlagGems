@@ -75,8 +75,13 @@ _DEV_SORT_MIN_NW = 64
 
 @triton.jit
 def _svd_sort_stage_kernel(
-    S_ptr, LO_ptr, COND_ptr, d: tl.constexpr, stage: tl.constexpr,
-    NW: tl.constexpr, PAD: tl.constexpr,
+    S_ptr,
+    LO_ptr,
+    COND_ptr,
+    d: tl.constexpr,
+    stage: tl.constexpr,
+    NW: tl.constexpr,
+    PAD: tl.constexpr,
 ):
     """One bitonic compare-exchange stage (descending). One program per row."""
     pid = tl.program_id(0)
@@ -112,10 +117,10 @@ def _device_desc_sort(S, k, dev, dtype):
     buf = torch.zeros(batch, NWs + 2 * PAD, device=dev, dtype=torch.float32)
     buf[:, PAD : PAD + NW] = S.to(device=dev, dtype=torch.float32)
     offs = np.arange(NWs)
-    for l in range(1, NWs.bit_length()):
-        stage = 1 << l
-        for s in range(l):
-            d = 1 << (l - s - 1)
+    for lev in range(1, NWs.bit_length()):
+        stage = 1 << lev
+        for s in range(lev):
+            d = 1 << (lev - s - 1)
             is_lo = ((offs % (2 * d)) < d).astype(np.float32)
             block_odd = ((offs // stage) % 2 == 1).astype(np.float32)
             cond = (np.logical_xor(is_lo > 0.5, block_odd > 0.5)).astype(np.float32)
@@ -179,7 +184,7 @@ def linalg_svdvals(A: torch.Tensor, driver: str = None) -> torch.Tensor:
     Returns:
         Singular values in descending order, shape (*, min(m, n)).
     """
-    logger.debug("GEMS LINALG_SVDVALS (kunlunxin)")
+    logger.debug("GEMS_KUNLUNXIN LINALG_SVDVALS")
     if A.dtype != torch.float32:
         raise TypeError(f"linalg_svdvals only supports float32 input, got {A.dtype}")
     if not A.is_contiguous():

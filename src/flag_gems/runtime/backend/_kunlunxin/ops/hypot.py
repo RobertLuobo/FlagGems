@@ -280,7 +280,7 @@ def hypot_(self: torch.Tensor, other):
     implementation resolves the logical->storage offsets directly from
     explicit shapes/strides instead, using the two in-place kernels above.
     """
-    logger.debug("GEMS HYPOT_ (KUNLUNXIN)")
+    logger.debug("GEMS_KUNLUNXIN HYPOT_")
 
     if isinstance(other, torch.Tensor):
         other_t = (

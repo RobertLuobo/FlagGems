@@ -161,7 +161,7 @@ def linear(input, weight, bias=None):
     Returns:
         Output tensor of shape (*, out_features)
     """
-    logger.debug("GEMS KUNLUNXIN LINEAR")
+    logger.debug("GEMS_KUNLUNXIN LINEAR")
 
     if (input.dtype == torch.bfloat16 and input.shape[-1] >= 2048) or (
         input.dtype == torch.float32
