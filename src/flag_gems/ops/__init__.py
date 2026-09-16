@@ -22,6 +22,7 @@ from flag_gems.ops.__xor__ import xor, xor_, xor_scalar_, xor_scalar_tensor
 from flag_gems.ops._adaptive_avg_pool2d_backward import _adaptive_avg_pool2d_backward
 from flag_gems.ops._add_relu import _add_relu
 from flag_gems.ops._add_relu_ import _add_relu_
+from flag_gems.ops._addmm_activation import _addmm_activation, _addmm_activation_out
 from flag_gems.ops._amp_foreach_non_finite_check_and_unscale_ import (
     _amp_foreach_non_finite_check_and_unscale_,
 )
@@ -174,6 +175,10 @@ from flag_gems.ops._upsample_nearest_exact2d_backward import (
     _upsample_nearest_exact2d_backward,
 )
 from flag_gems.ops._upsample_nearest_exact3d import _upsample_nearest_exact3d
+from flag_gems.ops._upsample_nearest_exact3d_backward import (
+    _upsample_nearest_exact3d_backward,
+    _upsample_nearest_exact3d_backward_grad_input,
+)
 from flag_gems.ops._weight_int4pack_mm_with_scales_and_zeros import (
     _weight_int4pack_mm_with_scales_and_zeros,
 )
@@ -547,6 +552,7 @@ from flag_gems.ops.index_reduce import index_reduce, index_reduce_, index_reduce
 from flag_gems.ops.index_select import index_select
 from flag_gems.ops.index_select_backward import index_select_backward
 from flag_gems.ops.is_nonzero import is_nonzero
+from flag_gems.ops.is_same_size import is_same_size
 from flag_gems.ops.isclose import allclose, isclose
 from flag_gems.ops.isfinite import isfinite
 from flag_gems.ops.isin import isin
@@ -1016,6 +1022,7 @@ from flag_gems.ops.sym_stride import sym_stride
 from flag_gems.ops.t_ import t_
 from flag_gems.ops.t_copy import t_copy, t_copy_out
 from flag_gems.ops.take import take, take_out
+from flag_gems.ops.take_along_dim import take_along_dim, take_along_dim_out
 from flag_gems.ops.tan import tan, tan_
 from flag_gems.ops.tanh import tanh, tanh_, tanh_backward
 from flag_gems.ops.te_rmsnorm import te_rmsnorm_bwd, te_rmsnorm_fwd
@@ -1030,6 +1037,7 @@ from flag_gems.ops.trace import trace
 from flag_gems.ops.trace_backward import trace_backward
 from flag_gems.ops.transpose import transpose
 from flag_gems.ops.transpose_copy import transpose_copy
+from flag_gems.ops.triangular_indices import tril_indices, triu_indices
 from flag_gems.ops.tril import tril, tril_, tril_out
 from flag_gems.ops.triu import triu, triu_
 from flag_gems.ops.true_divide import true_divide, true_divide_tensor
@@ -1113,6 +1121,8 @@ __all__ = [
     "_adaptive_avg_pool3d_backward",
     "_add_relu",
     "_add_relu_",
+    "_addmm_activation",
+    "_addmm_activation_out",
     "_amp_foreach_non_finite_check_and_unscale_",
     "_amp_update_scale_",
     "_assert_async",
@@ -1218,6 +1228,8 @@ __all__ = [
     "_upsample_nearest_exact2d",
     "_upsample_nearest_exact2d_backward",
     "_upsample_nearest_exact3d",
+    "_upsample_nearest_exact3d_backward",
+    "_upsample_nearest_exact3d_backward_grad_input",
     "_weight_int4pack_mm_with_scales_and_zeros",
     "_weight_norm",
     "abs",
@@ -1645,6 +1657,7 @@ __all__ = [
     "index_select",
     "index_select_backward",
     "is_nonzero",
+    "is_same_size",
     "isclose",
     "isfinite",
     "isin",
@@ -2161,6 +2174,8 @@ __all__ = [
     "t_copy",
     "t_copy_out",
     "take",
+    "take_along_dim",
+    "take_along_dim_out",
     "take_out",
     "tan",
     "tan_",
@@ -2183,9 +2198,11 @@ __all__ = [
     "transpose_copy",
     "tril",
     "tril_",
+    "tril_indices",
     "tril_out",
     "triu",
     "triu_",
+    "triu_indices",
     "true_divide",
     "true_divide_",
     "true_divide_out",
