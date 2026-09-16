@@ -30,6 +30,10 @@ _NPU_BLOCK_SIZE = 256
 _UNIFORM_FAST_PATH_MIN_NUMEL = 1 << 20
 _UNIFORM_KERNEL_MAX_SEGMENT_LENGTH = 256
 _UNIFORM_LENGTHS_CACHE = {}
+# Validation of `lengths` (negative / row-sum checks) needs two device->host
+# syncs; the result only depends on the lengths tensor and data.size(axis), so
+# it is cached like _UNIFORM_LENGTHS_CACHE to make those syncs cold-path only.
+_LENGTHS_VALID_CACHE = {}
 _SUPPORTED_REDUCES = ("sum", "mean", "max", "min", "prod")
 _SUPPORTED_DATA_DTYPES = (
     torch.float16,
@@ -131,6 +135,15 @@ def _validate_lengths(data, lengths, axis, unsafe):
     _check_index_tensor(data, lengths, "lengths", axis)
     if unsafe:
         return
+    cache_key = (
+        lengths.device.type,
+        lengths.data_ptr(),
+        tuple(lengths.shape),
+        getattr(lengths, "_version", None),
+        data.size(axis),
+    )
+    if _LENGTHS_VALID_CACHE.get(cache_key):
+        return
     lengths_detached = lengths.detach()
     if torch.any(lengths_detached < 0).item():
         raise RuntimeError("lengths contains negative value!")
@@ -140,6 +153,9 @@ def _validate_lengths(data, lengths, axis, unsafe):
             "segment_reduce(): Expected all rows of lengths along axis to sum to "
             "data.size(lengths.dim()-1) when !unsafe."
         )
+    if len(_LENGTHS_VALID_CACHE) > 128:
+        _LENGTHS_VALID_CACHE.clear()
+    _LENGTHS_VALID_CACHE[cache_key] = True
 
 
 def _make_initial(reduce, initial):
@@ -508,46 +524,32 @@ def _segment_reduce_uniform_lengths(data, reduce, lengths, axis):
 
     output_shape = lengths.shape + data.shape[axis + 1 :]
     inner_size = _prod(data.shape[axis + 1 :])
-    if segment_length <= _UNIFORM_KERNEL_MAX_SEGMENT_LENGTH:
-        output = torch.empty(output_shape, dtype=data.dtype, device=data.device)
-        if output.numel() == 0:
-            return output
-        total_rows = _prod(lengths.shape)
-        if inner_size == 1:
-            block_m = 4 if data.device.type == "npu" else 32
-            block_n = min(
-                _get_block_size(data.device),
-                triton.next_power_of_2(segment_length),
-            )
-            grid = (triton.cdiv(total_rows, block_m),)
-            with torch_device_fn.device(data.device):
-                _segment_reduce_uniform_inner1_forward_kernel[grid](
-                    data,
-                    output,
-                    total_rows,
-                    segment_count,
-                    segment_length,
-                    data.shape[axis],
-                    reduce == "sum",
-                    reduce == "mean",
-                    reduce == "max",
-                    reduce == "min",
-                    reduce == "prod",
-                    BLOCK_M=block_m,
-                    BLOCK_N=block_n,
-                )
-            return output
+    output = torch.empty(output_shape, dtype=data.dtype, device=data.device)
+    if output.numel() == 0:
+        return output
+    total_rows = _prod(lengths.shape)
 
-        block_m, block_k = _get_uniform_kernel_config(data.device, inner_size)
-        grid = (triton.cdiv(total_rows, block_m), triton.cdiv(inner_size, block_k))
+    # The inner1 kernel's 1d tile (BLOCK_N = next_pow2(segment_length)) is
+    # only valid for short segments, so the inner1 fast path keeps the
+    # _UNIFORM_KERNEL_MAX_SEGMENT_LENGTH gate.  The generic uniform forward
+    # kernel loops over the segment with a dynamic (scf.for) bound and is
+    # correct for any length, so long uniform segments run it directly instead
+    # of the previous torch.squeeze/sum/mean/amax/amin/prod fallback (removed:
+    # it was an ATen detour and its segment_length == 1 branch was dead code).
+    if segment_length <= _UNIFORM_KERNEL_MAX_SEGMENT_LENGTH and inner_size == 1:
+        block_m = 4 if data.device.type == "npu" else 32
+        block_n = min(
+            _get_block_size(data.device),
+            triton.next_power_of_2(segment_length),
+        )
+        grid = (triton.cdiv(total_rows, block_m),)
         with torch_device_fn.device(data.device):
-            _segment_reduce_uniform_forward_kernel[grid](
+            _segment_reduce_uniform_inner1_forward_kernel[grid](
                 data,
                 output,
                 total_rows,
                 segment_count,
                 segment_length,
-                inner_size,
                 data.shape[axis],
                 reduce == "sum",
                 reduce == "mean",
@@ -555,30 +557,39 @@ def _segment_reduce_uniform_lengths(data, reduce, lengths, axis):
                 reduce == "min",
                 reduce == "prod",
                 BLOCK_M=block_m,
-                BLOCK_K=block_k,
+                BLOCK_N=block_n,
             )
         return output
 
-    if data.device.type == "npu":
+    if (
+        segment_length > _UNIFORM_KERNEL_MAX_SEGMENT_LENGTH
+        and data.device.type == "npu"
+    ):
+        # npu keeps the previous conservative fallback to the generic path for
+        # long segments (the forward kernel below is only validated on
+        # cuda/kunlunxin backends).
         return None
 
-    view_shape = (
-        data.shape[:axis] + (segment_count, segment_length) + data.shape[axis + 1 :]
-    )
-    reshaped = data.reshape(view_shape)
-    reduce_dim = axis + 1
-
-    if segment_length == 1:
-        return torch.squeeze(reshaped, dim=reduce_dim)
-    if reduce == "sum":
-        return torch.sum(reshaped, dim=reduce_dim)
-    if reduce == "mean":
-        return torch.mean(reshaped, dim=reduce_dim)
-    if reduce == "max":
-        return torch.amax(reshaped, dim=reduce_dim)
-    if reduce == "min":
-        return torch.amin(reshaped, dim=reduce_dim)
-    return torch.prod(reshaped, dim=reduce_dim)
+    block_m, block_k = _get_uniform_kernel_config(data.device, inner_size)
+    grid = (triton.cdiv(total_rows, block_m), triton.cdiv(inner_size, block_k))
+    with torch_device_fn.device(data.device):
+        _segment_reduce_uniform_forward_kernel[grid](
+            data,
+            output,
+            total_rows,
+            segment_count,
+            segment_length,
+            inner_size,
+            data.shape[axis],
+            reduce == "sum",
+            reduce == "mean",
+            reduce == "max",
+            reduce == "min",
+            reduce == "prod",
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+        )
+    return output
 
 
 def _segment_reduce_uniform_sum_mean_backward(data, grad, reduce, lengths, axis):

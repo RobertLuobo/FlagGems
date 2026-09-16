@@ -15,6 +15,8 @@ import logging
 
 import torch
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger("flag_gems." + __name__)
 
 
@@ -62,15 +64,18 @@ def _nested_view_from_buffer_copy(
         values = torch.empty_strided(
             self.shape, self.stride(), dtype=self.dtype, device=self.device
         )
-        torch.ops.aten._copy_from(self, values, False)
+        if not tle_copy(self, values):
+            torch.ops.aten._copy_from(self, values, False)
         # Jagged offsets must have num_components+1 entries; with explicit
         # `lengths` the trailing entry is not used for component sizes, so the
         # input offsets (padded by one element) are passed through unchanged.
         full_offsets = torch.empty_strided(
             (num_components + 1,), (1,), dtype=torch.int64, device=self.device
         )
-        torch.ops.aten._copy_from(offsets, full_offsets[:num_components], False)
-        torch.ops.aten._copy_from(offsets[:1], full_offsets[num_components:], False)
+        if not tle_copy(offsets, full_offsets[:num_components]):
+            torch.ops.aten._copy_from(offsets, full_offsets[:num_components], False)
+        if not tle_copy(offsets[:1], full_offsets[num_components:]):
+            torch.ops.aten._copy_from(offsets[:1], full_offsets[num_components:], False)
         # Construct the jagged NestedTensor directly instead of going through
         # torch._nested_view_from_jagged (whose torch-function dispatch chain
         # costs ~125us/call and hits use_gems-intercepted resolve_conj /
@@ -90,7 +95,8 @@ def _nested_view_from_buffer_copy(
     snapshot = torch.empty_strided(
         self.shape, self.stride(), dtype=self.dtype, device=self.device
     )
-    torch.ops.aten._copy_from(self, snapshot, False)
+    if not tle_copy(self, snapshot):
+        torch.ops.aten._copy_from(self, snapshot, False)
 
     num_components = nested_size.shape[0]
     components = []

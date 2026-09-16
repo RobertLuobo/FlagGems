@@ -10,6 +10,7 @@ from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.limits import get_dtype_max
 
 from ..utils.block_size_utils import get_block_size_1d
+from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
@@ -265,9 +266,9 @@ def _amin_flat(inp, out, device):
                     # the chunk kernel stays fully unmasked.
                     TL = triton.next_power_of_2(tail)
                     staged = torch.zeros((TL,), dtype=inp.dtype, device=device)
-                    torch.ops.aten._copy_from(
-                        inp[nfull * _FLAT_CHUNK :], staged[:tail], False
-                    )
+                    src_tail = inp[nfull * _FLAT_CHUNK :]
+                    if not tle_copy(src_tail, staged[:tail]):
+                        torch.ops.aten._copy_from(src_tail, staged[:tail], False)
                     amin_flat_chunk_kernel[(1, 1, 1)](
                         staged, mid[nfull : nfull + 1], TL, buffer_size_limit=2048
                     )
@@ -310,7 +311,8 @@ def _amin_flat(inp, out, device):
             else:
                 g = (nb + 8191) // 8192
                 padded = torch.zeros((g * 8192,), dtype=inp.dtype, device=device)
-                torch.ops.aten._copy_from(mid, padded[:nb], False)
+                if not tle_copy(mid, padded[:nb]):
+                    torch.ops.aten._copy_from(mid, padded[:nb], False)
                 gsum = torch.empty((g,), dtype=inp.dtype, device=device)
                 amin_flat_group_kernel[(g, 1, 1)](padded, gsum, 8192)
                 amin_flat_merge_kernel[(1, 1, 1)](
@@ -352,7 +354,8 @@ def amin(inp, dim=None, keepdim=False):
             # `_copy_from`) instead of launching a reduction kernel at all.
             out = torch.empty(shape, dtype=dtype, device=inp.device)
             with torch_device_fn.device(inp.device):
-                torch.ops.aten._copy_from(inp, out, False)
+                if not tle_copy(inp, out):
+                    torch.ops.aten._copy_from(inp, out, False)
             if not keepdim:
                 out = out.squeeze(dim=dim)
             return out
@@ -371,7 +374,8 @@ def amin(inp, dim=None, keepdim=False):
         else:
             src = torch.empty(list(view.shape), dtype=dtype, device=inp.device)
             with torch_device_fn.device(inp.device):
-                torch.ops.aten._copy_from(view, src, False)
+                if not tle_copy(view, src):
+                    torch.ops.aten._copy_from(view, src, False)
 
         out = torch.empty(shape, dtype=dtype, device=inp.device)
 

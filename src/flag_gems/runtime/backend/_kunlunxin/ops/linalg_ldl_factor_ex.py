@@ -224,7 +224,10 @@ def _dsytf2_step_kernel(W, LD, PIV, INFO, N, K, LDA: tl.constexpr, TOT: tl.const
     T = tl.where(two, T2, T1)
     T = tl.where(is_prev2x2, T0, T)
     tl.store(W + base + e, T)
-    tl.store(LD + base + e, T)
+    # LD output keeps only the lower triangle (L + D blocks; strict upper
+    # zeroed in-kernel -- replaces the host-side torch.tril; masked stores are
+    # not honored on this backend, so the mask is folded into the value).
+    tl.store(LD + base + e, tl.where(col > row, 0.0, T))
 
     kp_val = tl.where(kstep == 1, kp + 1, -(kp + 1))
     two2 = two & (K + 1 < N)
@@ -294,6 +297,6 @@ def ldl_factor_ex(A, hermitian=False, check_errors=False):
             ALPHA=_ALPHA,
             num_warps=1,
         )
-    LD_out = torch.tril(LD.view(batch_count, n, lda)[:, :n, :n].contiguous())
+    LD_out = LD.view(batch_count, n, lda)[:, :n, :n].contiguous()
     LD_out = LD_out.reshape(A.shape).to(A.dtype)
     return LD_out, pivots.reshape(A.shape[:-1]), info.reshape(A.shape[:-2])

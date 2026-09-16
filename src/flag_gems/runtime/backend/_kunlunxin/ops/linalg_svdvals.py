@@ -39,6 +39,7 @@ dtype: float32 only (matching the generic linalg_svdvals contract).
 
 import logging
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -123,11 +124,16 @@ def _osj_svals_impl(A, sweeps=12):
     # S = column norms of B, computed on host (scalar-store workaround);
     # the D2H copy is also the completion barrier for the pipeline kernel.
     Bc = B.cpu().double()
-    S = Bc.norm(dim=1).to(device=dev, dtype=A.dtype)  # (batch, NW)
+    S = Bc.norm(dim=1).numpy()  # (batch, NW)
 
     k = min(m, n)
-    S_sorted, _ = torch.sort(S, dim=-1, descending=True)
-    S_sorted = S_sorted[:, :k]
+    # Descending sort on the host: the norms already live there, and the rows
+    # are short (pow2 NW), so a device round-trip + Triton radix sort (the
+    # vendor-registered torch.sort) would be pure overhead.
+    S_sorted = np.sort(S, axis=-1)[:, ::-1][:, :k]
+    S_sorted = torch.from_numpy(np.ascontiguousarray(S_sorted)).to(
+        device=dev, dtype=A.dtype
+    )
 
     if batch == 1:
         return S_sorted[0]

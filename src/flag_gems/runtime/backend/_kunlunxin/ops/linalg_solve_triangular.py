@@ -65,6 +65,8 @@ import triton.language as tl
 
 from flag_gems.utils import libentry
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 KS_SLICE = 64  # max RHS-column slice width (single-CTA lane width)
@@ -472,7 +474,8 @@ def _solve_tri_serial(A_view, B_view, unitriangular, upper, n, k, batch, orig_sh
         Bp = B_view.clone()
     else:
         Bp = torch.zeros((batch, n, kpad), dtype=A_view.dtype, device=A_view.device)
-        torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
+        if not tle_copy(B_view, Bp[:, :, :k]):
+            torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
     br = _pick_block_rows(n)
     if br:
         for r0 in range(0, n, br):
@@ -556,7 +559,8 @@ def _solve_tri_dot(A_view, B_view, unitriangular, upper, n, k, batch, orig_shape
         Bp = B_view.clone()
     else:
         Bp = torch.zeros((batch, n, kpad), dtype=dtype, device=device)
-        torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
+        if not tle_copy(B_view, Bp[:, :, :k]):
+            torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
     rsa = A_view.stride(1)
     csb = kpad
     nb = (n + bs - 1) // bs
@@ -726,8 +730,10 @@ def _solve_tri(A, B, unitriangular, upper):
         Ah, Al, Bh0, Bl0 = _expand_fp64_inputs(A_view, B_view)
         Bh = torch.zeros((batch, n, kpad), dtype=torch.float32, device=A.device)
         Bl = torch.zeros((batch, n, kpad), dtype=torch.float32, device=A.device)
-        torch.ops.aten._copy_from(Bh0, Bh[:, :, :k], False)
-        torch.ops.aten._copy_from(Bl0, Bl[:, :, :k], False)
+        if not tle_copy(Bh0, Bh[:, :, :k]):
+            torch.ops.aten._copy_from(Bh0, Bh[:, :, :k], False)
+        if not tle_copy(Bl0, Bl[:, :, :k]):
+            torch.ops.aten._copy_from(Bl0, Bl[:, :, :k], False)
         _trsm_slice_xpu_kernel[grid](
             A_view,
             B_view,
@@ -754,7 +760,8 @@ def _solve_tri(A, B, unitriangular, upper):
             Bp = B_view.clone()
         else:
             Bp = torch.zeros((batch, n, kpad), dtype=A.dtype, device=A.device)
-            torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
+            if not tle_copy(B_view, Bp[:, :, :k]):
+                torch.ops.aten._copy_from(B_view, Bp[:, :, :k], False)
         if n % 16 == 0 and n >= 64:
             # Blocked TRSM (measured 2026-09-10, XPU card 6): the serial
             # substitution sweep is O(n^2) straight-line iterations per slice
@@ -880,7 +887,8 @@ def linalg_solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=
 
     if A.numel() == 0 or B.numel() == 0:
         if out is not None:
-            torch.ops.aten._copy_from(B, out, False)
+            if not tle_copy(B, out):
+                torch.ops.aten._copy_from(B, out, False)
             return out
         return B.clone()
 
@@ -896,7 +904,8 @@ def linalg_solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=
         )
         result = result.mT.contiguous()
         if out is not None:
-            torch.ops.aten._copy_from(result, out, False)
+            if not tle_copy(result, out):
+                torch.ops.aten._copy_from(result, out, False)
             return out
         return result
 
@@ -920,7 +929,8 @@ def linalg_solve_triangular(A, B, *, upper, left=True, unitriangular=False, out=
         X = _solve_tri(A, B, unitriangular, False)
 
     if out is not None:
-        torch.ops.aten._copy_from(X, out, False)
+        if not tle_copy(X, out):
+            torch.ops.aten._copy_from(X, out, False)
         return out
     return X
 

@@ -31,6 +31,7 @@ CUSTOMIZED_UNUSED_OPS = (
     "unique", 
     "slice",
     "conv_transpose1d",
+    "mkldnn_rnn_layer",
 )
 
 

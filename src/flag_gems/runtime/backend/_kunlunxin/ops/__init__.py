@@ -177,7 +177,6 @@ from .conv1d import conv1d
 from .conv2d import conv2d
 from .conv3d import conv3d
 from .conv_depthwise2d import _conv_depthwise2d
-from .conv_transpose1d import conv_transpose1d
 from .conv_transpose2d import conv_transpose2d
 from .copy import copy, copy_
 from .copysign import copysign, copysign_out
@@ -269,7 +268,6 @@ from .fused_experts_impl import (
     inplace_fused_experts,
     outplace_fused_experts,
 )
-from .fused_recurrent_gated_delta_rule_fwd import fused_recurrent_gated_delta_rule_fwd
 from .gather import gather, gather_backward
 from .gcd import gcd, gcd_, gcd_out
 from .ge import ge, ge_scalar, greater_equal_
@@ -403,7 +401,6 @@ from .minimum import minimum
 from .miopen_batch_norm_backward import miopen_batch_norm_backward
 from .mish import mish, mish_
 from .mish_backward import mish_backward
-from .mkldnn_rnn_layer import mkldnn_rnn_layer
 from .mm import mm, mm_out
 from .mode import mode
 from .moe_sum import moe_sum
@@ -1306,7 +1303,6 @@ __all__ = [
     "fused_experts_impl",
     "inplace_fused_experts",
     "outplace_fused_experts",
-    "fused_recurrent_gated_delta_rule_fwd",
     "get_paged_mqa_logits_metadata",
     "group_mm",
     "native_group_norm",
@@ -1318,7 +1314,6 @@ __all__ = [
     "mish_",
     "mish_backward",
     "miopen_batch_norm_backward",
-    "mkldnn_rnn_layer",
     "moe_sum",
     "mse_loss_backward",
     "multiply",
@@ -1488,7 +1483,6 @@ __all__ = [
     "avg_pool3d",
     "avg_pool3d_backward",
     "col2im",
-    "conv_transpose1d",
     "conv_transpose2d",
     "fractional_max_pool2d",
     "fractional_max_pool2d_backward",

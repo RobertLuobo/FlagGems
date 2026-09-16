@@ -66,6 +66,8 @@ from flag_gems.ops.linalg_matrix_norm import _ord2_norm as _generic_ord2_norm
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_NUMERIC = {1, -1, 2, -2, float("inf"), -float("inf")}
@@ -196,7 +198,8 @@ def _native_contiguous(t):
     if t.is_contiguous():
         return t
     out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
-    torch.ops.aten._copy_from(t, out, False)
+    if not tle_copy(t, out):
+        torch.ops.aten._copy_from(t, out, False)
     return out
 
 
@@ -233,7 +236,8 @@ def _row_reduce(x, R, C, op, final_sqrt=False):
     if C % BN:
         ncols = triton.cdiv(C, BN) * BN
         pad = torch.full((R, ncols), _identity(op), dtype=x.dtype, device=dev)
-        torch.ops.aten._copy_from(x, pad[:, :C], False)
+        if not tle_copy(x, pad[:, :C]):
+            torch.ops.aten._copy_from(x, pad[:, :C], False)
         x = pad
         pitch = ncols
     nfull = ncols // BN
@@ -283,11 +287,9 @@ def _row_reduce(x, R, C, op, final_sqrt=False):
         )
         cop = _combine_op(op)
         pt = torch.full((R, BN), _identity(cop), dtype=torch.float32, device=dev)
-        torch.ops.aten._copy_from(
-            part[: nchunk * RP].reshape(nchunk, RP)[:, :R].transpose(0, 1),
-            pt[:, :nchunk],
-            False,
-        )
+        part_t = part[: nchunk * RP].reshape(nchunk, RP)[:, :R].transpose(0, 1)
+        if not tle_copy(part_t, pt[:, :nchunk]):
+            torch.ops.aten._copy_from(part_t, pt[:, :nchunk], False)
         out = torch.empty(RP + BM, dtype=torch.float32, device=dev)
         _row_reduce_kernel[(nrow_blocks, 1)](
             pt,
@@ -453,7 +455,8 @@ def _rank2_sigma_norm(Ab, B, M, N, mode):
     if K % BN:
         pitch = triton.cdiv(K, BN) * BN
         Wp = torch.zeros((B, 2, pitch), dtype=W.dtype, device=dev)
-        torch.ops.aten._copy_from(W, Wp[:, :, :K], False)
+        if not tle_copy(W, Wp[:, :, :K]):
+            torch.ops.aten._copy_from(W, Wp[:, :, :K], False)
         W = Wp
 
     aa = _row_reduce(W[:, 0, :], B, pitch, _OP_SUMSQ)
@@ -968,7 +971,8 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
         Wt = _native_contiguous(Ab.transpose(-2, -1))
     else:
         Wt = Ab
-    torch.ops.aten._copy_from(Wt, Wh[:, :K, :R], False)
+    if not tle_copy(Wt, Wh[:, :K, :R]):
+        torch.ops.aten._copy_from(Wt, Wh[:, :K, :R], False)
 
     sc_h = torch.empty((B, _BD_L), dtype=torch.float32, device=dev)
     sc_l = torch.empty_like(sc_h)
@@ -987,8 +991,10 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
 
     with torch_device_fn.device(dev):
         for j in range(min(K, R - 1)):
-            torch.ops.aten._copy_from(Wh[:, :, j], sc_h, False)
-            torch.ops.aten._copy_from(Wl[:, :, j], sc_l, False)
+            if not tle_copy(Wh[:, :, j], sc_h):
+                torch.ops.aten._copy_from(Wh[:, :, j], sc_h, False)
+            if not tle_copy(Wl[:, :, j], sc_l):
+                torch.ops.aten._copy_from(Wl[:, :, j], sc_l, False)
             _bidiag_col_h_kernel[(B,)](sc_h, sc_l, v_h, v_l, th, tl_, B, j)
             _bidiag_left_w_kernel[(B, int(RP // _BD_C))](
                 Wh, Wl, v_h, v_l, th, tl_, wh_b, wl_b, B, j, RP, PROW
@@ -1010,12 +1016,16 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
         eh = torch.zeros_like(dh)
         el = torch.zeros_like(dh)
         nd = min(_BD_L, RP)
-        torch.ops.aten._copy_from(Wh.diagonal(0, 1, 2), dh[:, :nd], False)
-        torch.ops.aten._copy_from(Wl.diagonal(0, 1, 2), dl[:, :nd], False)
+        if not tle_copy(Wh.diagonal(0, 1, 2), dh[:, :nd]):
+            torch.ops.aten._copy_from(Wh.diagonal(0, 1, 2), dh[:, :nd], False)
+        if not tle_copy(Wl.diagonal(0, 1, 2), dl[:, :nd]):
+            torch.ops.aten._copy_from(Wl.diagonal(0, 1, 2), dl[:, :nd], False)
         ne = min(_BD_L, RP - 1)
         if ne > 0:
-            torch.ops.aten._copy_from(Wh.diagonal(1, 1, 2), eh[:, :ne], False)
-            torch.ops.aten._copy_from(Wl.diagonal(1, 1, 2), el[:, :ne], False)
+            if not tle_copy(Wh.diagonal(1, 1, 2), eh[:, :ne]):
+                torch.ops.aten._copy_from(Wh.diagonal(1, 1, 2), eh[:, :ne], False)
+            if not tle_copy(Wl.diagonal(1, 1, 2), el[:, :ne]):
+                torch.ops.aten._copy_from(Wl.diagonal(1, 1, 2), el[:, :ne], False)
         td = torch.empty((B, _BD_L), dtype=torch.float32, device=dev)
         tdl = torch.empty_like(td)
         te = torch.empty_like(td)

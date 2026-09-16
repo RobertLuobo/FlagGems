@@ -20,6 +20,8 @@ import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 
@@ -287,7 +289,8 @@ def launch_replication_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
             _launch_flat_clamp(x, kout, W_in, W_out, pad_l, total_out)
         if kout is not out3:
             with torch_device_fn.device(x.device):
-                torch.ops.aten._copy_from(kout, out3)
+                if not tle_copy(kout, out3):
+                    torch.ops.aten._copy_from(kout, out3)
         return out3.squeeze(0) if is_2d else out3
 
     # Fast path: interior block via one vendor strided copy (torch.narrow
@@ -299,7 +302,9 @@ def launch_replication_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
     if not out3.is_contiguous():
         kout3 = torch.empty_like(out3)
         with torch_device_fn.device(x.device):
-            torch.ops.aten._copy_from(x, torch.narrow(kout3, 2, pad_l, W_in))
+            dst = torch.narrow(kout3, 2, pad_l, W_in)
+            if not tle_copy(x, dst):
+                torch.ops.aten._copy_from(x, dst)
             per = pad_l + pad_r
             if per > 0:
                 grid = (triton.cdiv(N * C * per, _EDGE_BLOCK),)
@@ -313,11 +318,14 @@ def launch_replication_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
                     N * C,
                     BLOCK=_EDGE_BLOCK,
                 )
-            torch.ops.aten._copy_from(kout3, out3)
+            if not tle_copy(kout3, out3):
+                torch.ops.aten._copy_from(kout3, out3)
         return out3.squeeze(0) if is_2d else out3
 
     with torch_device_fn.device(x.device):
-        torch.ops.aten._copy_from(x, torch.narrow(out3, 2, pad_l, W_in))
+        dst2 = torch.narrow(out3, 2, pad_l, W_in)
+        if not tle_copy(x, dst2):
+            torch.ops.aten._copy_from(x, dst2)
         per = pad_l + pad_r
         if per > 0:
             grid = (triton.cdiv(N * C * per, _EDGE_BLOCK),)

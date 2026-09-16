@@ -189,10 +189,10 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
                 f"The broadcast shape {broadcast_shape} does not match destination shape {tuple(dst.shape)}"
             ) from None
     if dst.numel() == 0:
-        # Respect PyTorch behaviour: empty tensors should still validate broadcast.
-        return torch.ops.aten.copy_.default.redispatch(
-            _FALLBACK_KEYSET, dst, src, non_blocking
-        )
+        # Empty copy is a no-op (broadcast compatibility was already validated
+        # above); the previous aten::copy_.default.redispatch re-entry is not
+        # needed on any backend.
+        return dst
 
     logger.debug("GEMS_KUNLUNXIN COPY_")
 

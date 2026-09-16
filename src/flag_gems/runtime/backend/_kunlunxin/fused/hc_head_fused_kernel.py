@@ -10,46 +10,7 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-HC head fused kernel (kunlunxin / XPU specialized).
-
-Why a specialized file (XPU, measured 2026-09-04):
-- The general implementation in ``flag_gems/fused/mhc/hc_head_fused_kernel.py``
-  launches a single per-token Triton kernel whose inner loads are masked with
-  ``h_mask = h_off < H`` (``other=0.0``). On XPU the masked tail of the last
-  row of the last token reads out of the tensor allocation (mask/other is not
-  enforced at the load level, same family of defect as documented for
-  ``mhc_bwd``/``mhc_pre``), which raises a device kernel exception
-  (``torch.AcceleratorError: CUDA error: unspecified launch failure``,
-  ``cuapi_xpu_wait ... status=719``) and wedges the device for all subsequent
-  launches: functional baseline ``-m hc_head_fused_kernel --ref cpu`` gives
-  15 failed / 1 passed / 16 skipped (of the 16 non-skipped cases only the
-  smallest ``n1_h1280_hc4`` survives; every following case dies at a plain
-  ``torch.manual_seed`` in the test harness).
-- The general kernel also carries ``@triton.autotune`` (5 configs keyed on
-  (H, HC)); the mhc family convention on XPU is a single fixed config.
-
-Design (mirrors the proven ``_kunlunxin/fused/mhc_pre.py`` 3-kernel pattern,
-all single-shot, no internal loops, no reduction over masked lanes):
-  1. ``_sqrsum_partials_kernel``  grid (N, T): exact unmasked tiles
-     (K % B == 0 for the full test/benchmark matrix) -> (N, T) partials.
-  2. ``torch.mm`` (vendor engine, f32, numerically identical to the reference
-     ``torch.matmul``) -> (N, HC) mixes.
-  3. ``_head_mix_kernel``        grid (N,): rsqrt + sigmoid -> pre_mix, all
-     scalar loads, no vector reductions.
-  4. ``_weighted_row_kernel``    grid (N,): weighted sum, masked loads clamped
-     to an in-bounds index, masked store (mhc_pre-proven safe pattern).
-
-Key points:
-- NO ``@triton.autotune``; single config, num_stages=1 (mhc convention).
-- H, HC, B are ``tl.constexpr``; any K not divisible by B is zero-padded in
-  the wrapper (padded lanes contribute 0 to sqrsum and mixes, and the rsqrt
-  denominator keeps the original ``K = HC * H``), so arbitrary shapes stay
-  correct instead of faulting.
-"""
-
+# limitations under the License. 
 import logging
 import os
 
@@ -73,17 +34,28 @@ _T_MAX = 128
 
 @triton.jit
 def _sqrsum_partials_kernel(
-    residual_ptr,  # (N, K) bf16, contiguous, K % B == 0
-    part_ptr,  # (N, T) f32, T = K // B
-    K: tl.constexpr,
+    residual_ptr,  # (N, K) bf16, contiguous
+    part_ptr,  # (N, T) f32, T = cdiv(K, B)
+    columns,  # runtime K
     B: tl.constexpr,
+    T: tl.constexpr,
+    ALIGNED: tl.constexpr,
 ):
-    """Exact unmasked per-token tile squares (grid (N, cdiv(K, B)))."""
+    """Exact per-token tile squares (grid (N, cdiv(K, B))).
+
+    ALIGNED == True (K % B == 0, the official-matrix path) compiles to the
+    unmasked block DMA; otherwise the tail tile is masked (contiguous access).
+    """
     pid_n = tl.program_id(0)
     pid_t = tl.program_id(1)
     offs = pid_t * B + tl.arange(0, B)
-    v = tl.load(residual_ptr + pid_n * K + offs).to(tl.float32)
-    tl.store(part_ptr + pid_n * (K // B) + pid_t, tl.sum(v * v))
+    if ALIGNED:
+        v = tl.load(residual_ptr + pid_n * columns + offs).to(tl.float32)
+    else:
+        v = tl.load(
+            residual_ptr + pid_n * columns + offs, mask=offs < columns, other=0.0
+        ).to(tl.float32)
+    tl.store(part_ptr + pid_n * T + pid_t, tl.sum(v * v))
 
 
 @triton.jit
@@ -195,31 +167,30 @@ def hc_head_fused_kernel(
     residual_c = hs_flat.contiguous()
     out_c = out if out.is_contiguous() else torch.empty_like(out)
 
-    # zero-pad the flattened K dim when it is not an exact tile (matrix shapes
-    # are exact, so no copy for the common path)
-    K_eff = T * B
-    if K_eff == K:
-        x2d = residual_c.reshape(num_tokens, K)
-        fn_eff = fn
-    else:
-        x2d = torch.nn.functional.pad(
-            residual_c.reshape(num_tokens, K), (0, K_eff - K)
-        )
-        fn_eff = torch.nn.functional.pad(fn, (0, K_eff - K))
+    # No host-side zero-padding of the flattened K dim: the sqrsum kernel masks
+    # the tail tile (ALIGNED constexpr keeps the exact-tile common path
+    # unmasked) and the vendor mm pads un-aligned K internally, so the previous
+    # ``torch.nn.functional.pad`` round-trips are unnecessary (and are an ATen
+    # fallback).  Pad columns were all-zero; dropping them is bit-identical.
+    x2d = residual_c.reshape(num_tokens, K)
 
-    # 1) rms sqrsum partials (exact unmasked tiles)
-    part = torch.empty(num_tokens, K_eff // B, dtype=torch.float32, device=hs_flat.device)
-    _sqrsum_partials_kernel[(num_tokens, K_eff // B)](
+    # 1) rms sqrsum partials (exact tiles, masked tail for K % B != 0)
+    part = torch.empty(num_tokens, T, dtype=torch.float32, device=hs_flat.device)
+    _sqrsum_partials_kernel[(num_tokens, T)](
         x2d,
         part,
-        K=K_eff,
+        K,
         B=B,
+        T=T,
+        ALIGNED=(K % B == 0),
         num_warps=4,
         num_stages=1,
     )
 
     # 2) mixes via vendor f32 mm (numerically identical to the reference)
-    mixes = torch.mm(x2d.to(torch.float32), fn_eff.t())
+    from flag_gems.runtime.backend._kunlunxin.ops.mm import mm as _gems_mm
+
+    mixes = _gems_mm(x2d.to(torch.float32), fn.t())
 
     # 3) rsqrt + sigmoid -> pre_mix
     pre_mix = torch.empty(num_tokens, HC, dtype=torch.float32, device=hs_flat.device)
@@ -229,7 +200,7 @@ def hc_head_fused_kernel(
         hc_scale,
         hc_base,
         pre_mix,
-        T=K_eff // B,
+        T=T,
         K=K,
         rms_eps=rms_eps,
         hc_eps=hc_eps,

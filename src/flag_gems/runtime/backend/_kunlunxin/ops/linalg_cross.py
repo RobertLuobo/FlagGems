@@ -23,6 +23,8 @@ from flag_gems.ops.linalg_cross import _resolve_view, _validate_inputs
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 # The generic complex kernels of flag_gems.ops.linalg_cross do not compile on
@@ -123,8 +125,10 @@ def _linalg_cross_complex_xpu(input, other, dim, output=None):
     if output is None:
         return result
     # Write through the user's (possibly strided) out tensor with the native
-    # strided-copy engine; flag_gems never overrides _copy_from.
-    torch.ops.aten._copy_from(result, output, False)
+    # strided-copy engine; flag_gems never overrides _copy_from. tle dma
+    # first where it can express the copy.
+    if not tle_copy(result, output):
+        torch.ops.aten._copy_from(result, output, False)
     return output
 
 

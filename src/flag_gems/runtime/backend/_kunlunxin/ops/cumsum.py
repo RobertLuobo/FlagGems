@@ -23,6 +23,8 @@ from flag_gems.runtime import device, torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 device = device.name
 
@@ -541,9 +543,11 @@ def _scan_mid_into(inp, out, M, N, K):
         scan_group_add_kernel[(R, n_groups)](
             xp, out_t, sums, Np, n_groups, _GROUP, num_warps=8, buffer_size_limit=2048
         )
-    torch.ops.aten._copy_from(
-        out_t[:, :N].reshape(M, K, N).permute(0, 2, 1), out.view(M, N, K), False
-    )
+    src_t = out_t[:, :N].reshape(M, K, N).permute(0, 2, 1)
+    if not tle_copy(src_t, out.view(M, N, K)):
+        torch.ops.aten._copy_from(
+            out_t[:, :N].reshape(M, K, N).permute(0, 2, 1), out.view(M, N, K), False
+        )
 
 
 def cumsum_wrapper(inp, dim=1, dtype=None, out=None):

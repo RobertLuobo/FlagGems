@@ -26,6 +26,7 @@ from flag_gems.utils import libentry
 
 from .cumsum import cumsum
 from .topk import _get_finfo_val, _get_iinfo_val, argsort
+from ..utils.tle_copy import tle_copy
 
 logger = logging.getLogger(__name__)
 
@@ -1321,7 +1322,8 @@ def sort_stable(inp, *, stable, dim=-1, descending=False):
         # renorm.py::_native_transposed_copy).
         view = torch.movedim(inp, dim, -1)
         inp = torch.empty(view.shape, device=inp.device, dtype=inp.dtype)
-        torch.ops.aten._copy_from(view, inp, False)
+        if not tle_copy(view, inp):
+            torch.ops.aten._copy_from(view, inp, False)
     else:
         inp = inp.contiguous()
 

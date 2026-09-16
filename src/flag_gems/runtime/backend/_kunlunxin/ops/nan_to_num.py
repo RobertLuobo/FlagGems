@@ -70,7 +70,7 @@ _RAW_TYPE_CODE = {
 
 if _TLE_OK:
 
-    @tle.raw.dialect("xpu", file=os.path.join(_HERE, "nan_to_num_raw.xpu"))
+    @tle.raw.dialect("xpu3", file=os.path.join(_HERE, "nan_to_num_raw.xpu"))
     def nan_to_num_raw_(in_, out, numel, esz, type_code, nan_bits, pinf_bits,
                         ninf_bits, chunk_start, chunk_count):
         ...

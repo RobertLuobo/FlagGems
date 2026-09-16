@@ -24,6 +24,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 
@@ -1173,8 +1175,10 @@ def softmax(self, dim, half_to_float=False):
             # transpose-copy on top of the input transpose).
             inp_view = self.view(M, N, K).transpose(1, 2)
             inp_reshaped = torch.empty((M * K, N), dtype=self.dtype, device=self.device)
-            # native strided copy (flag_gems never overrides _copy_from)
-            torch.ops.aten._copy_from(inp_view, inp_reshaped, False)
+            # native strided copy (flag_gems never overrides _copy_from); tle
+            # dma first where it can express the copy.
+            if not tle_copy(inp_view, inp_reshaped):
+                torch.ops.aten._copy_from(inp_view, inp_reshaped, False)
             out_reshaped = torch.empty((M * K, N), dtype=dtype, device=self.device)
 
             _softmax_forward_launch(out_reshaped, inp_reshaped, M * K, N)
@@ -1235,7 +1239,8 @@ def _native_contiguous(t):
     native XPU strided copy). `aten::_copy_from` is never overridden by gems.
     """
     dst = torch.empty(t.shape, dtype=t.dtype, device=t.device)
-    torch.ops.aten._copy_from(t, dst, False)
+    if not tle_copy(t, dst):
+        torch.ops.aten._copy_from(t, dst, False)
     return dst
 
 
@@ -1294,25 +1299,29 @@ def softmax_out(self, dim, half_to_float=False, *, out):
             # innermost, run the K == 1 launch family into a contiguous
             # scratch, then mirror it back through a transposed view of out.
             inp_t = torch.empty((M * K, N), dtype=inp.dtype, device=inp.device)
-            torch.ops.aten._copy_from(
-                inp.view(M, N, K).transpose(1, 2), inp_t.view(M, K, N), False
-            )
+            inp_view = inp.view(M, N, K).transpose(1, 2)
+            if not tle_copy(inp_view, inp_t.view(M, K, N)):
+                torch.ops.aten._copy_from(inp_view, inp_t.view(M, K, N), False)
             tmp = torch.empty((M * K, N), dtype=dtype, device=inp.device)
             _softmax_forward_launch(tmp, inp_t, M * K, N)
             src = tmp.view(M, K, N).transpose(1, 2)
             if out.is_contiguous():
-                torch.ops.aten._copy_from(src, out.view(M, N, K), False)
+                if not tle_copy(src, out.view(M, N, K)):
+                    torch.ops.aten._copy_from(src, out.view(M, N, K), False)
             else:
                 scratch = torch.empty((M, N, K), dtype=dtype, device=out.device)
-                torch.ops.aten._copy_from(src, scratch, False)
-                torch.ops.aten._copy_from(scratch.view(self.shape), out, False)
+                if not tle_copy(src, scratch):
+                    torch.ops.aten._copy_from(src, scratch, False)
+                if not tle_copy(scratch.view(self.shape), out):
+                    torch.ops.aten._copy_from(scratch.view(self.shape), out, False)
         elif not out.is_contiguous():
             # The launch kernels write flat [M, N] offsets; a strided out
             # (e.g. a slice view) would be corrupted. Compute into a
             # contiguous scratch and mirror it with the native strided copy.
             tmp = torch.empty(self.shape, dtype=dtype, device=self.device)
             _softmax_forward_launch(tmp, inp, M, N)
-            torch.ops.aten._copy_from(tmp, out, False)
+            if not tle_copy(tmp, out):
+                torch.ops.aten._copy_from(tmp, out, False)
         else:
             _softmax_forward_launch(out, inp, M, N)
     return out
@@ -1363,8 +1372,10 @@ def softmax_backward(grad_output, output, dim, input_dtype, grad_input=None):
             out_reshaped = torch.empty(
                 (M * K, N), dtype=output.dtype, device=output.device
             )
-            torch.ops.aten._copy_from(out_grad_view, out_grad_reshaped, False)
-            torch.ops.aten._copy_from(out_view, out_reshaped, False)
+            if not tle_copy(out_grad_view, out_grad_reshaped):
+                torch.ops.aten._copy_from(out_grad_view, out_grad_reshaped, False)
+            if not tle_copy(out_view, out_reshaped):
+                torch.ops.aten._copy_from(out_view, out_reshaped, False)
             # `in_grad` is a fresh (uninitialized) buffer and the kernels
             # below overwrite every lane of in_grad_reshaped, so no copy of
             # the uninitialized data is needed (the previous code paid one
@@ -1417,5 +1428,6 @@ def softmax_backward_out(grad_output, output, dim, input_dtype, *, grad_input):
         # this would run the Triton strided copy (~1.25 GB/s, 100-1000x slower
         # than the native XPU copy for a transposed source).  `aten::_copy_from`
         # is never overridden by gems: native strided copy.
-        torch.ops.aten._copy_from(result, grad_input, False)
+        if not tle_copy(result, grad_input):
+            torch.ops.aten._copy_from(result, grad_input, False)
     return grad_input

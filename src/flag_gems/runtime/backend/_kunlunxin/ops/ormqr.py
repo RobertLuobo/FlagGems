@@ -43,6 +43,8 @@ import triton.language as tl
 
 from flag_gems.utils import libentry
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 # Max safe 1D vector width on the XPU backend (probe-verified).
@@ -968,12 +970,14 @@ def ormqr(input, tau, other, left=True, transpose=False):
             dtype=input.dtype,
             device=input.device,
         )
-        torch.ops.aten._copy_from(
-            input_flat, V_work[:, : input_flat.shape[-2], :], False
-        )
+        V_slice = V_work[:, : input_flat.shape[-2], :]
+        if not tle_copy(input_flat, V_slice):
+            torch.ops.aten._copy_from(input_flat, V_slice, False)
         V_work = _set_diag(V_work, k)
         C_pad = torch.zeros(B, M + 2 * BR, N, dtype=C.dtype, device=C.device)
-        torch.ops.aten._copy_from(C_flat, C_pad[:, :M, :], False)
+        C_slice = C_pad[:, :M, :]
+        if not tle_copy(C_flat, C_slice):
+            torch.ops.aten._copy_from(C_flat, C_slice, False)
         C_t = C_pad.transpose(1, 2)  # (B, N, M + 2*BR)
         s_cb, s_cm, s_cn = C_t.stride(0), C_t.stride(1), C_t.stride(2)
         s_vb, s_vm, s_vk = V_work.stride(0), V_work.stride(1), V_work.stride(2)
@@ -1008,7 +1012,9 @@ def ormqr(input, tau, other, left=True, transpose=False):
         Nchunk = BR // _XPU_VEC
         N_pad = N + 2 * BR
         C_pad = torch.zeros(B, M, N_pad, dtype=C.dtype, device=C.device)
-        torch.ops.aten._copy_from(C_flat, C_pad[:, :, :N], False)
+        C_slice2 = C_pad[:, :, :N]
+        if not tle_copy(C_flat, C_slice2):
+            torch.ops.aten._copy_from(C_flat, C_slice2, False)
         V_rows = input_flat.shape[-2]
         V_pad_rows = N + 2 * BR
         V_work = torch.zeros(
@@ -1018,7 +1024,9 @@ def ormqr(input, tau, other, left=True, transpose=False):
             dtype=input.dtype,
             device=input.device,
         )
-        torch.ops.aten._copy_from(input_flat, V_work[:, :V_rows, :], False)
+        V_slice2 = V_work[:, :V_rows, :]
+        if not tle_copy(input_flat, V_slice2):
+            torch.ops.aten._copy_from(input_flat, V_slice2, False)
         V_work = _set_diag(V_work, k)
         s_cb, s_cm, s_cn = C_pad.stride(0), C_pad.stride(1), C_pad.stride(2)
         s_vb, s_vm, s_vk = V_work.stride(0), V_work.stride(1), V_work.stride(2)

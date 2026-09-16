@@ -21,9 +21,10 @@ Simple baseline for correctness. Each butterfly stage reads from IN, writes to O
 import math
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+from .copy import copy_
 
 MAX_GRID = 65535
 
@@ -109,7 +110,16 @@ def _hadamard_transform_fwd(x, scale):
     log_dim = math.ceil(math.log2(dim)) if dim > 0 else 0
     dim_padded = 1 << log_dim
     if dim != dim_padded:
-        x = F.pad(x, (0, dim_padded - dim))
+        # F.pad -> ATen constant_pad_nd (an ATen fallback on XPU); allocate the
+        # zero-padded buffer directly and fill its left part with the vendor
+        # copy (the "_zeros + copy_" pattern used by the other de-ATen fixes).
+        # The pad columns must be zeros: the butterfly stages mix columns, so
+        # garbage in the tail would leak into the first `dim` outputs.
+        x_padded = torch.zeros(
+            *x.shape[:-1], dim_padded, dtype=x.dtype, device=x.device
+        )
+        copy_(x_padded[..., :dim], x)
+        x = x_padded
 
     x_flat = x.reshape(-1, dim_padded).contiguous()
     n_rows = x_flat.shape[0]

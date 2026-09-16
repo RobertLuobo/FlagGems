@@ -26,6 +26,8 @@ from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.limits import get_dtype_max
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 # NOTE (kunlunxin/XPU): performance recipe (2026-08-17) follows the
@@ -389,7 +391,8 @@ def _pad_buffer(src, pad_to, device):
     n = src.numel()
     buf = torch.full((pad_to,), _pad_value(src.dtype), dtype=src.dtype, device=device)
     if n:
-        torch.ops.aten._copy_from(src, buf[:n], False)
+        if not tle_copy(src, buf[:n]):
+            torch.ops.aten._copy_from(src, buf[:n], False)
     return buf
 
 
@@ -438,7 +441,8 @@ def _min_flat(inp, out, device):
     pad_val = _pad_value(inp.dtype)
     if numel <= block:
         buf = torch.full((block,), pad_val, dtype=inp.dtype, device=device)
-        torch.ops.aten._copy_from(inp, buf[:numel], False)
+        if not tle_copy(inp, buf[:numel]):
+            torch.ops.aten._copy_from(inp, buf[:numel], False)
         min_kernel_1[(1, 1)](
             buf,
             out,
@@ -493,11 +497,13 @@ def _min_flat(inp, out, device):
             tail_buf = torch.full(
                 (bm * block,), pad_val, dtype=inp.dtype, device=device
             )
-            torch.ops.aten._copy_from(
-                inp[rows_exact * block : rows * block],
-                tail_buf[: tail_rows * block],
-                False,
-            )
+            src_tail = inp[rows_exact * block : rows * block]
+            if not tle_copy(src_tail, tail_buf[: tail_rows * block]):
+                torch.ops.aten._copy_from(
+                    src_tail,
+                    tail_buf[: tail_rows * block],
+                    False,
+                )
             tail_mid = torch.empty((bm,), dtype=inp.dtype, device=device)
             min_kernel_2d[(1, 1)](
                 tail_buf,
@@ -509,12 +515,15 @@ def _min_flat(inp, out, device):
                 False,
                 buffer_size_limit=2048,
             )
-            torch.ops.aten._copy_from(
-                tail_mid[:tail_rows], mid[rows_exact : rows_exact + tail_rows], False
-            )
+            src_h1 = tail_mid[:tail_rows]
+            dst_h1 = mid[rows_exact : rows_exact + tail_rows]
+            if not tle_copy(src_h1, dst_h1):
+                torch.ops.aten._copy_from(src_h1, dst_h1, False)
         if res:
             res_buf = torch.full((block,), pad_val, dtype=inp.dtype, device=device)
-            torch.ops.aten._copy_from(inp[rows * block :], res_buf[:res], False)
+            src_res = inp[rows * block :]
+            if not tle_copy(src_res, res_buf[:res]):
+                torch.ops.aten._copy_from(src_res, res_buf[:res], False)
             min_kernel_1[(1, 1)](
                 res_buf,
                 mid[rows:],
@@ -666,7 +675,8 @@ def min_dim(inp, dim=None, keepdim=False):
         # min along a size-1 dim is the identity (value = input, index = 0) --
         # the native strided copy engine instead of launching a kernel.
         with torch_device_fn.device(inp.device):
-            torch.ops.aten._copy_from(inp, out_value, False)
+            if not tle_copy(inp, out_value):
+                torch.ops.aten._copy_from(inp, out_value, False)
         out_index.zero_()
         if not keepdim:
             out_value = torch.squeeze(out_value, dim)
@@ -715,7 +725,8 @@ def min_dim(inp, dim=None, keepdim=False):
                             list(view.shape), dtype=inp.dtype, device=inp.device
                         )
                         with torch_device_fn.device(inp.device):
-                            torch.ops.aten._copy_from(view, src, False)
+                            if not tle_copy(view, src):
+                                torch.ops.aten._copy_from(view, src, False)
                     part_val = torch.empty(VR, dtype=torch.float32, device=inp.device)
                     best_c = torch.empty((M2,), dtype=torch.int32, device=inp.device)
                     out_flat = out_value.reshape(-1)
@@ -783,7 +794,8 @@ def min_dim(inp, dim=None, keepdim=False):
             else:
                 src = torch.empty(list(view.shape), dtype=inp.dtype, device=inp.device)
                 with torch_device_fn.device(inp.device):
-                    torch.ops.aten._copy_from(view, src, False)
+                    if not tle_copy(view, src):
+                        torch.ops.aten._copy_from(view, src, False)
             nc = triton.cdiv(N, block_n)
             part_val = torch.empty((M2, nc), dtype=torch.float32, device=inp.device)
             best_c = torch.empty((M2,), dtype=torch.int32, device=inp.device)

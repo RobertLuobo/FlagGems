@@ -21,6 +21,8 @@ import triton.language as tl
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 
@@ -554,7 +556,9 @@ def _vendor_copy_from(src: torch.Tensor, dst: torch.Tensor):
     # aten::_copy_from is not registered by flag_gems -> dispatches straight to
     # the vendor native copy (fast), unlike copy_() which redispatch to the
     # gems kernel under use_gems (catastrophically slower on this XPU).
-    torch.ops.aten._copy_from(src, dst)
+    # tle dma (TMA/DSA) is preferred where it can express the copy.
+    if not tle_copy(src, dst):
+        torch.ops.aten._copy_from(src, dst)
     return dst
 
 

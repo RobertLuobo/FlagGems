@@ -193,6 +193,24 @@ def _smooth_l1_loss_partial_sum_kernel(
 
 @libentry()
 @triton.jit
+def _sum_partial_kernel(inp, mid, M, MEAN: tl.constexpr, BLOCK_SIZE: tl.constexpr):
+    # Masked stage-1 for a plain 1-D tensor sum (replaces torch.sum on the
+    # broadcast path): one program sums BLOCK_SIZE fp32-promoted elements into
+    # mid[pid] (fp32 accumulation, so the fp16/bf16 large-shape overflow of
+    # summing in the input dtype is avoided). Tail blocks are handled with
+    # mask + other=0.0 (needs TRITONXPU_OTHER_SIM=1 at launch).
+    pid = ext.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < M
+    v = tl.load(inp + offset, mask=mask, other=0.0).to(tl.float32)
+    sum_val = tl.sum(v)
+    if MEAN:
+        sum_val = sum_val / M
+    tl.store(mid + pid, sum_val)
+
+
+@libentry()
+@triton.jit
 def _smooth_l1_loss_final_sum_kernel(mid, out, mid_size, BLOCK_MID: tl.constexpr):
     offset = tl.arange(0, BLOCK_MID)
     mid_ptrs = mid + offset
@@ -250,6 +268,44 @@ def _smooth_l1_loss_reduce_fused(input, target, beta, reduction):
     return out
 
 
+def _sum_reduce(loss, mean):
+    """Two-stage fp32 sum of a 1-D tensor (replaces ``torch.sum``).
+
+    The broadcast path materializes the loss with the generic pointwise codegen
+    and reduces it here; stage-1 is shared logic with
+    ``_smooth_l1_loss_reduce_fused`` (masked tail, fp32 accumulation, and the
+    ``mean`` division inside stage-1 so the returned 0-d is already the mean).
+    """
+    loss = loss.contiguous().reshape(-1)
+    M = loss.numel()
+    block_size = get_block_size_1d(M, loss.element_size())
+    mid_size = triton.cdiv(M, block_size)
+    if mid_size > _MAX_MID:
+        block_size = triton.next_power_of_2(triton.cdiv(M, _MAX_MID))
+        mid_size = triton.cdiv(M, block_size)
+    block_mid = triton.next_power_of_2(mid_size)
+
+    mid = torch.empty((mid_size,), dtype=torch.float32, device=loss.device)
+    out = torch.empty([], dtype=loss.dtype, device=loss.device)
+
+    os.environ["TRITONXPU_OTHER_SIM"] = "1"
+    with torch_device_fn.device(loss.device):
+        _sum_partial_kernel[(mid_size, 1, 1)](
+            loss, mid, M, mean, block_size, buffer_size_limit=2048
+        )
+        if mid_size == 1:
+            if "TRITONXPU_OTHER_SIM" in os.environ:
+                del os.environ["TRITONXPU_OTHER_SIM"]
+            return mid.reshape([]).to(loss.dtype)
+        _smooth_l1_loss_final_sum_kernel[(1, 1, 1)](
+            mid, out, mid_size, block_mid, buffer_size_limit=2048
+        )
+    if "TRITONXPU_OTHER_SIM" in os.environ:
+        del os.environ["TRITONXPU_OTHER_SIM"]
+
+    return out
+
+
 def smooth_l1_loss(input, target, reduction=1, beta: float = 1.0):
     logger.debug("GEMS_KUNLUNXIN SMOOTH_L1_LOSS")
     reduction = _normalize_reduction(reduction)
@@ -277,12 +333,10 @@ def smooth_l1_loss(input, target, reduction=1, beta: float = 1.0):
         )
 
     # Broadcast inputs keep the generic pointwise path (the fused stage-1
-    # kernel indexes both operands with the same linear offset).
+    # kernel indexes both operands with the same linear offset); the emitted
+    # loss is reduced with a two-stage fp32 sum (no torch.sum).
     loss = _loss_values(input_expanded, target_expanded, beta)
-    result = torch.sum(loss)
-    if reduction == 1:
-        result = result / loss.numel()
-    return result
+    return _sum_reduce(loss, mean=(reduction == 1))
 
 
 def smooth_l1_loss_out(input, target, reduction=1, beta: float = 1.0, *, out):

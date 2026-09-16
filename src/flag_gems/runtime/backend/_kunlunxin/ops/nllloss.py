@@ -1375,14 +1375,40 @@ def nll_loss_nd_backward(
 # override is what the whole nll 2d/nd family actually executes.  The generic
 # KernelGen nll_loss2d (src/flag_gems/ops/nll_loss2d.py) builds its output from
 # torch.empty + raw kernels and therefore has no autograd edge to `self`, which
-# breaks torch.autograd.grad for every 3D+ nll_loss test.  Re-delegating to the
-# registered nll_loss2d_forward restores the graph: that op is autograd-visible
-# (its C++ autograd kernel builds the NllLoss2DBackward0 node and its backward
-# re-dispatches to the vendor nll_loss2d_backward), so torch.autograd.grad
-# works while the kernels stay the existing vendor ones.
+# breaks torch.autograd.grad for every 3D+ nll_loss test.  The previous
+# ``torch.ops.aten.nll_loss2d_forward`` re-entry rebuilt that edge from the
+# C++ autograd kernel (NllLoss2DBackward0); the same edge is rebuilt in pure
+# Python here: the Function's forward calls the vendor nll_loss2d_forward
+# directly (no ATen dispatch) and its backward calls the vendor
+# nll_loss2d_backward, so loss values and gradients are identical to the ATen
+# node while the dispatch-key path falls off the graph entirely.
+class _NllLoss2dAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, self, target, weight, reduction, ignore_index):
+        output, total_weight = nll_loss2d_forward(
+            self, target, weight, reduction, ignore_index
+        )
+        ctx.reduction = reduction
+        ctx.ignore_index = ignore_index
+        ctx.save_for_backward(self, target, weight, total_weight)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        self, target, weight, total_weight = ctx.saved_tensors
+        grad_input = nll_loss2d_backward(
+            grad_output,
+            self,
+            target,
+            weight=weight,
+            reduction=ctx.reduction,
+            ignore_index=ctx.ignore_index,
+            total_weight=total_weight,
+        )
+        # nll_loss has no weight gradient (matches NllLoss2DBackward0).
+        return grad_input, None, None, None, None
+
+
 def nll_loss2d(self, target, weight=None, reduction=1, ignore_index=-100):
     logger.debug("GEMS_KUNLUNXIN NLL_LOSS2D")
-    output, _ = torch.ops.aten.nll_loss2d_forward(
-        self, target, weight, reduction, ignore_index
-    )
-    return output
+    return _NllLoss2dAutograd.apply(self, target, weight, reduction, ignore_index)

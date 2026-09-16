@@ -21,6 +21,8 @@ import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
 
+from ..utils.tle_copy import tle_copy
+
 logger = logging.getLogger(__name__)
 
 
@@ -192,7 +194,8 @@ def _launch_reflection_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
     if total_out >= 262144:
         with torch_device_fn.device(x.device):
             mid = torch.ops.aten.slice(out, -1, pad_left, pad_left + W_in)
-            torch.ops.aten._copy_from(x, mid, False)
+            if not tle_copy(x, mid):
+                torch.ops.aten._copy_from(x, mid, False)
             # BLOCK=1024 vs 256 for the pad side kernels: measured on
             # [32,64,2048] pad(3,5) (big-shape split path) 61.8us -> 55.8us
             # (per-program dispatch dominates the reversed-gather pads; the

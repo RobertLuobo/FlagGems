@@ -17,13 +17,13 @@ import math
 from collections import namedtuple
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
+from ..utils.tle_copy import tle_copy
 from .sort import radix_sort_low_mem
 
 logger = logging.getLogger(__name__)
@@ -150,7 +150,8 @@ def _mode_impl(inp, dim, keepdim):
         # while radix_sort_low_mem requires row-major contiguous input.
         view = torch.movedim(inp, dim, -1)
         rows = torch.empty((M, N), device=inp.device, dtype=inp.dtype)
-        torch.ops.aten._copy_from(view, rows, False)
+        if not tle_copy(view, rows):
+            torch.ops.aten._copy_from(view, rows, False)
     else:
         rows = inp.reshape(M, N)
 
