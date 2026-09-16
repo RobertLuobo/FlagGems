@@ -1,28 +1,3 @@
-"""Kunlunxin backend override for ``linalg_svdvals``.
-
-The generic ``flag_gems.ops.linalg_svdvals`` routes through the generic CUDA
-Triton SVD kernels (``_small_jacobi_svals_kernel`` /
-``_blocked_jacobi_svals_kernel`` in ``flag_gems/ops/svd.py``), whose
-constexpr-tiled kernels do not finish compiling on the Triton-XPU backend
-(``xpu.llvm.translate_to_asm`` still running after 900 s for a (16, 16) tile;
-``pytest-timeout`` killed the benchmark baseline).  The overload store is also
-CPU/ATen-fallback-free in the generic path only for shapes whose Triton kernels
-compile, which does not hold on XPU.
-
-This override reuses the Kunlunxin ``linalg_svd`` one-sided Jacobi pipeline
-basis (``_osj_pipeline`` in ``linalg_svd.py``), which is built from *runtime*
-loops (nothing constexpr-unrolled beyond ``tl.arange`` tiles) and therefore
-compiles fast on XPU, but **keeps only the ``B = U*S`` workspace**: contrary to
-``linalg_svd`` (which needs ``U``/``Vh``), ``linalg_svdvals`` only needs the
-singular values ``S = ||B[:, j]||``, so the pipeline here stops after the
-cyclic rotations (no ``U = B*diag(1/S)`` normalization in-kernel, and no
-``torch.gather`` / ``U^H A`` matmul / ``Vh`` scaling on the host side).  The
-rotations are *bit-identical* to ``_osj_pipeline`` (same schedule, same
-arithmetic), so the singular values match the ``linalg_svd`` S output exactly.
-
-dtype: float32 only (matching the generic linalg_svdvals contract).
-"""
-
 import logging
 
 import numpy as np

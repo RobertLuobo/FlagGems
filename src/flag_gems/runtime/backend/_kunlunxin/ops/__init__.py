@@ -35,7 +35,6 @@ from ._is_all_true import _is_all_true
 from ._jagged_to_padded_dense_forward import (  # noqa: F401
     _jagged_to_padded_dense_forward,
 )
-from ._linalg_eigvals import _linalg_eigvals
 from ._masked_scale import _masked_scale  # noqa: F401
 from ._native_batch_norm_legit_functional import _native_batch_norm_legit_functional
 from ._native_batch_norm_legit_no_training import _native_batch_norm_legit_no_training
@@ -685,7 +684,6 @@ __all__ = [
     "_fused_adam_",
     "_index_put_impl_",
     "_is_all_true",
-    "_linalg_eigvals",
     "_native_batch_norm_legit_functional",
     "_native_batch_norm_legit_no_training",
     "_nested_view_from_buffer_copy",

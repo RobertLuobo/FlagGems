@@ -1,46 +1,3 @@
-"""Kunlunxin (XPU) ``linalg_matrix_norm``.
-
-The generic ``flag_gems/ops/linalg_matrix_norm.py`` is unusable on this
-backend for the five non-SVD orders:
-
-* ``ord = +/-1`` reduces a 2-D tile with ``tl.sum(..., axis=0)``.  TritonXPU
-  rejects that outright ("axis must not be 0 for 2D+ shapes, consider
-  manually transpose"), so every ``+/-1`` case is a hard compile failure.
-* ``ord = +/-inf`` and ``ord = 'fro'`` combine ``tl.atomic_add`` /
-  ``tl.atomic_max`` / ``tl.atomic_min`` fan-in with masked tail tiles that
-  carry ``other=0.0``.  Both are known silent-miscompute sources on this XPU,
-  which is why those orders come out numerically wrong instead of failing
-  loudly.
-* the generic file also binds ``flag_gems.ops.max/min/sqrt/sum`` at *import*
-  time, so the Kunlunxin overrides of those four operators can never be
-  substituted by ``SpecOpRegistrar``; the generic (non-XPU-safe) reductions
-  are what actually run.
-
-This override reimplements the five non-SVD orders on a single XPU-safe
-primitive: a row-wise reduction over a contiguous ``[R, C]`` buffer that
-
-* only ever reduces along ``axis=1`` (a ``dim=-2`` reduction is materialised
-  by a native transposing ``aten::_copy_from``, never by ``axis=0``),
-* never issues a masked or ``other=``-carrying load - the row index is
-  clamped and the ragged column tail is copied into a separate
-  identity-filled tile,
-* uses ``BLOCK_M = 64`` so the backend's "every vector store touches exactly
-  64 contiguous elements" behaviour lands exactly on the slice the program
-  owns (no cross-program clobber, no masked store),
-* uses an inner tile width of 128 (>= 64 to dodge the narrow-tile lowering
-  bug, != 32/64 to dodge the NOC wedge, 64 x 128 = 8192 elements to satisfy
-  the 2-D tile minimum),
-* accumulates in fp32 and uses no atomics at all.
-
-The SVD-based orders (``2``, ``-2``, ``'nuc'``) go through the vendor DS
-(double-single, two-fp32) pipeline below: ``k <= 2`` has a closed form
-(``_rank2_sigma_norm`` / ``_fro``), ``k >= 3`` runs the DS bidiagonalisation
-plus DS tridiagonal Sturm bisection (``_svd_bidiag_sturm``).  The generic fp64
-Gram/eigen Triton kernels cannot be lowered by TritonXPU (``out of resource:
-uni_sram``), so nothing is delegated to them inside this backend's coverage
-(``k <= 512``, ``rows <= 2048``).
-"""
-
 import logging
 import math
 
@@ -844,7 +801,10 @@ def _sturm_eig_kernel(TD, TL, TE, EL, OUT, B, K):
         his = tl.where(take, mid, his)
         lo = tl.where(take, lo, mid)
     lam = 0.5 * (lo + his)
-    tl.store(OUT + b * _BD_L + j, lam)
+    # T = B B^T is PSD, but the Sturm bisection can return lambdas slightly
+    # below zero (pure rounding); clamp in-kernel so the caller never touches
+    # an ATen sqrt/clamp (the sigma = sqrt(lambda) is all the caller consumes).
+    tl.store(OUT + b * _BD_L + j, tl.sqrt(tl.maximum(lam, 0.0)))
 
 
 def _svd_bidiag_sturm(Ab, B, M, N, mode):
@@ -931,9 +891,8 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
         te = torch.empty_like(td)
         tel = torch.empty_like(td)
         _bidiag_tridiag_kernel[(B,)](dh, dl, eh, el, td, tdl, te, tel, B)
-        lam = torch.empty((B, _BD_L), dtype=torch.float32, device=dev)
-        _sturm_eig_kernel[(B, int(_BD_L // _BD_C))](td, tdl, te, tel, lam, B, int(K))
-        sig = torch.sqrt(torch.clamp(lam, min=0.0))
+        sig = torch.empty((B, _BD_L), dtype=torch.float32, device=dev)
+        _sturm_eig_kernel[(B, int(_BD_L // _BD_C))](td, tdl, te, tel, sig, B, int(K))
         if mode == 0:
             return sig[:, K - 1 : K].reshape(B)
         if mode == 1:
