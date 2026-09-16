@@ -57,6 +57,81 @@ def _osj_svals_pipeline(
         tl.store(B_ptr + q + rows * NW, s_rot * ap + c * aq, mask=msk)
 
 
+# --- device-side descending bitonic sort -------------------------------------
+# ``tl.sort``/``tl.flip``/``tl.split``/``tl.join`` and 2D/3D reductions are all
+# unusable on this backend (GlobalEncodingAttr UNREACHABLE), so the sorted
+# singular values are produced by a hand-rolled bitonic network. The stage
+# kernel uses only shifted affine loads + min/max/where; the per-stage
+# direction patterns are precomputed on the host.
+#
+# NOTE(kunlunxin): the stage kernel silently miscompiles for *tiles narrower
+# than 64 lanes* (data-dependent wrong values; single-stage micro-tests fail
+# for NW <= 32 and pass for every NW >= 64), so rows are padded up to
+# ``_DEV_SORT_MIN_NW`` lanes; the padding zeros are negative-free, and
+# ``S >= 0`` (column norms), so they always sort to the tail (unchanged from
+# the previous host ``np.sort``, which sorted the same zero-padded row).
+_DEV_SORT_MIN_NW = 64
+
+
+@triton.jit
+def _svd_sort_stage_kernel(
+    S_ptr, LO_ptr, COND_ptr, d: tl.constexpr, stage: tl.constexpr,
+    NW: tl.constexpr, PAD: tl.constexpr,
+):
+    """One bitonic compare-exchange stage (descending). One program per row."""
+    pid = tl.program_id(0)
+    offs = tl.arange(0, NW)
+    base = S_ptr + pid * (NW + 2 * PAD) + PAD
+    x = tl.load(base + offs)
+    xf = tl.load(base + offs + d)
+    xb = tl.load(base + offs - d)
+    is_lo = tl.load(LO_ptr + offs) > 0.5
+    v = tl.where(is_lo, xf, xb)
+    mn = tl.minimum(x, v)
+    mx = tl.maximum(x, v)
+    cond = tl.load(COND_ptr + offs) > 0.5
+    tl.store(base + offs, tl.where(cond, mx, mn))
+
+
+def _device_desc_sort(S, k, dev, dtype):
+    """Sort ``S`` (values >= 0) descending on the device.
+
+    Args:
+        S: ``[batch, NW]`` CPU f64 (NW a power of two, trailing columns zero).
+        k: number of leading (= largest) values to keep.
+        dev: target device.
+        dtype: output dtype.
+
+    Returns:
+        ``[batch, k]`` f32 device tensor = the k largest values of each row,
+        in descending order.
+    """
+    batch, NW = S.shape
+    NWs = max(NW, _DEV_SORT_MIN_NW)
+    PAD = NWs // 2
+    buf = torch.zeros(batch, NWs + 2 * PAD, device=dev, dtype=torch.float32)
+    buf[:, PAD : PAD + NW] = S.to(device=dev, dtype=torch.float32)
+    offs = np.arange(NWs)
+    for l in range(1, NWs.bit_length()):
+        stage = 1 << l
+        for s in range(l):
+            d = 1 << (l - s - 1)
+            is_lo = ((offs % (2 * d)) < d).astype(np.float32)
+            block_odd = ((offs // stage) % 2 == 1).astype(np.float32)
+            cond = (np.logical_xor(is_lo > 0.5, block_odd > 0.5)).astype(np.float32)
+            _svd_sort_stage_kernel[(batch,)](
+                buf,
+                torch.tensor(is_lo, device=dev),
+                torch.tensor(cond, device=dev),
+                d,
+                stage,
+                NW=NWs,
+                PAD=PAD,
+                num_warps=4,
+            )
+    return buf[:, PAD : PAD + k].contiguous()
+
+
 def _osj_svals_impl(A, sweeps=12):
     """One-sided Jacobi singular values only; returns ``S`` (descending)."""
     dev = A.device
@@ -83,14 +158,10 @@ def _osj_svals_impl(A, sweeps=12):
             num_stages=1,
         )
 
-    Bc = B.cpu().double()
-    S = Bc.norm(dim=1).numpy()
+    S = B.cpu().double().norm(dim=1)  # [batch, NW] f64 CPU, values >= 0
 
     k = min(m, n)
-    S_sorted = np.sort(S, axis=-1)[:, ::-1][:, :k]
-    S_sorted = torch.from_numpy(np.ascontiguousarray(S_sorted)).to(
-        device=dev, dtype=A.dtype
-    )
+    S_sorted = _device_desc_sort(S, k, dev, A.dtype)
 
     if batch == 1:
         return S_sorted[0]

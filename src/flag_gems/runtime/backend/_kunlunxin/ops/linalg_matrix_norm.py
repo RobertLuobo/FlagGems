@@ -121,19 +121,71 @@ def _row_reduce_kernel(
     tl.store(Out + chunk * RP + rows_raw, res)
 
 
+@libentry()
+@triton.jit(do_not_specialize=["R", "C", "XPITCH", "PITCH"])
+def _pad_rows_kernel(
+    X,
+    PAD,
+    R,
+    C,
+    XPITCH,
+    PITCH,
+    IDENT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Write ``X`` into the first ``C`` columns of ``PAD``, ``IDENT`` after.
+
+    The copy engine cannot express this destination -- ``tle_copy`` writes runs
+    back to back, and once ``C`` reaches 1 the only run left is a single element
+    with the row pitch as its stride -- so the padding step fills the buffer
+    with a kernel instead.  Doing both in one launch is what lets
+    ``_row_reduce`` keep its unmasked loads.
+
+    Indexing is clamped rather than masked, like ``_row_reduce_kernel``: rows
+    past ``R - 1`` rewrite the last row with the values already in it, and the
+    clamped column keeps the read inside ``X`` (an unclamped column past ``C``
+    would read the next row).
+    """
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    r = tl.minimum(rows, R - 1)
+    c = tl.minimum(cols, C - 1)
+
+    val = tl.load(X + r[:, None] * XPITCH + c[None, :])
+    val = tl.where(cols[None, :] < C, val, IDENT).to(val.dtype)
+    tl.store(PAD + r[:, None] * PITCH + cols[None, :], val)
+
+
+def _pad_rows(x, pad, R, C, pitch, ident):
+    """Materialise ``x`` into the first ``C`` columns of the ``pad`` buffer."""
+    ncols = pad.shape[1]
+    _pad_rows_kernel[(triton.cdiv(R, _BLOCK_M), triton.cdiv(ncols, _BLOCK_N))](
+        x,
+        pad,
+        R,
+        C,
+        pitch,
+        ncols,
+        IDENT=ident,
+        BLOCK_M=_BLOCK_M,
+        BLOCK_N=_BLOCK_N,
+    )
+
+
 def _native_contiguous(t):
-    """Materialise ``t`` contiguously through the vendor strided-copy engine.
+    """Materialise ``t`` contiguously through the vendor DMA engine.
 
     ``Tensor.contiguous()`` is itself a FlagGems-registered operator, so using
     it here would drag a Triton copy kernel into the timed region (and into
-    every ``use_gems`` call site).  ``aten::_copy_from`` is never overridden by
-    FlagGems and goes straight to the vendor engine.
+    every ``use_gems`` call site).  ``tle_copy`` drives the vendor SDNN copy
+    engine directly (no ATen, no FlagGems kernel).
     """
     if t.is_contiguous():
         return t
     out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
-    if not tle_copy(t, out):
-        torch.ops.aten._copy_from(t, out, False)
+    tle_copy(t, out)
     return out
 
 
@@ -167,9 +219,8 @@ def _row_reduce(x, R, C, op, final_sqrt=False):
     ncols = C
     if C % BN:
         ncols = triton.cdiv(C, BN) * BN
-        pad = torch.full((R, ncols), _identity(op), dtype=x.dtype, device=dev)
-        if not tle_copy(x, pad[:, :C]):
-            torch.ops.aten._copy_from(x, pad[:, :C], False)
+        pad = torch.empty((R, ncols), dtype=x.dtype, device=dev)
+        _pad_rows(x, pad, R, C, pitch, _identity(op))
         x = pad
         pitch = ncols
     nfull = ncols // BN
@@ -220,8 +271,7 @@ def _row_reduce(x, R, C, op, final_sqrt=False):
         cop = _combine_op(op)
         pt = torch.full((R, BN), _identity(cop), dtype=torch.float32, device=dev)
         part_t = part[: nchunk * RP].reshape(nchunk, RP)[:, :R].transpose(0, 1)
-        if not tle_copy(part_t, pt[:, :nchunk]):
-            torch.ops.aten._copy_from(part_t, pt[:, :nchunk], False)
+        tle_copy(part_t, pt[:, :nchunk])
         out = torch.empty(RP + BM, dtype=torch.float32, device=dev)
         _row_reduce_kernel[(nrow_blocks, 1)](
             pt,
@@ -386,8 +436,7 @@ def _rank2_sigma_norm(Ab, B, M, N, mode):
     if K % BN:
         pitch = triton.cdiv(K, BN) * BN
         Wp = torch.zeros((B, 2, pitch), dtype=W.dtype, device=dev)
-        if not tle_copy(W, Wp[:, :, :K]):
-            torch.ops.aten._copy_from(W, Wp[:, :, :K], False)
+        tle_copy(W, Wp[:, :, :K])
         W = Wp
 
     aa = _row_reduce(W[:, 0, :], B, pitch, _OP_SUMSQ)
@@ -833,8 +882,7 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
         Wt = _native_contiguous(Ab.transpose(-2, -1))
     else:
         Wt = Ab
-    if not tle_copy(Wt, Wh[:, :K, :R]):
-        torch.ops.aten._copy_from(Wt, Wh[:, :K, :R], False)
+    tle_copy(Wt, Wh[:, :K, :R])
 
     sc_h = torch.empty((B, _BD_L), dtype=torch.float32, device=dev)
     sc_l = torch.empty_like(sc_h)
@@ -853,10 +901,8 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
 
     with torch_device_fn.device(dev):
         for j in range(min(K, R - 1)):
-            if not tle_copy(Wh[:, :, j], sc_h):
-                torch.ops.aten._copy_from(Wh[:, :, j], sc_h, False)
-            if not tle_copy(Wl[:, :, j], sc_l):
-                torch.ops.aten._copy_from(Wl[:, :, j], sc_l, False)
+            tle_copy(Wh[:, :, j], sc_h)
+            tle_copy(Wl[:, :, j], sc_l)
             _bidiag_col_h_kernel[(B,)](sc_h, sc_l, v_h, v_l, th, tl_, B, j)
             _bidiag_left_w_kernel[(B, int(RP // _BD_C))](
                 Wh, Wl, v_h, v_l, th, tl_, wh_b, wl_b, B, j, RP, PROW
@@ -876,16 +922,12 @@ def _svd_bidiag_sturm(Ab, B, M, N, mode):
         eh = torch.zeros_like(dh)
         el = torch.zeros_like(dh)
         nd = min(_BD_L, RP)
-        if not tle_copy(Wh.diagonal(0, 1, 2), dh[:, :nd]):
-            torch.ops.aten._copy_from(Wh.diagonal(0, 1, 2), dh[:, :nd], False)
-        if not tle_copy(Wl.diagonal(0, 1, 2), dl[:, :nd]):
-            torch.ops.aten._copy_from(Wl.diagonal(0, 1, 2), dl[:, :nd], False)
+        tle_copy(Wh.diagonal(0, 1, 2), dh[:, :nd])
+        tle_copy(Wl.diagonal(0, 1, 2), dl[:, :nd])
         ne = min(_BD_L, RP - 1)
         if ne > 0:
-            if not tle_copy(Wh.diagonal(1, 1, 2), eh[:, :ne]):
-                torch.ops.aten._copy_from(Wh.diagonal(1, 1, 2), eh[:, :ne], False)
-            if not tle_copy(Wl.diagonal(1, 1, 2), el[:, :ne]):
-                torch.ops.aten._copy_from(Wl.diagonal(1, 1, 2), el[:, :ne], False)
+            tle_copy(Wh.diagonal(1, 1, 2), eh[:, :ne])
+            tle_copy(Wl.diagonal(1, 1, 2), el[:, :ne])
         td = torch.empty((B, _BD_L), dtype=torch.float32, device=dev)
         tdl = torch.empty_like(td)
         te = torch.empty_like(td)

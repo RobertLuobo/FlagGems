@@ -119,31 +119,7 @@ def reglu_pair_kernel(
     num_tasks,
     N_OUT: tl.constexpr,
     TILE: tl.constexpr,
-):
-    """1D flattened "pair" kernel for reglu (2 loads + 1 store).
-
-    XPU-specialized variant used for N_OUT <= 1024 (see
-    `_pick_reglu_pair_tile`). The 2D (BLOCK_M x BLOCK_N) tiling above is
-    pathological on this backend whenever the row count M dwarfs the half-width
-    N_OUT: the CoreTiling pass collapses the block to a single row and
-    serializes BLOCK_M rows one by one, and the many small programs stay
-    launch/over-read bound (e.g. (16,7,57,32,30) fp32 ~19.7ms and
-    (64,64,2) fp16 ~0.38ms for the same-family geglu 2D kernel;
-    reglu 2D (64,512,512) fp16 is 4.31ms here).
-
-    Instead (same idea as the dreglu/geglu pair kernels) we iterate over the
-    M*N_OUT output elements, one "pair" per element: element t of row t//N_OUT
-    reads input[2*N_OUT*(t//N_OUT) + t%N_OUT] (the a-half) and
-    input[2*N_OUT*(t//N_OUT) + t%N_OUT + N_OUT] (the b-half) and writes
-    output[t]. Every load/store then stays on wide contiguous ranges
-    (N_OUT elements per row), so the backend emits full-width block DMA
-    instead of row-serialized tiles; a handful of programs covers the whole
-    tensor.
-
-    N_OUT is a tl.constexpr (not a runtime arg) on purpose: with a compile-time
-    N_OUT the (tid // N_OUT) * N_OUT division folds to a shift (see the geglu
-    pair kernel note on the runtime-H mis-lowering minefield).
-    """
+): 
     pid = tl.program_id(0)
     tid = pid * TILE + tl.arange(0, TILE)
     mask = tid < num_tasks
@@ -154,31 +130,7 @@ def reglu_pair_kernel(
     tl.store(output_ptr + tid, (gate * x_b).to(input_ptr.type.element_ty), mask=mask)
 
 
-def _pick_reglu_pair_tile(dtype, M, N_OUT):
-    """XPU fixed tile for the 1D reglu pair kernel (all N_OUT).
-
-    Probe-tuned for reglu on the official benchmark + accuracy-test matrix and
-    a dense (M x N_OUT x TILE) correctness grid (see solution/reglu/README.md);
-    every chosen cell is bit-identical to the TE reference. The reglu pair
-    kernel (simple maximum + multiply) has a *wider* clean-tile envelope than
-    the same-family geglu pair kernel (tanh-based):
-    - fp32: clean at every TILE in the probe grids -> widest wins; T=8192 for
-      N_OUT > 1024 (0.58ms vs 1.77ms on (1024, 131072), 0.078ms vs 0.483ms on
-      (4096, 4096) vs the 2D path), T=2048 for large-M short-col cells
-      (M >= 65536, e.g. the accuracy-test (16,128,64,60) shape), else 1024.
-    - fp16: clean at every TILE in the probe grids (unlike geglu, T=2048+ does
-      NOT mis-lower here) -> T=16384 for N_OUT > 1024 (8.8ms -> 0.33ms on
-      (1024, 131072) vs the 2D path; the 2D BLOCK_N >= 2048 configs do not even
-      compile for fp16), T=1024 otherwise (proven clean + fastest for the
-      short-column cells).
-    - bf16: ONLY T=512 (N_OUT <= 64) and T=1024 (otherwise) are clean — every
-      T >= 2048 mis-lowers at any N_OUT and, importantly, so does the 2D
-      kernel at every BLOCK_N >= 2048 (the previous vendor wide-row configs
-      (1, 2048/4096/16384, 8/16) silently returned wrong bf16 values;
-      nwrong ~ M*2*N_OUT/2^15). T=1024 is nonetheless 1.6-2x faster than the
-      only clean 2D config (8, 1024, 4) and ~4.3x faster at (1024, 131072).
-    - num_warps is 4 (dreglu/geglu-consistent; w8/w16 within noise).
-    """
+def _pick_reglu_pair_tile(dtype, M, N_OUT): 
     if dtype == torch.bfloat16:
         return 512 if N_OUT <= 64 else 1024
     if dtype == torch.float16:
@@ -188,23 +140,7 @@ def _pick_reglu_pair_tile(dtype, M, N_OUT):
     return 2048 if M >= 65536 else 1024
 
 
-def _pick_reglu_config(dtype, M, N_OUT):
-    """XPU4 probe-tuned fixed tiling for reglu.
-
-    Probe findings (2026-08-13, XPU4, official benchmark matrix, probe6 A/B):
-    - fp16 BLOCK_N>=2048 is compile-flaky (ConvertTritonXPUToLLVM assertion),
-      so fp16 stays at BLOCK_N<=1024 (BLOCK_N=512 only for tiny rows).
-    - fp32/bf16 large rows: wider BLOCK_N slashes per-program overhead
-      (fp32 [4096,4096] 0.82ms -> 0.47ms @ BN2048; fp32 [1024,131072]
-      6.58ms -> 1.80ms @ BN8192; bf16 [1024,131072] 8.52ms -> 2.94ms @ BN16384).
-    - Tiny rows are launch-overhead bound; A/B (official do_bench, median):
-        (64,64) M=64:                 bm1_bn1024 best (14.1/11.6/13.5us)
-        (1024,2)/(1024,32) fp16/bf16: bm8_bn512 wins (127 vs 157us)
-        (1024,2)/(64,64,2) fp32:      bm8_bn1024 wins (107 vs 111us)
-        (64,64,2)/(64,64,32) fp16:    bm8_bn512 wins (452 vs 558us)
-        (64,512,512) (M=32768):       bm16_bn1024 best (3245 vs 3318us)
-        (1024,512):                   bm1_bn1024 best
-    """
+def _pick_reglu_config(dtype, M, N_OUT): 
     if N_OUT >= 2048 and M >= 1024:
         if dtype == torch.float32:
             if N_OUT >= 65536:
@@ -264,22 +200,7 @@ def reglu(input_tensor: torch.Tensor, quantizer: Optional[Any] = None) -> torch.
     return output_2d.view(output_shape)
 
 
-def _pick_dreglu_config(dtype, M, N):
-    """XPU1 probe-tuned fixed tiling for dreglu (3 loads + 2 stores).
-
-    Probe findings (2026-08-19, XPU1, official benchmark matrix, probe1/probe2
-    fixed-config sweeps + libtuner ConfigCache dump):
-    - libtuner's favourite big-row config (342,2048) is the best known for
-      N==2048 (fp16 (4096,2048) 0.824ms) and for M=32768 x N=256 (fp16 6.42ms);
-      huge tiles in general (BLOCK_N >= 16384 fp32 / bn>=8192 fp16/bf16) hit
-      TritonXPULegalize/uni_sram failures -> exclude.
-    - N==4096/N==65536 win with wide single-row tiles:
-      fp16 (1024,4096) 0.805->0.212ms @1x4096w8; fp16 (1024,65536)
-      6.51->1.68ms @1x16384w16; fp32 (1024,65536) 5.56->2.23ms @4x8192w8;
-      bf16 (1024,65536) 6.64->2.33ms @1x16384w8.
-    - fp16 1x(N<=2048) tiles lose to (342,2048); fp16 above BN=2048 compiles
-      (unlike forward reglu) but 2D tiles fill uni_sram -> cap bn.
-    """
+def _pick_dreglu_config(dtype, M, N): 
     f16 = dtype == torch.float16
     f32 = dtype == torch.float32
     if N >= 2048:
