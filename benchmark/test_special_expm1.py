@@ -12,9 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""GPU-worker execution adapters for FlagGems FlagTune workflows.
+import pytest
+import torch
 
-Runtime code converts validated workload descriptions into tensors and calls
-trusted public operators.  Scheduling, process ownership, and SQLite merging
-are deliberately kept in :mod:`flag_gems.flagtune.collection`.
-"""
+from . import base, consts
+
+
+@pytest.mark.special_expm1
+def test_special_expm1():
+    bench = base.UnaryPointwiseBenchmark(
+        op_name="special_expm1",
+        torch_op=torch.special.expm1,
+        dtypes=consts.FLOAT_DTYPES,
+    )
+    bench.run()
