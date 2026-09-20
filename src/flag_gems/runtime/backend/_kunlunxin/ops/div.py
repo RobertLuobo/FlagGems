@@ -101,8 +101,6 @@ def true_divide(A, B):
             and A.numel() >= DIV_TENSOR_U16_MIN_NUMEL
         ):
             return true_div_func_u16(A, B)
-        if A.dtype == B.dtype and A.dtype.is_floating_point and A.shape == B.shape:
-            return true_div_func(A, B, out0=torch.empty_like(A))
         return true_div_func(A, B)
     elif isinstance(A, torch.Tensor):
         if A.is_complex():
@@ -182,7 +180,6 @@ def divide(A, B):
 def true_divide_tensor_(A, B):
     """Canonical Tensor overload for in-place true division (aten::true_divide.Tensor_)."""
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_TENSOR_")
-    logging.getLogger("flag_gems.ops.true_divide_").debug("GEMS TRUE_DIVIDE_")
     return true_divide_(A, B)
 
 
@@ -359,10 +356,6 @@ def floor_divide(A, B):
             if A.dtype == torch.bfloat16:
                 B = _as_bfloat16_scalar(B)
             return floor_div_lowp_tensor_scalar_func(A, B)
-        if A.is_contiguous():
-            return floor_div_func_corrected_tensor_scalar(
-                A, B, out0=torch.empty_like(A)
-            )
         return floor_div_func_corrected_tensor_scalar(A, B)
     elif isinstance(B, torch.Tensor):
         return floor_div_func_corrected_scalar_tensor(A, B)
