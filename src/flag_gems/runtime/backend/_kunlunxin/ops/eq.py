@@ -218,11 +218,10 @@ def _eq_scalar_fast_masked(A, scalar, numel):
 #      out-of-place config_ has isCloseMemoryAsync=False = async copy ON,
 #      which with in-place aliasing is the documented "noc idle timeout"
 #      deadlock, see the config_inplace_ note in lt.py / gt.py).
-#   2. unmasked flat-tile in-place fast kernel for fp16/fp32 contiguous
-#      tensors whose numel is an exact multiple of TILE (grid >= MIN_GRID):
-#      the always-true runtime mask of the codegen path would force the slow
-#      masked-memory channel, so a fixed pow2 TILE with no mask at all
-#      restores the fast DMA path (per lt.py/gt.py in-place probes).
+#   2. [REMOVED 2026-09-19] the unmasked flat-tile in-place fast kernel for
+#      fp16/fp32 exact-multiple numel: it was measured strictly SLOWER than
+#      this codegen path (same-process A/B, see the NOTE inside eq_ below),
+#      so eq_ now always uses the codegen path for contiguous float inputs.
 #   3. Equality has no gap direction, so the gt/lt `max(0, min(1, (x-y)*K))`
 #      shape cannot be used; instead saturate the *distance* (the same
 #      two-stage 1e32*1e32 = 1e64 factor as the gt_scalar_ in-place fast
@@ -262,18 +261,19 @@ def eq_(A, B):
     logger.debug("GEMS_KUNLUNXIN EQ_ TENSOR")
     if A.device != B.device:
         B = B.to(A.device)
-    numel = A.numel()
     if A.is_contiguous() and A.dtype in (torch.float16, torch.float32, torch.bfloat16):
-        if (
-            A.dtype in (torch.float16, torch.float32)
-            and B.is_contiguous()
-            and B.dtype == A.dtype
-            and A.shape == B.shape
-            and numel >= _EQ_TENSOR_INPLACE_FAST_TILE * _EQ_TENSOR_INPLACE_MIN_GRID
-            and numel % _EQ_TENSOR_INPLACE_FAST_TILE == 0
-        ):
-            # exact-multiple flat tiles: no mask at all; grid fixed.
-            return _eq_tensor_inplace_fast(A, B, numel)
+        # NOTE (margin hardening 2026-09-19): the former "unmasked flat-tile
+        # fast kernel" branch (_eq_tensor_inplace_fast) was REMOVED here.
+        # Same-process A/B (4096x4096, do_bench median, use_gems) measured it
+        # strictly SLOWER than this codegen path on every dtype:
+        #   fp16 79.2us (0.692) vs codegen 66.1us (0.830)
+        #   fp32 112.8us (0.983) vs codegen 106.4us (1.041)
+        # (a masked-memory penalty was assumed for the codegen path but its
+        #  1d-tile lowering fuses the two loads + store better than the plain
+        #  flat-tile kernel; the fast branch was benchmarked against the old
+        #  ALWAYS_BOOL generic path, not against this DEFAULT-promotion one.)
+        # bf16 already took this path. Small shapes are unaffected (they never
+        # matched the fast branch's numel threshold).
         eq_func_tensor_inplace(A, B, out0=A)
         return A
     # Everything else (non-float dtype, non-contiguous, ...) keeps the
@@ -281,40 +281,11 @@ def eq_(A, B):
     return _generic_eq_(A, B)
 
 
-# in-place alias safety: the fast kernel writes into the SAME tensor it
-# reads, so it must keep the DEFAULT isCloseMemoryAsync (True = async copy
-# closed); passing False with in-place aliasing is the documented "noc idle
-# timeout" deadlock, same as gt.py's _gt_scalar_inplace_fast note.
-_EQ_TENSOR_INPLACE_FAST_TILE = 131072
-_EQ_TENSOR_INPLACE_MIN_GRID = 128
-
-
-@triton.jit
-def eq_tensor_inplace_fast_kernel(x_ptr, y_ptr, TILE: tl.constexpr):
-    pid = tl.program_id(0)
-    tid = pid * TILE + tl.arange(0, TILE)
-    x = tl.load(x_ptr + tid)
-    y = tl.load(y_ptr + tid)
-    t = (x.to(tl.float32) - y.to(tl.float32)) * 1.0e32
-    t = t * 1.0e32
-    t = tl.abs(t)
-    t = tl.minimum(1.0, t)
-    t = tl.maximum(0.0, 1.0 - t)
-    tl.store(x_ptr + tid, t)
-
-
-def _eq_tensor_inplace_fast(A, B, numel):
-    grid = (numel // _EQ_TENSOR_INPLACE_FAST_TILE,)
-    eq_tensor_inplace_fast_kernel[grid](
-        A,
-        B,
-        TILE=_EQ_TENSOR_INPLACE_FAST_TILE,
-        num_warps=4,
-        buffer_size_limit=8192,
-        unroll_num=16,
-        isCloseMemoryAsync=True,
-    )
-    return A
+# in-place alias safety: the codegen kernel writes into the SAME tensor it
+# reads, so config_inplace_ below must keep the DEFAULT isCloseMemoryAsync
+# (True = async copy closed); passing False with in-place aliasing is the
+# documented "noc idle timeout" deadlock, same as gt.py's _gt_scalar_inplace_fast
+# note.
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +369,7 @@ def eq_scalar_(A, B):
 # in-place alias safety: the fast kernel writes into the SAME tensor it reads,
 # so it must keep isCloseMemoryAsync=True (async copy closed); passing False
 # with in-place aliasing is the documented "noc idle timeout" deadlock, same
-# as _eq_tensor_inplace_fast above.
+# as the eq_func_tensor_inplace codegen path above.
 _EQ_SCALAR_INPLACE_FAST_TILE = 131072
 _EQ_SCALAR_INPLACE_MIN_GRID = 128
 

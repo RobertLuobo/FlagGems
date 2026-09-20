@@ -13,6 +13,8 @@
 # change (both are -x), zero correctness risk.
 import logging
 
+import torch
+
 from .neg import neg_func
 
 logger = logging.getLogger(__name__)
@@ -20,4 +22,12 @@ logger = logging.getLogger(__name__)
 
 def negative(A):
     logger.debug("GEMS_KUNLUNXIN NEGATIVE")
+    # Host-side pre-allocation: handing `out0` over to pointwise_dynamic makes
+    # prepare_args skip its per-call dtype-promotion walk + `empty_like`, which is
+    # the dominant cost at launch-bound shapes. It is only valid while the
+    # promoted result dtype is provably A.dtype: a single floating-point operand
+    # with promotion method DEFAULT promotes to itself, so the guard is exact
+    # (integer/bool/complex inputs keep the generic path).
+    if A.is_floating_point():
+        return neg_func(A, out0=torch.empty_like(A))
     return neg_func(A)

@@ -20,6 +20,7 @@
 # fp32 large shapes >=1.0). log(1+x) is more vectorization-sensitive than cos.
 import logging
 
+import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
@@ -49,6 +50,22 @@ def log1p_func(x):
 
 def log1p(A):
     logger.debug("GEMS_KUNLUNXIN LOG1P")
+    # Host-side guarded `out0` pre-allocation. Without it, pointwise_dynamic's
+    # prepare_args re-derives the promoted result dtype via type_promotion()
+    # before every launch (pure host time, ~4.8us measured), which dominates at
+    # launch-bound shapes such as (64,64) (gems 6.8us). Passing out0 skips that
+    # re-derivation entirely. Large shapes are device bound and are unaffected.
+    #
+    # Equivalence guard: log1p_func promotes with `INT_TO_FLOAT`, so for a
+    # FLOATING-POINT A the result dtype is exactly A.dtype (an integer A would
+    # promote to the default float, hence the `is_floating_point()` guard); the
+    # task shape of a single-tensor op is A.shape; and `A.is_contiguous()`
+    # keeps the *route* identical too -- the generated fast path assumes
+    # `(numel,)` / stride `(1,)` buffers, which is only sound when A and the
+    # empty_like(A) result are memory-dense and contiguous. Non-floating /
+    # non-contiguous inputs keep the pre-existing generic route untouched.
+    if A.is_floating_point() and A.is_contiguous():
+        return log1p_func(A, out0=torch.empty_like(A))
     return log1p_func(A)
 
 

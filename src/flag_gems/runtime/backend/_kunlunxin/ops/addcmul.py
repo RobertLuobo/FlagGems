@@ -30,6 +30,15 @@ logger = logging.getLogger(__name__)
 # but keep vectorization OPEN (isCloseVectorization=False). Unlike addcdiv (whose
 # division favors closing vectorization), addcmul's pure multiply-add vectorizes
 # well: measured 4096^2 fp16 0.25->0.80, fp32 0.60->0.94 with vec open vs closed.
+#
+# kunlunAutoGrid=True (2026-09-19): the 1d-tile wrapper otherwise hardcodes
+# num_ctas=12 for EVERY task, which for the tiny `(64,64)` benchmark case is pure
+# launch/cluster overhead (host-dispatch bound, no bandwidth to hide it). With the
+# knob, `num_tasks <= 2048*64` launches 1 CTA (see gen_task_partition_1d); the
+# large shapes keep the 12-CTA / bandwidth-bound path, so the (4096,4096) and
+# (64,512,512) cases are unaffected. `config_` is SHARED by addcmul/addcmul_out/
+# addcmul_ (all three already pass an explicit `out0=`), so this single knob fixes
+# the whole family; large-shape no-regression is re-measured per-dtype.
 config_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),
@@ -39,6 +48,7 @@ config_ = CodeGenConfig(
     buffer_size_limit=4096,
     isCloseVectorization=False,
     unroll_num=16,
+    kunlunAutoGrid=True,
 )
 
 
@@ -68,6 +78,16 @@ def addcmul(inp, tensor1, tensor2, *, value=1.0, out=None):
 
 def addcmul_out(inp, tensor1, tensor2, *, value=1.0, out):
     logger.debug("GEMS_KUNLUNXIN ADDCMUL_OUT")
+    # Fast path for the (overwhelmingly common) fully-same-shape case:
+    #   if all three operands already share one shape, `broadcast_shapes` is
+    #   provably that very shape, and if `out` already has it the `resize_`
+    #   below is a no-op as well. Skipping both removes a per-call C++
+    #   dispatch (`torch.broadcast_shapes` + `list()` builds) that dominates
+    #   the latency of tiny shapes; behaviour is unchanged by construction.
+    # Any broadcasting / mis-shaped `out` falls through to the original path.
+    if inp.shape == tensor1.shape == tensor2.shape and out.shape == inp.shape:
+        addcmul_forward(inp, tensor1, tensor2, value, out0=out)
+        return out
     broadcast_shape = torch.broadcast_shapes(inp.shape, tensor1.shape, tensor2.shape)
     if list(out.shape) != list(broadcast_shape):
         out.resize_(broadcast_shape)
