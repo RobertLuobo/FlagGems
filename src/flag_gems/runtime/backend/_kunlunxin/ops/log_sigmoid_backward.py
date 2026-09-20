@@ -3,6 +3,7 @@ import logging
 import torch
 import triton
 import triton.language as tl
+import triton.language.extra.xpu.libdevice as xpu
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
 from flag_gems.utils import triton_lang_extension as ext
@@ -12,11 +13,29 @@ from ..utils.pointwise_dynamic import pointwise_dynamic as xpu_pointwise_dynamic
 logger = logging.getLogger(__name__)
 
 
-UNROLL_NUM = 2
 BUFFER_SIZE_LIMIT = 8192
 IS_CLOSE_MEMORY_ASYNC = False
+FLAT_NUM_WARPS = 8
 
-FLAT_MAX_NUMEL = 4 * 1024 * 1024
+# Flat-kernel tuning, measured on P800 (xpu3) with 16.7M contiguous elements:
+# dtype -> (BLOCK_SIZE, unroll_num, buffer_size_limit).  See
+# harness/solution/log_sigmoid_backward/README.md for the raw numbers.
+FLAT_TUNE = {
+    torch.float16: (131072, 2, 4096),
+    torch.bfloat16: (65536, 8, BUFFER_SIZE_LIMIT),
+    torch.float32: (32768, 4, BUFFER_SIZE_LIMIT),
+}
+FLAT_TUNE_DEFAULT = (65536, 4, BUFFER_SIZE_LIMIT)
+
+# The tuned tiles launch very few programs below this element count, so small
+# inputs use a smaller tile with more programs (measured faster for all dtypes).
+SMALL_MAX_NUMEL = 1 << 21
+SMALL_TUNE = {
+    torch.float16: (16384, 2, BUFFER_SIZE_LIMIT),
+    torch.bfloat16: (16384, 8, BUFFER_SIZE_LIMIT),
+    torch.float32: (16384, 4, BUFFER_SIZE_LIMIT),
+}
+SMALL_TUNE_DEFAULT = (16384, 4, BUFFER_SIZE_LIMIT)
 
 config_ = CodeGenConfig(
     512,
@@ -38,14 +57,27 @@ def log_sigmoid_backward_func(grad_output, self):
     return (go * tl.sigmoid(0.0 - x)).to(grad_output.dtype)
 
 
-def _pick_block(n_elements):
-    if n_elements >= 32768 and n_elements % 32768 == 0:
-        return 32768, 8, False
-    if n_elements >= 16384 and n_elements % 16384 == 0:
-        return 16384, 8, False
+def _pick_block(n_elements, dtype):
+    if n_elements <= SMALL_MAX_NUMEL:
+        block_size, unroll_num, buffer_size = SMALL_TUNE.get(dtype, SMALL_TUNE_DEFAULT)
+    else:
+        block_size, unroll_num, buffer_size = FLAT_TUNE.get(dtype, FLAT_TUNE_DEFAULT)
+    if n_elements % block_size == 0:
+        return block_size, FLAT_NUM_WARPS, unroll_num, buffer_size, False
     if n_elements <= 65536:
-        return 2048, 4, True
-    return 16384, 8, True
+        return 2048, 4, 2, BUFFER_SIZE_LIMIT, True
+    if n_elements <= (1 << 20):
+        return 16384, FLAT_NUM_WARPS, 2, BUFFER_SIZE_LIMIT, True
+    return 65536, FLAT_NUM_WARPS, 2, BUFFER_SIZE_LIMIT, True
+
+
+@triton.jit
+def _log_sigmoid_backward_derivative(x):
+    # d/dx log_sigmoid(x) = sigmoid(-x) = 0.5 * (1 - tanh(x / 2)).
+    # A single `tanhf` call measured ~1.6x faster than `1 / (1 + exp(x))` here:
+    # `tl.exp` lowers to the fast `llvm.intr.exp2` intrinsic, but the fp32
+    # divide that follows it dominates on this backend.
+    return 0.5 - 0.5 * xpu.tanh(0.5 * x)
 
 
 @triton.jit
@@ -61,7 +93,7 @@ def log_sigmoid_backward_flat_kernel(
     mask = offsets < n_elements
     g = tl.load(grad_output_ptr + offsets, mask=mask)
     x = tl.load(self_ptr + offsets, mask=mask)
-    derivative = 1.0 / (1.0 + tl.exp(x.to(tl.float32)))
+    derivative = _log_sigmoid_backward_derivative(x.to(tl.float32))
     res = g.to(tl.float32) * derivative
     tl.store(
         grad_input_ptr + offsets,
@@ -81,7 +113,7 @@ def log_sigmoid_backward_flat_kernel_unmasked(
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     g = tl.load(grad_output_ptr + offsets)
     x = tl.load(self_ptr + offsets)
-    derivative = 1.0 / (1.0 + tl.exp(x.to(tl.float32)))
+    derivative = _log_sigmoid_backward_derivative(x.to(tl.float32))
     res = g.to(tl.float32) * derivative
     tl.store(grad_input_ptr + offsets, res.to(grad_input_ptr.dtype.element_ty))
 
@@ -107,7 +139,9 @@ def _launch_flat_kernel(grad_output, self, grad_input):
     n_elements = self.numel()
     if n_elements == 0:
         return grad_input
-    block_size, num_warps, masked = _pick_block(n_elements)
+    block_size, num_warps, unroll_num, buffer_size, masked = _pick_block(
+        n_elements, self.dtype
+    )
     if masked:
         grid = (triton.cdiv(n_elements, block_size),)
         log_sigmoid_backward_flat_kernel[grid](
@@ -117,8 +151,8 @@ def _launch_flat_kernel(grad_output, self, grad_input):
             n_elements,
             BLOCK_SIZE=block_size,
             num_warps=num_warps,
-            unroll_num=UNROLL_NUM,
-            buffer_size_limit=BUFFER_SIZE_LIMIT,
+            unroll_num=unroll_num,
+            buffer_size_limit=buffer_size,
             isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
         )
     else:
@@ -129,8 +163,8 @@ def _launch_flat_kernel(grad_output, self, grad_input):
             grad_input,
             BLOCK_SIZE=block_size,
             num_warps=num_warps,
-            unroll_num=UNROLL_NUM,
-            buffer_size_limit=BUFFER_SIZE_LIMIT,
+            unroll_num=unroll_num,
+            buffer_size_limit=buffer_size,
             isCloseMemoryAsync=IS_CLOSE_MEMORY_ASYNC,
         )
     return grad_input
@@ -139,8 +173,6 @@ def _launch_flat_kernel(grad_output, self, grad_input):
 def log_sigmoid_backward(grad_output, self, buffer):
     logger.debug("GEMS_KUNLUNXIN LOG_SIGMOID_BACKWARD")
     if _can_use_flat_kernel(grad_output, self):
-        if self.numel() > FLAT_MAX_NUMEL:
-            return log_sigmoid_backward_func(grad_output, self)
         return _launch_flat_kernel(grad_output, self, torch.empty_like(self))
     return log_sigmoid_backward_func(grad_output, self)
 
@@ -148,7 +180,5 @@ def log_sigmoid_backward(grad_output, self, buffer):
 def log_sigmoid_backward_out(grad_output, self, buffer, *, grad_input):
     logger.debug("GEMS_KUNLUNXIN LOG_SIGMOID_BACKWARD OUT")
     if _can_use_flat_kernel(grad_output, self, grad_input):
-        if self.numel() > FLAT_MAX_NUMEL:
-            return log_sigmoid_backward_func(grad_output, self, out0=grad_input)
         return _launch_flat_kernel(grad_output, self, grad_input)
     return log_sigmoid_backward_func(grad_output, self, out0=grad_input)
