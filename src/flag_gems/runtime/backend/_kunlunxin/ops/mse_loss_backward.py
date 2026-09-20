@@ -37,7 +37,26 @@ logger = logging.getLogger(__name__)
 #     10000x65536 for fp16).
 #   - per-call NEED_MASK dispatch so fully-divisible shapes skip the masked
 #     memory path entirely.
-_SMALL_NUMEL = 8192
+#
+# Which of the two kernels to use is a size decision, not a correctness one:
+# the plain `libentry` kernel enqueues for ~1/3 of the host cost of the
+# `pointwise_dynamic` wrapper, so it wins whenever its (somewhat lower) device
+# throughput is not yet the binding constraint.  Measured crossover on P800
+# with the harness do_bench (MED-of-3 of do_bench median; ratio = pd / plain,
+# >1 means the plain kernel is faster):
+#       n       fp16    fp32    bf16
+#      64K       1.82    1.76    1.50
+#     256K       1.96    1.83    1.52
+#     512K       1.07    1.08    0.89
+#       1M       0.99    0.97    0.65
+#       2M       0.78    0.91    0.50
+# So fp16/fp32 stay on the plain kernel up to 1M elements while bf16 switches
+# at 256K: bf16's plain load path (`tl.load(bf16).to(tl.float32)`) is
+# intrinsically slower in this backend, so it only pays off where the launch
+# cost still dominates.  Above the threshold the pd kernel's higher DMA
+# throughput wins outright (0.5-0.9 ratio at/above 2M, worse further up).
+_SMALL_NUMEL = 1 << 20
+_SMALL_NUMEL_BF16 = 1 << 18
 _SMALL_MAX_BLOCK = 8192
 _SMALL_WARPS = 4
 
@@ -107,9 +126,13 @@ def mse_loss_backward(grad_output, self, target, reduction=1):
 
     # Reduction.MEAN(=1) divides by numel; none(=0)/sum(=2) do not.
     scale = 2.0 / n_elements if reduction == 1 else 2.0
+    plain_max_numel = (
+        _SMALL_NUMEL_BF16 if self_contiguous.dtype == torch.bfloat16
+        else _SMALL_NUMEL
+    )
 
     with torch_device_fn.device(self.device):
-        if n_elements <= _SMALL_NUMEL:
+        if n_elements <= plain_max_numel:
             block_size = min(_SMALL_MAX_BLOCK, triton.next_power_of_2(n_elements))
             need_mask = (n_elements % block_size) != 0
             if need_mask and block_size == 1024:

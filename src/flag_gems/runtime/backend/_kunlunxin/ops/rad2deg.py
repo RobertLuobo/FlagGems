@@ -1,6 +1,7 @@
 import logging
 import math
 
+import torch
 import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
@@ -39,6 +40,16 @@ def rad2deg_func(x):
 
 def rad2deg(A):
     logger.debug("GEMS_KUNLUNXIN RAD2DEG")
+    # margin hardening 2026-09-19: hand the kernel a pre-materialized output so
+    # pointwise_dynamic.prepare_args skips the promotion + empty_like host path
+    # (~10us, which dominates the small shapes). The guard must be
+    # is_floating_point(): the promotion is INT_TO_FLOAT, so an integer input
+    # produces fp32 while empty_like(A) would give the integer dtype back
+    # (silent wrong dtype). For floating inputs the promoted dtype is A.dtype,
+    # and the generic path would itself have used
+    # torch.empty_like(A, dtype=A.dtype) for the shape-matching operand.
+    if A.is_floating_point():
+        return rad2deg_func(A, out0=torch.empty_like(A))
     return rad2deg_func(A)
 
 
