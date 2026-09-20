@@ -23,15 +23,6 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
-# Small-input threshold.  The generic pointwise_dynamic wrapper carries a
-# large fixed host-side cost (~150us/call on P800: shape/stride bookkeeping,
-# dtype promotion, libentry cache-key + StridedBuffer construction).  For
-# small inputs the device kernel finishes in a few microseconds, so that host
-# cost - not the kernel - dominates the measured latency.  Below this size we
-# launch a purpose-built 1D kernel directly (host cost ~50us) instead of going
-# through the wrapper.  Above it the device kernel is long enough that the
-# wrapper's host cost is fully hidden and the tuned codegen below wins, so we
-# keep the original path untouched.
 _SMALL_NUMEL = 1 << 20
 
 config_ = CodeGenConfig(
@@ -61,8 +52,6 @@ def _hardtanh_backward_small_kernel(
     mask = offs < n_elements
     grad_output = tl.load(grad_output_ptr + offs, mask=mask).to(tl.float32)
     self_val = tl.load(self_ptr + offs, mask=mask).to(tl.float32)
-    # Same strict open-interval semantics as the generic implementation:
-    # 1.0 exactly when min_val < x < max_val, 0.0 on/outside the bounds.
     p = tl.maximum(0.0, (self_val - min_val) * 1.0e30)
     q = tl.maximum(0.0, (max_val - self_val) * 1.0e30)
     in_range = tl.minimum(1.0, p) * tl.minimum(1.0, q)

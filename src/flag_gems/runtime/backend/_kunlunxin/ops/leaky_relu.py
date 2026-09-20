@@ -17,16 +17,6 @@ config_ = CodeGenConfig(
     prefer_1d_tile=True,
     buffer_size_limit=4096,
     isCloseVectorization=False,
-    # kunlunAutoGrid=True lets the 1d-tile wrapper pick num_ctas=1 when
-    # num_tasks <= 2048*64 instead of the fixed 12-CTA launch.  At (64,64)
-    # (4096 elems) the fixed grid spreads the work over 12 CTAs and the
-    # per-CTA launch/cluster overhead dominates the end-to-end latency:
-    # 4096-elem leaky_relu latency 7.6 -> 5.6us (bf16) / 8.0 -> 5.2us (fp16)
-    # / 6.6 -> 5.3us (fp32) when combined with the pre-allocated out0 in
-    # leaky_relu() below (harness/solution/rolloutB/ab_arms.txt); the 5-round
-    # robust dtype-balanced speedup goes 0.7565 -> 0.9216.  Shapes above the
-    # 2048*64 threshold keep the 12-CTA grid, so the large shapes are
-    # unaffected.  Same knob and rationale as clamp.py / neg.py / rsub.py.
     kunlunAutoGrid=True,
     unroll_num=8,
 )
@@ -43,23 +33,6 @@ def leaky_relu_kernel(x, negative_slope):
 
 def leaky_relu(A, negative_slope=0.01):
     logger.debug("GEMS_KUNLUNXIN LEAKY_RELU")
-    # Allocate the result here and pass it as `out0`.  Without it
-    # pointwise_dynamic must re-derive the result dtype on every call
-    # (`type_promotion(A, negative_slope, DEFAULT)` + a fresh
-    # `torch.empty_like`), and at launch-bound shapes that host-side work is a
-    # large share of the end-to-end latency.  The pre-fix 5-round harness
-    # median for (64,64) was 9.60/8.74/10.67us (bf16/fp16/fp32); with out0 and
-    # the kunlunAutoGrid knob above it reaches torch parity (0.9838/1.0024/
-    # 1.0826 robust speedup, ab_arms.txt + agg_after_leaky_relu.txt).  The
-    # (4096,4096)/(64,512,512) cases are device bound and unaffected.  Same
-    # pattern as clamp_max()/rsub_scalar().
-    #
-    # Pre-allocating is only valid while the promoted result dtype is provably
-    # A.dtype: `promotion_methods=[(0, "DEFAULT")]` promotes a floating-point
-    # tensor with a Python numeric scalar, and a Python scalar is "weak" so it
-    # never widens the tensor (and leaky_relu is documented to preserve the
-    # input dtype anyway).  Integer/bool tensors or a non-numeric scalar keep
-    # the generic promotion path.
     if A.is_floating_point() and type(negative_slope) in (int, float):
         return leaky_relu_kernel(A, negative_slope, out0=torch.empty_like(A))
     return leaky_relu_kernel(A, negative_slope)

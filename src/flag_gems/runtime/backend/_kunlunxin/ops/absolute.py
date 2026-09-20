@@ -43,18 +43,7 @@ def absolute_func(x):
 
 def absolute(A):
     logger.debug("GEMS_KUNLUNXIN ABSOLUTE")
-    # Pre-allocating out0 skips prepare_args' promotion + allocation branch
-    # (~11us of host work per call).  Guard ① (single tensor, no scalar): the
-    # COMPLEX_TO_FLOAT promotion only diverges for complex input, so restrict
-    # the fast path to real floating point and keep the original path otherwise.
     if A.is_floating_point():
-        # bf16-specific codegen debt: `tl.abs` on a bf16 pointer type costs
-        # ~1.4x the pure-copy bandwidth (measured 56us vs 40us at 16.7M elems;
-        # f16 pays 39.7us), while the load/store themselves are unaffected.
-        # `abs` is a sign-bit-only operation and f16/bf16 both keep the sign at
-        # bit 15, so the *same bytes* pushed through the f16 kernel give a
-        # bit-identical result.  Verified exhaustively over all 65536 uint16
-        # patterns (see harness .../probe_bitident.txt: 0 mismatches).
         if (
             A.dtype == torch.bfloat16
             and A.dim() >= 1

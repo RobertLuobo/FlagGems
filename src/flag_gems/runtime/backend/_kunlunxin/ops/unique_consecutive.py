@@ -66,15 +66,10 @@ import triton.language as tl
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils.libentry import libentry
 
-# Reuse the already-verified scan machinery from the sibling vendor module
-# (`unique.py` is imported before this module by ops/__init__.py, so this import
-# cannot be circular, and `unique.py` does not import this file).
 from .unique import _SCAN_BLOCK, _triton_inclusive_scan
 
 logger = logging.getLogger(__name__)
 
-# One tile width for every stage.  Equal to _SCAN_BLOCK so the ne/cum buffers are
-# block-aligned and the finalize kernel can read them unmasked.
 _UC_BLOCK = _SCAN_BLOCK
 
 
@@ -106,8 +101,6 @@ def _ne_consecutive_kernel(
     a = tl.load(data_ptr + src)
     b = tl.load(data_ptr + src_prev)
 
-    # Pure int arithmetic (no vector i1 and/or) then a single cast, per the
-    # backend notes on narrow i1 vectors.
     is_first = tl.where(offs == 0, 1, 0)
     diff = tl.where(a != b, 1, 0)
     has_prev = tl.where(offs > 0, 1, 0)
@@ -173,9 +166,6 @@ def _unique_consecutive_finalize_kernel(
     tl.store(out_ptr + dst, a)
 
     if return_counts:
-        # Only the single group-start lane per group writes here, so the value is
-        # the start offset (int32) of that group -- exactly what
-        # `_uc_run_lengths_kernel` wants.
         tl.store(start_ptr + dst, offs)
 
 
@@ -284,11 +274,7 @@ def unique_consecutive(
     cum = _triton_inclusive_scan(ne)
     n_unique = int(cum[num_tasks - 1].item())
 
-    # Buffers over-allocated by one tile: the extra `_UC_BLOCK` slots are the
-    # per-lane scratch target for inactive lanes.
     data_out = torch.empty(n_unique + _UC_BLOCK, dtype=flat_input.dtype, device=device)
-    # Group start offsets are int32 here and widened to int64 only inside the
-    # counts kernel (see the compile-failure note on the finalize kernel).
     start_positions = (
         torch.empty(n_unique + _UC_BLOCK, dtype=torch.int32, device=device)
         if return_counts

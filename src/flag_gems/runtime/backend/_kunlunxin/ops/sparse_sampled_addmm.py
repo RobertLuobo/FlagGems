@@ -247,10 +247,6 @@ def _ssa_pos_group_kernel(
         # DMA into a per-lane gather and costs 1.7x on this backend
         # (27.18 ms vs 15.95 ms measured at B=16, M=N=4096, BLOCK=256).
         c = tl.load(col_base + e, mask=keep, other=0).to(tl.int64)
-        # Row of each nnz within the group: count how many of the group's crow
-        # boundaries it has reached.  `r0 + 1 + j` is clamped so the trailing
-        # (partial) group never reads past crow[M]; the clamped terms compare
-        # against crow[M] which is > every kept e, so they contribute 0.
         row = tl.zeros([BLOCK], dtype=tl.int64)
         for j in tl.static_range(R):
             bnd = tl.load(crow_base + tl.minimum(r0 + 1 + j, M)).to(tl.int64)
@@ -442,18 +438,6 @@ def _sparse_sampled_addmm_impl(input, mat1, mat2, *, beta=1.0, alpha=1.0, out=No
     # pos[b * nnz_per_batch + e] = flat offset of value e inside `dense`.
     # Over-allocated by one block so that the row-tail store can never touch
     # memory outside this buffer.
-    #
-    # int32 fast path: when the whole flat dense scratch (and therefore every
-    # index into it, and nnz itself) fits in int32, the position pass runs with
-    # 32-bit address arithmetic and a 4-byte `pos` element.  The stored offset is
-    # exact either way (check_narrow.py Part A: bit-identical), so this is a pure
-    # codegen/traffic win -- measured 1.4-1.7x on the pass.
-    #
-    # The narrow kernel additionally addresses the CSR row pointer block with
-    # `crow_ptr + b * (M + 1)` in int32 (one `M + 1`-entry block per batch).
-    # That index is *not* bounded by the flat dense-scratch size above: with
-    # `Np == 1` a huge `M` can make `B * (M + 1)` overflow even though
-    # `B * Mp * Np` does not.  Guard both int32 index spaces explicitly.
     narrow = B * Mp * Np < (1 << 31) and B * (M + 1) < (1 << 31)
     if narrow:
         pos_rows, pos_block = _pos_plan(nnz_per_batch, M)

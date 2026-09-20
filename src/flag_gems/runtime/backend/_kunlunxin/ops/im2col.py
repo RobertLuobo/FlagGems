@@ -159,14 +159,9 @@ def im2col(input, kernel_size, dilation=1, padding=0, stride=1):
             and output_w == width
             and locations == (1 << (locations.bit_length() - 1))
             and 256 <= locations <= 16384
-            # For padded reads the affine path must zero the padding lanes,
-            # which only pays off once the block is big enough to amortise it;
-            # the fully-in-bounds (1x1, no-pad) form is always at least as fast.
             and (locations >= 512 or not bounded)
         )
         if affine:
-            # One program per output row: the read collapses to a unit-stride
-            # affine block (see _im2col_affine_kernel).
             with torch_device_fn.device(input.device):
                 _im2col_affine_kernel[(batch * rows,)](
                     x,

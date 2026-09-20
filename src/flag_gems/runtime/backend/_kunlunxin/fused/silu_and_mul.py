@@ -27,13 +27,6 @@ logger = logging.getLogger(__name__)
 @triton.jit
 def silu_and_mul_kernel(x, y):
     x_fp32 = x.to(tl.float32)
-    # XPU: a division whose numerator is a *tensor value* (`tl.fdiv(a, b)` or
-    # `a / b`, both tensors) lowers to a full IEEE division sequence, while a
-    # CONSTANT numerator over a tensor takes the backend reciprocal path.
-    # Mechanism probe (harness/solution/silu_and_mul_out/ab_mech_run1.json,
-    # 4096x4096 fp32, min of 5 interleaved do_bench rounds): tensor/tensor
-    # 0.4298 ms, tl.fdiv(t, t) 0.4299 ms, 1.0/tensor 0.2224 ms.
-    # Same idiom as `sig = 1 / (1 + tl.exp(-x_fp32))` in the grad kernel below.
     x_silu = x_fp32 * (1.0 / (1.0 + tl.exp(-x_fp32)))
     return x_silu * y
 

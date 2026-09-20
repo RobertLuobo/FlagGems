@@ -101,28 +101,6 @@ def true_divide(A, B):
             and A.numel() >= DIV_TENSOR_U16_MIN_NUMEL
         ):
             return true_div_func_u16(A, B)
-        # Pre-allocate the output and pass it as `out0`. Without it,
-        # pointwise_dynamic has to derive the promoted result dtype from scratch
-        # on every call (`elementwise_dtypes(A, B, INT_TO_FLOAT)`), which costs
-        # ~6.5us of pure host time on this stack - more than the whole device
-        # time of a launch-bound shape like (64,64) (measured: the (64,64)
-        # tensor-tensor case drops by ~8.5us, i.e. down to the bare triton
-        # launch floor; the 16.7M-element cases are device bound and are
-        # unaffected). Same pattern as rsub_scalar() in ../rsub.py and
-        # fill_scalar() in ../fill.py.
-        #
-        # Passing out0 is only equivalent to the generic allocation when the
-        # promoted result dtype is provably A.dtype and the task shape is
-        # provably A.shape:
-        #   * two operands of the SAME floating-point dtype promote to that
-        #     dtype (INT_TO_FLOAT only widens integer/bool inputs, and a float
-        #     operand always dominates them), and
-        #   * with equal shapes the task space is that shape, so an
-        #     `empty_like(A)` is exactly the buffer pointwise_dynamic would
-        #     have allocated itself (it uses `torch.empty_like` on the first
-        #     operand as well).
-        # Every other combination (mixed dtypes, integer/bool/complex
-        # operands, broadcasting) keeps the generic promotion path.
         if A.dtype == B.dtype and A.dtype.is_floating_point and A.shape == B.shape:
             return true_div_func(A, B, out0=torch.empty_like(A))
         return true_div_func(A, B)
@@ -381,26 +359,6 @@ def floor_divide(A, B):
             if A.dtype == torch.bfloat16:
                 B = _as_bfloat16_scalar(B)
             return floor_div_lowp_tensor_scalar_func(A, B)
-        # Allocate the result tensor here and pass it as `out0`. Without it,
-        # pointwise_dynamic re-derives the promoted result dtype from scratch on
-        # every call (`type_promotion(A, DEFAULT)` inside prepare_args), which is
-        # pure host time paid before the launch and dominates at a launch-bound
-        # shape such as (64,64). Same pattern as true_divide() above in this
-        # file, rsub_scalar() in ../rsub.py and clamp_max() in ../clamp.py; the
-        # large shapes are device bound and are unaffected.
-        #
-        # Passing out0 is only equivalent to the generic allocation when the
-        # result is provably A.dtype with A.shape AND A.is_contiguous():
-        #   * the tensor-scalar schema uses promotion method `[(0, "DEFAULT")]`,
-        #     i.e. only operand 0 (the tensor) participates, so DEFAULT promotion
-        #     of A is A.dtype for every dtype A can have here;
-        #   * with a single tensor input the task shape is A.shape;
-        #   * `A.is_contiguous()` keeps the *route* identical as well: without
-        #     out0 the fast path is decided on the single-element list [A], which
-        #     a non-overlapping-dense-but-non-contiguous A also passes, whereas
-        #     with out0 the list becomes [out0, A] and that fast path would not
-        #     be taken. Non-contiguous inputs therefore keep the pre-existing
-        #     generic route untouched.
         if A.is_contiguous():
             return floor_div_func_corrected_tensor_scalar(
                 A, B, out0=torch.empty_like(A)

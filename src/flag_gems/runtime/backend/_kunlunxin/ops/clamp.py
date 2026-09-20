@@ -41,37 +41,9 @@ clamp_max_config = CodeGenConfig(
     buffer_size_limit=4096,
     isCloseVectorization=False,
     unroll_num=8,
-    # kunlunAutoGrid=True lets the 1d-tile wrapper pick num_ctas=1 when
-    # num_tasks <= 2048*64 instead of the fixed 12-CTA launch.  At (64,64)
-    # (4096 elems) the fixed grid splits the work into 12 CTAs of a 512-tile
-    # each, and the per-CTA launch/cluster overhead dominates: 4096-elem
-    # elementwise latency 7.35 -> 6.34us (bf16) / 6.49 -> 6.02us (fp16) when
-    # combined with the pre-allocated out0 below (harness/solution/pdhost_cost
-    # /phase1d_clamp_ab.txt).  Shapes above the 2048*64 threshold keep the
-    # 12-CTA grid, so the large shapes are unaffected (verified 47.5->47.1us
-    # bf16, 41.4->41.2us fp16, 69.7->69.9us fp32 on (64,512,512)).  Same knob
-    # and rationale as neg.py / rsub.py.
     kunlunAutoGrid=True,
 )
 
-# clamp_tensor's benchmark entry combines THREE same-shape tensors, and that is
-# the only entry whose (64,64) case sits on the wrong side of 0.8: 22.2/20.8/20.1us
-# gems vs ~5.8us torch (speedup 0.26).  Two independent host/launch-side levers,
-# both measured on the real entry (harness/solution/clamp_tensor/fix_margin_20260919
-# /real_entry_*.log) at (64,64):
-#   * out0 pre-allocation in clamp_tensor()      : 22.2 -> 10.6 (bf16) /
-#     20.8 -> 9.8 (fp16) / 20.1 -> 9.0us (fp32)   [~12us = elementwise_dtypes
-#     + torch.empty_like, which out0 skips]
-#   * this config (kunlunAutoGrid=True + the proven tile/unroll recipe)
-#                                                : 10.6 -> 6.4 / 9.8 -> 6.3 /
-#     9.0 -> 6.6us  [fixed 12-CTA -> 1-CTA launch at num_tasks<=2048*64]
-# The two knobs are single-variable A/B verified in ab_decompose.py (V0/VA/VB/VAB).
-# NOTE: this is a NEW CodeGenConfig instance, deliberately not clamp_max_config
-# (which is clamp_max/clamp_min's own tuned object); the 3-tensor kernel has a
-# different input count so the two are kept independent.
-# Shapes above the 2048*64 threshold keep the 12-CTA grid, so (4096,4096) and
-# (64,512,512) are unaffected (verified 79.8->80.1 / 74.3->74.7 / 136.3->136.6us,
-# i.e. within noise).
 clamp_tensor_config = CodeGenConfig(
     512,
     (65536, 65536, 65536),
@@ -191,22 +163,6 @@ def clamp_max(A, max_value):
     logger.debug("GEMS_KUNLUNXIN CLAMP_MAX")
     if max_value is None:
         raise ValueError("max_value must not be None")
-    # Allocate the result here and pass it as `out0`.  Without it
-    # pointwise_dynamic must re-derive the result dtype on every call
-    # (`elementwise_dtypes(tensor, python_scalar, DEFAULT)` + a fresh
-    # `torch.empty_like`), and at launch-bound shapes that host-side work is a
-    # large share of the end-to-end latency: (64,64) 10.5 -> 8.7us bf16,
-    # 9.0 -> 7.7us fp16, 7.1 -> 6.5us fp32 (phase1d_clamp_ab.txt, B-arm).
-    # Combined with the kunlunAutoGrid knob this brings (64,64) to 6.3/6.0/5.8us,
-    # i.e. torch parity.  The (4096,4096)/(64,512,512) cases are device bound
-    # and unaffected.  Same pattern as rsub_scalar()/fill_scalar().
-    #
-    # Pre-allocating is only valid while the promoted result dtype is provably
-    # A.dtype: a floating-point tensor combined with a Python numeric scalar is
-    # "weak", so such a scalar never widens it (and clamp is documented to
-    # preserve the input dtype anyway).  Every other combination (an
-    # integer/bool tensor, a Tensor max_value, a complex scalar) keeps the
-    # generic promotion path.
     if A.is_floating_point() and type(max_value) in (int, float):
         return clamp_max_func(A, max_value, out0=torch.empty_like(A))
     return clamp_max_func(A, max_value)

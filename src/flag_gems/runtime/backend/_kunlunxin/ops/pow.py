@@ -45,17 +45,6 @@ def pow_tensor_tensor_(A, exponent):
     return pow_func(A, exponent, out0=A)
 
 
-# XPU-tuned config for the `pow_tensor_scalar` family.  Without `config=` the
-# decorator falls back to the platform default
-# (`CodeGenConfig(512, ..., kunlunAutoGrid=False, unroll_num=0)`), which makes
-# `gen_task_partition_1d` emit the fixed `num_ctas = 12 / num_tiles = 12`
-# (fully masked, tile_size = next_pow2(cdiv(n, 12))) partition for every shape.
-# Measured on card 6 (2026-09-19, do_bench median, interleaved same-process
-# A/B, 3 shapes x 3 float dtypes): the two large 16.7M-element cases improve
-# ~20% for every dtype (float16 1.027 -> 0.882 ms, bfloat16 0.867 -> 0.679 ms,
-# float32 0.847 -> 0.680 ms event-caliber); the (64,64) case is unchanged.
-# `buffer_size_limit=4096` was probed as well and changes nothing (0.8819 vs
-# 0.8846 ms) -> not added.  Keeps `isCloseMemoryAsync` at its default (True).
 config_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),
@@ -88,15 +77,6 @@ def pow_tensor_scalar(A, exponent):
 
 
 # ---------------------------------------------------------------------------
-# pow_tensor_scalar / pow_tensor_scalar_ (tensor base ^ scalar exponent)
-# fast path.
-#
-# 同一配方同时服务 in-place 与 out-of-place（2026-09-19 扩展 out-of-place）：
-#   * in-place 侧自 2026-08-19 起就走这里；out-of-place 的 `pow_tensor_scalar`
-#     此前只走通用 extern pow，在 **float16** 上明显吃亏（harness robust 5 轮：
-#     f16 (4096,4096) gems 1262.9us vs base 831.2us = 0.656；同一内核的 bf16
-#     却是 1.06x），是 55 清单里 f16 dtype 均值 0.705 < 0.8 的唯一来源。
-#     两者门控/配方完全相同，故直接复用，不做任何新算法。
 #
 # XPU 探针（2026-08-19, XPU4, 16.7M fp32 do_bench 同窗）：
 #   * 通用 extern pow（pow_func_tensor_scalar）1290-1815us，约等于 torch 原生
@@ -110,11 +90,6 @@ def pow_tensor_scalar(A, exponent):
 #     分布矩阵全部 0 失败。
 #   * 门控：仅 有限、非零、非整数、>0 的指数走 fast path；整数/0/负非整数/±inf/NaN
 #     指数仍走原通用 extern 路径（语义完全不变）。
-#   * out-of-place 复用时的额外约束：门控里已有 `A.is_contiguous()`，且
-#     `type_promotion(float_tensor_A, python_float)` 恒为 `A.dtype`
-#     （已用 tests/ 的 3 个 float dtype 实测），故 `torch.empty_like(A)`
-#     与 wrapper 自己分配的输出 dtype/shape/layout 完全一致；其余情况一律
-#     回退通用路径。
 # ---------------------------------------------------------------------------
 
 
@@ -151,8 +126,6 @@ def pow_tensor_scalar_fast_kernel_masked(
 
 
 def _launch_pow_tensor_scalar_fast(x, exp, out=None):
-    # `out=None` keeps the historical in-place behaviour (out == x); the
-    # out-of-place entry passes a freshly allocated `torch.empty_like(A)`.
     if out is None:
         out = x
     n_elements = x.numel()

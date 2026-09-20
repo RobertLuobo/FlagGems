@@ -28,15 +28,6 @@ _prewarmed = False
 
 # Band scatter kernel for diagonal_backward.  Writes the diagonal band of the
 # (already zero-filled) output tensor from the contiguous gradient.
-# grid = (cdiv(D, BLOCK), num_rows).  out_ptr is the **base** data pointer of
-# the output tensor (not of the diagonal view): `row_out_ptr` already carries
-# the view's storage offset, so no `torch.diagonal` view has to be materialised
-# on the host.  col_tab gives j * band_stride and row_out_tab the per-row base
-# offset (storage offset + outer index walk).
-#
-# `do_not_specialize` matters here: the XPU allocator hands back pointers from
-# varying divisibility classes between calls, and with specialisation on the
-# launcher would re-derive a kernel ABI per call.
 @triton.jit(
     do_not_specialize=[
         "grad_ptr",
@@ -89,12 +80,8 @@ def _tle_eligible(view_shape, view_strides, src_strides, elem_size):
     side per element, which has no advantage over the kernel above.
     """
     if elem_size == 1:
-        # 1-byte elements fault the SDNN trans kernel and the row path has no
-        # transfer width for them either.
         return False
     if _torch_contiguous(view_shape, view_strides):
-        # tle_copy's tile path; `TensorDescriptor.from_tensor` asserts unless the
-        # last stride is genuinely 1, which a trailing size-1 dim can hide.
         return False
 
     dims = [
@@ -211,8 +198,6 @@ def _build_plan(input_sizes, offset, dim1, dim2, device, elem_size):
     for s in outer_shape:
         rows *= s
 
-    # The diagonal view torch.diagonal would build: the outer dims in order with
-    # their original strides, then the diagonal extent at stride st[a]+st[b].
     diag_stride = strides[a] + strides[b]
     view_shape = outer_shape + [D]
     view_strides = outer_strides + [diag_stride]
@@ -243,9 +228,6 @@ def _ensure_tables(plan, device):
     """Build the scatter kernel's lookup tables (only needed off the DMA path)."""
     if plan.col_tab is not None:
         return
-    # Per-row base offset: the diagonal view's storage offset plus the walk over
-    # the outer dims, i.e. exactly what `_row_table(diag)` produced, but without
-    # materialising the view.
     if plan.rows == 1:
         plan.row_tab = torch.full((1,), plan.base, dtype=torch.int64, device=device)
     else:
@@ -388,10 +370,6 @@ def diagonal_backward(grad_output, input_sizes, offset, dim1, dim2):
     )
 
     if plan.use_tle and band_ok:
-        # Single DMA-class device op for the band, on the layouts the vendor
-        # copy can express (the on-chip transpose).  Returns False without
-        # writing anything when the layout is outside its envelope or the
-        # operands are misaligned, in which case the kernel below still runs.
         diag = torch.diagonal(grad_input, int(offset), int(dim1), int(dim2))
         if tle_copy(grad_output, diag):
             return grad_input

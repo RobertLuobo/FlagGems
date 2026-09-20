@@ -47,10 +47,6 @@ def _functional_sym_constrain_range(*args, **kwargs):
     if tensor_arg is None:
         return args[0] if len(args) > 0 else None
     if tensor_arg.is_contiguous() and tensor_arg.numel() > 0:
-        # Pre-allocating out0 skips prepare_args' promotion + allocation branch
-        # (~11us of host work per call).  Guard ① (single tensor, no scalar):
-        # the DEFAULT promotion preserves the input dtype only for real floats
-        # here, so restrict the fast path and keep the original path otherwise.
         if tensor_arg.is_floating_point():
             return _sym_constrain_range_copy(
                 tensor_arg, out0=torch.empty_like(tensor_arg)

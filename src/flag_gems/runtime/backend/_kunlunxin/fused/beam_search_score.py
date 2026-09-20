@@ -64,8 +64,6 @@ def _block_and_warps(numel, dtype):
         if numel <= 1048576:
             return 131072, 4
         return 262144, 4
-    # bfloat16: the backend's bf16 vector path degrades past a 64K tile, so the
-    # last tier is capped lower than for fp16/fp32.
     if numel <= 65536:
         return 8192, 8
     if numel <= 262144:
@@ -73,14 +71,6 @@ def _block_and_warps(numel, dtype):
     return 65536, 4
 
 
-# The XPU backend stages every global load through a per-core local-memory
-# buffer whose length is ``buffer_size_limit`` (default 512 -> a 256-element
-# tile per core).  For this kernel the measured effect is a DMA issued in 16
-# chunks per BLOCK instead of 4, and the streaming shapes run ~2.7x off the DMA
-# roofline.  This is the same value the elementwise CodeGenConfig recipes in
-# this backend already use (see ``_kunlunxin/ops/acosh.py``).  The compiler
-# halves it again when a large tile would overflow the local-memory budget, so
-# large BLOCKs settle at 2048 and never over-read.
 _XPU_LAUNCH_OPTIONS = {"buffer_size_limit": 4096}
 
 

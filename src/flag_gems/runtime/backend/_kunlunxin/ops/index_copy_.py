@@ -5,14 +5,6 @@ import triton.language as tl
 from flag_gems.utils import libentry
 
 
-# ---------------------------------------------------------------------------
-# XPU3 tuning helpers
-#
-# On Kunlunxin the flat block copy is a pure block-DMA; a grid of tiny tiles
-# (the historical ``BLOCK=256``) is launch-bound and leaves the DMA engine
-# idle, while one large bounded tile per program reaches the engine's peak.
-# The tiers mirror ``_pick_flat_block`` in ``ops/copy.py``.
-# ---------------------------------------------------------------------------
 def _pick_copy_block(n_elements):
     if n_elements >= 1 << 19:
         return 65536
@@ -51,15 +43,6 @@ def _scatter_num_warps(block):
     return 32
 
 
-# ---------------------------------------------------------------------------
-# Bounds-check kernel
-#
-# The historical host-side check ``((0 <= index) & (index < size)).all()``
-# dispatches four separate flag_gems python kernels (two scalar compares, an
-# ``and`` and a full reduce); inside ``use_gems()`` each one pays the
-# ``torch.library`` dispatch cost, adding ~0.49 ms to *every* call.  A single
-# fused kernel plus one ``.item()`` sync keeps the same semantics for ~0.11 ms.
-# ---------------------------------------------------------------------------
 @libentry()
 @triton.jit
 def _oob_flag_kernel(index, n, size_dim, flag, BLOCK: tl.constexpr):
@@ -68,8 +51,6 @@ def _oob_flag_kernel(index, n, size_dim, flag, BLOCK: tl.constexpr):
     mask = offsets < n
     values = tl.load(index + offsets, mask=mask, other=0)
     bad = tl.where(mask & ((values < 0) | (values >= size_dim)), 1, 0)
-    # Unconditional store (0 or 1) so the caller can use ``torch.empty`` and
-    # skip the ``torch.zeros`` memset launch that a conditional store needs.
     tl.store(flag + pid, tl.minimum(tl.sum(bad, axis=0), 1))
 
 
@@ -202,8 +183,6 @@ def _index_copy_flat(
     c = r - j * INNER
     if NEED_MASK:
         m = e < total
-        # ``j`` is always in [0, LENGTH) even for padded lanes (``r < LENGTH *
-        # INNER``), so the index load never needs a guard.
         dst = (o * OUT_DIM + tl.load(index + j)) * INNER + c
         tl.store(inp + dst, tl.load(src + e, mask=m, other=0), mask=m)
     else:

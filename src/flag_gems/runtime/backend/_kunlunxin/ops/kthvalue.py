@@ -73,8 +73,6 @@ def _kthvalue_packed_kernel(
     """
     pid = ext.program_id(0)
     col_offs = tl.arange(0, BLOCK_N)
-    # Row stride is BLOCK_N: the host pads the reduction dim to BLOCK_N with
-    # +inf, so the load below is a plain contiguous (affine) load.
     base = input_ptr + pid * BLOCK_N
     pos = col_offs
     v = tl.load(base + col_offs)
@@ -99,16 +97,9 @@ def _kthvalue_packed_kernel(
     neg = ~(key >> 31)
     bits = key ^ (neg | -2147483648)
     kth_val = bits.to(tl.float32, bitcast=True)
-    # count only logical lanes: +inf padding lanes must not inflate the tie
-    # count (a finite k-th value never equals +inf anyway, but the mask keeps
-    # the all-+inf edge case correct too).
     cnt = tl.sum(((v == kth_val) & (col_offs < N)).to(tl.int32), axis=0)
     kth = K - 1
     idxv = col_offs
-    # The tie-exact sim must run at kernel top level (wrapping it in an if
-    # makes the tt.reduce ops illegal on this backend); a dynamic (runtime)
-    # loop bound skips the work entirely for untied rows instead, so the
-    # fast path above is all a row does when its k-th value is unique.
     sim_bound = tl.where(cnt > 1, MAXC, 0)
     # ---------- exact quick_select_port (register-resident) ----------
     L = tl.full((), 0, dtype=tl.int32)
@@ -135,8 +126,6 @@ def _kthvalue_packed_kernel(
         iR = tl.min(tl.where(mskR, idxv, BIG), axis=0)
         iL1 = tl.min(tl.where(mskL1, idxv, BIG), axis=0)
         iP = tl.min(tl.where(mskP, idxv, BIG), axis=0)
-        # median-of-three 3-sort (scalar chain; torch uses > and
-        # swaps the (value, index) pairs in lockstep)
         c1 = vP > vR
         vL1s = tl.where(c1, vR, vP)
         iL1s = tl.where(c1, iR, iP)
@@ -153,8 +142,6 @@ def _kthvalue_packed_kernel(
         vLs2 = tl.where(c3, vL1s, vLs)
         iLs2 = tl.where(c3, iL1s, iLs)
         p0c = s0 & (R >= L + 2)
-        # application order matters when P == L+1: P first, then
-        # L+1 (last write wins at the shared position)
         v = tl.where(mskP & (p0c != 0), vL1, v)
         v = tl.where(mskL1 & (p0c != 0), vL1s2, v)
         v = tl.where(mskL & (p0c != 0), vLs2, v)
@@ -323,20 +310,10 @@ def kthvalue(inp, k, dim=-1, keepdim=False):
     max_programs = 16384
     with torch_device_fn.device(inp.device):
         if dim_size <= 512:
-            # Fast path: one program per row (a grid-strided row loop would
-            # put the tt.reduce ops two region levels deeper, which this
-            # backend refuses to legalize).
             block_n = triton.next_power_of_2(dim_size)
             if block_n == dim_size:
                 transposed = src.contiguous()
             else:
-                # Non-power-of-two dim: pad the reduction dim to block_n with
-                # +inf so the kernel can use a fully affine contiguous load.
-                # A wrapped (``col % N``) load scalarizes and is ~1000x
-                # slower here.  torch.full is a plain device allocation; the
-                # copy_ below is a device-to-device copy (vendor copy kernel),
-                # not an ATen/native fallback.  Padding lanes carry +inf and
-                # are excluded by the logical ``col_offs < N`` masks.
                 transposed = torch.full(
                     (M, block_n),
                     float("inf"),
@@ -357,10 +334,6 @@ def kthvalue(inp, k, dim=-1, keepdim=False):
                 isCloseVectorization=True,
             )
         else:
-            # multi-chunk (or large-N) path: masked loads. For N > 512 the
-            # kth value is an extreme order statistic of many samples and
-            # exact float ties at it are ~1e-4 or rarer, so the min-based
-            # index selection below is exact in practice.
             transposed = src.contiguous()
             selected = torch.full((4, M), -1, dtype=torch.int32, device=inp.device)
             block_n = 512

@@ -377,9 +377,6 @@ def _lstsq_tall(A, B, rcond):
     KP = max(_LANES, _p2(nrhs))
     MP = max(_MIN_ROW, _p2(m))
     NP = max(_MIN_COL, _p2(n))
-    # NCP only has to be a multiple of the QR column-block (_LANES) so that the
-    # (NCP - c0) / BC block count is exact; rounding it to a power of two padded
-    # the row dimension of every rank-1 update.
     NCP = max(NP, _ceil_to(n + KP, _LANES))
 
     W = torch.zeros((batch, NCP, MP), dtype=dt, device=dev)

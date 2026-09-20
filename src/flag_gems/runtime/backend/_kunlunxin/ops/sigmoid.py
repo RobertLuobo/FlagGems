@@ -59,21 +59,6 @@ def sigmoid_backward_kernel(dy, y):
     return dy_f32 * (1.0 - y_f32) * y_f32
 
 
-# 16-bit twin of the kernel above.  Identical math -- dy*y*(1-y) -- written so
-# that no scalar constant appears in the expression.  On this backend `1.0 - y`
-# lowers to an `svsubf` against a splat whose cluster layout does not match the
-# value tile; at 16.7M elements that costs fp16 ~10% of the kernel's device time
-# (0.0662 -> 0.0598 ms measured, card 7) while bf16 is unaffected.  Evaluating the
-# same polynomial as dy*(y - y*y) has no scalar operand and removes the penalty.
-#
-# Output equivalence, measured on 16.7M randn elements per dtype (probe_numerics):
-#   bf16: 0 of 16777216 values differ -- bit-identical to the form above.
-#   fp16: 58 of 16777216 values differ, each by 1 ulp (a rounding-boundary flip
-#         between two f32 evaluations, both rounded to fp16; well inside the
-#         `--ref cpu` tolerances, which are atol=1e-4 + dtype rtol).
-#   fp32: NOT used -- the two forms disagree on 51.6% of values by <=1 ulp there,
-#         and the constant form is bit-identical to the native op, so fp32 and the
-#         mixed-dtype fallback keep the exact kernel.
 @pointwise_dynamic(promotion_methods=[(0, "INT_TO_FLOAT")])
 @triton.jit
 def sigmoid_backward_kernel_16b(dy, y):
@@ -178,16 +163,6 @@ def sigmoid_backward(grad_output, output):
         and output.dim() > 0
         and output.shape == grad_output.shape
     ):
-        # Large contiguous float tensors.  The pointwise codegen kernel is kept
-        # because its *device* time already matches the native op (measured
-        # 63/99/63us vs native 50/98/53us at 16.7M on P800); a hand-written
-        # flat kernel is 1.5-2.9x slower on the device, so switching would be a
-        # real regression.  What is not optimal is the pointwise wrapper's
-        # per-call *host* work: without out0 it runs the INT_TO_FLOAT promotion
-        # machinery and allocates the result itself.  Handing it a
-        # pre-allocated, already correctly-typed output skips both, while the
-        # device work and the returned tensor are unchanged (out0 is returned
-        # as-is by StridedBuffer.unwrap, with output's shape and stride).
         out = torch.empty_strided(
             output.shape, output.stride(), dtype=output.dtype, device=output.device
         )

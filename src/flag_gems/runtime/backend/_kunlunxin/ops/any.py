@@ -70,10 +70,6 @@ def reduce_any(a, b):
 
 @triton.jit
 def reduce_or_i32(a, b):
-    # Bitwise OR over the packed int32 words of a bitmap.  `OR_w (w & MAG)`
-    # equals `(OR_w w) & MAG`, so a zero result means every element of every
-    # reduced word was zero.  On XPU this tree is markedly cheaper than the
-    # equivalent `tl.max(where(...))` select tree (~2.8x on f32 rows).
     return a | b
 
 
@@ -340,8 +336,6 @@ def any_row_stage2_kernel(mid, out, MID_N, BLOCK_MID: tl.constexpr):
     tl.store(out + pid_m, any_val)
 
 
-# Cap on the per-program int32-word tile (32768 words = 128 KB), matching the
-# block the global `any()` word path picks for its largest inputs.
 _ROW_WORD_MAX = 32768
 
 
@@ -381,9 +375,6 @@ def _any_dims_reduce(inp, M, N, out_shape, raw_i32=False):
         else None
     )
     if mag is not None and (N * elem_size) % 4 == 0:
-        # int32-word bitmap path; same idiom as the global-any fast path, which
-        # the i1 OR-tree below is the slow counterpart of.  `N * elem_size % 4`
-        # keeps every row start word-aligned.
         n_words = N * elem_size // 4
         BLOCK_W = min(triton.next_power_of_2(n_words), _ROW_WORD_MAX)
         n_chunks = triton.cdiv(n_words, BLOCK_W)
@@ -395,8 +386,6 @@ def _any_dims_reduce(inp, M, N, out_shape, raw_i32=False):
             M, dtype=torch.int32 if raw_i32 else torch.bool, device=inp.device
         )
         if n_chunks == 1:
-            # Single chunk: stage 1 writes the finished result, so no per-chunk
-            # int32 scratch and no stage-2 launch (~90 us fixed cost here).
             with torch_device_fn.device(inp.device):
                 any_row_word_stage1_kernel[(M, 1)](
                     view,
@@ -521,20 +510,12 @@ def _permute_contig(permuted):
         dtype=permuted.dtype,
         device=permuted.device,
     )
-    # `permuted` is a strided permute view; tle takes it as a TMA tile when the
-    # permutation keeps the innermost axis contiguous and otherwise transposes
-    # a tile on chip (see permute_copy). The pointwise kernel keeps whatever
-    # tle cannot express -- no `torch.ops.aten._copy_from`, which bypasses gems
-    # and dispatches to the vendor fallback.
     if tle_copy(permuted, dst):
         return dst
     try:
         _any_permute_copy_pw(permuted, out0=dst)
         return dst
     except Exception:  # noqa: BLE001
-        # Neither tle nor the pointwise kernel can express this permutation;
-        # fall back to the shared helper's route (correct, just slow under
-        # use_gems). Never let the fast path turn into a hard failure.
         logger.warning(
             "GEMS_KUNLUNXIN ANY: tle/pointwise permute copy failed for "
             "shape=%s strides=%s dtype=%s; using contiguous()",
@@ -606,8 +587,6 @@ def _byte_word_compress(inp, dims):
     if inp.shape[last] % 4 != 0 or inp.storage_offset() % 4 != 0:
         return None
     if _row_word_mag(inp.dtype, 1) is None:
-        # float8: a `-0.0` lane has its sign bit set, so a byte-level test is
-        # not bit-exact with `!= 0`; leave it to the generic path.
         return None
     words = inp.view(torch.int32)
     dset = set(dims)
@@ -691,8 +670,6 @@ def any_dims(inp, dim=None, keepdim=False):
     n_red = 1
     for i in dim:
         n_red *= shape[i]
-    # 1-byte dtypes take the word-level transpose (see `_byte_word_compress`);
-    # kept to M > 1 so the already-fast M == 1 (global `any`) route is untouched.
     byte_words = (
         _byte_word_compress(inp, dim)
         if inp.numel() > 0 and n_red > 0 and inp.numel() // n_red > 1
@@ -703,15 +680,10 @@ def any_dims(inp, dim=None, keepdim=False):
         shape1 = list(shape)
         for i in dim:
             shape1[i] = 1
-        # `n_red` is in elements; when the packed axis is itself reduced
-        # (`expand` False) four of its elements share one word, so the word
-        # tensor's reduced length is a quarter of it.
         n_red_w = n_red if expand else n_red // 4
         M = words.numel() // n_red_w
         if expand:
             o = _any_dims_reduce(words, M, n_red_w, [M], raw_i32=True)
-            # One word -> its four bytes -> four consecutive outputs (exact for
-            # bool / int8 / uint8, whose `!= 0` is a byte-level test).
             out = (o.view(torch.uint8) != 0).reshape(shape1)
         else:
             out = _any_dims_reduce(words, M, n_red_w, shape1)

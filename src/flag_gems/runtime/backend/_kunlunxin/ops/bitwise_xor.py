@@ -37,23 +37,6 @@ def bitwise_xor_func(x, y):
 
 def bitwise_xor_tensor(A, B):
     logger.debug("GEMS_KUNLUNXIN BITWISE_XOR_TENSOR")
-    # Hand pointwise_dynamic a pre-allocated result as `out0`.  Without it the
-    # wrapper re-derives the promoted dtype on every call (type_promotion) and
-    # allocates the output itself through the *registered* torch.empty_like; at
-    # the (64,64) launch-bound shape that host work dominates the op (measured
-    # ~15-18us -> ~5.3us, single-variable A/B, harness/solution/
-    # bitwise_tensor_family/README_out0.md).  The (4096,4096) cases are device
-    # bound and are unaffected.
-    #
-    # Gate: only take the fast path when the promoted result is provably
-    # identical to a fresh tensor of A's own dtype/shape/layout, i.e.
-    #   * A.dtype == B.dtype          -> promotion picks that very dtype
-    #   * A.shape == B.shape          -> broadcast shape == A.shape
-    #   * both contiguous             -> empty_strided(A.shape, A.stride())
-    #                                    reproduces exactly the empty_like(A)
-    #                                    buffer the wrapper would have built
-    # Anything else (mixed dtype, broadcast shapes, non-contiguous operands)
-    # keeps the generic path, bit-for-bit unchanged.
     if (
         A.dtype == B.dtype
         and A.shape == B.shape

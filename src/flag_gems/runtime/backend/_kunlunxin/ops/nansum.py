@@ -162,12 +162,6 @@ def _is_fp64_like(t):
     return t in (torch.float64, torch.int64)
 
 
-# torch.nansum promotes every non-floating (integer/bool) input to int64,
-# exactly like torch.sum; the generic flag_gems/ops/nansum.py encodes this in
-# `_nansum_out_dtype`. This override previously only handled bool and kept the
-# input dtype otherwise, so int8/uint8 inputs produced an int8/uint8 `out` and
-# the tests' `assert res.dtype == ref.dtype (int64)` failed on all 74 integer
-# cases.
 _INTEGRAL_DTYPES = (
     torch.bool,
     torch.int8,

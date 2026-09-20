@@ -48,14 +48,6 @@ config_ = CodeGenConfig(
     unroll_num=8,
 )
 
-# Dedicated config for the two `lerp.Scalar` kernels ONLY (the tensor-path config_
-# above is deliberately left untouched). It is the platform default
-# (CodeGenConfig(512, (65536,65536,65536), 32, True, prefer_1d_tile=True)) with a
-# single extra knob: kunlunAutoGrid=True. Rationale: the 1d-tile wrapper otherwise
-# hardcodes num_ctas=12 for every task, which for the tiny `(64,64)` benchmark case
-# is pure launch/cluster overhead. With the knob, `num_tasks <= 2048*64` launches
-# 1 CTA (see _kunlunxin/utils/pointwise_dynamic.py gen_task_partition_1d); large
-# shapes keep the 12-CTA / bandwidth-bound path, measured no regression.
 config_scalar_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),

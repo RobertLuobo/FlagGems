@@ -166,13 +166,6 @@ def lt_(A, B):
     return A
 
 
-# margin hardening 2026-09-19: a DEDICATED config instance for the in-place
-# scalar codegen kernel only (never share an existing config object across
-# signatures). Measured on [4096,4096] bf16, same process, 3x do_bench median:
-#   buffer_size_limit 2048 (config_inplace_ default) -> 63.3us  sp=0.610
-#   buffer_size_limit 4096                           -> 57.0us  sp=0.678
-# 8192/16384/32768 are identical (57.0-57.1); 512 is a disaster (99.7us).
-# This only affects the bf16 / non-fast-path codegen route of lt_scalar_.
 config_scalar_inplace_ = CodeGenConfig(
     512,
     (65536, 65536, 65536),

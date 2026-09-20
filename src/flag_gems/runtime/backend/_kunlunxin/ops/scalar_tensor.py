@@ -67,11 +67,6 @@ def scalar_tensor(s, *, dtype=None, layout=None, device=None, pin_memory=None):
     if dtype == torch.bool:
         s = bool(s)
     elif dtype is None or dtype.is_floating_point:
-        # A Python int large enough to be materialised as an i64 kernel
-        # argument cannot be lowered to bf16 by this backend's LLVM backend
-        # ("LLVM ERROR: Cannot select: sint_to_fp"); pass floating-point
-        # outputs a float instead.  The previous in-place fill_ path crashed
-        # identically on this input, so this is a strict improvement.
         try:
             s = float(s)
         except (TypeError, ValueError, OverflowError):
