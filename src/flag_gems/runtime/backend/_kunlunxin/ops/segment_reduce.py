@@ -261,7 +261,13 @@ def _segment_reduce_uniform_other_backward_kernel(
             zero_mask = (values == 0) & mask & ~nan_mask
             nan_count += nan_mask.to(tl.int64)
             zero_count += zero_mask.to(tl.int64)
-            product *= tl.where(nan_mask | zero_mask | ~mask, 1.0, values)
+            # NOTE: keep the selected operand (values) in the *true* slot.
+            # `tl.where(mask_a | mask_b | ~mask, 1.0, values)` miscompiles the
+            # whole kernel on this backend (`TritonXPUVectorize` pass failure ->
+            # "out of resource: uni_sram") for every tested tile/dtype; the
+            # negated-keep form below is bit-identical and compiles.
+            keep_mask = mask & ~(nan_mask | zero_mask)
+            product *= tl.where(keep_mask, values, 1.0)
         product *= INITIAL_PROD_VALUE
 
         zero_scalar = tl.full((BLOCK_M, BLOCK_K), 0.0, dtype=compute_dtype)
@@ -286,11 +292,13 @@ def _segment_reduce_uniform_other_backward_kernel(
                 tl.where(zero_count > 0, zero_scalar, product),
             )
             exclusive = tl.where(nan_mask, nan_exclusive, zero_exclusive)
-            grad_result = tl.where(
-                nan_mask | zero_mask,
-                grad_value * exclusive,
-                normal_grad,
-            )
+            # Same backend hazard as above: keep `normal_grad` in the true slot
+            # of the select. Masked-off lanes take `grad_value * exclusive`
+            # instead of `normal_grad`, but they are never stored (both
+            # branches store under `mask`), so the observable result is
+            # unchanged.
+            store_keep = mask & ~(nan_mask | zero_mask)
+            grad_result = tl.where(store_keep, normal_grad, grad_value * exclusive)
             tl.store(grad_input + data_offsets, grad_result, mask=mask)
 
 
