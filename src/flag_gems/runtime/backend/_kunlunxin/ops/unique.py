@@ -1613,12 +1613,13 @@ def _unique2(
             sorted_data, ne, cum_input, N, BLOCK=_BOUND_BLOCK, num_warps=8
         )
 
-    start = torch.nonzero(ne).ravel()
-    n_unique = start.numel()
-    if n_unique == N:
-        data_out = sorted_data
-    else:
-        data_out = torch.index_select(sorted_data, 0, start)
+    # data_out == sorted_data[ne] (order preserving). masked_select performs the
+    # whole compaction in a single kernel, whereas the old nonzero + index_select
+    # pair paid two full passes over the N-element index data (a full gather for
+    # near-all-unique inputs). `start` is only needed by the run-length/counts path.
+    data_out = torch.masked_select(sorted_data, ne)
+    n_unique = data_out.numel()
+    start = torch.nonzero(ne).ravel() if return_counts else None
 
     inverse_indices = None
     counts = None

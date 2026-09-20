@@ -867,11 +867,25 @@ def radix_sort_packed(inp, k_bits=4, descending=False):
     grid = (M * grid_n,)
 
     dtype = inp.dtype
+    # NOTE(kunlunxin, bf16 pass elision): bfloat16 is promoted to float32 for
+    # the order transform (see convert_to_uint_preverse_order), so the packed
+    # key is 32 bits wide.  A bf16->fp32 image however zero-fills the low 16
+    # mantissa bits, so after the sign-aware XOR the *low* 16 key bits are
+    # constant per sign (0x0000 for non-negative, 0xFFFF for negative) and the
+    # sign itself is already carried by the top key bit.  The high 16 key bits
+    # are therefore a faithful order-preserving encoding on their own, and the
+    # four lowest radix passes only shuffle those constant bits around: with a
+    # stable LSD radix sort, running passes over bits 16..31 alone leaves the
+    # result ordered by (value, original column) exactly as before.  Skipping
+    # them halves the pass count (8 -> 4) and, since every pass costs one
+    # data-dependent gather store per element on this backend, halves the sort.
+    bit_start = 0
     num_bits = 1
     if dtype == torch.bool:
         pass
     elif dtype == torch.bfloat16:
-        num_bits = 4 * 8
+        num_bits = 16
+        bit_start = 16
     else:
         num_bits = inp.element_size() * 8
     num_passes = (num_bits + k_bits - 1) // k_bits
@@ -902,7 +916,7 @@ def radix_sort_packed(inp, k_bits=4, descending=False):
                     packed_out,
                     M,
                     N,
-                    p * k_bits,
+                    bit_start + p * k_bits,
                     num_bins,
                     BLOCK_N,
                 )
@@ -916,7 +930,7 @@ def radix_sort_packed(inp, k_bits=4, descending=False):
                 M * r_pad, device=inp.device, dtype=torch.int32
             )
             for p in range(num_passes):
-                bit_offset = p * k_bits
+                bit_offset = bit_start + p * k_bits
                 count_packed_kernel[grid](
                     packed_in,
                     counts,

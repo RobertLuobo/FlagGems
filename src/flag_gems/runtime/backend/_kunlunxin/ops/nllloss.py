@@ -293,11 +293,16 @@ def nll_loss2d_forward_tiled_kernel(
         tl.store(ignore_wgt_tgt_ptr + flat, wgt_tgt)
 
 
-_NLL2D_FLAT_BLOCKS = (2048, 512, 256, 128)
+_NLL2D_FLAT_BLOCKS = (2048, 1024, 512, 256, 128)
 
 
 def _nll2d_flat_cap(M):
     """Measured best `BLOCK_ND` band for the wide flat kernel.
+
+    The wide flat kernel is a plain 1-D tile; on this backend only tile widths
+    that are `<= 64` or a multiple of 1024 map onto the vectorised load path, so
+    512-wide tiles behave like the (1 x 512) tiled kernel while 1024/2048-wide
+    tiles are ~2x faster (see `nll_loss2d_forward` for the crossover data).
 
     Wrapper-level `do_bench` minima over 3 interleaved rounds, `weight=None`
     (the weight-gather cells are bimodal and unusable for tuning), block cap
@@ -307,12 +312,17 @@ def _nll2d_flat_cap(M):
       M=8192    68.2/55.0  35.6/29.7  26.0/20.5   19.2/15.1   [14.9/14.8] 21.8/21.6  35.5/35.4  61.9/61.3
       M=131072  425/375    223/194    150/135     113/98       96.8/90.3 *89.9/88.8* 94.9/94.4  117/116
 
-    The optimum grows with `M` (more parallelism needed) but a single tile that
-    covers all of `M` is always bad (M=8192 @ 8192 -> 61 us vs 14.9 us @ 1024).
-    The M=8192 optimum (1024, in brackets) is *not* usable - see
-    `_NLL2D_FLAT_BLOCKS` - so 512 is taken there instead.
+    A single tile covering all of `M` is always bad (M=8192 @ 8192 -> 61 us vs
+    14.9 us @ 1024), and the optimum grows with `M`.  Interleaved re-measurement
+    of the 1024/2048 blocks (fp16 mean-time, us) gives the band breaks used
+    below: 2048:512, 4096:512/1024, 8192:1024, 16384:2048, 32768:1024/2048,
+    65536:2048, 131072:2048, 524288:2048.
     """
-    return 512 if M <= 65536 else 2048
+    if M <= 2048:
+        return 512
+    if M <= 8192:
+        return 1024
+    return 2048
 
 
 @libentry()
@@ -537,6 +547,184 @@ def nll_loss2d_backward_flat_kernel(
     tl.store(inp_grad_ptrs, inp_grad)
 
 
+# ---------------------------------------------------------------------------
+# Plain-`@triton.jit` copies of the *forward* kernels.
+#
+# `libentry`'s `run()` re-derives a per-argument specialisation / constexpr
+# cache key on every call (`_descriptor_cache_key` does a
+# `triton.tools.tensor_descriptor` import per argument).  Measured on this box
+# that is ~48-55 us of host time per launch, and the benchmark's
+# `triton.testing.do_bench` only hides the first `Z ~= 106 us` of host work per
+# timed iteration (the 256 MB L2 `clear_cache` that precedes `start_event`):
+#
+#     measured ~= max(0, host - 106us) + device
+#
+# The nll forward kernels only need 8-45 us of device time, so the libentry
+# host cost is exactly what caps the measured speedup (e.g. `(64,64)` fp16
+# measures 35.1 us against 12.8 us of bare kernels).  Plain `@triton.jit`
+# launches of the *identical* bodies cost ~18-27 us, which keeps the whole
+# wrapper inside the hidden window, so the measured latency collapses onto the
+# device time.  The bodies below are copies of their libentry counterparts so
+# the numerics cannot drift.
+#
+# `is_use_mask_zero=True` is *mandatory* for every one of these launches: the
+# `ignore_mask` gathers are `tl.load(ptr, mask=m, other=0)`, and on this XPU
+# backend the mask-zero option is what makes the backend honour `other`.  With
+# it off the masked lanes come back as the raw loaded value (verified with a
+# minimal `tl.load(p + off, mask=t != ig, other=0.0)` kernel: all 128 lanes
+# returned the unmasked payload), so every `target == ignore_index` entry leaks
+# weight[tgt] * input[tgt] into `out`.  The option is part of the Triton
+# compilation key, so a kernel already compiled without it is *reused* for a
+# later flagged launch - which is exactly how this regressed silently.
+# ---------------------------------------------------------------------------
+@triton.jit(do_not_specialize=["ignore_index"])
+def _nll_fwd_plain_kernel(
+    inp_ptr,
+    tgt_ptr,
+    wgt_ptr,
+    out_ptr,
+    ignore_wgt_tgt_ptr,
+    ignore_index,
+    N,
+    C,
+    reduction: tl.constexpr = 1,
+    BLOCK_N: tl.constexpr = 128,
+    PADDED: tl.constexpr = False,
+):
+    pid_n = tl.program_id(0)
+    offsets_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask_n = offsets_n < N
+
+    tgt = tl.load(tgt_ptr + offsets_n, mask=mask_n, other=0)
+    assert (tgt == ignore_index) or (tgt >= 0 and tgt < C), "Invalid target value"
+    ignore_mask = not (tgt == ignore_index) and mask_n
+
+    if wgt_ptr is None:
+        wgt_tgt = tl.where(ignore_mask, 1.0, 0.0)
+    else:
+        wgt_tgt = tl.load(wgt_ptr + tgt, mask=ignore_mask, other=0).to(tl.float32)
+
+    inp_tgt_ptrs = inp_ptr + offsets_n * C + tgt
+    inp_tgt = tl.load(inp_tgt_ptrs, mask=ignore_mask, other=0).to(tl.float32)
+    out = inp_tgt * wgt_tgt * -1
+
+    if PADDED:
+        tl.store(out_ptr + offsets_n, out)
+        tl.store(ignore_wgt_tgt_ptr + offsets_n, wgt_tgt)
+    else:
+        tl.store(out_ptr + offsets_n, out, mask=mask_n)
+        if reduction != 0:
+            tl.store(ignore_wgt_tgt_ptr + offsets_n, wgt_tgt, mask=mask_n)
+
+
+@triton.jit
+def _nll_fwd_plain_reduce_kernel(
+    out_ptr,
+    wgt_ptr,
+    total_out_ptr,
+    total_wgt_ptr,
+    MEAN: tl.constexpr,
+    NTILES: tl.constexpr,
+    TL: tl.constexpr,
+):
+    total_o = tl.zeros([], dtype=tl.float32)
+    total_wgt = tl.zeros([], dtype=tl.float32)
+    for i in tl.static_range(NTILES):
+        off = i * TL + tl.arange(0, TL)
+        o = tl.load(out_ptr + off).to(tl.float32)
+        w = tl.load(wgt_ptr + off).to(tl.float32)
+        total_o += tl.sum(o)
+        total_wgt += tl.sum(w)
+
+    if MEAN:
+        res = total_o / total_wgt
+    else:
+        res = total_o
+    tl.store(total_out_ptr, res.to(total_out_ptr.dtype.element_ty))
+    tl.store(total_wgt_ptr, total_wgt.to(total_wgt_ptr.dtype.element_ty))
+
+
+@triton.jit(do_not_specialize=["ignore_index"])
+def _nll2d_fwd_plain_flat_kernel(
+    inp_ptr,
+    tgt_ptr,
+    wgt_ptr,
+    out_ptr,
+    ignore_wgt_tgt_ptr,
+    ignore_index,
+    C,
+    reduction: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_ND: tl.constexpr,
+):
+    pid_nd = tl.program_id(0)
+    offset_nd = pid_nd * BLOCK_ND + tl.arange(0, BLOCK_ND)
+
+    tgt = tl.load(tgt_ptr + offset_nd)
+    assert (tgt == ignore_index) or (tgt >= 0 and tgt < C), "Invalid target value"
+    ignore_mask = tgt != ignore_index
+
+    if wgt_ptr is None:
+        wgt_tgt = tl.where(ignore_mask, 1.0, 0.0)
+    else:
+        wgt_tgt = tl.load(wgt_ptr + tgt, mask=ignore_mask, other=0).to(tl.float32)
+
+    offset_d = offset_nd % D
+    offset_n = offset_nd // D
+    inp_tgt_ptrs = inp_ptr + offset_n * C * D + tgt * D + offset_d
+    inp_tgt = tl.load(inp_tgt_ptrs, mask=ignore_mask, other=0).to(tl.float32)
+    out = inp_tgt * wgt_tgt * -1
+
+    tl.store(out_ptr + offset_nd, out)
+    if reduction != 0:
+        tl.store(ignore_wgt_tgt_ptr + offset_nd, wgt_tgt)
+
+
+@triton.jit
+def _nll2d_fwd_plain_partial_reduce_kernel(
+    out_ptr,
+    wgt_ptr,
+    pout_ptr,
+    pwgt_ptr,
+    TPP: tl.constexpr,
+    TL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_o = tl.zeros([], dtype=tl.float32)
+    total_w = tl.zeros([], dtype=tl.float32)
+    for j in tl.static_range(TPP):
+        off = (pid * TPP + j) * TL + tl.arange(0, TL)
+        o = tl.load(out_ptr + off).to(tl.float32)
+        w = tl.load(wgt_ptr + off).to(tl.float32)
+        total_o += tl.sum(o)
+        total_w += tl.sum(w)
+    tl.store(pout_ptr + pid, total_o)
+    tl.store(pwgt_ptr + pid, total_w)
+
+
+@triton.jit
+def _nll2d_fwd_plain_finalize_kernel(
+    pout_ptr,
+    pwgt_ptr,
+    total_out_ptr,
+    total_wgt_ptr,
+    MEAN: tl.constexpr,
+    NP: tl.constexpr,
+    nprog,
+):
+    off = tl.arange(0, NP)
+    mask = off < nprog
+    total_o = tl.sum(tl.load(pout_ptr + off, mask=mask, other=0).to(tl.float32))
+    total_w = tl.sum(tl.load(pwgt_ptr + off, mask=mask, other=0).to(tl.float32))
+    if MEAN:
+        res = total_o / total_w
+    else:
+        res = total_o
+    tl.store(total_out_ptr, res.to(total_out_ptr.dtype.element_ty))
+    tl.store(total_wgt_ptr, total_w.to(total_wgt_ptr.dtype.element_ty))
+
+
 def nll_loss_forward(self, target, weight=None, reduction=1, ignore_index=-100):
     logger.debug("GEMS_KUNLUNXIN NLL_LOSS_FWD")
     assert self.ndim <= 2, "Invalid input ndim"
@@ -582,7 +770,7 @@ def nll_loss_forward(self, target, weight=None, reduction=1, ignore_index=-100):
         n_blocks = triton.cdiv(N, BLOCK_N)
 
     with torch_device_fn.device(self.device):
-        nll_loss_forward_kernel[(n_blocks, 1, 1)](
+        _nll_fwd_plain_kernel[(n_blocks, 1, 1)](
             self,
             target,
             weight,
@@ -594,6 +782,10 @@ def nll_loss_forward(self, target, weight=None, reduction=1, ignore_index=-100):
             reduction,
             BLOCK_N,
             fused,
+            # `tl.load(mask=..., other=0)` is only honoured when the XPU backend
+            # compiles the kernel with the mask-zero option; without it the
+            # masked lanes return the raw loaded value and every ignored
+            # target leaks into `out` (see the note next to the plain kernels).
             is_use_mask_zero=True,
         )
 
@@ -604,7 +796,7 @@ def nll_loss_forward(self, target, weight=None, reduction=1, ignore_index=-100):
         output = torch.empty([], dtype=self.dtype, device=self.device)
         total_weight = torch.empty([], dtype=self.dtype, device=self.device)
         with torch_device_fn.device(self.device):
-            nll_loss_reduce_kernel[(1, 1, 1)](
+            _nll_fwd_plain_reduce_kernel[(1, 1, 1)](
                 out,
                 ignore_weight_tgt,
                 output,
@@ -699,10 +891,28 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
         ignore_weight_tgt = torch.empty((N, D), dtype=self.dtype, device=self.device)
 
     block_d = _nll2d_block_d(D)
-    flat_block = None if block_d is not None else _nll2d_flat_block(N * D)
+    flat_block = _nll2d_flat_block(N * D)
+    # Prefer the wide flat kernel over the (1 x BLOCK_D) tiled one.  The tiled
+    # kernel caps BLOCK_D at 512, and a 512-wide 2-D tile does not reach the
+    # vectorised load path of this backend, while a 1024/2048-wide 1-D tile
+    # does.  Two interleaved `do_bench` sweeps over
+    #   M in {1024, 2048, 4096, 8192, 32768, 131072, 524288}
+    #   x D in {128, 256, 512, 1024}, x {weight, no-weight}, fp16 + fp32
+    # (48 cells) show flat BLOCK_ND=1024/2048 clearly ahead of tiled
+    # BLOCK_D=128/256/512 once `M >= 8192`, e.g. for the benchmark shape
+    # M=32768 (fp16):
+    #   no-weight  tiled(512) 26.1 us -> flat(1024) 13.4 us
+    #   weight     tiled(512) 45.9 us -> flat(1024) 40.6 us
+    # and for M=524288 no-weight: tiled 197.7 us -> flat(2048) 84.9 us.
+    # For `M <= 4096` the two are within the run-to-run noise of this box
+    # (<=0.8 us apart, tiled occasionally marginally ahead) - that range is not
+    # exercised by either nll benchmark matrix, so the flat band is applied
+    # uniformly rather than adding an unmeasurable threshold.
+    # `_nll2d_block_d`/the tiled kernel are kept below only as a defensive
+    # fallback; `_nll2d_flat_block` returns non-None whenever it does.
     with torch_device_fn.device(self.device):
         if flat_block is not None:
-            nll_loss2d_forward_flat_kernel[((N * D) // flat_block, 1, 1)](
+            _nll2d_fwd_plain_flat_kernel[((N * D) // flat_block, 1, 1)](
                 self_flat,
                 target_flat,
                 weight,
@@ -713,6 +923,10 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
                 reduction,
                 D,
                 flat_block,
+                # Required for the `ignore_mask` gathers below: see the note
+                # next to the plain kernels.  `_nll2d_flat_block` routes every
+                # dim>=3 NLL shape here, so dropping this option silently breaks
+                # any `ignore_index` that actually occurs in `target`.
                 is_use_mask_zero=True,
             )
         elif block_d is None:
@@ -757,7 +971,7 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
         wgt_buf = ignore_weight_tgt
         with torch_device_fn.device(self.device):
             if ntiles <= _NLL2D_REDUCE_MAX_TILES:
-                nll_loss_reduce_kernel[(1, 1, 1)](
+                _nll_fwd_plain_reduce_kernel[(1, 1, 1)](
                     out,
                     wgt_buf,
                     output,
@@ -770,7 +984,7 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
                 nprog, tpp = _nll2d_partial_config(ntiles)
                 pout = torch.empty((nprog,), dtype=torch.float32, device=self.device)
                 pwgt = torch.empty((nprog,), dtype=torch.float32, device=self.device)
-                nll_loss2d_partial_reduce_kernel[(nprog, 1, 1)](
+                _nll2d_fwd_plain_partial_reduce_kernel[(nprog, 1, 1)](
                     out,
                     wgt_buf,
                     pout,
@@ -778,7 +992,7 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
                     tpp,
                     tl_width,
                 )
-                nll_loss2d_finalize_kernel[(1, 1, 1)](
+                _nll2d_fwd_plain_finalize_kernel[(1, 1, 1)](
                     pout,
                     pwgt,
                     output,
@@ -786,6 +1000,9 @@ def nll_loss2d_forward(self, target, weight=None, reduction=1, ignore_index=-100
                     reduction == 1,
                     triton.next_power_of_2(nprog),
                     nprog,
+                    # `nprog` is not always a power of two, so the `off < nprog`
+                    # gather below needs the same mask-zero option.
+                    is_use_mask_zero=True,
                 )
         return output, total_weight
 
