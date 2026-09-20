@@ -214,9 +214,7 @@ def _stage_contiguous_kernel(
 
     if NEED_MASK:
         value = tl.load(src_ptr + src_off, mask=mask, other=0.0)
-        tl.store(
-            dst_ptr + offsets, value.to(dst_ptr.dtype.element_ty), mask=mask
-        )
+        tl.store(dst_ptr + offsets, value.to(dst_ptr.dtype.element_ty), mask=mask)
     else:
         value = tl.load(src_ptr + src_off)
         tl.store(dst_ptr + offsets, value.to(dst_ptr.dtype.element_ty))

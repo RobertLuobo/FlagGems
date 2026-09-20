@@ -652,8 +652,8 @@ from .upsample_nearest1d import upsample_nearest1d
 from .upsample_nearest2d import upsample_nearest2d
 from .upsample_nearest3d import upsample_nearest3d
 from .upsample_nearest_exact1d import upsample_nearest_exact1d
-from .upsample_nearest_exact2d_backward import upsample_nearest_exact2d_backward
 from .upsample_nearest_exact2d import _upsample_nearest_exact2d
+from .upsample_nearest_exact2d_backward import upsample_nearest_exact2d_backward
 from .upsample_trilinear3d import upsample_trilinear3d
 from .var import var, var_correction, var_dim
 from .var_mean import var_mean
@@ -715,6 +715,7 @@ __all__ = [
     "_unsafe_masked_index_put_accumulate",
     "_upsample_bicubic2d_aa",
     "_upsample_bicubic2d_aa_backward",
+    "_upsample_nearest_exact2d",
     "_upsample_nearest_exact2d_backward",
     "_upsample_nearest_exact3d",
     "_weight_norm",
@@ -1434,7 +1435,6 @@ __all__ = [
     "upsample_nearest3d",
     "upsample_nearest_exact1d",
     "upsample_nearest_exact2d_backward",
-    "_upsample_nearest_exact2d",
     "upsample_trilinear3d",
     "var",
     "var_correction",

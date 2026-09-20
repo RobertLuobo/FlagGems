@@ -79,9 +79,7 @@ def bitwise_or_tensor(A, B):
         and A.is_contiguous()
         and B.is_contiguous()
     ):
-        out = torch.empty_strided(
-            A.shape, A.stride(), dtype=A.dtype, device=A.device
-        )
+        out = torch.empty_strided(A.shape, A.stride(), dtype=A.dtype, device=A.device)
         return bitwise_or_func(A, B, out0=out)
     return bitwise_or_func(A, B)
 

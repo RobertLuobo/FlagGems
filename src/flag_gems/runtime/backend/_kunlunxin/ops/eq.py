@@ -265,8 +265,6 @@ def eq_(A, B):
     return _generic_eq_(A, B)
 
 
-
-
 # ---------------------------------------------------------------------------
 # eq_scalar_ (in-place alias of eq.Scalar, e.g. `x.eq_(0)` on a float tensor).
 # torch keeps the input dtype and stores 0.0/1.0 (False/True) back into x.

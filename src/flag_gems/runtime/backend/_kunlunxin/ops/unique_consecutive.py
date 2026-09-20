@@ -11,51 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Kunlunxin (XPU) unique_consecutive.
-
-History / why this file no longer looks like the generic implementation:
-
-The previous body was a verbatim copy of ``flag_gems/ops/unique_consecutive.py``
-and carried two XPU-specific defects that its functional tests never exercised
-end to end:
-
-* **Wrong results** (shapes where ``num_tasks % tile_size == 0``, e.g.
-  ``(1024, 1024)``, ``(20, 320, 15)``, ``(16, 128, 64, 1280)``): the
-  ``global_cumsum_consecutive_impl`` kernel mixes a ``tl.sum`` carry with a
-  ``tl.cumsum`` in the *same* kernel.  On this backend that pairing miscompiles
-  (measured garbage); the sibling ``_kunlunxin/ops/unique.py`` documents the very
-  same finding and works around it by splitting ``tl.sum`` and ``tl.cumsum`` into
-  separate kernels.
-* **Hang** (shapes with a partial last tile, e.g. ``N=9000`` and
-  ``(16, 7, 57, 32, 29)``): the tail lanes of ``local_ne_consecutive_impl`` are
-  loaded with a ``mask`` but no ``other=``, so their undefined values feed
-  ``ne_result``; the resulting inflated ``out_idx`` reaches >= ``num_tasks`` and
-  the (masked) scatter store into ``data_out`` runs off the end of the buffer.
-  Worse, on the last tile ``global_cumsum_consecutive_impl`` stores a
-  ``tile_size``-wide vector at ``tile_sum_ptr + global_pid`` even though
-  ``tile_sum`` only has ``global_ctas_num`` elements -- an overrun of up to
-  ``tile_size - 1`` int64 past the allocation.  Those wild writes are what took
-  the device into the ``KL_XID_KERNEL_EXCEPTION`` / ``-299`` state.
-
-The rewrite below follows the backend's endorsed strategy (see the
-``unique_dim.py`` docstring): no ``other=``, no masked stores on a discrete
-scatter, every buffer over-allocated to whole tiles, and ``tl.sum`` / ``tl.cumsum``
-never mixed in one kernel.  It reuses the multi-level chunked scan toolkit that
-``_unique2`` already exercises (``_triton_inclusive_scan``), so the scan itself is
-the identical, verified code path.
-
-A later device review of that first rewrite found a *second* XPU-specific defect:
-the finalize kernel used to emit two int64-valued stores (the int64
-``inverse_indices`` writer and the int64 group-start writer), and on this backend
-a kernel with **>= 2 int64-valued stores** fails the ``TritonXPUUnrollControl``
-MLIR pass -- reported as
-``'arith.extsi' op failed to verify that input and output have the same tensor
-dimensions`` followed by ``OutOfResources: uni_sram`` -- so the op compiled for
-*no* shape.  The fix splits the work so that no single kernel emits more than one
-int64 store: the finalize kernel writes the data-dtype output and an **int32**
-group-start buffer, ``_uc_inverse_kernel`` writes the int64 inverse, and
-``_uc_run_lengths_kernel`` widens the int32 starts to the int64 counts.
-"""
 
 import logging
 
@@ -81,13 +36,6 @@ def _ne_consecutive_kernel(
     N,
     BLOCK: tl.constexpr,
 ):
-    """ne[i] = 1 if element i starts a new consecutive group, else 0 (int64).
-
-    Loads are unmasked with clamped addresses and the result is written unmasked,
-    so nothing depends on masked-load semantics or on `other=`.  `ne_ptr` is
-    over-allocated to a whole number of tiles (N_pad) and the padding lanes are
-    written as 0.
-    """
     pid = tl.program_id(0)
     r = tl.arange(0, BLOCK)
     offs = pid * BLOCK + r
@@ -122,30 +70,6 @@ def _unique_consecutive_finalize_kernel(
     BLOCK: tl.constexpr,
     return_counts: tl.constexpr,
 ):
-    """Scatter the unique values and the group start offsets.
-
-    `cum` is the inclusive prefix sum of `ne`, so `group = cum - 1` is the output
-    index of every element and `n_unique = cum[N-1]`.
-
-    Inactive lanes and padding lanes are *not* masked off: they are redirected to
-    a per-lane scratch slot ``n_unique + r`` (in-block unique), which is inside the
-    over-allocated buffers.  This keeps every store unmasked, so it is immune to
-    the backend's masked-store hazard.  For a group-start lane the destination is
-    the group index and exactly one lane per group writes it, so there is no
-    scatter race; the stored value is the group's first element, and every other
-    lane of the group would write the identical bytes anyway.
-
-    **Compile-failure workaround (TritonXPUUnrollControl).**  On this backend a
-    kernel that emits >= 2 stores whose *value* is int64 fails the
-    `TritonXPUUnrollControl` pass with a bogus
-    ``'arith.extsi' op failed to verify that input and output have the same tensor
-    dimensions`` (the real line is the last int64 store).  Hence this kernel
-    writes only two things: the data-dtype `out` value and -- when counts are
-    requested -- the group start offset as **int32**.  The int64 `inverse_indices`
-    moved to its own kernel (`_uc_inverse_kernel`) and the int64 `counts` to
-    `_uc_run_lengths_kernel`, so each kernel has at most one int64-valued store.
-    `start` values fit in int32 because ``num_tasks <= 2**31``.
-    """
     pid = tl.program_id(0)
     r = tl.arange(0, BLOCK)
     offs = pid * BLOCK + r
@@ -177,11 +101,6 @@ def _uc_inverse_kernel(
     N,
     BLOCK: tl.constexpr,
 ):
-    """inv[i] = cum[i] - 1 = the output index of input element i (int64).
-
-    Single int64-valued store in the kernel, per the compile-failure workaround
-    documented on `_unique_consecutive_finalize_kernel`.
-    """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     live = offs < N
@@ -198,17 +117,6 @@ def _uc_run_lengths_kernel(
     n,
     BLOCK: tl.constexpr,
 ):
-    """counts[i] = start32[i+1] - start32[i] (last: N - start32[n-1]).
-
-    `start32` is int32 (written by the finalize kernel); the subtraction is done
-    in int32 and only the final store is widened to int64 -- one int64-valued
-    store, per the compile-failure workaround.  The loads clamp their addresses
-    (so no read depends on mask semantics or on `other=`), but the store MUST be
-    masked: `counts` holds exactly `n_unique` elements while the grid covers
-    `ceil(n_unique / BLOCK)` whole tiles, so an unmasked store would write up to
-    `BLOCK - 1` int64 past the end of the allocation.  `n_unique` is an arbitrary
-    run count, so that overflow is the common case, not a corner case.
-    """
     pid = tl.program_id(0)
     i = pid * BLOCK + tl.arange(0, BLOCK)
     cur = tl.load(start32_ptr + tl.minimum(i, n - 1))
@@ -223,18 +131,6 @@ def unique_consecutive(
     return_counts: bool = False,
     dim: int = None,
 ):
-    """
-    Eliminates all but the first element from every consecutive group of equivalent elements.
-
-    Args:
-        input: the input tensor
-        return_inverse: Whether to return inverse indices
-        return_counts: Whether to return counts for each unique element
-        dim: the dimension to apply unique. If None, the unique of the flattened input is returned.
-
-    Returns:
-        (Tensor, Tensor (optional), Tensor (optional)): output, inverse_indices, counts
-    """
     logger.debug("GEMS_KUNLUNXIN UNIQUE_CONSECUTIVE")
 
     if dim is not None:
@@ -251,14 +147,10 @@ def unique_consecutive(
         # Handle empty input
         output = torch.empty(0, dtype=input.dtype, device=device)
         inverse_indices = (
-            torch.empty(0, dtype=torch.int64, device=device)
-            if return_inverse
-            else None
+            torch.empty(0, dtype=torch.int64, device=device) if return_inverse else None
         )
         counts = (
-            torch.empty(0, dtype=torch.int64, device=device)
-            if return_counts
-            else None
+            torch.empty(0, dtype=torch.int64, device=device) if return_counts else None
         )
         return output, inverse_indices, counts
 

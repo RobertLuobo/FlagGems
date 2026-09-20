@@ -57,25 +57,19 @@ clamp_tensor_config = CodeGenConfig(
 )
 
 
-@pointwise_dynamic(
-    promotion_methods=[(0, 1, 2, "DEFAULT")], config=clamp_tensor_config
-)
+@pointwise_dynamic(promotion_methods=[(0, 1, 2, "DEFAULT")], config=clamp_tensor_config)
 @triton.jit
 def clamp_func_tensor(x, mini, maxi):
     return tl.minimum(maxi, tl.maximum(mini, x))
 
 
-@pointwise_dynamic(
-    promotion_methods=[(0, 1, "DEFAULT")], config=clamp_tensor_config
-)
+@pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=clamp_tensor_config)
 @triton.jit
 def clamp_func_min_tensor(x, mini):
     return tl.maximum(mini.to(tl.float32), x.to(tl.float32))
 
 
-@pointwise_dynamic(
-    promotion_methods=[(0, 1, "DEFAULT")], config=clamp_tensor_config
-)
+@pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=clamp_tensor_config)
 @triton.jit
 def clamp_func_max_tensor(x, maxi):
     return tl.minimum(maxi, x)
@@ -90,12 +84,9 @@ def _clamp_out_alloc_ok(a, *others):
     match a in BOTH shape and dtype -- a shape-only or dtype-only check silently
     produces wrong values (broadcast or widening) while still "running".
     """
-    return (
-        a.is_floating_point()
-        and all(
-            isinstance(o, torch.Tensor) and o.shape == a.shape and o.dtype == a.dtype
-            for o in others
-        )
+    return a.is_floating_point() and all(
+        isinstance(o, torch.Tensor) and o.shape == a.shape and o.dtype == a.dtype
+        for o in others
     )
 
 

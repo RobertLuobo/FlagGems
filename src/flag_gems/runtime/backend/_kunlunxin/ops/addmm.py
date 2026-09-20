@@ -189,14 +189,12 @@ def addmm_kernel(
         else:
             a = tl.load(
                 a_ptrs,
-                mask=(offs_am[:, None] < M)
-                & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                mask=(offs_am[:, None] < M) & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
                 other=0.0,
             )
             b = tl.load(
                 b_ptrs,
-                mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K)
-                & (offs_bn[None, :] < N),
+                mask=(offs_k[:, None] < K - k * BLOCK_SIZE_K) & (offs_bn[None, :] < N),
                 other=0.0,
             )
         accumulator += tl.dot(a, b, allow_tf32=False)

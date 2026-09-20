@@ -1,33 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Kunlunxin (XPU) override of special_shifted_chebyshev_polynomial_u[_].
-#
-# Root cause: generic implementation evaluates U_n via the trig identity
-#   U_n(cos θ) = sin((n+1)θ) / sin(θ),  θ = acos(2x-1)
-# On XPU `tl_extra_shim.sin` / `acos` are imprecise (documented sin small-arg
-# error), and the sin/sin ratio amplifies it — fp32 mismatch up to rel 887,
-# 31.7% of elements over tol.
-#
-# Fix: evaluate U_n by the exact three-term recurrence (no transcendentals):
-#   U_0(y)=1, U_1(y)=2y, U_{k+1}=2y·U_k - U_{k-1},  y = 2x-1.
-# Test draws n in [0,10) so 8 unrolled steps (max degree 9) cover it.
-# pointwise_dynamic + isCloseVectorization=True keeps XPU codegen happy.
-#
-# Second defect fixed 2026-09-19: the degree was selected with a `|n - k| < 0.5`
-# tolerance chain.  That rounds a non-integral n to the *nearest* degree and,
-# when no level matches at all, silently leaves the initial value U*_1.  ATen
-# truncates n toward zero (`static_cast<int64_t>(n)`, ATen/native/Math.h), so on
-# this backend every non-integral n returned the wrong order (n = 3.7 -> U*_4
-# instead of U*_3, and n = 0.5 / 2.5 / 3.5 / 4.5 / 5.5 / 10 / 11 / 20 -> U*_1);
-# negative n returned U*_0 (1.0) where ATen returns 0.0.  This is not academic:
-# the benchmark feeds `inp2 = randn(float32)` as n (benchmark/base.py
-# `generate_tensor_input`), so nearly every benchmarked element took a wrong
-# degree.  The selection is now a monotone `n >= k` chain, which reproduces
-# truncation exactly (n < 0 -> 0.0, -1 < n < 1 -> U*_0, 3.7 -> U*_3,
-# NaN -> 0.0) at a lower select cost than the tolerance chain (one compare per
-# level instead of sub+abs+compare).  Integer n in [0, 9] -- the whole official
-# matrix -- is bit-identical to the previous version.  Same defect and same fix
-# as the sibling special_shifted_chebyshev_polynomial_t / _v (2026-08-30).
 import logging
 
 import torch

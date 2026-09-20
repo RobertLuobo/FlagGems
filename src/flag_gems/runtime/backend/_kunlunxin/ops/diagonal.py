@@ -293,8 +293,9 @@ def _prewarm(device):
         for dt in (torch.float16, torch.float32, torch.bfloat16):
             # scatter kernel, rows == 1
             shape = (2, 256)
-            out = torch.empty_strided(shape, _contig_strides(shape)[0],
-                                      dtype=dt, device=device)
+            out = torch.empty_strided(
+                shape, _contig_strides(shape)[0], dtype=dt, device=device
+            )
             out.zero_()
             plan = _build_plan(shape, 0, 0, 1, device, out.element_size())
             _ensure_tables(plan, device)
@@ -303,8 +304,9 @@ def _prewarm(device):
             )
             # scatter kernel, rows > 1 (the batched 2-D-diagonal layout)
             shape = (2, 256, 256)
-            out = torch.empty_strided(shape, _contig_strides(shape)[0],
-                                      dtype=dt, device=device)
+            out = torch.empty_strided(
+                shape, _contig_strides(shape)[0], dtype=dt, device=device
+            )
             out.zero_()
             plan = _build_plan(shape, 0, 1, 2, device, out.element_size())
             _ensure_tables(plan, device)
@@ -380,7 +382,9 @@ def diagonal_backward(grad_output, input_sizes, offset, dim1, dim2):
         _ensure_tables(plan, device_)
         dev_idx = grad_output.device.index
         _launch_scatter(
-            plan, grad_output, grad_input,
+            plan,
+            grad_output,
+            grad_input,
             torch.cuda.current_device() if dev_idx is None else dev_idx,
         )
     else:

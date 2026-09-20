@@ -298,8 +298,9 @@ def any_row_word_stage1_kernel(
 
 @libentry()
 @triton.jit
-def any_row_word_stage2_kernel(mid, out, MID_N, BLOCK_MID: tl.constexpr,
-                               RAW_I32: tl.constexpr):
+def any_row_word_stage2_kernel(
+    mid, out, MID_N, BLOCK_MID: tl.constexpr, RAW_I32: tl.constexpr
+):
     """Stage 2: fold the per-chunk int32 flags of one row into a bool."""
     pid_m = ext.program_id(0)
     off = tl.arange(0, BLOCK_MID)
@@ -379,9 +380,7 @@ def _any_dims_reduce(inp, M, N, out_shape, raw_i32=False):
         BLOCK_W = min(triton.next_power_of_2(n_words), _ROW_WORD_MAX)
         n_chunks = triton.cdiv(n_words, BLOCK_W)
         need_mask = n_words % BLOCK_W != 0
-        view = inp.reshape(-1).view(torch.uint8).view(torch.int32).reshape(
-            M, n_words
-        )
+        view = inp.reshape(-1).view(torch.uint8).view(torch.int32).reshape(M, n_words)
         out = torch.empty(
             M, dtype=torch.int32 if raw_i32 else torch.bool, device=inp.device
         )

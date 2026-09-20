@@ -109,8 +109,7 @@ def mse_loss_backward(grad_output, self, target, reduction=1):
     # Reduction.MEAN(=1) divides by numel; none(=0)/sum(=2) do not.
     scale = 2.0 / n_elements if reduction == 1 else 2.0
     plain_max_numel = (
-        _SMALL_NUMEL_BF16 if self_contiguous.dtype == torch.bfloat16
-        else _SMALL_NUMEL
+        _SMALL_NUMEL_BF16 if self_contiguous.dtype == torch.bfloat16 else _SMALL_NUMEL
     )
 
     with torch_device_fn.device(self.device):
