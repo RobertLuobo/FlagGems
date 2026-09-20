@@ -47,9 +47,3 @@ docs/benchmark/
 # Packaging build outputs (packaging/{debian,rpm} helpers)
 debian-packages/
 rpm-packages/
-
-# Kunlunxin harness: 外部拉取目录与运行产物，一律不提交（见 AGENTS.md 红线）
-harness/harness-over-harness/
-harness/KernelOpt_Knowledge/
-harness/perf_ir/
-harness/meta/regression_logs/
