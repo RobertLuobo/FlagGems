@@ -701,7 +701,13 @@ def _gather_backward_sum(grad, self, dim, index_contiguous, result):
     out_shapes = list(self.shape) + pad
     idx_strides = index_strides + pad
 
-    BO, BI, nw = 64, 512, 4
+    # The whole cost of this path is the i1 compare + select + reduction over
+    # the [BLOCK_OUTPUT, BLOCK_INDEX] tile, so index lanes past `S` are pure
+    # waste.  Pin BLOCK_INDEX to a power of two just covering `S` (this path is
+    # only reached for S <= 512).  LOOP stays 1 on purpose: the XPU compiler
+    # rejects multi-iteration tiles of this shape ("out of resource").
+    BO, nw = 64, 4
+    BI = min(512, max(32, triton.next_power_of_2(S)))
     LOOP = (S + BI - 1) // BI
 
     index32 = index_contiguous.to(torch.int32)
