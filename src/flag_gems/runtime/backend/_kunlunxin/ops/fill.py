@@ -1,3 +1,17 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 
 import torch
@@ -51,6 +65,10 @@ def fill_scalar(input, value):
 
 
 def fill_scalar_out(input, value, *, out=None):
+    # The generic ops/fill.py fill_scalar_out routes through a NO-config
+    # pointwise kernel whose store is judged discrete (lm2gm offsetState=-1) on
+    # XPU -> ~0.002-0.003 speedup on large shapes. Reuse the kunlunxin-tuned
+    # fill_scalar_func (prefer_1d_tile) so the write is a contiguous block DMA.
     logger.debug("GEMS_KUNLUNXIN FILL_SCALAR_OUT")
     if out is None:
         return fill_scalar(input, value)
@@ -84,6 +102,12 @@ def fill_tensor(input, value):
 
 
 def fill_tensor_out(input, value, *, out=None):
+    # fill.Tensor_out fills `out` from a single 0-dim `value` (equivalent to
+    # fill.Scalar_out). The generic ops/fill.py path (fill_tensor_func
+    # `return value`) reads the 0-dim scalar per element on XPU and breaks
+    # block DMA. This dedicated kernel does not load the input, keeps `tl.full`
+    # vectorized, and takes `value` as a Python scalar so the compiler folds it
+    # into a memset.
     logger.debug("GEMS_KUNLUNXIN FILL_TENSOR_OUT")
     if out is None:
         return fill_tensor(input, value)
