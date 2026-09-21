@@ -88,7 +88,7 @@ def digamma_(*args, **kwargs):
         n_elements = y.numel()
         if n_elements == 0:
             return x
-        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        grid = (triton.cdiv(n_elements, 512),)
         with torch_device_fn.device(y.device):
             digamma_kernel_[grid](y, n_elements, BLOCK_SIZE=512)
         x.copy_(y)
@@ -97,7 +97,7 @@ def digamma_(*args, **kwargs):
     n_elements = x.numel()
     if n_elements == 0:
         return x
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = (triton.cdiv(n_elements, 512),)
     with torch_device_fn.device(x.device):
         digamma_kernel_[grid](x, n_elements, BLOCK_SIZE=512)
     return x

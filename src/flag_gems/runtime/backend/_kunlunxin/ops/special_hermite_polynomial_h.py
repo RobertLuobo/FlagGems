@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.ops.aminmax import aminmax as _aminmax
 from flag_gems.utils import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
@@ -58,8 +59,9 @@ def special_hermite_polynomial_h(x, n):
         raise ValueError(f"Unsupported dtype {x.dtype}")
 
     if isinstance(n, torch.Tensor):
-        n = n.to(device=x.device, dtype=torch.int32)
-        if torch.any((n < 0) | (n > 9)).item():
+        n = n.to(device=x.device)
+        lo, hi = _aminmax(n)
+        if lo.item() < 0 or hi.item() > 9:
             raise ValueError("special_hermite_polynomial_h only supports n in [0, 9]")
         return _hermite_tensor_tensor(x, n)
 

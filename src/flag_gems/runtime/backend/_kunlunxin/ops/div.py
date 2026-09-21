@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
-from flag_gems.utils import tl_extra_shim
+from flag_gems.utils import libentry, tl_extra_shim
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
@@ -93,9 +93,45 @@ def true_div_func_u16(x, y):
     return x / y
 
 
+SMALL_DIV_MAX_NUMEL = 1 << 18
+
+
+@libentry()
+@triton.jit(do_not_specialize=["num_tasks"])
+def _small_true_div_kernel(X, Y, O, num_tasks, TILE: tl.constexpr):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    mask = tid < num_tasks
+    x = tl.load(X + tid, mask=mask)
+    y = tl.load(Y + tid, mask=mask)
+    tl.store(O + tid, x / y, mask=mask)
+
+
+def _small_true_div_eligible(A, B):
+    return (
+        A.dtype == B.dtype
+        and A.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and A.shape == B.shape
+        and 0 < A.numel() <= SMALL_DIV_MAX_NUMEL
+        and A.is_contiguous()
+        and B.is_contiguous()
+    )
+
+
+def _small_true_div_launch(A, B, out):
+    num_tasks = A.numel()
+    tile = triton.next_power_of_2(triton.cdiv(num_tasks, 12))
+    tile = min(max(tile, 512 if A.element_size() > 2 else 1024), 8192)
+    grid = (triton.cdiv(num_tasks, tile),)
+    _small_true_div_kernel[grid](A, B, out, num_tasks, TILE=tile)
+    return out
+
+
 def true_divide(A, B):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE")
     if isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor):
+        if _small_true_div_eligible(A, B):
+            return _small_true_div_launch(A, B, torch.empty_like(A))
         if (
             A.dtype in (torch.float16, torch.float32)
             and A.numel() >= DIV_TENSOR_U16_MIN_NUMEL
@@ -119,15 +155,6 @@ def true_divide(A, B):
 
 
 def true_divide_tensor(A, B):
-    """Canonical Tensor overload of true_divide (explicit aten true_divide.Tensor).
-
-    The generic flag_gems.ops.true_divide.true_divide_tensor routes through the
-    generic flag_gems.ops.div.true_divide, whose pointwise kernel lacks the
-    Kunlunxin tuned CodeGenConfig (measured ~330x slower on XPU for
-    (4096,4096) fp32: 69ms vs 205us). Exporting this vendor implementation lets
-    SpecOpRegistrar swap it in so torch.true_divide(tensor, tensor) and
-    aten::true_divide.Tensor use the same fast tuned kernel as div/div_.
-    """
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_TENSOR")
     logging.getLogger("flag_gems.ops.true_divide").debug("GEMS TRUE_DIVIDE")
     return true_divide(A, B)
@@ -157,6 +184,8 @@ def true_divide_out(A, B, out):
 def true_divide_(A, B):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_")
     if isinstance(B, torch.Tensor):
+        if _small_true_div_eligible(A, B):
+            return _small_true_div_launch(A, B, A)
         if (
             A.dtype in (torch.float16, torch.float32)
             and A.numel() >= DIV_TENSOR_U16_MIN_NUMEL

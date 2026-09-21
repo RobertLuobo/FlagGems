@@ -1,16 +1,3 @@
-# Copyright 2026 FlagOS Contributors
-#
-# Kunlunxin (XPU) override of special_modified_bessel_k0[_out].
-#
-# Root cause: generic `flag_gems/ops/special_modified_bessel_k0.py` uses a
-# raw-pointer kernel. On XPU the `tl.log(...)` call inside a complex kernel
-# lowers to a runtime `log2` symbol that links to `undefined symbol: log2`
-# (same class as our log2 override).
-#
-# Fix: raw-pointer kernel with launch-time `isCloseVectorization=True,
-# buffer_size_limit=2048` (same recipe as special_gammainc override, which
-# also uses tl.log successfully). `_i0_approx` is inlined to avoid a
-# `@triton.jit` helper that seems to push the vectorizer into the bad path.
 import logging
 
 import torch
@@ -103,7 +90,7 @@ def _launch(x: torch.Tensor, out: torch.Tensor):
     n_elements = x.numel()
     if n_elements == 0:
         return
-    BLOCK_SIZE = 512
+    BLOCK_SIZE = 1024
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     with torch_device_fn.device(x.device):
         _bessel_k0_kernel_xpu[grid](
@@ -111,8 +98,8 @@ def _launch(x: torch.Tensor, out: torch.Tensor):
             out,
             n_elements,
             BLOCK_SIZE=BLOCK_SIZE,
-            buffer_size_limit=2048,
-            isCloseVectorization=True,
+            buffer_size_limit=4096,
+            isCloseVectorization=False,
         )
 
 

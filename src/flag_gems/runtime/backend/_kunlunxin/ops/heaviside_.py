@@ -32,29 +32,13 @@ def _heaviside_inplace_kernel(x_ptr, v_ptr, n_elements, BLOCK_SIZE: tl.constexpr
 
     x = tl.load(x_ptr + offsets, mask=mask)
     v = tl.load(v_ptr + offsets, mask=mask)
-
-    # heaviside(x, v) = 0 if x < 0; v if x == 0 (incl. -0.0, which compares
-    # equal to 0); 1 if x > 0.  For NaN inputs no comparison holds, so the
-    # result is 0, matching ATen's CPU/CUDA kernels.  (The generic kernel's
-    # `x + x` else-branch propagates NaN instead.)
-    # Explicit .to(dtype) + single-level where measures 5-18% faster than
-    # int-scalar/nested-where forms on XPU for fp16/bf16 (min-of-3 A/B).
+    
     step = (x > 0).to(x.dtype)
     res = tl.where(x == 0, v, step)
     tl.store(x_ptr + offsets, res, mask=mask)
 
 
 def _expand_values(values: torch.Tensor, self: torch.Tensor) -> torch.Tensor:
-    """Broadcast ``values`` to ``self``'s shape as a contiguous device tensor.
-
-    NOTE: ``Tensor.contiguous()`` on a broadcast (stride-0) view funnels into
-    ``aten::_to_copy`` / ``copy_`` / ``cat``, which are intercepted by
-    flag_gems (vendor ``to``/``copy``/``cat``) and crash on XPU for
-    fp16/bf16 expanded copies of (1,N)/(N,1)/() -> (512,512)-class shapes
-    (illegal memory access, kernel exception).  ``aten::_copy_from`` is the
-    native strided-copy primitive that flag_gems never overrides, so it is
-    used explicitly to materialize the expanded values.
-    """
     v_exp = values.expand_as(self)
     if v_exp.is_contiguous():
         return v_exp
@@ -86,7 +70,7 @@ def heaviside_(self: torch.Tensor, values: torch.Tensor):
         x_contig = torch.empty_like(self)
         torch.ops.aten._copy_from(self, x_contig, False)
 
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = (triton.cdiv(n_elements, 1024),)
     with torch_device_fn.device(self.device):
         _heaviside_inplace_kernel[grid](
             x_contig.view(-1), v_tensor.view(-1), n_elements, BLOCK_SIZE=1024

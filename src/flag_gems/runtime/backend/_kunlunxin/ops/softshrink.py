@@ -90,7 +90,7 @@ def _softshrink_small_kernel(
 def _softshrink_small(x: torch.Tensor, out: torch.Tensor, lambd: float):
     n_elements = x.numel()
     BLOCK_SIZE = 1024
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
 
     with torch_device_fn.device(x.device):
         _softshrink_small_kernel[grid](
