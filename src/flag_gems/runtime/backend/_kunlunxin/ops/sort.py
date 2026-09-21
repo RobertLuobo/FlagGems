@@ -867,11 +867,13 @@ def radix_sort_packed(inp, k_bits=4, descending=False):
     grid = (M * grid_n,)
 
     dtype = inp.dtype
+    bit_start = 0
     num_bits = 1
     if dtype == torch.bool:
         pass
     elif dtype == torch.bfloat16:
-        num_bits = 4 * 8
+        num_bits = 16
+        bit_start = 16
     else:
         num_bits = inp.element_size() * 8
     num_passes = (num_bits + k_bits - 1) // k_bits
@@ -902,7 +904,7 @@ def radix_sort_packed(inp, k_bits=4, descending=False):
                     packed_out,
                     M,
                     N,
-                    p * k_bits,
+                    bit_start + p * k_bits,
                     num_bins,
                     BLOCK_N,
                 )
@@ -916,7 +918,7 @@ def radix_sort_packed(inp, k_bits=4, descending=False):
                 M * r_pad, device=inp.device, dtype=torch.int32
             )
             for p in range(num_passes):
-                bit_offset = p * k_bits
+                bit_offset = bit_start + p * k_bits
                 count_packed_kernel[grid](
                     packed_in,
                     counts,

@@ -824,6 +824,7 @@ _FULL_CONFIG = (
     ("huber_loss", huber_loss),
     ("huber_loss.out", huber_loss_out),
     ("hypot", hypot),
+    ("hypot.out", hypot_out),
     ("hypot_", hypot_),
     ("i0", i0),
     ("i0.out", i0_out),

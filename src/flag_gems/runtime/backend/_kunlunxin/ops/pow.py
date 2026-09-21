@@ -15,12 +15,14 @@
 import logging
 import math
 
+import torch
 import triton
 import triton.language as tl
 
 from flag_gems.utils import tl_extra_shim
 from flag_gems.utils import triton_lang_extension as ext
 
+from ..utils.codegen_config_utils import CodeGenConfig
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
@@ -44,7 +46,22 @@ def pow_tensor_tensor_(A, exponent):
     return pow_func(A, exponent, out0=A)
 
 
-@pointwise_dynamic(is_tensor=[True, False], promotion_methods=[(0, 1, "BOOL_TO_LONG")])
+config_ = CodeGenConfig(
+    512,
+    (65536, 65536, 65536),
+    32,
+    True,
+    prefer_1d_tile=True,
+    kunlunAutoGrid=True,
+    unroll_num=8,
+)
+
+
+@pointwise_dynamic(
+    is_tensor=[True, False],
+    promotion_methods=[(0, 1, "BOOL_TO_LONG")],
+    config=config_,
+)
 @triton.jit
 def pow_func_tensor_scalar(x, exponent):
     return _pow(x.to(tl.float32), exponent.to(tl.float32))
@@ -52,11 +69,15 @@ def pow_func_tensor_scalar(x, exponent):
 
 def pow_tensor_scalar(A, exponent):
     logger.debug("GEMS_KUNLUNXIN POW_TENSOR_SCALAR")
+    e = float(exponent)
+    if _pow_tensor_exponent_uses_fast_path(A, e):
+        out = torch.empty_like(A)
+        _launch_pow_tensor_scalar_fast(A, e, out=out)
+        return out
     return pow_func_tensor_scalar(A, exponent)
 
 
 # ---------------------------------------------------------------------------
-# pow_tensor_scalar_ (tensor base ^ scalar exponent, in-place) fast path.
 #
 # XPU probe (2026-08-19, XPU4, 16.7M fp32 do_bench, same window):
 #   * generic extern pow (pow_func_tensor_scalar) 1290-1815us, ~2x torch native
@@ -73,6 +94,17 @@ def pow_tensor_scalar(A, exponent):
 #     path; integer/0/negative-non-integer/+-inf/NaN exponents keep the
 #     generic extern path (semantics unchanged).
 # ---------------------------------------------------------------------------
+
+
+def _pow_tensor_exponent_uses_fast_path(A, e):
+    """Shared gate for the exp2/log2 fast path (identical for both entries)."""
+    return (
+        e > 0.0
+        and math.isfinite(e)
+        and not float(e).is_integer()
+        and A.is_floating_point()
+        and A.is_contiguous()
+    )
 
 
 @triton.jit
@@ -96,7 +128,9 @@ def pow_tensor_scalar_fast_kernel_masked(
     tl.store(out_ptr + offset, r.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-def _launch_pow_tensor_scalar_fast(x, exp):
+def _launch_pow_tensor_scalar_fast(x, exp, out=None):
+    if out is None:
+        out = x
     n_elements = x.numel()
     if n_elements == 0:
         return
@@ -105,7 +139,7 @@ def _launch_pow_tensor_scalar_fast(x, exp):
         grid = (triton.cdiv(n_elements, block_size),)
         pow_tensor_scalar_fast_kernel_masked[grid](
             x,
-            x,
+            out,
             n_elements,
             exp,
             BLOCK=block_size,
@@ -118,7 +152,7 @@ def _launch_pow_tensor_scalar_fast(x, exp):
         grid = (n_elements // block_size,)
         pow_tensor_scalar_fast_kernel[grid](
             x,
-            x,
+            out,
             exp,
             BLOCK=block_size,
             num_warps=num_warps,
@@ -131,13 +165,7 @@ def _launch_pow_tensor_scalar_fast(x, exp):
 def pow_tensor_scalar_(A, exponent):
     logger.debug("GEMS_KUNLUNXIN POW_TENSOR_SCALAR_")
     e = float(exponent)
-    if (
-        e > 0.0
-        and math.isfinite(e)
-        and not float(e).is_integer()
-        and A.is_floating_point()
-        and A.is_contiguous()
-    ):
+    if _pow_tensor_exponent_uses_fast_path(A, e):
         _launch_pow_tensor_scalar_fast(A, e)
         return A
     return pow_func_tensor_scalar(A, exponent, out0=A)
