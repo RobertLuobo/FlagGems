@@ -274,11 +274,102 @@ def _scalar_over_complex(A, B, out=None):
     return out
 
 
+# Smith fallback for overflow: the fast _cdiv_* kernels compute the denominator
+# as br*br + bi*bi in fp32, which overflows to inf for complex64 (fp32)
+# components with |component| near sqrt(FLT_MAX) (~1.8e19), turning the result
+# into nan. When the naive |b|^2 would overflow, fall back to Smith's algorithm
+# (divide by the larger component first), mirroring the generic CROSS kernel
+# div_complex_kernel in flag_gems/ops/div.py.
+_SMITH_OVERFLOW_THRESHOLD = 1.0e19
+
+
+def _true_div_complex_tt(A, B):
+    """Complex true division decomposed into real-lane kernels.
+
+    The vendor Triton runtime has no complex pointer dtype support (its
+    argument canonicalization rejects complex64/complex32), so -- like every
+    other complex-capable Kunlunxin op (see add.py) -- split the operands
+    into interleaved real/imag lanes and apply Smith's algorithm with
+    real-valued kernels. The formula mirrors the generic CROSS kernel
+    div_complex_kernel in flag_gems/ops/div.py.
+    """
+
+    def _real_lanes(T):
+        # (real, imag) lanes of a tensor or a python scalar. The lanes are made
+        # contiguous: `view_as_real(...).unbind(-1)` yields stride-2 views, and
+        # feeding those to the gems pointwise kernels this function's arithmetic
+        # dispatches to faults the device (XPUW dump, then the context is dead).
+        if isinstance(T, torch.Tensor):
+            if T.is_complex():
+                re, im = torch.view_as_real(T).unbind(-1)
+                return re.contiguous(), im.contiguous()
+            return T.contiguous(), torch.zeros_like(T)
+        if isinstance(T, complex):
+            return T.real, T.imag
+        return float(T), 0.0
+
+    ar, ai = _real_lanes(A)
+    br, bi = _real_lanes(B)
+
+    # Promote all lanes to a single real dtype: the component dtype of the
+    # complex result (fp32 for complex64, fp16 for complex32).
+    tensor_dtypes = [t.dtype for t in (ar, ai, br, bi) if isinstance(t, torch.Tensor)]
+    common = tensor_dtypes[0]
+    for dt in tensor_dtypes[1:]:
+        common = torch.promote_types(common, dt)
+    if not common.is_floating_point:
+        common = torch.get_default_dtype()
+
+    def _cast(x):
+        if isinstance(x, torch.Tensor):
+            return x.to(common)
+        return torch.tensor(x, dtype=common)
+
+    ar, ai, br, bi = _cast(ar), _cast(ai), _cast(br), _cast(bi)
+
+    # Smith's method: divide by the larger component to avoid overflow,
+    # same expressions as the generic div_complex_kernel.
+    use_br = br.abs() >= bi.abs()
+    ratio1 = torch.where(br == 0, torch.zeros_like(br), bi / br)
+    denom1 = br + bi * ratio1
+    real1 = (ar + ai * ratio1) / denom1
+    imag1 = (ai - ar * ratio1) / denom1
+    ratio2 = torch.where(bi == 0, torch.zeros_like(bi), br / bi)
+    denom2 = bi + br * ratio2
+    real2 = (ar * ratio2 + ai) / denom2
+    imag2 = (ai * ratio2 - ar) / denom2
+    real = torch.where(use_br, real1, real2)
+    imag = torch.where(use_br, imag1, imag2)
+    out = torch.view_as_complex(torch.stack((real, imag), dim=-1))
+    return out.to(torch.result_type(A, B))
+
+
+def _complex_requires_smith(A, B):
+    # complex32 (fp16) components never overflow fp32 even when squared
+    # (65504^2 ~ 4.3e9), so only complex64 (fp32) can trigger the fallback.
+    for T in (A, B):
+        if (
+            isinstance(T, torch.Tensor)
+            and T.is_complex()
+            and T.dtype == torch.complex64
+        ):
+            if (
+                torch.abs(torch.view_as_real(T)).max().item()
+                > _SMITH_OVERFLOW_THRESHOLD
+            ):
+                return True
+    return False
+
+
 def true_divide(A, B):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE")
     if isinstance(A, torch.Tensor) and A.is_complex():
+        if _complex_requires_smith(A, B):
+            return _true_div_complex_tt(A, B)
         return _complex_true_divide(A, B)
     if isinstance(B, torch.Tensor) and B.is_complex():
+        if _complex_requires_smith(A, B):
+            return _true_div_complex_tt(A, B)
         if isinstance(A, torch.Tensor):
             return _rational_true_divide(A, B)
         return _scalar_over_complex(A, B)
@@ -322,8 +413,12 @@ def true_divide_tensor(A, B):
 def true_divide_out(A, B, out):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_OUT")
     if isinstance(A, torch.Tensor) and A.is_complex():
+        if _complex_requires_smith(A, B):
+            return out.copy_(_true_div_complex_tt(A, B))
         return _complex_true_divide(A, B, out=out)
     if isinstance(B, torch.Tensor) and B.is_complex():
+        if _complex_requires_smith(A, B):
+            return out.copy_(_true_div_complex_tt(A, B))
         if isinstance(A, torch.Tensor):
             return _rational_true_divide(A, B, out=out)
         return _scalar_over_complex(A, B, out=out)
@@ -350,6 +445,8 @@ def true_divide_out(A, B, out):
 def true_divide_(A, B):
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_")
     if A.is_complex():
+        if _complex_requires_smith(A, B):
+            return A.copy_(_true_div_complex_tt(A, B))
         return _complex_true_divide(A, B, out=A)
     if isinstance(B, torch.Tensor):
         if (
