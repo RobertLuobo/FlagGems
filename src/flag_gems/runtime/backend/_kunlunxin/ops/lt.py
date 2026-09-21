@@ -20,6 +20,16 @@ except ImportError:
     tle = None
     _TLE_OK = False
 
+if _TLE_OK:
+    # The raw payload path needs the 'xpu3' tle dialect, but some flagtree/triton
+    # builds only register 'xpu'. Probe the name (the check runs before any
+    # payload compilation) and fall back to the pure-Triton path instead of
+    # raising ValueError at import time.
+    try:
+        tle.raw.dialect(name="xpu3")
+    except Exception:
+        _TLE_OK = False
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _NCLUSTER = 12
 _RAW_MAX_ELEMS = 2**31 - 1

@@ -355,6 +355,18 @@ def _is_dense(inp):
     return inp, inp_bool, prefix_sum, num_nonzeros
 
 
+def _unbind_views(out):
+    """``unbind(out, dim=1)`` as zero-copy ``as_strided`` views.
+
+    ``unbind`` has no device kernel on XPU and falls back to the ATen
+    composite implementation (forbidden); ``torch.as_strided`` is metadata-only
+    and unregistered, so it never re-dispatches. ``out`` is row-major
+    [N, ndim], so column i is the view shape (N,), stride (ndim,), offset i.
+    """
+    n, ndim = out.shape
+    return [torch.as_strided(out, (n,), (ndim,), storage_offset=i) for i in range(ndim)]
+
+
 def nonzero(inp, *, as_tuple=False):
     logger.debug("GEMS_KUNLUNXIN NONZERO")
 

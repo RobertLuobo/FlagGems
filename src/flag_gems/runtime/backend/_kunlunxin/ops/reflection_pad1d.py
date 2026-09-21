@@ -85,7 +85,20 @@ def _tle_interior_copy(x: torch.Tensor, out: torch.Tensor, pad_left: int, W_in: 
     return True
 
 
-@tle.raw.dialect("xpu3", file="pad_edges3.xpu")
+try:
+    _pad_edges3_dialect = tle.raw.dialect("xpu3", file="pad_edges3.xpu")
+    _RAW_EDGES_OK = True
+except Exception:
+    # The 'xpu3' tle.raw dialect is not registered in this triton build (some
+    # only register 'xpu'). Fall back to the general reflection_pad1d_kernel
+    # path for large shapes instead of raising ValueError at import time.
+    _RAW_EDGES_OK = False
+
+    def _pad_edges3_dialect(fn):
+        return fn
+
+
+@_pad_edges3_dialect
 def pad_edges3(out, inp, B, W_in, W_out, pad_left, pad_right, es, pid, npid): ...
 
 
@@ -264,7 +277,7 @@ def _launch_reflection_pad1d(input: torch.Tensor, padding, out: torch.Tensor = N
         )
 
     total_out = B * W_out
-    if total_out >= 262144:
+    if _RAW_EDGES_OK and total_out >= 262144:
         with torch_device_fn.device(x.device):
             # Interior bulk copy via on-chip DMA (tle.dsa). No ATen fallback.
             # `mid` is a pure strided view (no data movement, no kernel launch).
