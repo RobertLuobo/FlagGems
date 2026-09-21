@@ -14,7 +14,10 @@ ORMQR_SHAPES = [
 ]
 
 # ormqr only supports float32 and float64 (LAPACK limitation, no half/bfloat16)
-ORMQR_DTYPES = [torch.float32, torch.float64]
+# float64 is added only when the device supports it: on kunlunxin/XPU
+# (fp64_enabled=False) an fp64 device tensor is silently created as fp32, so the
+# dtype-strict comparison can never hold there.
+ORMQR_DTYPES = [torch.float32] + ([torch.float64] if utils.fp64_is_supported else [])
 
 
 @pytest.mark.ormqr

@@ -20,7 +20,7 @@ LU_SHAPES = [
     (1024, 1024),
 ]
 # torch.linalg.lu_factor only supports float32/float64; half/bfloat16 not supported
-LU_DTYPES = [torch.float32, torch.float64]
+LU_DTYPES = [torch.float32] + ([torch.float64] if utils.fp64_is_supported else [])
 
 
 @pytest.mark.lu_unpack

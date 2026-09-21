@@ -321,6 +321,7 @@ def test_dtype_param(ord):
         torch.float32
         # The backend of ASCEND and iluvatar do not support f64
         if flag_gems.vendor_name in ("ascend", "iluvatar")
+        or not flag_gems.runtime.device.support_fp64
         else torch.float64
     )
     ref = _compute_ref(A, ord, dtype=out_dtype)
