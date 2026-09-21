@@ -505,6 +505,7 @@ def _int_floordiv(x, y):
     # whereas in Pytorch x // 0 returns -1 if x >=0 and -2 if x < 0
     # but this special case is coalesced into the c1 and c2 check so
     # there's extra handling.
+    q = x // y
     r = x % y
     c1 = r != 0
     c2 = (x < 0) ^ (y < 0)
