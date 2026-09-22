@@ -154,27 +154,7 @@ def _index_copy_flat(
     OUT_DIM: tl.constexpr,
     NEED_MASK: tl.constexpr,
     BLOCK: tl.constexpr,
-):
-    """Flat scatter for *contiguous* ``inp``/``src`` (any rank, any dim).
-
-    ``src`` is contiguous, so the gather side collapses to ``src + e``.  The
-    destination is rebuilt from the flat element id:
-    ``e = (o * LENGTH + j) * INNER + c`` and the write lands at
-    ``(o * OUT_DIM + index[j]) * INNER + c``.
-
-    Two TritonXPU-specific decisions matter here:
-
-    * The three shape parameters are ``tl.constexpr``: integer division is
-      expensive on XPU3 and only a compile-time divisor lets the backend
-      replace ``//``/``%`` with multiply-shift sequences (measured ~35x on the
-      (64, 512, 512) rank-3 case versus passing them as runtime args).
-    * The tail is handled with a **mask**, never by clamping the lane index
-      with ``tl.minimum(e, total - 1)``.  Clamping introduces a non-affine
-      value into the index chain and destroys the backend's contiguity
-      analysis, falling back to per-lane scalar DMA: 30.5 ms versus 0.18 ms on
-      (64, 512, 512).  When ``total % BLOCK == 0`` the mask is compiled out
-      entirely (``NEED_MASK=False``) and the whole tile becomes one block DMA.
-    """
+): 
     e = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     li = LENGTH * INNER
     o = e // li
@@ -260,10 +240,14 @@ def _index_copy_impl(inp, dim, index, src):
     dim %= inp.ndim
     n_elements = src.numel()
 
-    if inp.is_contiguous() and src.is_contiguous():
-        inner = 1
-        for size in inp.shape[dim + 1 :]:
-            inner *= size
+    inner = 1
+    for size in inp.shape[dim + 1 :]:
+        inner *= size
+    outer = 1
+    for size in inp.shape[:dim]:
+        outer *= size 
+    flat_safe = not (outer > 1 and inner > 1)
+    if inp.is_contiguous() and src.is_contiguous() and flat_safe:
         block = _pick_scatter_block(n_elements)
         need_mask = (n_elements % block) != 0
         grid = (triton.cdiv(n_elements, block),)

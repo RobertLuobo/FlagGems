@@ -742,6 +742,9 @@ _DIM_MAX_INDEX = 1 << 31
 _DIM_CHUNKS = (32768, 8192)
 _DIM_MERGE_BLOCK = 1024
 _DIM_MASK_ROWS = 64
+_DIM_TILE_ROWS_WIDE = 128
+_DIM_TILE_ROWS_WIDE_SHORTN = 256
+_DIM_TILE_SHORTN = 512
 
 
 @libentry()
@@ -824,15 +827,7 @@ def l2_dim_merge_kernel(Partial, Out, M, K: tl.constexpr, BLOCK_M: tl.constexpr)
 
 
 @functools.lru_cache(maxsize=1024)
-def _l2_dim_plan(m, n):
-    """('tile', TILE_M) / ('mask', (BLOCK_M, BLOCK_N)) / ('chunk', CHUNK) for an
-    (M, N) trailing reduce, or None when the shape belongs on the generic path.
-
-    The unmasked ('tile', ...) kernel is only selected when N and TILE_M are both
-    powers of two -- any other extent is silently mis-lowered by TritonXPU (see
-    the block comment above).  Shapes that used to take an unsafe tile now take
-    the masked pow2 kernel; shapes that already fell through to the generic path
-    still do, so the generic path's behaviour is unchanged."""
+def _l2_dim_plan(m, n, wide=False): 
     if m < 1 or n < _DIM_MIN_N:
         return None
     if m * n < _DIM_MIN_WORK or m * n >= _DIM_MAX_INDEX:
@@ -850,8 +845,15 @@ def _l2_dim_plan(m, n):
             return None
         if n & (n - 1) == 0:
             p2 = m & (-m)
-            if p2 > _DIM_MASK_ROWS:
-                p2 = _DIM_MASK_ROWS
+            tile_cap = _DIM_MASK_ROWS
+            if wide:
+                tile_cap = (
+                    _DIM_TILE_ROWS_WIDE_SHORTN
+                    if n <= _DIM_TILE_SHORTN
+                    else _DIM_TILE_ROWS_WIDE
+                )
+            if p2 > tile_cap:
+                p2 = tile_cap
             if p2 * n >= _DIM_MIN_TILE:
                 return ("tile", p2)
         block_n = triton.next_power_of_2(n)
@@ -907,7 +909,7 @@ def _l2_trailing_dim(x, dim, keepdim, dtype):
     m = 1
     for d in range(ndim - len(red)):
         m *= x.shape[d]
-    plan = _l2_dim_plan(m, n)
+    plan = _l2_dim_plan(m, n, x.dtype in (torch.float16, torch.bfloat16))
     if plan is None:
         return None
     out = _l2_dim_launch(x, m, n, plan, dtype)
