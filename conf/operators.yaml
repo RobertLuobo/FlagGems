@@ -27,6 +27,33 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.1'
+- id: _ctc_loss
+  description: 'Computes the CTC loss and the alpha lattice used by its backward pass.
+
+    '
+  for:
+  - _ctc_loss
+  - _ctc_loss.Tensor
+  labels:
+  - aten
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
+- id: _ctc_loss_out
+  description: A variant of `_ctc_loss` that allows the outputs to be assigned to
+    `out`.
+  for:
+  - _ctc_loss.out
+  - _ctc_loss.Tensor_out
+  labels:
+  - aten
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: _flash_attention_forward
   description: Run the canonical FlashAttention forward operator.
   for:
@@ -1793,6 +1820,18 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.4'
+- id: batch_norm_with_update
+  description: Applies training-mode Batch Normalization using batch statistics and updates
+    running_mean/running_var in place.
+  for:
+  - _batch_norm_with_update
+  labels:
+  - KernelGen
+  - aten
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: batch_norm_with_update_functional
   description: Functional variant of _batch_norm_with_update that applies training-mode
     Batch Normalization and updates running statistics.
@@ -3632,6 +3671,23 @@ ops:
   - KernelGen
   kind:
   - Math
+  stages:
+  - alpha: '5.4'
+- id: cudnn_rnn
+  description: 'Vendor-agnostic RNN forward pass using Triton kernels that replaces
+    the cuDNN-backed _cudnn_rnn operator.  Supports RNN_RELU, RNN_TANH, LSTM and
+    GRU modes with multi-layer, bidirectional, LSTM projection (proj_size > 0),
+    dropout during training, and packed variable-length sequences.
+
+    '
+  for:
+  - _cudnn_rnn
+  labels:
+  - aten
+  - NoCPU
+  - KernelGen
+  kind:
+  - NeuralNetwork
   stages:
   - alpha: '5.4'
 - id: cudnn_rnn_backward
@@ -13421,6 +13477,17 @@ ops:
   - NeuralNetwork
   stages:
   - alpha: '5.3'
+- id: sample_dirichlet
+  description: Draws samples from a Dirichlet distribution parameterized by alpha.
+  for:
+  - _sample_dirichlet
+  labels:
+  - aten
+  - KernelGen
+  kind:
+  - Math
+  stages:
+  - alpha: '5.5'
 - id: scalar_tensor
   description: 'Creates a 0-dimensional (scalar) tensor from a Python numeric value.
 
@@ -14765,6 +14832,18 @@ ops:
   - BLAS
   stages:
   - alpha: '5.4'
+- id: spdiags
+  description: Triton kernel implementation for _spdiags that builds a sparse matrix
+    from diagonals.
+  for:
+  - _spdiags
+  labels:
+  - aten
+  - KernelGen
+  kind:
+  - Math
+  stages:
+  - alpha: '5.5'
 - id: special_airy_ai
   description: 'Computes the Airy function Ai(x) for each element of the input tensor.
 
@@ -16786,6 +16865,17 @@ ops:
   - BLAS
   stages:
   - alpha: '5.5'
+- id: transform_bias_rescale_qkv
+  description: Triton kernel implementation for _transform_bias_rescale_qkv.
+  for:
+  - _transform_bias_rescale_qkv
+  labels:
+  - aten
+  - KernelGen
+  kind:
+  - NeuralNetwork
+  stages:
+  - alpha: '5.5'
 - id: transpose
   description: 'Returns a view of the original tensor with its two dimensions swapped.
 
@@ -17704,6 +17794,17 @@ ops:
   - Reduction
   stages:
   - alpha: '5.4'
+- id: vander
+  description: Generates a Vandermonde matrix from a 1-D input tensor.
+  for:
+  - vander
+  labels:
+  - aten
+  - KernelGen
+  kind:
+  - Tensor
+  stages:
+  - alpha: '5.5'
 - id: var
   description: Calculates the variance over all dimensions.
   for:
