@@ -27,6 +27,7 @@ from flag_gems.logging_utils import setup_flaggems_logging, teardown_flaggems_lo
 from flag_gems.modules import *  # noqa: F403
 from flag_gems.ops import *  # noqa: F403
 from flag_gems.ops._dirichlet_grad import _HAS_MAP_ELEMENTWISE
+from flag_gems.ops._upsample_nearest_exact2d import _upsample_nearest_exact2d_out
 from flag_gems.patches import *  # noqa: F403
 from flag_gems.patches import patch_empty_vllm  # noqa: F401
 from flag_gems.runtime import flagtune
@@ -363,6 +364,7 @@ _FULL_CONFIG = (
         _upsample_nearest_exact1d_backward_grad_input,
     ),
     ("_upsample_nearest_exact2d", _upsample_nearest_exact2d),
+    ("_upsample_nearest_exact2d.out", _upsample_nearest_exact2d_out),
     ("_upsample_nearest_exact2d_backward", _upsample_nearest_exact2d_backward),
     ("_upsample_nearest_exact3d", _upsample_nearest_exact3d),
     (

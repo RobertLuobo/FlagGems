@@ -276,23 +276,4 @@ def _upsample_nearest_exact2d_out(
     return _launch(input, out, total, rheight, rwidth, out_strided, need_mask)
 
 
-_aten_out_lib = None
-
-
-def _register_upsample_nearest_exact2d_out():
-    global _aten_out_lib
-    if _aten_out_lib is not None:
-        return
-    _aten_out_lib = torch.library.Library("aten", "IMPL")
-    _aten_out_lib.impl(
-        "_upsample_nearest_exact2d.out",
-        _upsample_nearest_exact2d_out,
-        "CUDA",
-        allow_override=True,
-    )
-
-
-_register_upsample_nearest_exact2d_out()
-
-
 __all__ = ["_upsample_nearest_exact2d", "_upsample_nearest_exact2d_out"]
