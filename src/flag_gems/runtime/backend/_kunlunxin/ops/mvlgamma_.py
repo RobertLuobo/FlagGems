@@ -109,7 +109,7 @@ def mvlgamma_(*args, **kwargs):
         n_elements = y.numel()
         if n_elements == 0:
             return x
-        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        grid = (triton.cdiv(n_elements, 512),)
         with torch_device_fn.device(y.device):
             mvlgamma_kernel_xpu[grid](y, n_elements, p_tensor, BLOCK_SIZE=512)
         x.copy_(y)
@@ -118,7 +118,7 @@ def mvlgamma_(*args, **kwargs):
     n_elements = x.numel()
     if n_elements == 0:
         return x
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = (triton.cdiv(n_elements, 512),)
     with torch_device_fn.device(x.device):
         mvlgamma_kernel_xpu[grid](x, n_elements, p_tensor, BLOCK_SIZE=512)
     return x

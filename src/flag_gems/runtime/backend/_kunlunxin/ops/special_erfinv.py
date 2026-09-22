@@ -52,16 +52,9 @@ def _launch_special_erfinv_kernel(x: torch.Tensor, out: torch.Tensor):
         x.numel() == out.numel()
     ), "Input and output must have the same number of elements"
     assert x.dtype == out.dtype, "Input and output must have the same dtype"
-    n_elements = x.numel()
-    # Size-adaptive tile.  Large fixed blocks keep the grid small and avoid
-    # launch-bound overhead on XPU (large shapes), while small inputs use a
-    # modest tile so tiny tensors are not dominated by one oversized block.
-    # Block sweep (fp32/fp16/bf16, n in 2^16..2^26): >=2^18 elements are
-    # fastest at 16384; smaller inputs hit the ~20us launch floor at 1024.
-    # Note: keep the NaN compare as `~(xf == xf)` -- the `!=` form fails to
-    # lower at BLOCK_SIZE >= 1024 (LLVM "Cannot select" on setuo).
+    n_elements = x.numel() 
     BLOCK_SIZE = 1024 if n_elements <= 131072 else 16384
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
     _special_erfinv_kernel[grid](
         x,
         out,

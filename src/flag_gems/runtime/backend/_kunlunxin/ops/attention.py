@@ -422,23 +422,27 @@ def prob_dp_partial_kernel(
     kv_bh = batch_idx * KV_HEADS + query_head // GROUP_SIZE
     n_mask = n_offs < KV_LEN
     n_safe = tl.where(n_mask, n_offs, 0)
-    score = tl.zeros((BLOCK_N_,), dtype=tl.float32)
-    dp = tl.zeros((BLOCK_N_,), dtype=tl.float32)
-    for d_offset in tl.static_range(RED_):
-        d_idx = d_chunk * RED_ + d_offset
-        if d_idx < D:
-            q_value = tl.load(Q + (query_bh * Q_LEN + q_idx) * D + d_idx)
-            do_value = tl.load(DO + (query_bh * Q_LEN + q_idx) * D + d_idx).to(
-                tl.float32
-            )
-            k_value = tl.load(K + (kv_bh * KV_LEN + n_safe) * D + d_idx)
-            v_value = tl.load(V + (kv_bh * KV_LEN + n_safe) * D + d_idx).to(tl.float32)
-            # Gate after the multiply so the products keep the exact dtypes the
-            # original code used (bit-identical results on the in-matrix shapes
-            # where n_mask is all-true).  `n_safe` guarantees the loaded lanes
-            # are real in-range elements, so the products are always finite.
-            score += tl.where(n_mask, q_value * k_value, 0.0)
-            dp += tl.where(n_mask, do_value * v_value, 0.0)
+    # Vectorise over the D chunk to avoid a static_range(RED_) unroll overrunning the XPU buffer budget.
+    d_offs = d_chunk * RED_ + tl.arange(0, RED_)
+    d_mask = d_offs < D
+    d_safe = tl.where(d_mask, d_offs, 0)
+    q_vec = tl.load(
+        Q + (query_bh * Q_LEN + q_idx) * D + d_safe, mask=d_mask, other=0.0
+    ).to(tl.float32)
+    do_vec = tl.load(
+        DO + (query_bh * Q_LEN + q_idx) * D + d_safe, mask=d_mask, other=0.0
+    ).to(tl.float32)
+    kv_offs = (kv_bh * KV_LEN + n_safe)[:, None] * D + d_safe[None, :]
+    kv_mask = n_mask[:, None] & d_mask[None, :]
+    k_mat = tl.load(K + kv_offs, mask=kv_mask, other=0.0).to(tl.float32)
+    v_mat = tl.load(V + kv_offs, mask=kv_mask, other=0.0).to(tl.float32)
+    # Zero the tail explicitly since other= is not honoured on this backend's narrow loads.
+    q_vec = tl.where(d_mask, q_vec, 0.0)
+    do_vec = tl.where(d_mask, do_vec, 0.0)
+    k_mat = tl.where(kv_mask, k_mat, 0.0)
+    v_mat = tl.where(kv_mask, v_mat, 0.0)
+    score = tl.sum(tl.where(n_mask[:, None], q_vec[None, :] * k_mat, 0.0), axis=1)
+    dp = tl.sum(tl.where(n_mask[:, None], do_vec[None, :] * v_mat, 0.0), axis=1)
     partial_offs = ((query_bh * Q_LEN + q_idx) * KV_LEN + n_offs) * D_CHUNKS + d_chunk
     tl.store(SCORE_PARTIAL + partial_offs, score, mask=n_mask)
     tl.store(DP_PARTIAL + partial_offs, dp, mask=n_mask)
@@ -653,10 +657,11 @@ def dv_dot_kernel(
     n_mask = n_offs < KV_LEN
     d_mask = d_offs < D
     acc = tl.zeros((BLOCK_N_, BLOCK_D_), dtype=tl.float32)
-    for group_head in tl.static_range(GROUP_SIZE):
+    # Real loops rather than tl.static_range to stay within the XPU pipeline-event budget.
+    for group_head in range(GROUP_SIZE):
         query_head = kv_head * GROUP_SIZE + group_head
         query_bh = batch_idx * QUERY_HEADS + query_head
-        for q_base in tl.static_range(0, Q_LEN, BLOCK_Q_):
+        for q_base in range(0, Q_LEN, BLOCK_Q_):
             q_offs = q_base + tl.arange(0, BLOCK_Q_)
             q_mask = q_offs < Q_LEN
             p = tl.load(
@@ -685,26 +690,24 @@ def grad_finalize_kernel(
     D: tl.constexpr,
     R_CHUNKS: tl.constexpr,
     BLOCK_D_: tl.constexpr,
+    BLOCK_R_: tl.constexpr,
 ):
     row = tl.program_id(0)
     d_base = tl.program_id(1) * BLOCK_D_
     bh = tl.program_id(2)
-    out_base = (bh * ROWS + row) * D + d_base
-    for d_offset in tl.static_range(BLOCK_D_):
-        d_idx = d_base + d_offset
-        acc = 0.0
-        compensation = 0.0
-        for chunk in tl.static_range(R_CHUNKS):
-            value = tl.load(
-                PARTIAL + ((bh * ROWS + row) * R_CHUNKS + chunk) * D + d_idx,
-                mask=d_idx < D,
-                other=0.0,
-            )
-            corrected = value - compensation
-            updated = acc + corrected
-            compensation = (updated - acc) - corrected
-            acc = updated
-        tl.store(OUT + out_base + d_offset, acc, mask=d_idx < D)
+    d_offs = d_base + tl.arange(0, BLOCK_D_)
+    d_mask = d_offs < D
+    # Reduce the R_CHUNKS partials in one vector load to avoid unrolling scalar loads that stall the compiler.
+    chunk_offs = tl.arange(0, BLOCK_R_)
+    chunk_mask = chunk_offs < R_CHUNKS
+    # Layout is (BLOCK_D_, BLOCK_R_) because this backend only lowers a reduce on the trailing axis.
+    offs = ((bh * ROWS + row) * R_CHUNKS + chunk_offs[None, :]) * D + d_offs[:, None]
+    mask = d_mask[:, None] & chunk_mask[None, :]
+    value = tl.load(PARTIAL + offs, mask=mask, other=0.0).to(tl.float32)
+    # Zero the clamped tail explicitly since other= is not honoured on narrow loads.
+    value = tl.where(mask, value, 0.0)
+    acc = tl.sum(value, axis=1)
+    tl.store(OUT + (bh * ROWS + row) * D + d_offs, acc, mask=d_mask)
 
 
 def scaled_dot_product_attention_forward(
@@ -1060,6 +1063,7 @@ def _staged_attention_backward(do, query, key, value, o, lse, sm_scale, is_causa
         D=head_dim,
         R_CHUNKS=kv_chunks,
         BLOCK_D_=_STAGED_BLOCK_D,
+        BLOCK_R_=triton.next_power_of_2(kv_chunks),
         **launch_options,
     )
     grad_finalize_kernel[
@@ -1071,6 +1075,7 @@ def _staged_attention_backward(do, query, key, value, o, lse, sm_scale, is_causa
         D=head_dim,
         R_CHUNKS=query_chunks,
         BLOCK_D_=_STAGED_BLOCK_D,
+        BLOCK_R_=triton.next_power_of_2(query_chunks),
         **launch_options,
     )
     dv_dot_kernel[

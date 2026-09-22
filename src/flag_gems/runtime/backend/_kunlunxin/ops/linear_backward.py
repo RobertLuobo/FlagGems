@@ -56,8 +56,8 @@ def linear_backward(input, grad_output, weight, output_mask):
             grad_weight = mm(grad_output_transposed, input_flat)
 
     grad_bias = None
-    if output_mask[2]:
-        if weight.dtype == torch.float16:
+    if output_mask[2]: 
+        if weight.dtype in (torch.float16, torch.bfloat16):
             grad_bias = sum_dim(grad_output_flat.to(torch.float32), dim=(0,)).to(
                 weight.dtype
             )

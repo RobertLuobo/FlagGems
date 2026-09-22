@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 
-from flag_gems.utils import tl_extra_shim
+from flag_gems.utils import libentry, tl_extra_shim
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
@@ -271,6 +271,37 @@ def _scalar_over_complex(A, B, out=None):
     BLOCK = 256
     grid = (triton.cdiv(n, BLOCK),)
     _cdiv_st_kernel[grid](_complex_view(B), ov, n, float(A), BLOCK=BLOCK)
+SMALL_DIV_MAX_NUMEL = 1 << 18
+
+
+@libentry()
+@triton.jit(do_not_specialize=["num_tasks"])
+def _small_true_div_kernel(X, Y, O, num_tasks, TILE: tl.constexpr):
+    pid = tl.program_id(0)
+    tid = pid * TILE + tl.arange(0, TILE)
+    mask = tid < num_tasks
+    x = tl.load(X + tid, mask=mask)
+    y = tl.load(Y + tid, mask=mask)
+    tl.store(O + tid, x / y, mask=mask)
+
+
+def _small_true_div_eligible(A, B):
+    return (
+        A.dtype == B.dtype
+        and A.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and A.shape == B.shape
+        and 0 < A.numel() <= SMALL_DIV_MAX_NUMEL
+        and A.is_contiguous()
+        and B.is_contiguous()
+    )
+
+
+def _small_true_div_launch(A, B, out):
+    num_tasks = A.numel()
+    tile = triton.next_power_of_2(triton.cdiv(num_tasks, 12))
+    tile = min(max(tile, 512 if A.element_size() > 2 else 1024), 8192)
+    grid = (triton.cdiv(num_tasks, tile),)
+    _small_true_div_kernel[grid](A, B, out, num_tasks, TILE=tile)
     return out
 
 
@@ -283,6 +314,8 @@ def true_divide(A, B):
             return _rational_true_divide(A, B)
         return _scalar_over_complex(A, B)
     if isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor):
+        if _small_true_div_eligible(A, B):
+            return _small_true_div_launch(A, B, torch.empty_like(A))
         if (
             A.dtype in (torch.float16, torch.float32)
             and A.numel() >= DIV_TENSOR_U16_MIN_NUMEL
@@ -303,15 +336,6 @@ def true_divide(A, B):
 
 
 def true_divide_tensor(A, B):
-    """Canonical Tensor overload of true_divide (explicit aten true_divide.Tensor).
-
-    The generic flag_gems.ops.true_divide.true_divide_tensor routes through the
-    generic flag_gems.ops.div.true_divide, whose pointwise kernel lacks the
-    Kunlunxin tuned CodeGenConfig (measured ~330x slower on XPU for
-    (4096,4096) fp32: 69ms vs 205us). Exporting this vendor implementation lets
-    SpecOpRegistrar swap it in so torch.true_divide(tensor, tensor) and
-    aten::true_divide.Tensor use the same fast tuned kernel as div/div_.
-    """
     logger.debug("GEMS_KUNLUNXIN TRUE_DIVIDE_TENSOR")
     # keep the dispatch-contract log line expected by tests/test_true_divide.py
     # (caplog on logger "flag_gems.ops.true_divide", same pattern as special_erf)
@@ -352,6 +376,8 @@ def true_divide_(A, B):
     if A.is_complex():
         return _complex_true_divide(A, B, out=A)
     if isinstance(B, torch.Tensor):
+        if _small_true_div_eligible(A, B):
+            return _small_true_div_launch(A, B, A)
         if (
             A.dtype in (torch.float16, torch.float32)
             and A.numel() >= DIV_TENSOR_U16_MIN_NUMEL
@@ -496,23 +522,19 @@ def trunc_divide_(A, B):
 
 @triton.jit
 def _int_floordiv(x, y):
-    # TODO: request Triton to add an integer remainder builtin
-    # The semantic of Triton floordiv differs from Pytorch/Numpy
-    # Triton floordiv equates to
-    #     (x - np.fmod(x, y)) / y
-    # whereas Pytorch floordiv is
-    #     (x - np.remainder(x, y)) y
-    # The results show a one off difference when
-    #     C1) x and y have opposite signs
-    # and C2) x is not multiples of y.
-    # Apart from the above, there's an erroneous case x // 0 returns -1
-    # whereas in Pytorch x // 0 returns -1 if x >=0 and -2 if x < 0
-    # but this special case is coalesced into the c1 and c2 check so
-    # there's extra handling.
-    r = x % y
+    # Triton `//` and `%` on integers are truncating (C semantics), while PyTorch
+    # floor-division additionally needs a one-off correction when the signs
+    # differ and the remainder is non-zero.
+    # The remainder is derived from the quotient instead of using `x % y`:
+    # for truncating division the two are exactly equivalent, and it keeps a
+    # single integer division per element. The previous form emitted both
+    # `llvm.srem` and `llvm.sdiv` for every value (IR verified on XPU), which
+    # doubled the cost of the dominant operation of this kernel.
+    q = x // y
+    r = x - q * y
     c1 = r != 0
     c2 = (x < 0) ^ (y < 0)
-    return tl.where(c1 & c2, x // y - 1, x // y)
+    return tl.where(c1 & c2, q - 1, q)
 
 
 # floor_divide must be consistent with python/numpy/torch: floor(x/y) on the
@@ -689,6 +711,39 @@ def rem_st_cfg(x, y):
     return _remainder(x, y)
 
 
+def _fold_scalar_into_tensor_dtype(value, dtype):
+    """Reproduce ATen's "wrapped number" fold for the scalar operand.
+
+    ``aten::remainder.Scalar_Tensor`` converts the Python scalar with
+    ``Scalar::to<T>()`` (a C-style truncating conversion) *before* the kernel
+    runs, so ``300 % <int8 tensor>`` really computes ``44 % y``. The shared
+    pointwise generator instead keeps the scalar in a wide integer type and
+    truncates only when storing to the (narrower) output dtype, which silently
+    disagrees with ATen for any scalar that does not fit the tensor dtype.
+    Verified on XPU (aten CPU oracle): int8 300/130, int16 40000/32768,
+    int32 +/-2**40/2**31 all returned the wide-scalar result.
+
+    Python ``bool`` is folded to ``int`` as well: the generated scalar kernel
+    carries ``do_not_specialize=["val0"]``, so a ``bool`` first argument binds
+    ``val0`` to ``i1`` and aborts with ``CompilationError`` (ATen returns the
+    ``True % y`` result).
+    """
+    if isinstance(value, bool):
+        value = int(value)
+    if (
+        isinstance(value, int)
+        and not dtype.is_floating_point
+        and not dtype.is_complex
+        and dtype != torch.bool
+    ):
+        info = torch.iinfo(dtype)
+        mod = 1 << info.bits
+        value &= mod - 1
+        if info.min < 0 and value > info.max:
+            value -= mod
+    return value
+
+
 def remainder(A, B):
     logger.debug("GEMS_KUNLUNXIN FLOOR_DIVIDE")
     if isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor):
@@ -700,6 +755,7 @@ def remainder(A, B):
             return rem_ts_cfg(A, B)
         return rem_ts(A, B)
     elif isinstance(B, torch.Tensor):
+        A = _fold_scalar_into_tensor_dtype(A, B.dtype)
         if B.numel() >= REMAINDER_CFG_THRESHOLD:
             return rem_st_cfg(A, B)
         return rem_st(A, B)
