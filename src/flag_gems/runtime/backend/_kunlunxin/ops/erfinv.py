@@ -261,5 +261,5 @@ def erfinv_(x: torch.Tensor):
     else:
         x_cont = x.contiguous()
         _launch_erfinv(x_cont, x_cont)
-        torch.ops.aten._copy_from(x_cont, x, False)
+        x.copy_(x_cont)
     return x
