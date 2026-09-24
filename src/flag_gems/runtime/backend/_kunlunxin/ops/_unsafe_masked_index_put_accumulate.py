@@ -452,8 +452,13 @@ def _unsafe_masked_index_put_accumulate(input, mask, indices, values):
     # match is structurally unreachable, so take the multi-round path.
     if out_numel * mask.numel() >= _MULTI_ROUND_MIN_WORK:
         return _unsafe_masked_index_put_accumulate_multi_round(
-            inp, mask_contiguous, contiguous_indices, values_contiguous,
-            rank, shape, strides,
+            inp,
+            mask_contiguous,
+            contiguous_indices,
+            values_contiguous,
+            rank,
+            shape,
+            strides,
         ).view(inp.shape)
 
     dests = _dests_per_program(out_numel)
