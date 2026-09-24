@@ -1,26 +1,3 @@
-"""Kunlunxin erfinv (aten::erfinv) vendor override.
-
-torch.erfinv dispatches through its own ATen schema (aten::erfinv) and does not
-re-dispatch to special_erfinv. The general pointwise_dynamic implementation
-(tl_extra_shim.erfinv libdevice) measured ~0.1x on XPU.  This override uses a
-full-domain (-0.99..0.99, erf_erfinv test domain) polynomial evaluation:
-
-* fp32: Chebyshev-24 on z = 2 x^2/0.9801 - 1, split into two independent
-  degree-12 Clenshaw chains (even + odd in z) to halve the serial dependency
-  depth (48 -> 24); the 2.0/0.9801 division is folded to a reciprocal multiply.
-  fp32 error ~4.9e-5 (tolerance 1e-4), numerically identical to the single chain.
-* fp16/bf16: degree-16 power basis in (x^2 - 0.5), stable in fp32 Horner,
-  error ~7e-4 (dtype tolerances: fp16 ~1.9e-3, bf16 ~3e-2/ref|-scale).
-
-Edge handling is branch-free: instead of two `tl.where` (vselect scalarizes into
-per-lane branches on XPU, the dominant cost on large shapes) the input is clamped
-`ac = min(|x|, 1.0)`.  For |x| < 1 the result is unchanged and NaN inputs still
-propagate through `xf * p`; |x| >= 1 (outside erfinv's domain, untested) yields a
-bounded finite value instead of torch's NaN / +-inf.  The launch tile is
-size-adaptive (1024 / 16384) and the masked-memory path is elided for sizes that
-divide the tile (NEED_MASK constexpr).
-"""
-
 import logging
 
 import torch
@@ -240,6 +217,7 @@ def _launch_erfinv(x: torch.Tensor, out: torch.Tensor):
 
 
 def erfinv(x: torch.Tensor):
+    logger.debug("GEMS_KUNLUNXIN erfinv")
     """Inverse error function (aten::erfinv)."""
     x_in = x if x.is_contiguous() else x.contiguous()
     out = torch.empty_like(x_in)
@@ -248,14 +226,7 @@ def erfinv(x: torch.Tensor):
 
 
 def erfinv_(x: torch.Tensor):
-    """Inverse error function, in-place (aten::erfinv_).
-
-    Shares the same kernel entry as erfinv: the in-place payload is a pure
-    elementwise map, so an in-place launch on the same buffer (load slot i,
-    apply the polynomial, store slot i) is alias-safe for contiguous inputs.
-    Non-contiguous inputs are evaluated through a contiguous scratch and
-    written back in the original layout via the native strided copy engine.
-    """
+    logger.debug("GEMS_KUNLUNXIN erfinv_")
     if x.is_contiguous():
         _launch_erfinv(x, x)
     else:
