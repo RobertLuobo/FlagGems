@@ -929,8 +929,12 @@ def softmax(self, dim, half_to_float=False):
         if K > 1:
             inp_view = self.view(M, N, K).transpose(1, 2)
             inp_reshaped = torch.empty((M * K, N), dtype=self.dtype, device=self.device)
-            if not tle_copy(inp_view, inp_reshaped):
-                torch.ops.aten._copy_from(inp_view, inp_reshaped, False)
+            # Copy the [M, K, N] transposed view into a rank-3 view of the flat
+            # buffer so the ranks match: tle_copy returns False on the
+            # transpose-to-2D form and the aten::_copy_from fallback then fails
+            # to expand [M, K, N] onto [M*K, N] (same fix as softmax_out below).
+            if not tle_copy(inp_view, inp_reshaped.view(M, K, N)):
+                torch.ops.aten._copy_from(inp_view, inp_reshaped.view(M, K, N), False)
             out_reshaped = torch.empty((M * K, N), dtype=dtype, device=self.device)
 
             _softmax_forward_launch(out_reshaped, inp_reshaped, M * K, N)
@@ -940,6 +944,22 @@ def softmax(self, dim, half_to_float=False):
             out = torch.empty_like(self, dtype=dtype)
             _softmax_forward_launch(out, self, M, N)
     return out
+
+
+def special_softmax(self, dim, dtype=None):
+    # Backend override for `special_softmax`: the generic implementation binds
+    # `core_softmax` to the *generic* softmax at import time, which routes the
+    # K > 1 (dim != -1) case through `softmax_kernel_non_inner`'s axis-0 2D
+    # reduce - a form this XPU backend refuses to compile ("axis must not be 0
+    # for 2D+ shapes"). Route through the local kunlunxin `softmax`, whose K > 1
+    # path transposes the reduced axis innermost and reduces along axis 1.
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_SOFTMAX")
+
+    if dtype is not None:
+        # Match torch.special.softmax(x, dim, dtype=...): cast the input first.
+        self = self.to(dtype)
+
+    return softmax(self, dim)
 
 
 _SM_N1_BLOCK = 512
