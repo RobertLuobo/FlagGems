@@ -117,55 +117,34 @@ def _geqrf(af):
     tau = torch.zeros(B, k, dtype=af.dtype, device=af.device)
     V = torch.zeros(B, m, k, dtype=af.dtype, device=af.device)
     one = torch.ones(B, 1, dtype=af.dtype, device=af.device)
-    # Index masks (functions of the loop index j only, not of the data) are
-    # built ONCE with triu/tril/eye -- vendor ops that do NOT route through the
-    # float-compare 1d_tile kernel.  Doing ``rows == j`` / ``rows >= j`` per
-    # iteration instead compiles an eq_func_scalar / ge_func_scalar kernel
-    # specialised on m; on this backend the rank-1 "1d_tile" path fails to
-    # legalise 'triton_xpu.cmpf' for some m (e.g. m == 4096), so the whole op
-    # dies at compile time.  Row tables are (k, m), the column table is (k, n);
-    # column j selects the j-th row of each (a cheap view, no kernel):
-    #   ge_tab[j, i] = (i >= j)   lt_tab[j, i] = (i < j)
-    #   eye_tab[j, i] = (i == j)  gt_tab[j, c] = (c > j)
     ones_km = torch.ones(k, m, dtype=af.dtype, device=af.device)
-    ge_tab = torch.triu(ones_km)  # (k, m) upper incl diagonal: (i >= j)
-    lt_tab = torch.tril(ones_km, -1)  # (k, m) strict lower: (i < j)
-    eye_tab = torch.eye(k, m, dtype=af.dtype, device=af.device)  # (i == j)
-    gt_tab = torch.triu(
-        torch.ones(k, n, dtype=af.dtype, device=af.device), 1
-    )  # (k, n) strict upper: (c > j)
+    ge_tab = torch.triu(ones_km)
+    lt_tab = torch.tril(ones_km, -1)
+    eye_tab = torch.eye(k, m, dtype=af.dtype, device=af.device)
+    gt_tab = torch.triu(torch.ones(k, n, dtype=af.dtype, device=af.device), 1)
     for j in range(k):
-        # Per-batch scalars stay rank-2 (B, 1): the rank-1 "1d_tile" pointwise
-        # path miscompiles float comparisons for some tile sizes; B is small.
-        af_col = af[:, :, j]  # (B, m) fixed shape
-        ge = ge_tab[j].reshape(1, m)  # (1, m) 0/1 float, rows on/below diagonal
-        x = af_col * ge  # (B, m), entries above the diagonal zeroed
-        normx = torch.sqrt((x * x).sum(dim=1, keepdim=True))  # (B, 1)
-        alpha = af_col[:, j : j + 1]  # (B, 1)
-        zero = normx == 0  # (B, 1) zero sub-column -> H = I
-        # beta = -sign(alpha) * ||x|| ; sign(0) treated as +1.
+        af_col = af[:, :, j]
+        ge = ge_tab[j].reshape(1, m)
+        x = af_col * ge
+        normx = torch.sqrt((x * x).sum(dim=1, keepdim=True))
+        alpha = af_col[:, j : j + 1]
+        zero = normx == 0
         s = torch.where(alpha >= 0, one, -one)
-        beta = -s * normx  # (B, 1)
+        beta = -s * normx
         denom = alpha - beta
         safe_denom = torch.where(zero, one, denom)
-        # Reflector: v[i]=0 for i<j, v[j]=1, v[i]=x[i]/(alpha-beta) for i>j.
-        v = x / safe_denom  # (B, m) / (B, 1) broadcast
-        atdiag = eye_tab[j].reshape(1, m)  # (1, m) 0/1 float
-        # v[j] = 1, off-diagonal entries unchanged (float select, no cmpf).
+        v = x / safe_denom
+        atdiag = eye_tab[j].reshape(1, m)
         v = v * (1.0 - atdiag) + atdiag
         safe_beta = torch.where(zero, one, beta)
         tau_j = torch.where(zero, torch.zeros_like(beta), (beta - alpha) / safe_beta)
         tau[:, j : j + 1] = tau_j
         V[:, :, j] = v
-        # Apply H = I - tau v v^T to the trailing columns (c > j) of the whole
-        # matrix; leading columns are masked out (they already hold final R).
-        w = bmm(v.unsqueeze(1), af)  # (B, 1, n) = v^T A
-        upd = (tau_j * v).unsqueeze(2) * w  # (B, m, n) outer product
-        colmask = gt_tab[j].reshape(1, 1, n)  # (1, 1, n)
+        w = bmm(v.unsqueeze(1), af)
+        upd = (tau_j * v).unsqueeze(2) * w
+        colmask = gt_tab[j].reshape(1, 1, n)
         af = af - upd * colmask
-        # Finalise column j: R entries above the diagonal stay, diagonal = beta,
-        # below the diagonal is zeroed.
-        ltf = lt_tab[j].reshape(1, m)  # (1, m)
+        ltf = lt_tab[j].reshape(1, m)
         af[:, :, j] = af_col * ltf + beta * atdiag
     return af, tau, V
 
@@ -176,8 +155,6 @@ def _assemble_q(V, tau, m, k, qcols):
     if qcols <= k:
         Aq = V[:, :, :qcols].contiguous()
     else:
-        # complete mode needs qcols == m columns; pad the reflector block with
-        # zeros so orgqr applies the k reflectors to the full identity.
         Aq = torch.zeros(B, m, qcols, dtype=V.dtype, device=V.device)
         Aq[:, :, :k] = V[:, :, :k]
     return linalg_householder_product(Aq, tau)
@@ -206,8 +183,6 @@ def _linalg_qr(A, mode="reduced", *, out=None):
 
     q_shape, r_shape = _out_shapes(batch_shape, m, n, mode)
 
-    # Degenerate (zero-size) input: torch returns empty factors, except
-    # complete mode with zero columns where Q = I.
     if m == 0 or n == 0:
         if out is not None:
             Q, R = out
@@ -219,11 +194,9 @@ def _linalg_qr(A, mode="reduced", *, out=None):
             Q.copy_(eye.expand(*batch_shape, m, m))
         return LinalgQrResult(Q, R)
 
-    # Factor a contiguous clone so the caller's input is never mutated.
     af = A.reshape(B, m, n).contiguous().clone()
     af, tau, V = _geqrf(af)
 
-    # R = upper-triangular part of the factored matrix.
     rrows = k if mode in ("reduced", "r") else m
     R_flat = af[:, :rrows, :].triu()
 
@@ -246,11 +219,9 @@ def _linalg_qr(A, mode="reduced", *, out=None):
 
 def linalg_qr(A, mode="reduced", *, out=None):
     logger.debug("GEMS_KUNLUNXIN LINALG_QR")
-    logging.getLogger("flag_gems.ops.linalg_qr").debug("GEMS LINALG_QR")
     return _linalg_qr(A, mode, out=out)
 
 
 def linalg_qr_out(A, mode="reduced", *, Q, R):
     logger.debug("GEMS_KUNLUNXIN LINALG_QR_OUT")
-    logging.getLogger("flag_gems.ops.linalg_qr").debug("GEMS LINALG_QR_OUT")
     return _linalg_qr(A, mode, out=(Q, R))

@@ -29,7 +29,7 @@ _pow = tl_extra_shim.pow
 _SUPPORTED_COMPUTE_DTYPES = (torch.float32, torch.float64)
 _BLOCK = 1024
 _MAX_GRID = 65535
-_PAD_VALUE = 2.0  # a benign in-domain (x>1, q>0) padding value
+_PAD_VALUE = 2.0
 
 
 @triton.jit
@@ -48,7 +48,7 @@ def _zeta_compute(x, q):
     total = _pow(q, -x)
     a = q
     b = total
-    direct_done = x < x  # all-false vector, keeps NaN lanes false
+    direct_done = x < x
     for _ in tl.static_range(9):
         active = ~direct_done
         next_a = a + 1.0
@@ -147,7 +147,6 @@ def _zeta_compute(x, q):
     total = total + product * b / -7.1661652561756670113e18
     result = tl.where(direct_done, direct_result, total)
 
-    # ATen domain checks, applied in reverse order so x == 1 has precedence.
     q_nonpositive = q <= 0.0
     q_integer = q == tl.floor(q)
     x_integer = x == tl.floor(x)
@@ -160,11 +159,6 @@ def _zeta_compute(x, q):
 
 @triton.jit
 def _special_zeta_flat_kernel(x, q, out, n_tiles, BLOCK: tl.constexpr):
-    # Inputs/outputs are padded to a whole number of BLOCK tiles by the host,
-    # so every load/store is fully affine and unmasked (masked load `other=`
-    # corrupts valid lanes on this backend; unmasked avoids the mask pass that
-    # crashes the generic kernel).  A grid-stride loop covers tile counts past
-    # the 65535 grid limit.
     n_prog = tl.num_programs(0)
     tile = tl.program_id(0)
     while tile < n_tiles:
@@ -295,7 +289,7 @@ def _run(x, q, shape, device, dtype, *, x_is_tensor, q_is_tensor):
 
 
 def special_zeta(x, q):
-    logger.debug("GEMS SPECIAL_ZETA")
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_ZETA")
     device = _validate_tensor_devices(x, q)
     dtype = _promoted_dtype(x, q)
     shape = torch.broadcast_shapes(x.shape, q.shape)
@@ -303,7 +297,7 @@ def special_zeta(x, q):
 
 
 def special_zeta_out(x, q, out):
-    logger.debug("GEMS SPECIAL_ZETA_OUT")
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_ZETA_OUT")
     device = _validate_tensor_devices(x, q)
     dtype = _promoted_dtype(x, q)
     shape = torch.broadcast_shapes(x.shape, q.shape)
@@ -314,13 +308,13 @@ def special_zeta_out(x, q, out):
 
 
 def special_zeta_tensor_scalar(x, q):
-    logger.debug("GEMS SPECIAL_ZETA_TENSOR_SCALAR")
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_ZETA_TENSOR_SCALAR")
     dtype = _promoted_dtype(x, q)
     return _run(x, q, x.shape, x.device, dtype, x_is_tensor=True, q_is_tensor=False)
 
 
 def special_zeta_tensor_scalar_out(x, q, out):
-    logger.debug("GEMS SPECIAL_ZETA_TENSOR_SCALAR_OUT")
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_ZETA_TENSOR_SCALAR_OUT")
     dtype = _promoted_dtype(x, q)
     _prepare_out(out, x.shape, x.device, (x,))
     result = _run(x, q, x.shape, x.device, dtype, x_is_tensor=True, q_is_tensor=False)
@@ -329,13 +323,13 @@ def special_zeta_tensor_scalar_out(x, q, out):
 
 
 def special_zeta_scalar_tensor(x, q):
-    logger.debug("GEMS SPECIAL_ZETA_SCALAR_TENSOR")
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_ZETA_SCALAR_TENSOR")
     dtype = _promoted_dtype(x, q)
     return _run(x, q, q.shape, q.device, dtype, x_is_tensor=False, q_is_tensor=True)
 
 
 def special_zeta_scalar_tensor_out(x, q, out):
-    logger.debug("GEMS SPECIAL_ZETA_SCALAR_TENSOR_OUT")
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_ZETA_SCALAR_TENSOR_OUT")
     dtype = _promoted_dtype(x, q)
     _prepare_out(out, q.shape, q.device, (q,))
     result = _run(x, q, q.shape, q.device, dtype, x_is_tensor=False, q_is_tensor=True)

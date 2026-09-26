@@ -12,29 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU / P800) override for multi_margin_loss.
-#
-# Root cause of the generic crash:
-#   The generic forward/backward kernels wrap a per-row grid-stride loop
-#   (`for row in range(pid, N, program_count)`) around an inner class-tile loop
-#   that contains `tl.sum(..., axis=0)`.  On the TritonXPU backend a `tt.reduce`
-#   nested inside a runtime-bounded outer loop is rejected at MLIR lowering
-#   ("failed to legalize operation 'tt.reduce' that was explicitly marked
-#   illegal", ConvertTritonXPUToLLVM).  A `tl.sum` inside a *single* loop is
-#   accepted; the illegal case is specifically the nested-loop structure.
-#
-#   Additionally `@triton.jit(debug=True)` (needed by the generic
-#   `tl.device_assert` out-of-bounds check) fails XPU elfconv, so the device
-#   assert path cannot be used either.
-#
-# Fix:
-#   * De-nest the reduce by launching exactly one program per row (grid = (N,))
-#     with no grid-stride outer loop.  The inner class-tile loop keeps the
-#     `tl.sum` reduce, which compiles fine on its own.
-#   * Drop `debug=True` / `tl.device_assert`; instead perform an explicit
-#     host-synchronous out-of-bounds target check with the generic validation
-#     kernel (single loop + reduce, XPU-legal) and raise a RuntimeError, which
-#     is exactly what the synchronous-target-check vendors already do.
 
 import logging
 
@@ -42,7 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-# Reuse the generic host-side helpers and the XPU-legal validate/reduce kernels.
 from flag_gems.ops.multi_margin_loss import (
     _MAX_GRID_SIZE,
     _REDUCE_BLOCK_SIZE,
@@ -77,8 +53,6 @@ def _mml_fwd_row_kernel(
     HAS_WEIGHT: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    # One program per row; no grid-stride outer loop so the inner reduce is not
-    # nested (the nested case is what the XPU MLIR pass rejects).
     acc_dtype = tl.float64 if input_ptr.type.element_ty == tl.float64 else tl.float32
     margin = margin.to(acc_dtype)
     row = tl.program_id(0)
@@ -484,14 +458,6 @@ def multi_margin_loss_backward_out(
     return grad_input
 
 
-# The operator registrar (SpecOpRegistrar.apply) rebinds vendor implementations
-# onto the top-level ``flag_gems`` namespace only.  The generic
-# ``flag_gems.ops.multi_margin_loss`` function objects were bound into the
-# ``flag_gems.ops`` package namespace by ``ops/__init__.py`` *before* vendor
-# overrides run, and direct callers (e.g. ``flag_gems.ops.multi_margin_loss(...)``)
-# resolve against that package attribute.  Rebind those attributes here so direct
-# calls also use the XPU-legal kernels.  This mirrors the existing kunlunxin
-# precedent in ``_kunlunxin/ops/fused_experts_impl.py``.
 import sys as _sys  # noqa: E402
 
 _generic_ops_module = _sys.modules.get("flag_gems.ops")

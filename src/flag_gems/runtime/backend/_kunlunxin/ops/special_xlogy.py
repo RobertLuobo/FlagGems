@@ -21,42 +21,23 @@ from ..utils.pointwise_dynamic import pointwise_dynamic
 logger = logging.getLogger(__name__)
 
 
-# Kunlunxin/XPU override for the generic flag_gems.ops.special_xlogy.
-#
-# The generic implementation calls ``tl_extra_shim.log`` which lowers to a soft
-# libdevice extern on this backend; the XPU elf linker then fails with
-# ``ld.lld: error: undefined symbol: Unsupported`` at compile time (see
-# KernelOpt_Knowledge/xpu3/KERNEL_OPT_EXPERIENCE.md rows 7/35). The only change
-# needed is to use the core Triton ``tl.log`` primitive (natural log, LLVM
-# lowering) instead of the extern. Numerical/semantic logic is otherwise
-# identical to the generic op.
 @pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")])
 @triton.jit
 def special_xlogy_func(x, y):
-    # special_xlogy(x, y) = x * log(y) but returns 0 when x == 0 (even if y is 0)
-    # But if y is NaN, return NaN (regardless of x)
-    # Use float32 for computation
     x_fp32 = x.to(tl.float32)
     y_fp32 = y.to(tl.float32)
-    # Check if y is NaN (NaN != NaN is True)
     y_is_nan = y_fp32 != y_fp32
-    # Check if x is zero
     x_is_zero = x_fp32 == 0.0
-    # Compute log(y) - may produce inf/-inf/nan (core tl.log == ln on this backend)
     log_y = tl.log(y_fp32)
-    # Compute product
     prod = x_fp32 * log_y
-    # If y is NaN, return NaN (regardless of x)
-    # Else if x is 0, return 0 (even if y is 0 or inf)
-    # Else return x * log(y)
     return tl.where(y_is_nan, float("nan"), tl.where(x_is_zero, 0.0, prod))
 
 
 def special_xlogy(A, B):
-    logger.debug("GEMS SPECIAL_XLOGY")
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_XLOGY")
     return special_xlogy_func(A, B)
 
 
 def special_xlogy_(A, B):
-    logger.debug("GEMS SPECIAL_XLOGY_")
+    logger.debug("GEMS_KUNLUNXIN SPECIAL_XLOGY_")
     return special_xlogy_func(A, B, out0=A)

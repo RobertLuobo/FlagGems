@@ -71,8 +71,8 @@ def _adaptive_avg_pool3d_backward_exact_kernel(
 def _adaptive_avg_pool3d_backward_general_kernel(
     grad_output_ptr,
     grad_input_ptr,
-    out_last,  # out_total - 1, used to clamp the tap address in range
-    n_elems,  # in_n * in_c * in_d * in_h * in_w
+    out_last,
+    n_elems,
     in_d,
     in_h,
     in_w,
@@ -86,29 +86,6 @@ def _adaptive_avg_pool3d_backward_general_kernel(
     USE_STATIC: tl.constexpr,
 ):
     # General path (non-integer ratios, handles upsampling).
-    # One flat tile of *input* positions per program; every per-lane index
-    # (nc, d, h, w) is a vector, so the address arithmetic lives in the vector
-    # register file instead of the scalar tree.
-    #
-    # For a fixed input position only a handful of output cells per dimension
-    # cover it: o in [o_min, o_max), o_max - o_min <= ceil(out/in) + 1.  Loads
-    # clamp the tap address in range (masked loads are not honoured on this
-    # backend) and the contribution is gated with tl.where.  The masked store
-    # writes only the in-range lanes.
-    #
-    # Two mutually exclusive loop styles, chosen on the host by candidate-count
-    # (MAX_D*MAX_H*MAX_W) and picked here by the ``USE_STATIC`` constexpr:
-    #
-    #   * USE_STATIC (large input shapes, small MAX<=3 -> <=27 bodies): a
-    #     ``tl.static_range`` unroll compiles cleanly at the large BLOCK those
-    #     shapes need, whereas a runtime loop with its float32 loop-carried
-    #     accumulator overflows the uni_sram budget ("out of resource:
-    #     uni_sram Pass") at BLOCK=1024.
-    #   * runtime range (tiny inputs, big MAX up to 5 -> up to 125 bodies): a
-    #     125-way static unroll peaks the scalar tree at ~2384 (budget 24) and
-    #     the compiler bails with "Failed to tune buffer size"; the runtime
-    #     loop keeps a single body and compiles, and the tiny n_elems keeps
-    #     BLOCK<=64 so the loop-carried accumulator stays within budget.
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     lane_ok = offsets < n_elems
     safe = tl.where(lane_ok, offsets, 0)
@@ -200,13 +177,6 @@ def _fill_grad_input(grad_output, input, grad_input):
     in_n, in_c, in_d, in_h, in_w = input.shape
     out_d, out_h, out_w = grad_output.shape[-3:]
 
-    # bfloat16 is not viable as a kernel load/store type on this backend: an
-    # in-kernel bf16 load miscompiles (2x-scaled GEP, garbage reads) and a bf16
-    # store trips TritonXPUUnrollControl on the large tiles.  Route the whole
-    # bf16 case through a float32 gather (grad_output up-cast on the host, result
-    # written to a float32 scratch) and cast the result back to the caller's
-    # bf16 buffer afterwards.  This is host-side dtype handling, not a compute
-    # fallback: the arithmetic still runs entirely in the Triton kernel.
     if grad_input.dtype == torch.bfloat16:
         grad_output = grad_output.to(torch.float32)
         work = torch.empty_like(grad_input, dtype=torch.float32)
@@ -240,11 +210,6 @@ def _fill_grad_input(grad_output, input, grad_input):
             max_d = (out_d + in_d - 1) // in_d + 1
             max_h = (out_h + in_h - 1) // in_h + 1
             max_w = (out_w + in_w - 1) // in_w + 1
-            # Loop-style / tile-size selection (see kernel comment):
-            #   small candidate count -> static unroll at a large tile;
-            #   large candidate count (only tiny upsampling inputs reach it)
-            #   -> runtime loop, but cap the tile at 64 lanes so the float32
-            #   loop-carried accumulator stays within the uni_sram budget.
             use_static = max_d * max_h * max_w <= 27
             block = 1024
             if not use_static:
@@ -306,8 +271,6 @@ def adaptive_avg_pool3d_backward_grad_input(grad_output, input, *, grad_input):
         _fill_grad_input(grad_output, input, grad_input)
         return grad_input
 
-    # Non-contiguous out buffer: fill a contiguous scratch and copy back so the
-    # caller's buffer (and its data_ptr) is preserved.
     scratch = torch.empty_like(input)
     _fill_grad_input(grad_output, input, scratch)
     grad_input.copy_(scratch)

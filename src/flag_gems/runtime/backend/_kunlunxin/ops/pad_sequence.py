@@ -30,8 +30,7 @@ def pad_sequence(sequences, batch_first=False, padding_value=0.0):
     each sequence is copied into its slice through the DMA copy engine, so no
     element is ever left unwritten.
     """
-    logger.debug("GEMS PAD_SEQUENCE")
-    logging.getLogger("flag_gems.ops.pad_sequence").debug("GEMS PAD_SEQUENCE")
+    logger.debug("GEMS_KUNLUNXIN PAD_SEQUENCE")
 
     batch = len(sequences)
     if batch == 0:
@@ -73,8 +72,6 @@ def pad_sequence(sequences, batch_first=False, padding_value=0.0):
     else:
         out_shape = (max_len, batch, *trailing_shape)
 
-    # Pre-fill every element with the padding value; the copies below only touch
-    # the valid prefix of each sequence, so the tail stays exactly padding_value.
     out = torch.full(out_shape, padding_value, dtype=dtype, device=device)
     total_elements = batch * max_len * feature
     if total_elements == 0:
