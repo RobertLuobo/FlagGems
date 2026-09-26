@@ -11,23 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Kunlunxin (XPU/P800) override of grid_sampler_3d.
-#
-# Root cause vs. the generic implementation (identical to grid_sampler_2d):
-# on this XPU Triton backend a masked ``tl.load(..., other=0.0)`` does NOT
-# reliably return ``other`` for masked-out lanes -- it returns the value at the
-# (possibly out-of-bounds / clamped) address instead. The generic zeros-padding
-# paths (both nearest and trilinear) compute the load address from raw,
-# unclamped tap indices (which can be negative or >= size) and rely solely on
-# ``mask``/``other`` to suppress out-of-bounds contributions. On XPU that leaks
-# the neighbouring / clamped pixel value, so zeros padding produces wrong
-# results.
-#
-# This override always clamps the load address in-bounds and then explicitly
-# re-zeros invalid taps with ``tl.where(valid, v, 0.0)``, so out-of-bounds taps
-# contribute exactly 0. Border and reflection paths are unchanged (their
-# addresses are already clamped/reflected in-bounds).
 
 import logging
 
@@ -105,7 +88,6 @@ def grid_sampler_3d_kernel(
     gy = tl.load(grid_ptr + grid_offset + 1 * grid_stride_xyz).to(tl.float32)
     gz = tl.load(grid_ptr + grid_offset + 2 * grid_stride_xyz).to(tl.float32)
 
-    # PyTorch returns 0.0 for NaN grid values.
     grid_x_nan = gx != gx
     grid_y_nan = gy != gy
     grid_z_nan = gz != gz
@@ -122,15 +104,15 @@ def grid_sampler_3d_kernel(
         y = (gy + 1.0) * tl.cast(in_h, tl.float32) * 0.5 - 0.5
         z = (gz + 1.0) * tl.cast(in_d, tl.float32) * 0.5 - 0.5
 
-    if padding_mode == 0:  # ZEROS - keep original coords, mask handles OOB
+    if padding_mode == 0:
         x_pad = x
         y_pad = y
         z_pad = z
-    elif padding_mode == 1:  # BORDER - clamp to nearest edge
+    elif padding_mode == 1:
         x_pad = tl.maximum(tl.minimum(x, tl.cast(in_w - 1, tl.float32)), 0.0)
         y_pad = tl.maximum(tl.minimum(y, tl.cast(in_h - 1, tl.float32)), 0.0)
         z_pad = tl.maximum(tl.minimum(z, tl.cast(in_d - 1, tl.float32)), 0.0)
-    else:  # REFLECTION - triangle wave reflection in grid space
+    else:
         x_shifted = gx + 1.0
         x_mod = x_shifted % 4.0
         x_mod = tl.where(x_mod < 0, x_mod + 4.0, x_mod)
@@ -155,10 +137,10 @@ def grid_sampler_3d_kernel(
             y_pad = (gy_refl + 1.0) * tl.cast(in_h, tl.float32) * 0.5 - 0.5
             z_pad = (gz_refl + 1.0) * tl.cast(in_d, tl.float32) * 0.5 - 0.5
 
-    if interpolation_mode == 1:  # NEAREST
-        if padding_mode == 0:  # ZEROS - keep original (possibly OOB) coords
+    if interpolation_mode == 1:
+        if padding_mode == 0:
             xs, ys, zs = x, y, z
-        else:  # BORDER / REFLECTION - use padded coords
+        else:
             xs, ys, zs = x_pad, y_pad, z_pad
 
         ix = tl.cast(_round_half_to_even_fp32(xs), tl.int32)
@@ -169,7 +151,7 @@ def grid_sampler_3d_kernel(
             ix = tl.maximum(0, tl.minimum(ix, in_w - 1))
             iy = tl.maximum(0, tl.minimum(iy, in_h - 1))
             iz = tl.maximum(0, tl.minimum(iz, in_d - 1))
-    else:  # BILINEAR (trilinear)
+    else:
         if padding_mode == 0:
             ix0 = tl.cast(tl.floor(x), tl.int32)
             iy0 = tl.cast(tl.floor(y), tl.int32)
@@ -203,8 +185,8 @@ def grid_sampler_3d_kernel(
     )
 
     for channel in range(c):
-        if interpolation_mode == 1:  # NEAREST
-            if padding_mode == 0:  # ZEROS
+        if interpolation_mode == 1:
+            if padding_mode == 0:
                 valid = (
                     (iz >= 0)
                     & (iz < in_d)
@@ -216,8 +198,6 @@ def grid_sampler_3d_kernel(
                     & ~grid_y_nan
                     & ~grid_z_nan
                 )
-                # Clamp address in-bounds; XPU masked-load ``other`` is not
-                # honored, so re-zero via ``tl.where`` below.
                 ixc = tl.maximum(0, tl.minimum(ix, in_w - 1))
                 iyc = tl.maximum(0, tl.minimum(iy, in_h - 1))
                 izc = tl.maximum(0, tl.minimum(iz, in_d - 1))
@@ -244,7 +224,7 @@ def grid_sampler_3d_kernel(
                     tl.load(input_ptr + inp_offset),
                 )
         else:
-            if padding_mode == 0:  # ZEROS
+            if padding_mode == 0:
                 nm = ~grid_x_nan & ~grid_y_nan & ~grid_z_nan
                 iz0_v = (iz0 >= 0) & (iz0 < in_d)
                 iz1_v = (iz1 >= 0) & (iz1 < in_d)
@@ -262,7 +242,6 @@ def grid_sampler_3d_kernel(
                 m110 = iz1_v & iy1_v & ix0_v & nm
                 m111 = iz1_v & iy1_v & ix1_v & nm
 
-                # Clamp every tap address in-bounds; re-zero via ``tl.where``.
                 ix0c = tl.maximum(0, tl.minimum(ix0, in_w - 1))
                 ix1c = tl.maximum(0, tl.minimum(ix1, in_w - 1))
                 iy0c = tl.maximum(0, tl.minimum(iy0, in_h - 1))
@@ -395,7 +374,6 @@ def grid_sampler_3d_kernel(
                     + ix1 * in_strides_w
                 )
 
-            # Trilinear interpolation
             c00 = c000 * (1.0 - fz) + c100 * fz
             c01 = c001 * (1.0 - fz) + c101 * fz
             c10 = c010 * (1.0 - fz) + c110 * fz
@@ -419,7 +397,6 @@ def grid_sampler_3d(
 ):
     """Grid sampler 3D with trilinear or nearest interpolation (XPU override)."""
     logger.debug("GEMS_KUNLUNXIN GRID_SAMPLER_3D")
-    logging.getLogger("flag_gems.ops.grid_sampler_3d").debug("GEMS GRID_SAMPLER_3D")
 
     N, C, in_d, in_h, in_w = input.shape
     out_d, out_h, out_w = grid.shape[1:4]

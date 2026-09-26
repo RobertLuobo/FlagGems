@@ -5,10 +5,6 @@ import torch
 import triton
 import triton.language as tl
 
-# The generic implementation carries all the GRU triton kernels and host helpers.
-# ``flag_gems.ops`` rebinds the ``gru`` attribute to the *function* (via
-# ``from .gru import gru``), so ``import flag_gems.ops.gru`` would resolve to that
-# function rather than the module. Grab the real module object from sys.modules.
 import flag_gems.ops.gru  # noqa: F401  (ensure the module is imported)
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry, tl_extra_shim
@@ -16,24 +12,6 @@ from flag_gems.utils import libentry, tl_extra_shim
 _g = sys.modules["flag_gems.ops.gru"]
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# XPU / SDNN has no atomic scatter: the generic fast paths (``_gru_persistent_kernel``
-# and ``_gru_gemv_kernel``) implement a grid-wide barrier with ``tl.atomic_add``
-# (generic gru.py:576 / :735), which fails to legalize in ConvertTritonSDNNToLLVM
-# ("failed to legalize operation 'tt.atomic_rmw'/'tt.addptr'"). This override runs
-# a barrier-free per-timestep recurrence instead: stream ordering between launches
-# provides the cross-program synchronization the atomic barrier would give.
-#
-# The generic ``_gru_step_kernel`` co-locates ``tl.sigmoid``/``tanh`` with ``tl.dot``
-# and the K-reduction loop in one kernel body. On this backend that miscompiles the
-# transcendentals to a reduced-precision (~5e-5) variant, which the recurrence
-# amplifies past the fp32 atol (1e-4). We therefore split the step into two kernels:
-#   * ``_gate_gemm``  -- dot + K loop only, emits the three gate pre-activations.
-#   * ``_gate_act``   -- pure elementwise, applies sigmoid/tanh at full precision.
-# All ``tl.dot`` calls use ``input_precision="ieee"`` (fp32-exact on P800; the
-# generic ``allow_tf32=False`` path leaves ~1e-4 residual matmul error).
-# ---------------------------------------------------------------------------
 
 
 @libentry()
@@ -63,7 +41,6 @@ def _in_gemm(
     BLOCK_K: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
 ):
-    # Batched input-side pre-activation: u = x @ W_ih^T + b_ih for every timestep.
     pid_b = tl.program_id(0)
     seq_idx = tl.program_id(1)
     pid_n = tl.program_id(2)
@@ -71,11 +48,6 @@ def _in_gemm(
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     b_mask = offs_b < batch_size
     n_mask = offs_n < 3 * hidden_size
-    # NOTE: no PACKED early-return here. The SDNN TritonSDNNLoopGrid pass rejects an
-    # early-return block that also contains a store ("cannot find unique early-return
-    # block"). Padding rows (b >= batch_sizes[seq]) are harmless: their input x is
-    # zero-filled, and the recurrence output is frozen to h_prev in ``_gate_act`` via
-    # the row-active mask, so whatever these rows accumulate here is never observed.
     acc = tl.zeros((BLOCK_B, BLOCK_N), dtype=COMPUTE_DTYPE)
     for kb in range(0, tl.cdiv(input_size, BLOCK_K)):
         offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -133,10 +105,6 @@ def _gate_gemm(
     COMPUTE_DTYPE: tl.constexpr,
     PACKED: tl.constexpr,
 ):
-    # Dot + loop kernel: compute the three gate pre-activations (r, z pre-sigmoid
-    # accumulators and the hidden-side n term). Sigmoid/tanh are applied later in a
-    # separate elementwise kernel because this backend compiles the transcendentals
-    # to a reduced-precision (~1e-4) variant when they share a kernel body with tl.dot.
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -151,8 +119,6 @@ def _gate_gemm(
         offs_b[:, None] * gate_stride_b
         + (2 * hidden_size + offs_h[None, :]) * gate_stride_f
     )
-    # No PACKED early-return (see _in_gemm). Padding rows compute throwaway gate
-    # pre-activations here; ``_gate_act`` overwrites their output with h_prev.
     u_base = (
         seq_idx * u_stride_s
         + offs_b[:, None] * u_stride_b
@@ -240,16 +206,6 @@ def _gate_act(
     BLOCK_H: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
 ):
-    # Pure elementwise: apply sigmoid/tanh and the GRU gating. No tl.dot / reduction
-    # loop here, so the XPU backend keeps the full-precision transcendental path.
-    #
-    # This kernel is *identical* for dense and packed runs: it always writes the freshly
-    # computed h_new to both the recurrence state and the output. Row freezing for packed
-    # sequences is applied on the host (contiguous frozen tail copy in ``_run_direction``)
-    # rather than with an in-kernel ``tl.where``: that ``tl.where`` poisons this backend's
-    # strided ``out_ptr`` store codegen for small hidden sizes (garbage output at scattered
-    # timesteps even when no row actually freezes), whereas the dense path -- byte-for-byte
-    # the same shapes without the where -- is correct.
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
     offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -336,12 +292,9 @@ def _run_direction(
         compute_dtype = tl.float32
         gate_dtype = torch.float32
 
-    # Precompute input-side pre-activations for all timesteps in one batched GEMM.
     input_gates = _g._empty(
         (seq_len, batch_size, 3 * hidden_size), gate_dtype, layer_input.device
     )
-    # Scratch for the per-step gate pre-activations produced by ``_gate_gemm`` and
-    # consumed by ``_gate_act`` (r | z | n_h laid out along the feature axis).
     gate_buf = _g._empty((batch_size, 3 * hidden_size), gate_dtype, layer_input.device)
 
     BLOCK_B_IN, BLOCK_N_IN, BLOCK_K_IN = 16, 64, 32
@@ -351,9 +304,6 @@ def _run_direction(
         triton.cdiv(3 * hidden_size, BLOCK_N_IN),
     )
 
-    # Host-side per-timestep active-row counts. Passing batch_sizes[seq] as a plain
-    # kernel scalar (rather than an in-kernel tl.load) keeps the ``_gate_act`` strided
-    # output store codegen correct on this backend.
     if batch_sizes is not None:
         bs_host = batch_sizes.to("cpu", torch.int32).tolist()
     else:
@@ -386,10 +336,6 @@ def _run_direction(
             COMPUTE_DTYPE=compute_dtype,
         )
 
-        # Barrier-free recurrence: one gate-GEMM + one activation launch per timestep.
-        # Stream ordering between launches supplies the cross-program synchronization
-        # that the generic persistent/gemv kernels get from the (unsupported) atomic
-        # barrier. Sigmoid/tanh live in ``_gate_act`` (no tl.dot) to keep full precision.
         h_work = _g._empty((batch_size, hidden_size), hx.dtype, hx.device)
         _g._copy_hx_slice(hx, h_work, state_idx, batch_size, hidden_size)
         h_next = _g._empty((batch_size, hidden_size), hx.dtype, hx.device)
@@ -444,11 +390,6 @@ def _run_direction(
                 BLOCK_H=block_h_step,
                 COMPUTE_DTYPE=compute_dtype,
             )
-            # Packed row freezing: sequences shorter than the current step must keep
-            # their previous hidden state. enforce_sorted guarantees the still-active
-            # rows are a contiguous prefix, so the frozen rows are the tail
-            # [active_count:batch]. Restore that tail (a contiguous device slice copy)
-            # rather than masking inside the kernel -- see the note in ``_gate_act``.
             if bs_host is not None:
                 active_count = bs_host[seq_idx]
                 if active_count < batch_size:
@@ -478,9 +419,6 @@ def _gru_forward_impl(
     dropout,
     batch_sizes=None,
 ):
-    # Layer/direction driver copied from the generic implementation so it calls the
-    # barrier-free ``_run_direction`` above (rather than the generic one that would
-    # select the atomic fast paths). No generic module state is mutated.
     layer_input = input_view
     for layer in range(num_layers):
         layer_input_size = input_size if layer == 0 else hidden_size * num_directions
@@ -532,7 +470,6 @@ def gru(
     batch_first=False,
 ):
     logger.debug("GEMS_KUNLUNXIN GRU")
-    logging.getLogger("flag_gems.ops.gru").debug("GEMS GRU")
     _g._validate_args(input, hx, params, has_biases, num_layers, dropout, bidirectional)
 
     if batch_first:
@@ -590,7 +527,6 @@ def gru_data(
     bidirectional=False,
 ):
     logger.debug("GEMS_KUNLUNXIN GRU_DATA")
-    logging.getLogger("flag_gems.ops.gru").debug("GEMS GRU_DATA")
     if data.dim() != 2:
         raise RuntimeError("gru.data: packed data must have 2 dimensions")
     if batch_sizes.dim() != 1:
@@ -626,15 +562,6 @@ def gru_data(
     batch = hx.shape[1]
     hidden_size = hx.shape[2]
 
-    # Host-side batch_sizes / packed-row offsets. The generic ``_unpack_padded_kernel`` /
-    # ``_pack_output_kernel`` gather-scatter kernels index ``offsets``/``batch_sizes`` with
-    # per-program scalar ``tl.load``s; on this backend that pattern miscompiles into a
-    # nondeterministic gather (scattered packed rows read/write the wrong padded row, e.g.
-    # a single row off by a large delta that varies run-to-run). The generic gru.data path
-    # never exercised these kernels on XPU (its input GEMM fails the LoopGrid pass first),
-    # so they were unvalidated here. We replace both with contiguous per-timestep device
-    # slice copies (ordered DMA, deterministic): for step t the active rows are the packed
-    # slice [off:off+bs_t] <-> padded[t, :bs_t]. num_steps is the max sequence length (small).
     bs_list = batch_sizes.to("cpu", torch.int64).tolist()
     offsets_list = [0] * num_steps
     acc = 0

@@ -13,9 +13,6 @@ from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-# On this XPU backend, tl.log2 / tl.exp2 on RUNTIME (non-constant) values are
-# miscompiled to ln(x) / e^x respectively.  Convert with these factors so the
-# math is the true base-2 log / power of two.
 LOG2E = tl.constexpr(1.4426950408889634)
 LN2 = tl.constexpr(0.6931471805599453)
 
@@ -28,11 +25,6 @@ def _colsum_kernel(
     NP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    # One program per (batch, column-tile).  Load a single transposed [BLOCK, NP]
-    # tile (rows of the tile = columns of A) and reduce over axis=1, so we never
-    # hit the axis-0 reduction limit and never need a 2D mask (A is zero-padded
-    # to NP x NP with NP a power-of-two multiple of BLOCK, so all access is
-    # affine and every arange length is a valid power of two).
     pid = tle.program_id(0)
     num_ctile = NP // BLOCK
     pid_b = pid // num_ctile
@@ -41,7 +33,6 @@ def _colsum_kernel(
 
     cols = pid_c * BLOCK + tl.arange(0, BLOCK)
     rows = tl.arange(0, NP)
-    # transposed load: at[i, j] = A[row=rows[j], col=cols[i]]
     offs_t = base + rows[None, :] * NP + cols[:, None]
     at = tl.load(A + offs_t)
     cs = tl.sum(tl.abs(at), axis=1)
@@ -60,7 +51,6 @@ def _s_kernel(
     idx = tl.arange(0, NP)
     cs = tl.load(CS + pid * NP + idx)
     norm = tl.max(cs, axis=0)
-    # true log2(norm / THETA) == ln(norm / THETA) * LOG2E on this backend
     s = tl.maximum(tl.ceil(tl.log2(norm / THETA) * LOG2E), 0.0)
     s = tl.minimum(s, 4096.0)
     s = tl.where(norm != norm, 0.0, s)
@@ -95,7 +85,6 @@ def _matrix_exp_bmm_kernel(
     scale = tl.full((), 1.0, dtype=A.dtype.element_ty)
     if SCALE_A or SCALE_B:
         s_i = tl.load(S + pid_b)
-        # 2^-s == e^(-s*LN2) on this backend
         scale = tl.exp2(-s_i.to(A.dtype.element_ty) * LN2)
 
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -148,28 +137,12 @@ def _matrix_exp_lincomb_kernel(
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs = base + rm[:, None] * NP + rn[None, :]
 
-    # p1 is the already-scaled matrix a_s = A * 2^-s, precomputed on the host by
-    # a dot-path bmm (a_s = (A*scale) @ I).  Applying the per-batch scale HERE
-    # instead -- `tl.load(A + offs) * scale`, with scale = exp2(-s_i*LN2) a
-    # per-program runtime scalar -- is silently miscompiled on this backend
-    # whenever s differs across the programs of one launch (mixed-s batches):
-    # the scaled tile comes out wrong, poisoning every b-matrix that uses p1
-    # (b4 has C1==0 so it survives, which is why only some batch elements fail).
-    # A constant-s grid computes it correctly, hence the data-dependent failures.
-    # The identity term is loaded from a per-batch eye tensor using the SAME
-    # base=pid_b*NP*NP offset as every other load in this kernel.  A batch-
-    # independent offset load (rm*NP+rn, no base) or an rm==rn index comparison
-    # both miscompile for batch programs (pid_b>0), silently dropping the C0
-    # term; keeping all loads uniformly batch-indexed avoids the miscompile.
     p0 = tl.load(EYE + offs)
     p1 = tl.load(A1 + offs)
     p2 = tl.load(A2 + offs)
     p3 = tl.load(A3 + offs)
     p4 = tl.load(A6 + offs)
 
-    # Coefficients are baked in as constexpr (loading them as device scalars and
-    # broadcasting inside a loop miscompiles the leading lanes on this backend);
-    # each b-matrix is written by a separate launch so there is no multi-store.
     acc = C0 * p0 + C1 * p1 + C2 * p2 + C3 * p3 + C4 * p4
     tl.store(B_OUT + offs, acc)
 
@@ -228,12 +201,6 @@ def _matrix_exp_square_kernel(
     offs = base + rm[:, None] * NP + rn[None, :]
 
     s_i = tl.load(S + pid_b)
-    # Branchless squaring step: a data-dependent `if STEP >= s_i` produces
-    # divergent control flow across the batch programs of one launch, and the
-    # copy branch is miscompiled for the programs that take it while others take
-    # the matmul branch (batch elements whose s finishes early come out wrong).
-    # Always compute A@A, then select A@A (still squaring) or A (already final)
-    # with a value-domain tl.where so every program runs identical code.
     tile = tl.load(A + offs)
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=A.dtype.element_ty)
     for k0 in range(0, NP, BLOCK_K):
@@ -244,9 +211,6 @@ def _matrix_exp_square_kernel(
     still_squaring = STEP < s_i
     out = tl.where(still_squaring, acc, tile)
     tl.store(C_OUT + offs, out)
-
-
-# PLACEHOLDER_HOST
 
 
 def _pick_block(n):
@@ -293,10 +257,6 @@ def _linalg_matrix_exp_impl(A):
     block = _pick_block(n)
     np = triton.cdiv(n, block) * block
 
-    # Zero-pad every matrix to np x np so all kernel accesses are affine (no 2D
-    # masks) and the tile loops cover exactly.  exp([[A,0],[0,0]]) has exp(A) in
-    # its top-left n x n block, and zero padding leaves the 1-norm unchanged, so
-    # the top-left slice of the padded result is exactly exp(A).
     if np != n:
         A_pad = torch.zeros(batch_count, np, np, dtype=dtype, device=device)
         A_pad[:, :n, :n] = A_work
@@ -373,9 +333,6 @@ def _linalg_matrix_exp_impl(A):
             BLOCK_K=block,
             num_warps=4,
         )
-        # a1 = a_s = A * 2^-s, computed through the (mixed-s safe) dot path as
-        # (A*scale) @ I so the lincomb kernel can load it directly instead of
-        # applying the per-program runtime scale itself (which miscompiles).
         _matrix_exp_bmm_kernel[grid_mat](
             A_pad,
             eye,
