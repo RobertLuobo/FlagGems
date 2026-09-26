@@ -76,7 +76,6 @@ def _special_logit_impl(input: torch.Tensor, eps=None, out: torch.Tensor = None)
     n_elements = result.numel()
     # 1024 is a common power-of-2 block size that balances occupancy and memory throughput.
     BLOCK_SIZE = 1024
-    # Keep the grid a stable tuple: a per-call lambda changes the launch cache key and recompiles.
     grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
 
     with torch_device_fn.device(input.device):

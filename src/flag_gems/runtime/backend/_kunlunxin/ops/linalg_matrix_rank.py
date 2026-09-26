@@ -12,36 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# ---------------------------------------------------------------------------
-# Kunlunxin (P800) matrix_rank.
-#
-# The generic FlagGems implementation crashes on this backend: its fused
-# Jacobi kernel hits TritonXPUCoreTiling and its bidiagonalization path hits a
-# uni_sram OutOfResources at the power-of-two boundary (>= 1024 lanes in a
-# single program).  Neither is usable here.
-#
-# matrix_rank counts singular values above a tolerance:
-#     rank = #{ sigma_i(A) > tol },  tol = max(atol, rtol * sigma_max(A)).
-# For hermitian=True torch reads only the lower triangle; the singular values
-# of the symmetrized matrix are |eigenvalue|, so the same count applies.
-#
-# Two GEMM/vendor-only paths, selected per matrix by size:
-#   * both dims <= 512: the vendor one-sided-Jacobi ``linalg_svdvals`` returns
-#     exact singular values (it compiles only while next_pow2 of both dims
-#     stays <= 512; at 513+ the device faults 719), so the tolerance count is
-#     read straight off them.
-#   * a dim > 512: a GEMM-only sigma-domain method.  Non-hermitian uses the
-#     Jordan-Wielandt embedding H = [[0, B], [B^T, 0]] whose eigenvalues are
-#     +/- sigma_i(B); hermitian counts |lambda| > tol as two matrix-sign
-#     counts on the k x k matrix directly.  The matrix sign is evaluated with
-#     the GEMM-only Newton-Schulz iteration X <- 1.5 X - 0.5 X^3, and
-#     #{eig > 0} = (dim + trace(sign)) / 2.  Working in the sigma domain (no
-#     squaring) keeps zero singular values from being pushed below the fp32
-#     noise floor.
-#
-# Every matrix is prescaled by its max abs entry so extreme magnitudes
-# (1e20 / 1e-30) neither overflow nor underflow; rank is scale invariant.
-# ---------------------------------------------------------------------------
 
 import logging
 import struct
@@ -56,9 +26,7 @@ from .mm import mm as _mm
 
 logger = logging.getLogger(__name__)
 
-# svdvals compiles only while next_pow2 of both dims stays <= 512.
 _SVDVALS_MAX_DIM = 512
-# Newton-Schulz sign iterations and power-iteration spectral-norm sweeps.
 _SIGN_ITERS = 80
 _POWER_ITERS = 60
 
@@ -67,9 +35,6 @@ def _native_fp64_supported():
     return getattr(runtime_device, "support_fp64", True)
 
 
-# ---------------------------------------------------------------------------
-# Host-side tolerance / input validation (matches native torch semantics).
-# ---------------------------------------------------------------------------
 def _expand_tolerance(value, batch_shape, input, name):
     tol_dtype = torch.float64 if _native_fp64_supported() else torch.float32
     if isinstance(value, torch.Tensor):
@@ -170,11 +135,7 @@ def _empty_matrix_rank(input, output_shape):
     return torch.zeros(output_shape, dtype=torch.int64, device=input.device)
 
 
-# ---------------------------------------------------------------------------
-# GEMM-only spectral primitives.
-# ---------------------------------------------------------------------------
 def _power_iter_specnorm(M, iters=_POWER_ITERS):
-    # Largest |eigenvalue| of symmetric M via power iteration (GEMM only).
     d = M.shape[0]
     v = torch.randn(d, 1, device=M.device, dtype=torch.float32)
     nv = v.norm()
@@ -191,14 +152,11 @@ def _power_iter_specnorm(M, iters=_POWER_ITERS):
 
 
 def _count_pos_sign(M, iters=_SIGN_ITERS):
-    # #{eigenvalue(M) > 0} for symmetric M via the matrix sign function.
-    # sign(M) is built by Newton-Schulz (X <- 1.5 X - 0.5 X^3, GEMM only) after
-    # scaling M into [-1, 1]; #{eig > 0} = (dim + trace(sign(M))) / 2.
     d = M.shape[0]
     rho = _power_iter_specnorm(M)
     if rho == 0.0:
         return 0.0
-    rho *= 1.05  # safety margin so every eigenvalue lands strictly inside +/-1
+    rho *= 1.05
     X = M / rho
     for _ in range(iters):
         X2 = _mm(X, X)
@@ -209,16 +167,15 @@ def _count_pos_sign(M, iters=_SIGN_ITERS):
 
 
 def _symmetrize(mat):
-    # torch hermitian semantics: read the lower triangle, mirror it up.
-    low = torch.tril(mat)
-    return (low + torch.tril(mat, -1).transpose(0, 1)).contiguous()
+    m, n = mat.shape
+    row = torch.arange(m, device=mat.device).unsqueeze(-1)
+    col = torch.arange(n, device=mat.device).unsqueeze(0)
+    low = mat * (row >= col)
+    strict_low = mat * (row > col)
+    return (low + strict_low.transpose(0, 1)).contiguous()
 
 
 def _effective_tol(atol_b, s, rtol_b, sigma_max_scaled):
-    # Tolerance in the prescaled (B = A / s) domain:
-    #   sigma_i(A) > tol  <=>  sigma_i(B) > tol / s
-    #   tol / s = max(atol / s, rtol * sigma_max(B)).
-    # Clamp at 0; genuinely negative tolerances are corrected on the host.
     tol = max(atol_b / s, rtol_b * sigma_max_scaled)
     return tol if tol > 0.0 else 0.0
 
@@ -232,7 +189,7 @@ def _rank_single(mat, atol_b, rtol_b, hermitian):
     Bs = (B / s).contiguous()
 
     if m <= _SVDVALS_MAX_DIM and n <= _SVDVALS_MAX_DIM:
-        S = linalg_svdvals(Bs)  # scaled singular values, descending
+        S = linalg_svdvals(Bs)
         if S.numel() == 0:
             return 0
         sigma_max = S[0].item()
@@ -240,7 +197,6 @@ def _rank_single(mat, atol_b, rtol_b, hermitian):
         return int((S > tol).sum().item())
 
     if hermitian:
-        # rank = #{|lambda| > tol} = #{lambda > tol} + #{lambda < -tol}.
         sigma_max = _power_iter_specnorm(Bs)
         tol = _effective_tol(atol_b, s, rtol_b, sigma_max)
         eye = torch.eye(Bs.shape[0], device=Bs.device, dtype=torch.float32)
@@ -248,7 +204,6 @@ def _rank_single(mat, atol_b, rtol_b, hermitian):
         neg = _count_pos_sign((-Bs - tol * eye).contiguous())
         return int(round(pos + neg))
 
-    # Non-hermitian, a dim > 512: Jordan-Wielandt embedding (sigma domain).
     d = m + n
     H = torch.zeros(d, d, device=Bs.device, dtype=torch.float32)
     H[:m, m:] = Bs
@@ -290,9 +245,6 @@ def _launch_matrix_rank(input, atol_val, rtol_val, hermitian):
     return result.reshape(batch_shape)
 
 
-# ---------------------------------------------------------------------------
-# Negative-tolerance fixup + out= plumbing (matches native torch semantics).
-# ---------------------------------------------------------------------------
 def _needs_negative_tolerance_fixup(atol, rtol):
     if atol is None or rtol is None:
         return False
@@ -302,11 +254,13 @@ def _needs_negative_tolerance_fixup(atol, rtol):
 
 
 def _correct_negative_tolerance_rank(input, result, atol, rtol, hermitian):
-    # torch does not clamp tol at 0: where tol < 0 (both atol and rtol < 0)
-    # every singular value (>= 0) exceeds tol, so a nonzero matrix has full
-    # rank k while a zero matrix stays rank 0.  Fully asynchronous.
-    visible = torch.tril(input) if hermitian else input
-    nonzero = visible.abs().amax(dim=(-2, -1)) > 0
+    absin = input.abs()
+    if hermitian:
+        m, n = input.shape[-2], input.shape[-1]
+        row = torch.arange(m, device=input.device).unsqueeze(-1)
+        col = torch.arange(n, device=input.device).unsqueeze(0)
+        absin = absin * (row >= col)
+    nonzero = absin.amax(dim=(-2, -1)) > 0
     k = min(input.shape[-2:])
     if isinstance(atol, torch.Tensor) or isinstance(rtol, torch.Tensor):
         neg_pair = (atol < 0) & (rtol < 0)
@@ -341,14 +295,10 @@ def _copy_rank_to_out(input, result, out):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Public overloads.
-# ---------------------------------------------------------------------------
 def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
-    logger.debug("GEMS LINALG_MATRIX_RANK")
+    logger.debug("GEMS_KUNLUNXIN LINALG_MATRIX_RANK")
     _check_input(input, hermitian)
     output_shape = input.shape[:-2]
-    # Validate tolerances before the empty-input return, matching torch.
     atol_val, rtol_val = _prepare_tolerances(input, atol, rtol)
     if input.numel() == 0:
         return _empty_matrix_rank(input, output_shape)
@@ -361,17 +311,17 @@ def linalg_matrix_rank(input, *, atol=None, rtol=None, hermitian=False):
 
 
 def linalg_matrix_rank_tol(input, tol, hermitian=False):
-    logger.debug("GEMS LINALG_MATRIX_RANK_TOL")
+    logger.debug("GEMS_KUNLUNXIN LINALG_MATRIX_RANK_TOL")
     return linalg_matrix_rank(input, atol=tol, rtol=0.0, hermitian=hermitian)
 
 
 def linalg_matrix_rank_out(input, *, atol=None, rtol=None, hermitian=False, out=None):
-    logger.debug("GEMS LINALG_MATRIX_RANK_OUT")
+    logger.debug("GEMS_KUNLUNXIN LINALG_MATRIX_RANK_OUT")
     result = linalg_matrix_rank(input, atol=atol, rtol=rtol, hermitian=hermitian)
     return _copy_rank_to_out(input, result, out)
 
 
 def linalg_matrix_rank_tol_out(input, tol, hermitian=False, *, out=None):
-    logger.debug("GEMS LINALG_MATRIX_RANK_TOL_OUT")
+    logger.debug("GEMS_KUNLUNXIN LINALG_MATRIX_RANK_TOL_OUT")
     result = linalg_matrix_rank_tol(input, tol, hermitian)
     return _copy_rank_to_out(input, result, out)

@@ -23,18 +23,6 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import broadcastable_to, libentry, libtuner, tl_extra_shim
 from flag_gems.utils import triton_lang_extension as ext
 
-# NOTE(kunlunxin, 2026-09-25): this is a backend override of the generic
-# flag_gems.ops._addmm_activation. It is byte-for-byte identical to the generic
-# implementation except in the USE_GELU branch: the generic code computes the
-# cubic term with ``pow(acc_gelu, 2)`` (tl_extra_shim.pow). On the TritonXPU
-# backend that lowers to ``tt.extern_elementwise ... symbol="Unsupported"`` with
-# an i32 exponent operand, which the XPU pass pipeline marks illegal
-# (``failed to legalize operation 'tt.extern_elementwise'``), crashing every
-# use_gelu=True case at compile time while the ReLU path compiles fine. The fix
-# replaces ``pow(acc_gelu, 2)`` with the plain multiply ``acc_gelu * acc_gelu``
-# (same value, no extern call), matching how ops/gelu.py's gelu_tanh already
-# squares its argument on this backend. tanh (also an extern) is accepted by the
-# backend and is left unchanged. The ReLU branch is untouched.
 tanh = tl_extra_shim.tanh
 
 logger = logging.getLogger(__name__)
@@ -115,16 +103,10 @@ def addmm_activation_kernel(
     accumulator = accumulator * alpha + bias * beta
 
     if USE_GELU:
-        # GELU with tanh approximation (matches aten::_addmm_activation use_gelu=True)
-        # Route by accumulator dtype: float32 truncation cannot meet float64's
-        # tolerance, so fp64 evaluates the activation in double precision too.
-        # fp16/bf16 and fp32 keep their existing fp32 evaluation.
         if IS_FP64:
             acc_gelu = accumulator
         else:
             acc_gelu = accumulator.to(tl.float32)
-        # XPU: square with a plain multiply instead of pow(acc_gelu, 2); the
-        # extern pow with an i32 exponent is rejected by the backend lowering.
         acc_gelu_sq = acc_gelu * acc_gelu
         accumulator = (
             0.5
@@ -132,7 +114,6 @@ def addmm_activation_kernel(
             * (1 + tanh(acc_gelu * 0.79788456 * (1 + 0.044715 * acc_gelu_sq)))
         )
     else:
-        # ReLU (default activation)
         accumulator = tl.where(accumulator > 0, accumulator, 0.0)
 
     c = accumulator.to(bias.dtype)

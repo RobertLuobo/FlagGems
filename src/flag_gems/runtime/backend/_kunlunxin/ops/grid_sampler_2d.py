@@ -11,18 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Kunlunxin (XPU/P800) override of grid_sampler_2d.
-#
-# Root cause vs. the generic implementation: on this XPU Triton backend a
-# masked ``tl.load(..., other=0.0)`` does NOT reliably return ``other`` for
-# masked-out lanes -- it returns the value at the (clamped / in-bounds)
-# address instead. The generic bilinear-zeros path survives because it
-# re-zeros every loaded value with ``tl.where(valid, v, 0.0)`` after the load,
-# but the generic nearest-zeros and bicubic-zeros paths rely solely on
-# ``other=0.0`` and therefore leak the clamped / out-of-bounds pixel value.
-# This override adds the explicit ``tl.where`` zeroing to the nearest and
-# bicubic zeros paths so out-of-bounds taps contribute exactly 0.
 
 import logging
 
@@ -35,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 @triton.jit
 def _cubic_weight(t, a: tl.constexpr):
-    # Keys cubic convolution (a=-0.75), same as upsample_bicubic2d.
     ad = tl.abs(t)
     ad2 = ad * ad
     ad3 = ad2 * ad
@@ -46,7 +33,6 @@ def _cubic_weight(t, a: tl.constexpr):
 
 @triton.jit
 def _reflect_int_index(idx, n, align_corners: tl.constexpr):
-    # Reflect an integer tap index into [0, n-1].
     if align_corners:
         p = 2 * (n - 1)
         idx_mod = tl.where(p == 0, 0, idx - tl.floor(idx / p) * p)
@@ -61,7 +47,6 @@ def _reflect_int_index(idx, n, align_corners: tl.constexpr):
 
 @triton.jit
 def _reflect_coord(coord, n, align_corners: tl.constexpr):
-    # Reflect a continuous (pixel-space) coordinate into the valid range.
     if align_corners:
         min = 0.0
         span = n - 1.0
@@ -113,8 +98,8 @@ def grid_sampler_2d_kernel(
         x = gx * (IW / 2) + (IW - 1) / 2
         y = gy * (IH / 2) + (IH - 1) / 2
 
-    if interpolation_mode == 0:  # Bilinear
-        if padding_mode == 2:  # Reflection: reflect fractional coords first
+    if interpolation_mode == 0:
+        if padding_mode == 2:
             x_ref = _reflect_coord(x, IW, align_corners)
             y_ref = _reflect_coord(y, IH, align_corners)
             x0 = tl.floor(x_ref).to(tl.int32)
@@ -141,7 +126,7 @@ def grid_sampler_2d_kernel(
             wx0 = 1.0 - wx1
             wy0 = 1.0 - wy1
 
-        if padding_mode == 0:  # Zeros
+        if padding_mode == 0:
             x0_clamped = tl.minimum(tl.maximum(x0, 0), IW - 1)
             y0_clamped = tl.minimum(tl.maximum(y0, 0), IH - 1)
             x1_clamped = tl.minimum(tl.maximum(x1, 0), IW - 1)
@@ -150,7 +135,7 @@ def grid_sampler_2d_kernel(
             y0_valid = (y0 >= 0) & (y0 < IH)
             x1_valid = (x1 >= 0) & (x1 < IW)
             y1_valid = (y1 >= 0) & (y1 < IH)
-        elif padding_mode == 1:  # Border
+        elif padding_mode == 1:
             x0_clamped = tl.minimum(tl.maximum(x0, 0), IW - 1)
             y0_clamped = tl.minimum(tl.maximum(y0, 0), IH - 1)
             x1_clamped = tl.minimum(tl.maximum(x1, 0), IW - 1)
@@ -159,7 +144,7 @@ def grid_sampler_2d_kernel(
             y0_valid = True
             x1_valid = True
             y1_valid = True
-        else:  # Reflection: reflect each integer tap independently.
+        else:
             x0_clamped = _reflect_int_index(x0.to(tl.float32), IW, align_corners)
             y0_clamped = _reflect_int_index(y0.to(tl.float32), IH, align_corners)
             x1_clamped = _reflect_int_index(x1.to(tl.float32), IW, align_corners)
@@ -169,9 +154,6 @@ def grid_sampler_2d_kernel(
             x1_valid = True
             y1_valid = True
 
-        # Inline pixel loads. Addresses are clamped in-bounds; the zeros mode
-        # re-zeros invalid taps below (the XPU masked-load ``other`` is not
-        # reliably honored, so we cannot depend on it).
         v00 = tl.load(
             input_ptr + ((n * C + c) * IH + y0_clamped) * IW + x0_clamped,
             mask=mask,
@@ -193,7 +175,7 @@ def grid_sampler_2d_kernel(
             other=0.0,
         )
 
-        if padding_mode == 0:  # Zeros
+        if padding_mode == 0:
             v00 = tl.where(x0_valid & y0_valid, v00, 0.0)
             v01 = tl.where(x1_valid & y0_valid, v01, 0.0)
             v10 = tl.where(x0_valid & y1_valid, v10, 0.0)
@@ -201,11 +183,10 @@ def grid_sampler_2d_kernel(
 
         result = v00 * wx0 * wy0 + v01 * wx1 * wy0 + v10 * wx0 * wy1 + v11 * wx1 * wy1
 
-    elif interpolation_mode == 1:  # Nearest
-        if padding_mode == 2:  # Reflection: reflect fractional coords first
+    elif interpolation_mode == 1:
+        if padding_mode == 2:
             x = _reflect_coord(x, IW, align_corners)
             y = _reflect_coord(y, IH, align_corners)
-        # Round to nearest even (matching PyTorch's nearbyint).
         x_floor = tl.floor(x)
         y_floor = tl.floor(y)
         x_frac = x - x_floor
@@ -219,22 +200,21 @@ def grid_sampler_2d_kernel(
         x_nearest = x_floor_int + x_up.to(tl.int32)
         y_nearest = y_floor_int + y_up.to(tl.int32)
 
-        if padding_mode == 0:  # Zeros
+        if padding_mode == 0:
             x_in = (x_nearest >= 0) & (x_nearest < IW)
             y_in = (y_nearest >= 0) & (y_nearest < IH)
-        else:  # Border / Reflection
+        else:
             x_in = True
             y_in = True
-        # Always clamp the address in-bounds; zeros mode zeroes OOB below.
         x_nearest = tl.minimum(tl.maximum(x_nearest, 0), IW - 1)
         y_nearest = tl.minimum(tl.maximum(y_nearest, 0), IH - 1)
 
         offset = ((n * C + c) * IH + y_nearest) * IW + x_nearest
         result = tl.load(input_ptr + offset, mask=mask, other=0.0)
-        if padding_mode == 0:  # Zeros: OOB nearest taps contribute exactly 0.
+        if padding_mode == 0:
             result = tl.where(x_in & y_in, result, 0.0)
 
-    else:  # Bicubic
+    else:
         a: tl.constexpr = -0.75
         x_base_f = tl.floor(x)
         y_base_f = tl.floor(y)
@@ -261,7 +241,7 @@ def grid_sampler_2d_kernel(
         iy2 = y_base + 1
         iy3 = y_base + 2
 
-        if padding_mode == 0:  # Zeros: validity mask per tap, zero OOB below.
+        if padding_mode == 0:
             ix0_v = (ix0 >= 0) & (ix0 < IW)
             ix1_v = (ix1 >= 0) & (ix1 < IW)
             ix2_v = (ix2 >= 0) & (ix2 < IW)
@@ -278,7 +258,7 @@ def grid_sampler_2d_kernel(
             iy1_c = tl.minimum(tl.maximum(iy1, 0), IH - 1)
             iy2_c = tl.minimum(tl.maximum(iy2, 0), IH - 1)
             iy3_c = tl.minimum(tl.maximum(iy3, 0), IH - 1)
-        elif padding_mode == 1:  # Border: clamp each tap into [0, dim-1].
+        elif padding_mode == 1:
             ix0_c = tl.minimum(tl.maximum(ix0, 0), IW - 1)
             ix1_c = tl.minimum(tl.maximum(ix1, 0), IW - 1)
             ix2_c = tl.minimum(tl.maximum(ix2, 0), IW - 1)
@@ -295,7 +275,7 @@ def grid_sampler_2d_kernel(
             iy1_v = True
             iy2_v = True
             iy3_v = True
-        else:  # Reflection: reflect each integer tap independently.
+        else:
             ix0_c = _reflect_int_index(ix0.to(tl.float32), IW, align_corners)
             ix1_c = _reflect_int_index(ix1.to(tl.float32), IW, align_corners)
             ix2_c = _reflect_int_index(ix2.to(tl.float32), IW, align_corners)
@@ -313,7 +293,6 @@ def grid_sampler_2d_kernel(
             iy2_v = True
             iy3_v = True
 
-        # 4x4 pixel loads. Use int64 strides to avoid overflow on large tensors.
         nc_off = (n * C + c).to(tl.int64) * IH * IW
         p00 = tl.load(
             input_ptr + nc_off + iy0_c.to(tl.int64) * IW + ix0_c, mask=mask, other=0.0
@@ -364,7 +343,7 @@ def grid_sampler_2d_kernel(
             input_ptr + nc_off + iy3_c.to(tl.int64) * IW + ix3_c, mask=mask, other=0.0
         )
 
-        if padding_mode == 0:  # Zeros: OOB taps contribute exactly 0.
+        if padding_mode == 0:
             p00 = tl.where(ix0_v & iy0_v, p00, 0.0)
             p01 = tl.where(ix1_v & iy0_v, p01, 0.0)
             p02 = tl.where(ix2_v & iy0_v, p02, 0.0)
@@ -408,7 +387,7 @@ def grid_sampler_2d(
         padding_mode: 0=Zeros, 1=Border, 2=Reflection.
         align_corners: If True, corner pixels are aligned.
     """
-    logger.debug("GEMS GRID_SAMPLER_2D")
+    logger.debug("GEMS_KUNLUNXIN GRID_SAMPLER_2D")
 
     assert input.ndim == 4, "Input must be 4D"
     assert grid.ndim == 4, "Grid must be 4D"
