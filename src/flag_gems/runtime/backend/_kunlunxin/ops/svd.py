@@ -119,10 +119,6 @@ def _rank1_svd(a, batch, m, n):
     return u, s, vh
 
 
-# The per-batch Jacobi pipeline materializes ``MP``-wide (MP = next_pow2(rows))
-# vectors inside a single XPU program.  Beyond MP == 512 the launch exceeds the
-# on-chip vector budget and faults (err -714 / status 719).  For tall matrices
-# with more rows than this we fall back to the Gram route below.
 _OSJ_MAX_MP = 512
 
 
@@ -136,7 +132,7 @@ def _gram_thin_factors(w, batch, m, n, want_uv, sweeps):
     n), Vh (batch, n, n)); ``U``/``Vh`` are ``None`` when ``want_uv`` is False.
     """
     dev = w.device
-    G = bmm(w.transpose(-2, -1).contiguous(), w)  # (batch, n, n)
+    G = bmm(w.transpose(-2, -1).contiguous(), w)
     nw = n if n % 2 == 0 else n + 1
     NW = nw if (nw & (nw - 1)) == 0 else triton.next_power_of_2(nw)
     MPg = triton.next_power_of_2(n)
@@ -165,9 +161,9 @@ def _gram_thin_factors(w, batch, m, n, want_uv, sweeps):
     if not want_uv:
         return None, S, None
     idxg = idx.unsqueeze(1).expand(-1, MPg, -1)
-    V = torch.gather(Ug, 2, idxg)[:, :n, :n].contiguous()  # eigenvectors of G
+    V = torch.gather(Ug, 2, idxg)[:, :n, :n].contiguous()
     inv_s = torch.where(S > 1.0e-20, 1.0 / S, torch.zeros_like(S))
-    U = bmm(w, V) * inv_s.unsqueeze(1)  # (batch, m, n)
+    U = bmm(w, V) * inv_s.unsqueeze(1)
     Vh = V.transpose(-2, -1).contiguous()
     return U, S, Vh
 
@@ -182,8 +178,6 @@ def _osj_thin(a, batch, m0, n0, want_uv=True, sweeps=12):
     """
     dev = a.device
     k = min(m0, n0)
-    # Work on the tall orientation so the Jacobi column count is the small
-    # dimension (keeps the sweep iteration count bounded).
     transposed = n0 > m0
     w = a.transpose(-2, -1).contiguous() if transposed else a
     m, n = (n0, m0) if transposed else (m0, n0)
@@ -236,7 +230,6 @@ def _osj_thin(a, batch, m0, n0, want_uv=True, sweeps=12):
     Vhw = bmm(Uw.transpose(-2, -1), w) * inv_s.unsqueeze(-1)
 
     if transposed:
-        # w = a^T ; a = Vhw^T diag(S) Uw^T -> U_a = Vhw^T, Vh_a = Uw^T
         U_a = Vhw.transpose(-2, -1).contiguous()
         Vh_a = Uw.transpose(-2, -1).contiguous()
     else:
@@ -324,7 +317,7 @@ def _real_svd(input, some, compute_uv):
         v_thin = _ortho_complete(v_thin, k)
         vh = v_thin.transpose(-2, -1).contiguous()
 
-    v = vh.transpose(-2, -1).contiguous()  # (batch, n, k)
+    v = vh.transpose(-2, -1).contiguous()
     if not some:
         u = _ortho_complete(u, m)
         v = _ortho_complete(v, n)
@@ -346,13 +339,13 @@ def _complex_svd(input, some, compute_uv):
 
     top = torch.cat([ar, -ai], dim=-1)
     bot = torch.cat([ai, ar], dim=-1)
-    R = torch.cat([top, bot], dim=-2)  # (batch, 2m, 2n)
+    R = torch.cat([top, bot], dim=-2)
 
     _, s_r, vh_r = _osj_thin(R, batch, 2 * m, 2 * n, want_uv=True)
     s = s_r[:, 0::2][:, :k].contiguous()
 
-    v_full = vh_r.transpose(-2, -1)  # (batch, 2n, 2k)
-    v_cols = v_full[:, :, 0::2][:, :, :k].contiguous()  # (batch, 2n, k)
+    v_full = vh_r.transpose(-2, -1)
+    v_cols = v_full[:, :, 0::2][:, :, :k].contiguous()
     vcr = v_cols[:, :n, :].contiguous()
     vci = v_cols[:, n : 2 * n, :].contiguous()
 

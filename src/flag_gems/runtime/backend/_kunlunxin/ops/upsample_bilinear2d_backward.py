@@ -12,17 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (P800) override for upsample_bilinear2d_backward.
-#
-# The generic implementation dispatches strong-downsample geometries through a
-# scatter "disjoint" kernel and exact-2x geometries through a dedicated fast
-# kernel. Both miscompile at the trailing edge on the TritonXPU backend (the
-# ``2x`` case mismatches the x==0 column, the ``disjoint`` case mismatches the
-# last input column). The mathematically-equivalent per-input-pixel gather
-# kernel -- which every other geometry already uses and which produces one
-# deterministic writer per output element with no atomics -- is correct on XPU.
-# This override keeps only that gather path (plus the linear copy path for the
-# identity geometry) and never selects the exact-2x or disjoint fast paths.
 
 import logging
 import math
@@ -164,7 +153,6 @@ def _upsample_bilinear2d_backward_kernel(
                     0,
                 )
             result = tl.full((BLOCK,), 0.0, acc_dtype)
-            # Each lane owns one input pixel, so no atomics or scratch buffer are needed.
             for dy in range(KH):
                 oy = start_y + dy
                 wy, match_y, zero_y = _bilinear_backward_weight(
@@ -180,7 +168,6 @@ def _upsample_bilinear2d_backward_kernel(
                         acc_dtype
                     )
                     contribution = (wy * wx) * value
-                    # Merging clamped taps must preserve an original 0 * Inf update.
                     contribution = tl.where(
                         (zero_y | zero_x) & _bilinear_backward_isinf(value),
                         float("nan"),
@@ -216,7 +203,6 @@ def upsample_bilinear2d_backward(
         raise RuntimeError("Expected grad_output to be a tensor of dimension 4")
     if tuple(grad_output.shape) != (n, c, oh, ow):
         raise RuntimeError("Expected grad_output to have the same shape as output")
-    # Explicit scales are required to be positive; omitted scales are inferred.
     if any(scale is not None and not scale > 0 for scale in (scales_h, scales_w)):
         raise RuntimeError("scales_h and scales_w must be greater than 0")
     if grad_output.dtype not in (
@@ -267,16 +253,12 @@ def upsample_bilinear2d_backward(
         sh = 1.0 / scales_h if scales_h is not None else ih / oh
         sw = 1.0 / scales_w if scales_w is not None else iw / ow
     if not align_corners:
-        # Far inside the left clamp, every source coordinate is exactly zero.
-        # The margin avoids an FP32 rounding boundary and unbounded inverse windows.
         if (oh - 0.5) * sh <= 0.25:
             sh = 0.0
         if (ow - 0.5) * sw <= 0.25:
             sw = 0.0
     kh = oh if sh == 0 or ih == 1 else min(oh, math.ceil(2 / sh) + 2)
     kw = ow if sw == 0 or iw == 1 else min(ow, math.ceil(2 / sw) + 2)
-    # Inconsistent explicit scales can map the output tail beyond the input.
-    # The last input pixel then owns every remaining clamped contribution.
     shift = 0.0 if align_corners else 0.5
     if sh > 0 and ih > 1:
         tail_h = oh - max(0, math.floor((ih - 2 + shift) / sh - shift))
@@ -300,8 +282,6 @@ def upsample_bilinear2d_backward(
     )
     with torch_device_fn.device(grad_output.device):
         programs = triton.cdiv(n * c * ih * iw, block)
-        # Only the deterministic gather path is used on XPU: the exact-2x and
-        # disjoint scatter fast paths miscompile at the trailing edge here.
         _upsample_bilinear2d_backward_kernel[(programs,)](
             grad_output,
             grad_input,
@@ -351,10 +331,6 @@ def upsample_bilinear2d_backward_grad_input(
     )
 
 
-# The test-suite and benchmark call ``flag_gems.ops.upsample_bilinear2d_backward``
-# directly. SpecOpRegistrar only injects into the top-level ``flag_gems`` module
-# namespace, so patch the ``flag_gems.ops`` submodule attributes here at import
-# time to route both entry points through this XPU override.
 def _install_into_flag_gems_ops():
     try:
         import flag_gems.ops as _fg_ops

@@ -11,26 +11,6 @@ from .mm import mm
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Why this vendor override exists
-# ---------------------------------------------------------------------------
-# The generic ``flag_gems.ops.linalg_matrix_power`` drives a data-dependent
-# in-kernel ``while`` loop (``_single_tile_kernel``) whose loop-carried SSA
-# values fail MLIR dominance in the TritonXPU ``TritonSDNNMultiBuffer`` pass
-# (``operand #0 does not dominate this use``) — every case crashes at compile
-# time on the P800 backend, and forcing ``num_stages=1`` merely converts the
-# crash into an unbounded compile hang.  The tiled / grid-sync tiers rely on the
-# generic LU kernels which likewise fail ``TritonXPUCoreTiling``.
-#
-# This override sidesteps the broken kernels entirely: A^n is computed by
-# host-side binary exponentiation using the already-registered vendor GEMM
-# kernels (``mm`` / ``bmm``), and A^(-n) uses the vendor LU factorisation
-# (``linalg_lu_factor_ex`` -> ``lu_unpack`` -> two ``linalg_solve_triangular``
-# solves) to form the inverse before exponentiating.  No ATen / native /
-# composite compute fallback is used.
-# ---------------------------------------------------------------------------
-
-
 def _matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Dispatch to the vendor GEMM kernels (2-D -> mm, 3-D -> bmm)."""
     if a.dim() == 2:
@@ -51,9 +31,7 @@ def _inverse(a_flat: torch.Tensor) -> torch.Tensor:
     lu, pivots, _info = linalg_lu_factor_ex(a_flat)
     p, l, u = lu_unpack(lu, pivots)
     pt = p.transpose(-2, -1).contiguous()
-    # L (unit lower) @ (L^{-1} P^T) = P^T  ->  Y = L^{-1} P^T
     y = linalg_solve_triangular(l, pt, upper=False, left=True, unitriangular=True)
-    # U (upper) @ (U^{-1} Y) = Y          ->  X = U^{-1} Y = A^{-1}
     x = linalg_solve_triangular(u, y, upper=True, left=True)
     return x
 
@@ -97,7 +75,6 @@ def linalg_matrix_power(
     shape = a.shape
     m = shape[-1]
 
-    # ---- n == 0 -> identity ----
     if n == 0:
         eye = _eye_like(a)
         if out is not None:
@@ -105,7 +82,6 @@ def linalg_matrix_power(
             return out
         return eye
 
-    # ---- n == 1 -> plain copy ----
     if n == 1:
         if out is not None:
             out.copy_(a)
@@ -120,10 +96,8 @@ def linalg_matrix_power(
             f"got {a.device}"
         )
 
-    # ---- flatten batch dims to a single leading dim (mm/bmm take <=3-D) ----
     a_flat = a.reshape(-1, m, m).contiguous() if a.dim() != 2 else a.contiguous()
 
-    # ---- negative n -> exponentiate the inverse ----
     if n < 0:
         if a_flat.dim() == 2:
             a_flat = _inverse(a_flat.unsqueeze(0)).squeeze(0)
@@ -131,7 +105,6 @@ def linalg_matrix_power(
             a_flat = _inverse(a_flat)
         n = -n
 
-    # ---- host-side binary exponentiation via vendor GEMM ----
     result = None
     z = a_flat
     remaining = n

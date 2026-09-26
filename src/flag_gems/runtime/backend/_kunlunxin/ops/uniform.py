@@ -113,15 +113,6 @@ def uniform_(self, from_=0.0, to=1.0, *, generator=None):
     return self
 
 
-# Out-of-place ``uniform`` needs the exclusive upper bound of ``[from, to)`` in
-# the *output* dtype: a value computed in fp32 can round up onto ``to`` when
-# stored to fp16/bf16. The generic kernel (flag_gems/ops/uniform.py) computes
-# that predecessor in-kernel via int<->float bitcasts (``_next_below``); on the
-# XPU triton fork that bitcast crashes the TritonXPUDtypeConvert pass for
-# bf16/fp16 (baseline: uniform_kernel MLIR pipeline failure in
-# TritonXPUDtypeConvert, and an fp16 upper-edge leak assertion). We instead
-# compute the single scalar predecessor on host and pass it in, so the kernel
-# only does a plain fp32->OUT_DT truncf plus a minimum (no in-kernel bitcast).
 @triton.jit(do_not_specialize=["philox_seed", "philox_offset"])
 def uniform_out_kernel(
     out_ptr,
@@ -147,11 +138,6 @@ def uniform_out_kernel(
     r2 = uint_to_uniform_float(r2) * (to - from_) + from_
     r3 = uint_to_uniform_float(r3) * (to - from_) + from_
     OUT_DT: tl.constexpr = out_ptr.dtype.element_ty
-    # ``lo``/``hi`` are already OUT_DT-representable (computed on host): ``hi`` is
-    # the predecessor of ``to`` and ``lo`` is the smallest OUT_DT value >=
-    # ``from_``. Rounding an fp32 sample to a low-precision output dtype can push
-    # it onto/past either edge, so clamp both after the conversion. The fp32->
-    # OUT_DT conversions below are exact.
     lo_dt = (r0 * 0.0 + lo).to(OUT_DT)
     hi_dt = (r0 * 0.0 + hi).to(OUT_DT)
     r0 = tl.minimum(tl.maximum(r0.to(OUT_DT), lo_dt), hi_dt)
@@ -169,15 +155,6 @@ def uniform_out_kernel(
 
 
 def _clamp_bounds(from_, to, dtype):
-    # Return ``(lo, hi)`` as OUT_DT-representable python floats bounding the
-    # sampling interval ``[from, to)`` in the output dtype:
-    #   * ``hi`` = largest ``dtype`` value strictly below ``to`` (exclusive bound;
-    #     when the interval is empty/degenerate in ``dtype`` we return ``to``,
-    #     matching the generic kernel).
-    #   * ``lo`` = smallest ``dtype`` value >= ``from_`` (rounding ``from_`` to a
-    #     low-precision dtype can land below the requested ``from_``).
-    # These are single scalar constants computed on host; the random draw and
-    # the clamp still run entirely in the XPU kernel.
     ninf = torch.tensor(float("-inf"), dtype=dtype)
     pinf = torch.tensor(float("inf"), dtype=dtype)
     to_dt = torch.tensor(to, dtype=dtype)
@@ -195,8 +172,6 @@ def _clamp_bounds(from_, to, dtype):
 
 def uniform(self, from_=0.0, to=1.0, *, generator=None):
     logger.debug("GEMS_KUNLUNXIN UNIFORM")
-    # aten::uniform rejects an empty interval before launch; mirror that so
-    # from > to raises instead of silently producing out-of-range values.
     if from_ > to:
         raise RuntimeError(
             "uniform_ expects to return a [from, to) range, but found "

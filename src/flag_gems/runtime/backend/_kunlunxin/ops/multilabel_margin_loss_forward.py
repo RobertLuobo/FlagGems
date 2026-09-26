@@ -12,30 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU / P800) override for multilabel_margin_loss_forward.
-#
-# Root cause of the generic crash:
-#   The generic validation/loss kernels wrap a per-row grid-stride loop
-#   (`for row in range(row_start, row_end)`) around an inner class/target-tile
-#   loop that contains `tl.sum(...)`.  On the TritonXPU backend a `tt.reduce`
-#   nested inside a runtime-bounded outer loop is rejected at MLIR lowering
-#   ("failed to legalize operation 'tt.reduce' that was explicitly marked
-#   illegal", ConvertTritonXPUToLLVM), and a 2D `[T, C]` reduce is rejected by
-#   the TritonXPUCoreTiling pass even inside a single loop.
-#
-# Fix (mirrors the kunlunxin multi_margin_loss precedent):
-#   * De-nest every reduce by launching exactly one program per row (or per
-#     row/class-tile), with no grid-stride outer loop.
-#   * Keep only strictly-1D reduces.  The per-target contributions are summed
-#     into a 1D lane accumulator with plain vector adds inside the target loop,
-#     and a *single* `tl.sum(..., axis=0)` is taken once at the end -- a reduce
-#     placed *inside* a runtime-bounded target loop miscompiles on this backend
-#     (double/dropped terms for duplicate targets), so it must be lifted out.
-#   * `is_target` is built by direct comparison (`class == target_id`) rather
-#     than a masked `atomic_add` scatter: the XPU backend does not honour the
-#     mask on an all-masked-off atomic scatter, which spuriously marked empty
-#     rows (target prefix length 0) as members.
-#   * fp64 is unavailable on this backend, so accumulation is always fp32.
 
 import logging
 import sys as _sys
@@ -44,7 +20,6 @@ import torch
 import triton
 import triton.language as tl
 
-# Reuse the generic host-side validation / shape helpers and constants.
 from flag_gems.ops.multilabel_margin_loss_forward import (
     _FUSED_CLASS_LIMIT,
     _VALIDATION_BLOCK,
@@ -57,11 +32,6 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
-# Large-C tile width for the loop-bearing kernels.  The per-target streaming
-# loop keeps a live ``[BLOCK_C]`` vector across every iteration; a wide tile
-# (e.g. 128) overflows ``uni_sram`` in the TritonXPUUnrollControl pass, so the
-# large-C class tile is capped at 64 (the widest in-loop vector this backend
-# reliably compiles).
 _LARGE_C_BLOCK = 64
 
 
@@ -175,7 +145,6 @@ def _mlml_row_loss_kernel(
             tl.float32
         )
         margins = 1.0 - tval + class_values
-        # Match native `if (z > 0)`: NaN margins do not contribute.
         contrib = tl.where(non_target & use & (margins > 0.0), margins, 0.0)
         lane_acc += contrib
 
@@ -308,8 +277,6 @@ def multilabel_margin_loss_forward(
             BLOCK=_VALIDATION_BLOCK,
         )
 
-        # A single synchronous scalar read: invalid targets must raise before
-        # any loss kernel runs (device_assert is unavailable on this backend).
         if int(invalid.item()) != 0:
             raise RuntimeError(
                 "multilabel_margin_loss_forward: target values must be -1 or in [0, C)"
@@ -346,10 +313,6 @@ def multilabel_margin_loss_forward(
                 BLOCK_C=block_c,
             )
         else:
-            # One program per row per launch (grid=(n_rows,)); iterate the
-            # class tiles on the host and read-modify-write accumulate.  A
-            # multi-program-per-row grid miscompiles the loss accumulation on
-            # this backend once the program count grows.
             row_acc = torch.zeros((n_rows,), dtype=torch.float32, device=input.device)
             for class_tile in range(class_tiles):
                 _mlml_accum_tile_kernel[(n_rows,)](
@@ -382,10 +345,6 @@ def multilabel_margin_loss_forward(
     return loss, is_target
 
 
-# The operator registrar rebinds vendor implementations onto the top-level
-# ``flag_gems`` namespace.  Direct callers of ``flag_gems.ops.<op>`` resolve
-# against the package attribute that ``ops/__init__.py`` bound before the
-# vendor override ran, so rebind it here as well (mirrors multi_margin_loss).
 _generic_ops_module = _sys.modules.get("flag_gems.ops")
 if _generic_ops_module is not None:
     setattr(
