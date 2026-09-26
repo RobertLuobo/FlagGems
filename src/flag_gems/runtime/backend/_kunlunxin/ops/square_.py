@@ -69,7 +69,6 @@ def square_(A):
             return fn(A, out0=A)
         limit = _SMALL_MAX_BF16 if bf16 else _SMALL_MAX
         if n <= limit:
-            # bf16 only rounds correctly at BLOCK >= 2048 (see harness/meta/operators/square_.md)
             BLOCK = (
                 _SMALL_BLOCK if bf16 else min(_SMALL_BLOCK, triton.next_power_of_2(n))
             )

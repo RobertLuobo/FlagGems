@@ -8,7 +8,6 @@ from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
 
-# ATen's error messages use the C++ scalar-type spelling, e.g. "Float"/"Double".
 _SCALAR_NAMES = {
     torch.float16: "Half",
     torch.bfloat16: "BFloat16",
@@ -51,13 +50,9 @@ def _replication_pad1d_backward_fold_kernel(
     iw = o % W_in
     nc = o // W_in
 
-    # Starting grad_output column for this input column (before clamping).
     lo_raw = tl.where(iw == 0, 0, tl.where(iw == W_in - 1, pl + W_in - 1, pl + iw))
     lo = tl.minimum(tl.maximum(lo_raw, 0), W_out - 1)
 
-    # Number of grad_output columns folded into this input column. Left and
-    # right edges gather the replicated span (clamped to what actually exists);
-    # interior columns map 1:1 when in range, otherwise are cropped away.
     cnt = tl.where(
         iw == 0,
         tl.where(W_in == 1, W_out, tl.minimum(tl.maximum(pl + 1, 0), W_out)),
@@ -125,8 +120,6 @@ def replication_pad1d_backward(
             "replication_pad1d_backward expects 2D (C, W) or 3D (N, C, W) input"
         )
 
-    # ATen rejects a gradient whose dtype differs from the input rather than
-    # promoting it, with this wording.
     if grad_output.dtype != self_tensor.dtype:
         raise RuntimeError(
             f"expected scalar type {_scalar_name(self_tensor.dtype)} but found "
@@ -138,7 +131,6 @@ def replication_pad1d_backward(
             f"{grad_output.device}"
         )
 
-    # The output takes the *input's* options (at::empty_like(self)).
     grad_input = torch.empty(
         self_tensor.shape,
         device=self_tensor.device,
@@ -160,11 +152,6 @@ def replication_pad1d_backward(
         )
 
     if self_tensor.is_complex():
-        # Triton has no complex scalar type; this operator never mixes the real
-        # and imaginary parts (it only gathers/sums along W), so fold each
-        # component independently as a real problem. view_as_real appends a
-        # size-2 axis; take each component contiguously and copy the result back
-        # into the (complex) grad_input via its real view.
         go_r = torch.view_as_real(grad_output)
         gi_r = torch.view_as_real(grad_input)
         for comp in (0, 1):
@@ -172,8 +159,6 @@ def replication_pad1d_backward(
             gi_r[..., comp].copy_(folded.reshape(gi_r[..., comp].shape))
         return grad_input
 
-    # grad_input is freshly allocated and contiguous, so its flat (N*C, W_in)
-    # view is a valid kernel output target -- write straight into it.
     go_flat = grad_output.contiguous().reshape(N * C, W_out)
     _run_fold(go_flat, grad_input.reshape(N * C, W_in), W_out, W_in, left)
     return grad_input

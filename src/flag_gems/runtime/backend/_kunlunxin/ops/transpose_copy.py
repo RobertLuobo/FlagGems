@@ -34,7 +34,6 @@ import logging
 import torch
 import triton
 
-# Reuse the generic (device-agnostic) helpers and the *working* gather kernel.
 from flag_gems.ops.transpose_copy import (
     _complex_copy_kernel,
     _has_lazy_metadata,
@@ -74,8 +73,6 @@ def _word_layout(input: torch.Tensor):
 def _launch_word_gather(
     input: torch.Tensor, out: torch.Tensor, dim0: int, dim1: int
 ) -> torch.Tensor:
-    # Logical transposed view: shares storage/offset with ``input`` and has the
-    # same shape as the contiguous ``out``. ``stride()`` is in element units.
     view = input if dim0 == dim1 else input.transpose(dim0, dim1)
 
     word_bits, words, word_dtype = _word_layout(input)
@@ -114,7 +111,7 @@ def _launch_word_gather(
 
 def transpose_copy(input: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:
     """Return a contiguous copy with ``dim0`` and ``dim1`` swapped (XPU)."""
-    logger.debug("GEMS TRANSPOSE_COPY")
+    logger.debug("GEMS_KUNLUNXIN TRANSPOSE_COPY")
 
     normalized_dim0 = _normalize_dim(dim0, input.ndim)
     normalized_dim1 = _normalize_dim(dim1, input.ndim)

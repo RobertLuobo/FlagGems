@@ -12,23 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU/P800) override for aten::linalg_multi_dot.
-#
-# The generic implementation multiplies each pair in the chain with an
-# in-kernel ``tl.dot(bf16, bf16)``.  On this backend ``tl.dot`` with low
-# precision inputs carries a bf16-level (~0.4-0.6%) relative error per
-# product (see MEMORY: P800 tl.dot precision), which compounds across the
-# optimally-bracketed chain and systematically overshoots the bf16 test
-# tolerance (395/600 bf16 trials fail).
-#
-# Fix: perform every pairwise product in fp32 via the registered vendor ``mm``
-# (fp32 inputs -> vendor mm error ~1e-5, i.e. essentially exact), then round
-# the product back to the working dtype.  This reproduces exactly the semantics
-# of a hardware bf16/fp16 matmul (fp32 accumulation, round-to-dtype output),
-# so each intermediate matches torch's own bf16 mm bit-for-bit.  The only
-# residual failures (2/600 bf16 trials) are catastrophic-cancellation elements
-# where PyTorch's *own* native XPU multi_dot also disagrees with the x86 CPU
-# reference (3/600) -- a platform floor, not a kernel bug.
 
 import logging
 import warnings
@@ -175,14 +158,14 @@ def _multi_dot_impl(arrays, out=None):
 
 
 def linalg_multi_dot(tensors):
-    logger.debug("GEMS LINALG_MULTI_DOT")
+    logger.debug("GEMS_KUNLUNXIN LINALG_MULTI_DOT")
     arrays, output_shape = _validate_and_prepare(tensors)
     result = _multi_dot_impl(arrays)
     return result.view(output_shape)
 
 
 def linalg_multi_dot_out(tensors, *, out):
-    logger.debug("GEMS LINALG_MULTI_DOT_OUT")
+    logger.debug("GEMS_KUNLUNXIN LINALG_MULTI_DOT_OUT")
     arrays, output_shape = _validate_and_prepare(tensors)
     first = arrays[0]
     if out.dtype != first.dtype:

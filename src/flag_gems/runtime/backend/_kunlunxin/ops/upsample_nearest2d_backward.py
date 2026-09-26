@@ -12,26 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU / P800) override for aten::upsample_nearest2d_backward.
-#
-# The generic implementation compiles a single vectorized kernel that inverts
-# the forward nearest map inside the kernel with data-dependent ``while`` loops
-# and ``tl.max`` reductions, followed by runtime-length nested loops. On the
-# TritonXPU backend that kernel is rejected at compile time (``TritonXPUUnroll
-# Control`` / ``ConvertTritonXPUToLLVM`` failures). This override keeps the exact
-# CPU-legacy floor map (the accuracy oracle) but drives it from host-precomputed
-# per-axis gather windows so the device kernels only use affine addressing.
-#
-# Two device kernels, both deterministic single-writer gathers (no atomics):
-#   * ``_vec_kernel``  : one program handles a BLOCK of input pixels. The output
-#     window per pixel is unrolled with ``tl.static_range`` up to a small span
-#     bound; loads are clamped in-bounds (unmasked strided load, which the XPU
-#     backend compiles correctly) and zeroed in the register domain via
-#     ``tl.where``. A masked strided *gather* would miscompile here, so it is
-#     avoided. Used when the per-pixel window is small.
-#   * ``_scalar_kernel``: one lane per input pixel with runtime-length loops.
-#     Handles arbitrarily large windows (e.g. 1x1 -> HxW upsampling) and 64-bit
-#     addressing. Slower but always compiles.
 
 import logging
 import warnings
@@ -45,14 +25,10 @@ from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
 
-# Route to the vectorized kernel only when the per-pixel output window is small
-# enough for tl.static_range unrolling; larger windows go to the scalar kernel.
 _MAX_STATIC_SPAN = 32
 
 
 def _src_map(input_length, output_length, scale):
-    # CPU-legacy forward nearest source map (matches the accuracy reference in
-    # tests: aten.upsample_nearest2d_backward on CPU == this floor construction).
     if input_length == output_length:
         return np.arange(output_length, dtype=np.int64)
     if output_length == 2 * input_length:
@@ -67,8 +43,6 @@ def _src_map(input_length, output_length, scale):
 
 
 def _windows(input_length, output_length, scale):
-    # Contiguous output run mapping to each input index. Returns (lo, length,
-    # max_length). Inputs that receive no output get length 0 (lo = 0).
     src = _src_map(input_length, output_length, scale)
     lo = np.zeros(input_length, dtype=np.int32)
     length = np.zeros(input_length, dtype=np.int32)
@@ -109,8 +83,6 @@ def _vec_kernel(
     pid = tl.program_id(0)
     index = pid * BLOCK + tl.arange(0, BLOCK)
     valid = index < TOTAL
-    # Clamp the flat logical index so decoded coordinates and gathered window
-    # entries stay in-bounds for the masked-off lanes (final store is masked).
     idx = tl.where(valid, index, 0)
     iw_i = idx % IW
     tmp = idx // IW
@@ -136,9 +108,6 @@ def _vec_kernel(
         oy = tl.minimum(hlo + dy, OH - 1)
         for dx in tl.static_range(MAX_W):
             ox = tl.minimum(wlo + dx, OW - 1)
-            # Unmasked, in-bounds strided load; masked strided gather
-            # miscompiles on this backend so out-of-window lanes are zeroed
-            # in the register domain instead.
             v = tl.load(GO + base + oy * GO_H + ox * GO_W)
             keep = (dy < hlen) & (dx < wlen)
             acc += tl.where(keep, v.to(acc.dtype), tl.zeros_like(acc))
@@ -260,7 +229,6 @@ def _dispatch(grad_output, output_size, input_size, scales_h, scales_w, grad_inp
     if total == 0:
         return grad_input
 
-    # Host-precomputed per-axis floor-map gather windows (CPU-legacy oracle).
     hlo_np, hlen_np, max_h = _windows(ih, oh, scales_h)
     wlo_np, wlen_np, max_w = _windows(iw, ow, scales_w)
     dev = grad_output.device
@@ -329,10 +297,7 @@ def _dispatch(grad_output, output_size, input_size, scales_h, scales_w, grad_inp
 def upsample_nearest2d_backward(
     grad_output, output_size, input_size, scales_h=None, scales_w=None
 ):
-    logger.debug("GEMS UPSAMPLE_NEAREST2D_BACKWARD")
-    logging.getLogger("flag_gems.ops.upsample_nearest2d_backward").debug(
-        "GEMS UPSAMPLE_NEAREST2D_BACKWARD"
-    )
+    logger.debug("GEMS_KUNLUNXIN UPSAMPLE_NEAREST2D_BACKWARD")
     return _dispatch(grad_output, output_size, input_size, scales_h, scales_w, None)
 
 
@@ -345,19 +310,12 @@ def upsample_nearest2d_backward_grad_input(
     *,
     grad_input,
 ):
-    logger.debug("GEMS UPSAMPLE_NEAREST2D_BACKWARD.GRAD_INPUT")
-    logging.getLogger("flag_gems.ops.upsample_nearest2d_backward").debug(
-        "GEMS UPSAMPLE_NEAREST2D_BACKWARD.GRAD_INPUT"
-    )
+    logger.debug("GEMS_KUNLUNXIN UPSAMPLE_NEAREST2D_BACKWARD.GRAD_INPUT")
     return _dispatch(
         grad_output, output_size, input_size, scales_h, scales_w, grad_input
     )
 
 
-# The test-suite and benchmark call ``flag_gems.ops.upsample_nearest2d_backward``
-# directly. SpecOpRegistrar only injects into the top-level ``flag_gems`` module
-# namespace, so patch the ``flag_gems.ops`` submodule attributes here at import
-# time to route both entry points through this XPU override.
 def _install_into_flag_gems_ops():
     try:
         import flag_gems.ops as _fg_ops

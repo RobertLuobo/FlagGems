@@ -7,37 +7,11 @@ from .linalg_inv_ex import linalg_inv_ex
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Why this vendor override exists
-# ---------------------------------------------------------------------------
-# The generic ``flag_gems.ops.linalg_tensorinv`` implements the matrix inverse
-# with a custom fused Gauss-Jordan Triton kernel (``_tensorinv_register_kernel``
-# / ``_tensorinv_blocked_kernel``) that holds the whole N x N tile plus the
-# identity in registers and drives a data-dependent pivot loop with vectorised
-# row/column selects.  On the P800 TritonXPU backend that kernel fails to
-# compile outright -- ``TritonXPUCoreTiling`` aborts the MLIR pass pipeline
-# (``linalg_tensorinv.py:60: Failures have been detected while processing an
-# MLIR pass pipeline``), so every tensorinv case is a hard compile-time crash,
-# not a numeric mismatch.
-#
-# tensorinv is by definition a single dense matrix inverse: flatten the first
-# ``ind`` dims into rows and the rest into cols (validated equal), invert the
-# resulting N x N matrix, then reshape back to ``shape[ind:] + shape[:ind]``.
-# This override sidesteps the broken fused kernel by delegating the inverse to
-# the already-PASS vendor ``linalg_inv_ex`` (LU factor + triangular solves,
-# all registered XPU Triton kernels).  reshape / contiguous are pure views /
-# copies; no ATen / native / composite inverse fallback is used.
-# ---------------------------------------------------------------------------
-
-
 def check_inv_input(A, ind):
     """Validate input for tensorinv: ind is strictly positive, A is >=2D, and
     prod(A.shape[:ind]) == prod(A.shape[ind:]). Raises RuntimeError on
     violation, matching torch.linalg.tensorinv's behaviour.
     """
-    # ind is checked first (as in torch): a non-positive ind is rejected before
-    # any shape reasoning, so ind=0 cannot slip through to the prod comparison
-    # (which it satisfies trivially for a 1x1 input).
     if ind <= 0:
         raise RuntimeError(
             "linalg.tensorinv: Expected a strictly positive integer for "
@@ -83,10 +57,6 @@ def linalg_tensorinv(A, ind=2, *, out=None):
     n = matrix_size
     orig_dtype = A.dtype
 
-    # Work in float32: linalg_inv_ex only accepts float32/float64, and fp16
-    # inputs must be inverted in fp32 then cast back (matching the fp32
-    # reference path the test uses).  clone() so the underlying LU factorisation
-    # cannot mutate the caller's tensor.
     A_work = (
         A.contiguous()
         .to(torch.float32)

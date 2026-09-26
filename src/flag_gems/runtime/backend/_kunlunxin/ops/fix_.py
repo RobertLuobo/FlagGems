@@ -53,8 +53,6 @@ def fix_(self: torch.Tensor):
     logger.debug("GEMS_KUNLUNXIN FIX_")
 
     if self.is_complex():
-        # Truncate real and imaginary parts independently by operating on the
-        # real view, which shares storage (view_as_real is a metadata-only op).
         _fix_real_(torch.view_as_real(self))
         return self
 

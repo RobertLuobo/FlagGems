@@ -27,10 +27,6 @@ logger = logging.getLogger("flag_gems.ops.fix")
 
 
 def _fix_complex(self: torch.Tensor) -> torch.Tensor:
-    # trunc/fix has no complex ATen kernel; apply it component-wise via the gems
-    # trunc kernel on the real view (real, imag laid out as the last dim), then
-    # reinterpret the result as complex. view_as_real/view_as_complex are
-    # metadata-only reinterpretations and do no numeric work.
     return torch.view_as_complex(gems_trunc(torch.view_as_real(self)).contiguous())
 
 

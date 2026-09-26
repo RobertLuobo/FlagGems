@@ -74,12 +74,10 @@ def _fill_tril_ramp(output, plan):
     local_row = torch.arange(m, device=dev, dtype=torch.int64)
     lengths = plan.ramp_first_length + local_row
     total = int(lengths.sum().item())
-    # Exclusive prefix sum -> flat start offset of each ramp row.
     starts = torch.cumsum(lengths, 0) - lengths
     matrix_rows = plan.ramp_row_start + local_row
     row_block = torch.repeat_interleave(matrix_rows, lengths)
     starts_rep = torch.repeat_interleave(starts, lengths)
-    # tril columns run 0 .. length-1 for each row.
     col_block = torch.arange(total, device=dev, dtype=torch.int64) - starts_rep
     off = plan.ramp_output_offset
     end = off + total
@@ -98,7 +96,6 @@ def tril_indices(
     pin_memory=None,
 ):
     logger.debug("GEMS_KUNLUNXIN TRIL_INDICES")
-    logging.getLogger("flag_gems.ops.triangular_indices").debug("GEMS TRIL_INDICES")
 
     row, col, offset, dtype, layout, device, pin_memory = _validate_arguments(
         row, col, offset, dtype, layout, device, pin_memory

@@ -70,23 +70,17 @@ def _conv_transpose2d(
     dh, dw = _pair(dilation)
 
     n, cin, hin, win = input.shape
-    # transposed weight layout: (in_channels, out_channels/groups, kH, kW)
     _, cout_pg, kh, kw = weight.shape
     cin_pg = cin // groups
 
-    # Effective forward padding must be non-negative; padding <= dilation*(k-1)
-    # always holds for a valid transposed convolution.
     pf_h = dh * (kh - 1) - ph
     pf_w = dw * (kw - 1) - pw
 
-    # Insert (stride - 1) zeros between input samples and append output_padding
-    # trailing zeros so the forward conv reproduces the transposed output size.
     hd = (hin - 1) * sh + 1 + oph
     wd = (win - 1) * sw + 1 + opw
     x_dil = torch.zeros((n, cin, hd, wd), device=input.device, dtype=input.dtype)
     x_dil[:, :, 0 : (hin - 1) * sh + 1 : sh, 0 : (win - 1) * sw + 1 : sw] = input
 
-    # Flip the kernel spatially and swap in/out channels within each group.
     w_flip = (
         weight.reshape(groups, cin_pg, cout_pg, kh, kw)
         .permute(0, 2, 1, 3, 4)
@@ -122,7 +116,6 @@ def _convolution_overrideable_impl(
 
     if transposed:
         if spatial_dims == 1:
-            # Promote the single spatial axis and reuse the 2D transpose path.
             stride_w = _pair(stride)[0]
             padding_w = _pair(padding)[0]
             output_padding_w = _pair(output_padding)[0]

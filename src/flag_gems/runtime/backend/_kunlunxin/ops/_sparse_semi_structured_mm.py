@@ -11,22 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# Kunlunxin (TritonXPU) specialization of ``_sparse_semi_structured_mm``.
-#
-# The generic implementation (flag_gems/ops/_sparse_semi_structured_mm.py) fuses
-# the 2:4 selection and the matmul in a single kernel by broadcasting the A and B
-# tiles into rank-3 tensors (a0[:, :, None] * b0[None, :, :] -> (BM, BK, BN)) and
-# then reducing with ``tl.sum(axis=1)``.  The TritonXPU MLIR pipeline cannot lower
-# that rank-3 broadcast+reduce and aborts in ``TritonXPULegalize`` (all 9 cases).
-#
-# Rewrite: the operation is mathematically equivalent to a plain dense GEMM on a
-# "gated" copy of mat1.  For each group of 4 columns (4k, 4k+1, 4k+2, 4k+3):
-#   meta[m, k] == True  -> keep columns 4k, 4k+1  (zero 4k+2, 4k+3)
-#   meta[m, k] == False -> keep columns 4k+2, 4k+3 (zero 4k, 4k+1)
-# so masked_mat1 = mat1 * expanded_meta and out = masked_mat1 @ mat2.  We build
-# masked_mat1 with a purely 2D pointwise kernel (no rank-3 tile, no in-kernel
-# reduction) and route the dense matmul through the vendor ``mm`` triton op.
 import logging
 
 import torch
@@ -42,9 +26,9 @@ logger = logging.getLogger(__name__)
 
 @triton.jit
 def _sparse_gate_kernel(
-    A,  # (M, 4*K4) source
-    Meta,  # (M, K4) bool/int mask
-    O,  # (M, 4*K4) gated output
+    A,
+    Meta,
+    O,
     M,
     K4,
     stride_am,
@@ -79,8 +63,8 @@ def _sparse_gate_kernel(
         mask=mk,
         other=0,
     )
-    keep_lo = meta != 0  # keep columns 4k, 4k+1
-    keep_hi = meta == 0  # keep columns 4k+2, 4k+3
+    keep_lo = meta != 0
+    keep_hi = meta == 0
 
     for p in tl.static_range(4):
         col = offs_k * 4 + p
@@ -100,7 +84,7 @@ def _sparse_semi_structured_mm(mat1, mat1_meta, mat2, *, out_dtype=None):
     mat2:      (4*K4, N)
     returns:   (M, N)
     """
-    logger.debug("GEMS SPARSE_SEMI_STRUCTURED_MM")
+    logger.debug("GEMS_KUNLUNXIN SPARSE_SEMI_STRUCTURED_MM")
 
     M = mat1.shape[0]
     K4 = mat1_meta.shape[1]
@@ -121,7 +105,6 @@ def _sparse_semi_structured_mm(mat1, mat1_meta, mat2, *, out_dtype=None):
 
     output_dtype = out_dtype if out_dtype is not None else mat1.dtype
 
-    # Build the gated (masked) copy of mat1 with a 2D pointwise kernel.
     masked = torch.empty((M, 4 * K4), device=mat1.device, dtype=mat1.dtype)
 
     BLOCK_M = 32
@@ -144,7 +127,6 @@ def _sparse_semi_structured_mm(mat1, mat1_meta, mat2, *, out_dtype=None):
             BLOCK_K=BLOCK_K,
         )
 
-    # Dense GEMM via the vendor triton mm op.
     out = _gems_mm(masked, mat2)
     if out.dtype != output_dtype:
         out = out.to(output_dtype)

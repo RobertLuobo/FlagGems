@@ -12,28 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU / P800) override for aten::upsample_bicubic2d_backward.
-#
-# The generic implementation reaches this operator through either a fully
-# vectorized 2D masked-gather kernel (small tensors) or a two-pass per-axis
-# kernel whose inner ``for contributor in range(count)`` loop issues masked
-# *strided* loads. Both patterns miscompile on the TritonXPU backend: the 2D
-# masked gather and the vectorized runtime-length masked strided load silently
-# produce wrong values (measured maxdiff up to ~62 against the CPU FP64 oracle).
-#
-# This override keeps the exact Keys' cubic-convolution math and coefficient
-# evaluation order of the generic kernel (so the FP32 result is bit-identical to
-# ATen for the exact non-finite / limiting-scale cases) but drives it from a
-# single deterministic scalar kernel: one lane per input pixel, runtime-length
-# *scalar* loops over the contributing output window, and only in-bounds
-# unmasked strided loads. Out-of-window / untouched taps are zeroed in the
-# register domain via ``tl.where`` instead of a masked load, which is the only
-# addressing form this backend compiles correctly (same discipline used by the
-# neighbouring upsample_nearest2d_backward XPU override).
-#
-# FP64 is unreachable on this stack (fp64_enabled=False -> every FP64 tensor is
-# silently demoted to FP32), so FP64 accumulation is performed in FP32 and the
-# FP64-reference test cases are a documented platform limitation, not a bug.
 
 import logging
 import warnings
@@ -49,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 @triton.jit
 def _cubic_coefficients(t):
-    # Keys' cubic convolution, matching ATen's coefficient evaluation order.
     a = -0.75
     p = t + 1.0
     w0 = ((a * p - 5.0 * a) * p + 8.0 * a) * p - 4.0 * a
@@ -69,10 +46,6 @@ def _cubic_axis_weight(
     SCALE: tl.constexpr,
     ALIGN: tl.constexpr,
 ):
-    # Weight contributed to ``index`` (an input coordinate on one axis) by the
-    # forward tap centred at ``output_index``. FP32 throughout: the XPU stack
-    # demotes FP64, and the generic kernel's FP32 path is the accuracy oracle
-    # the non-finite / limiting-scale exact tests are written against.
     scale = tl.full((), SCALE, tl.float32)
     output_f = output_index.to(tl.float32)
     if ALIGN:
@@ -83,7 +56,6 @@ def _cubic_axis_weight(
     base -= (base.to(tl.float32) > source).to(index.dtype)
     fraction = source - base.to(tl.float32)
     w0, w1, w2, w3 = _cubic_coefficients(fraction)
-    # The coordinate is deliberately NOT clamped: only the four addresses are.
     m0 = tl.minimum(tl.maximum(base - 1, 0), INPUT - 1) == index
     m1 = tl.minimum(tl.maximum(base, 0), INPUT - 1) == index
     m2 = tl.minimum(tl.maximum(base + 1, 0), INPUT - 1) == index
@@ -96,8 +68,6 @@ def _cubic_axis_weight(
     positive = (m0 & (w0 > 0)) | (m1 & (w1 > 0)) | (m2 & (w2 > 0)) | (m3 & (w3 > 0))
     negative = (m0 & (w0 < 0)) | (m1 & (w1 < 0)) | (m2 & (w2 < 0)) | (m3 & (w3 < 0))
     zero = (m0 & (w0 == 0)) | (m1 & (w1 == 0)) | (m2 & (w2 == 0)) | (m3 & (w3 == 0))
-    # Repeated boundary taps can turn infinity into NaN before their weights
-    # are combined. Keep that IEEE behavior without atomics or a native call.
     nonfinite_nan = zero | (positive & negative)
     return weight, touched, nonfinite_nan
 
@@ -111,10 +81,6 @@ def _cubic_contributors(
     INVERSE: tl.constexpr,
     ALIGN: tl.constexpr,
 ):
-    # Half-open [start, end) range of output indices that can touch ``index``.
-    # ``INVERSE`` (= 1/SCALE, or 0 when SCALE is negligibly small) is supplied by
-    # the host so the kernel never evaluates a constexpr 1.0/SCALE that would
-    # divide by zero for the equal-size / degenerate-axis launches.
     if SCALE < (INPUT + 4) / 1073741824.0 or INPUT == 1:
         start = tl.full(index.shape, 0, index.dtype)
         end = tl.full(index.shape, OUTPUT, index.dtype)
@@ -122,7 +88,6 @@ def _cubic_contributors(
         inverse = tl.full((), INVERSE, tl.float32)
         shift: tl.constexpr = 0.0 if ALIGN else 0.5
         center = (index.to(tl.float32) + shift) * inverse - shift
-        # An extra output element on each side protects inverse-rounding boundaries.
         start = (center - 2.0 * inverse).to(index.dtype) - 1
         end = (center + 2.0 * inverse).to(index.dtype) + 2
         start = tl.minimum(tl.maximum(start, 0), OUTPUT)
@@ -157,10 +122,6 @@ def _bicubic_backward_scalar(
     ALIGN: tl.constexpr,
     COPY: tl.constexpr,
 ):
-    # One lane per input pixel. The loop / index / address chain is int64.
-    # ``total`` may arrive as a plain constexpr (Triton specializes the value 1),
-    # so drive the loop bound directly instead of calling ``.to`` on it; the
-    # int64 program id / stride keep the comparison and addressing 64-bit.
     start = tl.program_id(0).to(tl.int64)
     step = tl.num_programs(0).to(tl.int64)
     for pixel in range(start, total, step):
@@ -180,9 +141,6 @@ def _bicubic_backward_scalar(
                 wy, ty, ny = _cubic_axis_weight(y, oy, IH, SH, ALIGN)
                 for ox in range(xs, xe):
                     wx, tx, nx = _cubic_axis_weight(x, ox, IW, SW, ALIGN)
-                    # oy, ox are already clamped in-bounds by _cubic_contributors,
-                    # so the strided load is unmasked; untouched taps are zeroed
-                    # in the register domain (masked strided loads miscompile).
                     value = tl.load(source + n * S0 + c * S1 + oy * S2 + ox * S3)
                     value = tl.where(tx & ty, value.to(tl.float32), 0.0)
                     contribution = (value * wx) * wy
@@ -295,7 +253,7 @@ def upsample_bicubic2d_backward(
     scales_h=None,
     scales_w=None,
 ):
-    logger.debug("GEMS UPSAMPLE_BICUBIC2D_BACKWARD")
+    logger.debug("GEMS_KUNLUNXIN UPSAMPLE_BICUBIC2D_BACKWARD")
     return _upsample_bicubic2d_backward_impl(
         grad_output,
         output_size,
@@ -317,7 +275,7 @@ def upsample_bicubic2d_backward_grad_input(
     *,
     grad_input,
 ):
-    logger.debug("GEMS UPSAMPLE_BICUBIC2D_BACKWARD.GRAD_INPUT")
+    logger.debug("GEMS_KUNLUNXIN UPSAMPLE_BICUBIC2D_BACKWARD.GRAD_INPUT")
     return _upsample_bicubic2d_backward_impl(
         grad_output,
         output_size,
@@ -329,10 +287,6 @@ def upsample_bicubic2d_backward_grad_input(
     )
 
 
-# The test-suite and benchmark call ``flag_gems.ops.upsample_bicubic2d_backward``
-# directly. SpecOpRegistrar only injects into the top-level ``flag_gems`` module
-# namespace, so patch the ``flag_gems.ops`` submodule attributes here at import
-# time to route both entry points through this XPU override.
 def _install_into_flag_gems_ops():
     try:
         import flag_gems.ops as _fg_ops

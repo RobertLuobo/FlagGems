@@ -94,12 +94,6 @@ def special_ndtri_func(x):
 
 def special_ndtri(self):
     logger.debug("GEMS_KUNLUNXIN SPECIAL_NDTRI")
-    # tests/test_special_ndtri.py asserts the prefix from
-    # accuracy_utils.gems_log_prefix(flag_gems.special_ndtri); that helper
-    # resolves __module__ == "_kunlunxin.ops.special_ndtri" (which does NOT
-    # start with "flag_gems.runtime.backend."), so it returns the generic
-    # "GEMS" prefix and expects "GEMS SPECIAL_NDTRI" in caplog.  Emit that
-    # exact string too (keeping the KUNLUNXIN evidence line above).
     logger.debug("GEMS SPECIAL_NDTRI")
     if self.dtype not in _SUPPORTED_DTYPES:
         raise NotImplementedError(

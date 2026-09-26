@@ -140,13 +140,6 @@ def adaptive_max_pool3d(input: torch.Tensor, output_size, return_indices=False):
     # tiles; do not raise BLOCK_SIZE without re-measuring every shape).  For
     # the common window of at most 2 per dim (out = in / 2) the scan also
     # fits 128-lane tiles / num_warps=2, which is measurably faster.
-    #
-    # Exception: when the output is a single global cell (out_d==out_h==out_w==1)
-    # Triton constant-folds those equal-to-one args, and the resulting IR of the
-    # multi-iteration (win>1) window loop overflows TritonXPUUnrollControl's vrf
-    # budget at 128 lanes (observed on (1,8192,2,2,2)->(1,1,1): win=(2,2,2)).
-    # 64-lane tiles compile that loop safely, matching the general
-    # "loop-carried accumulator: 128 lane fails, 64 lane safe" XPU rule.
     global_out = out_d == 1 and out_h == 1 and out_w == 1
     if max(win_d, win_h, win_w) <= 2 and not (
         global_out and max(win_d, win_h, win_w) > 1

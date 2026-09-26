@@ -13,9 +13,7 @@ from flag_gems.utils.random_utils import philox_backend_seed_offset
 logger = logging.getLogger("flag_gems.ops.alpha_dropout")
 
 _UNROLL = 4
-_TILE = (
-    1024 * _UNROLL
-)  # BLOCK(N>512)==1024 times UNROLL; divisor that avoids the masked-tail miscompile
+_TILE = 1024 * _UNROLL
 
 
 def _alpha_dropout_grid(meta):

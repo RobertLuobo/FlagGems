@@ -1804,7 +1804,6 @@ def nmdim_single_kernel(
         lo = tl.where((~go_left) & active, mid + 1, lo)
     hit = inb & (keys == lo)
     ridx = tl.minimum(tl.min(tl.where(hit, cols, BLOCK_N), axis=0), N - 1)
-    # a 0-d store costs ~const/element_size here; a masked 1-lane vector store is ~10x cheaper
     dst = tl.arange(0, 8)
     keep = dst < 1
     tl.store(out_values + pid + dst, tl.load(inp + base + ridx), mask=keep)
@@ -1990,7 +1989,6 @@ def nmdim_finish_kernel(
     slots = row * PSTRIDE + tl.arange(0, NTP)
     best = tl.min(tl.load(pfirst + slots), axis=0)
     ridx = tl.minimum(best, N - 1)
-    # a 0-d store costs ~const/element_size here; a masked 1-lane vector store is ~10x cheaper
     dst = tl.arange(0, 8)
     keep = dst < 1
     tl.store(

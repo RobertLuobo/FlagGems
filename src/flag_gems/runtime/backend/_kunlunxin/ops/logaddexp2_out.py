@@ -69,7 +69,6 @@ def _lad2_flat(
     m = tl.maximum(xv, yv)
     mn = tl.minimum(xv, yv)
     d = mn - m
-    # log2(2**a+2**b)=m+ln(1+e**(d*ln2))/ln2; tl.exp/tl.log is the fast native path here.
     p = tl.exp(d * 0.6931471805599453094172321214581765680755001343602552)
     r = m + tl.log(1.0 + p) * 1.44269504088896340735992468100189213742664595415299
     if EVEN:
@@ -122,7 +121,6 @@ def _lad2_bcast(
     m = tl.maximum(xv, yv)
     mn = tl.minimum(xv, yv)
     d = mn - m
-    # log2(2**a+2**b)=m+ln(1+e**(d*ln2))/ln2; tl.exp/tl.log is the fast native path here.
     p = tl.exp(d * 0.6931471805599453094172321214581765680755001343602552)
     r = m + tl.log(1.0 + p) * 1.44269504088896340735992468100189213742664595415299
     tl.store(o_ptr + ooff, r, mask=msk)

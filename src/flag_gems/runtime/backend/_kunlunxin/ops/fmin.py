@@ -113,7 +113,6 @@ def fmin(a, b):
         out_c = torch.empty(out_shape, dtype=compute_dtype, device=a_c.device)
     n_elements = out_c.numel()
     block_size = _pick_block_size(n_elements)
-    # Keep the grid a stable tuple: a per-call lambda changes the launch cache key and recompiles.
     grid = (triton.cdiv(n_elements, block_size),)
     with torch_device_fn.device(a_c.device):
         fmin_kernel[grid](a_c, b_c, out_c, n_elements, BLOCK_SIZE=block_size)
@@ -142,7 +141,6 @@ def fmin_out(a, b, out):
         out_c = torch.empty(expected_shape, dtype=compute_dtype, device=out.device)
     n_elements = out_c.numel()
     block_size = _pick_block_size(n_elements)
-    # Stable tuple grid, same reason as in fmin(): avoids a per-call launch cache miss.
     grid = (triton.cdiv(n_elements, block_size),)
     with torch_device_fn.device(out.device):
         fmin_kernel[grid](a_c, b_c, out_c, n_elements, BLOCK_SIZE=block_size)
