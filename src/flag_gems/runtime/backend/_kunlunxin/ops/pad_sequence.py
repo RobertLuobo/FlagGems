@@ -40,7 +40,9 @@ def _pad_copy_contig_kernel(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _pad_copy_strided_kernel(src_ptr, dst_ptr, feature, row_stride, BLOCK: tl.constexpr):
+def _pad_copy_strided_kernel(
+    src_ptr, dst_ptr, feature, row_stride, BLOCK: tl.constexpr
+):
     """Copy a contiguous ``[length, feature]`` source into a row-strided
     destination slice (batch_first=False: consecutive time steps are
     ``row_stride`` elements apart, the ``feature`` block is contiguous).
