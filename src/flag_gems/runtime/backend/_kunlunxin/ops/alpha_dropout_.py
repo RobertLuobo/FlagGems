@@ -67,9 +67,7 @@ def _ensure_contiguous(t):
     """
     if t.is_contiguous():
         return t
-    return _triton_copy_(
-        torch.empty(t.shape, dtype=t.dtype, device=t.device), t
-    )
+    return _triton_copy_(torch.empty(t.shape, dtype=t.dtype, device=t.device), t)
 
 
 def alpha_dropout_(input, p=0.5, train=True):

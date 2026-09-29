@@ -19,6 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.ops.copy import copy_ as _gems_copy_
 from flag_gems.ops.multi_margin_loss import (
     _MAX_GRID_SIZE,
     _REDUCE_BLOCK_SIZE,
@@ -33,7 +34,6 @@ from flag_gems.ops.multi_margin_loss import (
     _normalize_reduction,
     _output_shape,
 )
-from flag_gems.ops.copy import copy_ as _gems_copy_
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
