@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.ops.copy import copy_ as _gems_copy_
 from flag_gems.ops.exp import exp
 from flag_gems.ops.linalg_matrix_exp import _T18_B, _THETA_18
 from flag_gems.runtime import torch_device_fn
@@ -149,6 +150,38 @@ def _matrix_exp_lincomb_kernel(
 
 @libentry()
 @triton.jit
+def _eye_kernel(
+    EYE,
+    NP,
+    TOTAL,
+    BLOCK: tl.constexpr,
+):
+    pid = tle.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < TOTAL
+    within = idx % (NP * NP)
+    r = within // NP
+    c = within % NP
+    val = (r == c).to(EYE.dtype.element_ty)
+    tl.store(EYE + idx, val, mask=mask)
+
+
+@libentry()
+@triton.jit
+def _zero_kernel(
+    OUT,
+    TOTAL,
+    BLOCK: tl.constexpr,
+):
+    pid = tle.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < TOTAL
+    val = tl.zeros((BLOCK,), dtype=OUT.dtype.element_ty)
+    tl.store(OUT + idx, val, mask=mask)
+
+
+@libentry()
+@triton.jit
 def _matrix_exp_add_kernel(
     X,
     Y,
@@ -221,6 +254,26 @@ def _pick_block(n):
     return 64
 
 
+def _zeros(shape, dtype, device):
+    out = torch.empty(shape, dtype=dtype, device=device)
+    total = out.numel()
+    if total == 0:
+        return out
+    block = 1024
+    grid = (triton.cdiv(total, block),)
+    with torch_device_fn.device(device):
+        _zero_kernel[grid](out, total, BLOCK=block, num_warps=4)
+    return out
+
+
+def _ensure_contiguous(t):
+    if t.is_contiguous():
+        return t
+    out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    _gems_copy_(out, t)
+    return out
+
+
 def _linalg_matrix_exp_impl(A):
     if A.dim() < 2:
         raise RuntimeError(
@@ -239,38 +292,33 @@ def _linalg_matrix_exp_impl(A):
         )
 
     if n == 0:
-        return A.clone()
+        return torch.empty_like(A)
     if n == 1:
         return exp(A)
 
     batch_shape = A.shape[:-2]
     batch_count = math.prod(batch_shape)
     if batch_count == 0:
-        return A.clone()
+        return torch.empty_like(A)
 
     dtype = A.dtype
     device = A.device
     theta = _THETA_18[dtype]
 
-    A_work = A.contiguous().reshape(batch_count, n, n)
+    A_work = _ensure_contiguous(A).reshape(batch_count, n, n)
 
     block = _pick_block(n)
     np = triton.cdiv(n, block) * block
 
     if np != n:
-        A_pad = torch.zeros(batch_count, np, np, dtype=dtype, device=device)
-        A_pad[:, :n, :n] = A_work
+        A_pad = _zeros((batch_count, np, np), dtype, device)
+        _gems_copy_(A_pad[:, :n, :n], A_work)
     else:
         A_pad = A_work
 
     S = torch.empty(batch_count, dtype=torch.int32, device=device)
     CS = torch.empty(batch_count, np, dtype=dtype, device=device)
-    eye = (
-        torch.eye(np, dtype=dtype, device=device)
-        .unsqueeze(0)
-        .expand(batch_count, np, np)
-        .contiguous()
-    )
+    eye = torch.empty(batch_count, np, np, dtype=dtype, device=device)
 
     a2 = torch.empty(batch_count, np, np, dtype=dtype, device=device)
     a3 = torch.empty(batch_count, np, np, dtype=dtype, device=device)
@@ -286,6 +334,16 @@ def _linalg_matrix_exp_impl(A):
     grid_mat = (batch_count * num_tiles,)
 
     with torch_device_fn.device(device):
+        eye_total = batch_count * np * np
+        eye_block = 1024
+        grid_eye = (triton.cdiv(eye_total, eye_block),)
+        _eye_kernel[grid_eye](
+            eye,
+            np,
+            eye_total,
+            BLOCK=eye_block,
+            num_warps=4,
+        )
         _colsum_kernel[grid_cs](A_pad, CS, np, BLOCK=block, num_warps=4)
         _s_kernel[grid_s](CS, S, np, theta, num_warps=1)
         _matrix_exp_bmm_kernel[grid_mat](
@@ -424,7 +482,7 @@ def _linalg_matrix_exp_impl(A):
                 r, tmp = tmp, r
 
     if np != n:
-        r = r[:, :n, :n].contiguous()
+        r = _ensure_contiguous(r[:, :n, :n])
     return r.reshape(A.shape)
 
 
@@ -452,5 +510,5 @@ def linalg_matrix_exp_out(A, *, out=None):
             f"linalg_matrix_exp: shape of out {tuple(out.shape)} does not match "
             f"expected shape {tuple(A.shape)}"
         )
-    out.copy_(_linalg_matrix_exp_impl(A))
+    _gems_copy_(out, _linalg_matrix_exp_impl(A))
     return out

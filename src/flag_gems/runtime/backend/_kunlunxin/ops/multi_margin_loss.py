@@ -33,6 +33,7 @@ from flag_gems.ops.multi_margin_loss import (
     _normalize_reduction,
     _output_shape,
 )
+from flag_gems.ops.copy import copy_ as _gems_copy_
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 
@@ -374,7 +375,9 @@ def multi_margin_loss_out(
         output=destination,
     )
     if result is not out:
-        out.copy_(result)
+        # gems Triton copy (no torch data-movement fallback): write the
+        # contiguous compute result into the non-contiguous user `out`.
+        _gems_copy_(out, result)
     return out
 
 
@@ -454,7 +457,9 @@ def multi_margin_loss_backward_out(
         grad_input=destination,
     )
     if result is not grad_input:
-        grad_input.copy_(result)
+        # gems Triton copy (no torch data-movement fallback): write the
+        # contiguous compute result into the non-contiguous user `grad_input`.
+        _gems_copy_(grad_input, result)
     return grad_input
 
 

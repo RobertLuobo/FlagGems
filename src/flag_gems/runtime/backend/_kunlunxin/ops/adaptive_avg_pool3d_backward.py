@@ -62,8 +62,12 @@ def _adaptive_avg_pool3d_backward_exact_kernel(
         + (h // KH) * out_w
         + (w // KW)
     )
-    val = tl.load(grad_output_ptr + o_off, mask=mask)
-    tl.store(grad_input_ptr + offsets, val / AREA, mask=mask)
+    val = tl.load(grad_output_ptr + o_off, mask=mask).to(tl.float32)
+    tl.store(
+        grad_input_ptr + offsets,
+        (val / AREA).to(grad_input_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
 @libentry()
@@ -168,20 +172,25 @@ def _adaptive_avg_pool3d_backward_general_kernel(
 def _fill_grad_input(grad_output, input, grad_input):
     """Launch the backward kernel, writing the result into ``grad_input``.
 
-    ``grad_input`` must be a contiguous buffer of ``input``'s shape.  The
-    kernel overwrites every element (accumulation is in float32 and the store
-    converts to the buffer's element type), so no prior initialization is
-    needed.
+    ``grad_input`` must be a contiguous buffer of ``input``'s shape.  Both
+    kernels accumulate in float32 and the store converts to the buffer's
+    element type, so bf16/fp16 outputs are written straight into
+    ``grad_input`` -- no fp32 scratch and no host-side copy are needed.
     """
-    grad_output = grad_output.contiguous()
+    if not grad_output.is_contiguous():
+        # Stage a contiguous copy with a gems Triton kernel (never a torch
+        # data-movement fallback).  The kernels below index grad_output with a
+        # flat contiguous offset, so a strided grad_output must be regularised
+        # first.
+        from flag_gems.ops.copy import copy_ as _gems_copy_
+
+        staged = torch.empty(
+            grad_output.shape, dtype=grad_output.dtype, device=grad_output.device
+        )
+        _gems_copy_(staged, grad_output)
+        grad_output = staged
     in_n, in_c, in_d, in_h, in_w = input.shape
     out_d, out_h, out_w = grad_output.shape[-3:]
-
-    if grad_input.dtype == torch.bfloat16:
-        grad_output = grad_output.to(torch.float32)
-        work = torch.empty_like(grad_input, dtype=torch.float32)
-    else:
-        work = grad_input
 
     with torch_device_fn.device(input.device):
         if in_d % out_d == 0 and in_h % out_h == 0 and in_w % out_w == 0:
@@ -190,7 +199,7 @@ def _fill_grad_input(grad_output, input, grad_input):
             grid = (triton.cdiv(n_elems, 1024),)
             _adaptive_avg_pool3d_backward_exact_kernel[grid](
                 grad_output,
-                work,
+                grad_input,
                 in_d,
                 in_h,
                 in_w,
@@ -220,7 +229,7 @@ def _fill_grad_input(grad_output, input, grad_input):
             out_total = grad_output.numel()
             _adaptive_avg_pool3d_backward_general_kernel[(n_tiles,)](
                 grad_output,
-                work,
+                grad_input,
                 out_total - 1,
                 n_elems,
                 in_d,
@@ -237,16 +246,15 @@ def _fill_grad_input(grad_output, input, grad_input):
                 num_warps=1,
             )
 
-    if work is not grad_input:
-        grad_input.copy_(work)
-
 
 def _adaptive_avg_pool3d_backward(grad_output, input):
     """Gradient of adaptive_avg_pool3d (Kunlunxin/XPU implementation)."""
     logger.debug("GEMS_KUNLUNXIN _ADAPTIVE_AVG_POOL3D_BACKWARD")
 
-    input = input.contiguous()
-    grad_input = torch.empty_like(input)
+    # Allocate a fresh contiguous buffer (torch.empty on an explicit shape is a
+    # pure allocation and always contiguous, so no .contiguous() call on
+    # ``input`` is required -- the kernels only read grad_output).
+    grad_input = torch.empty(input.shape, dtype=input.dtype, device=input.device)
     if grad_output.numel() == 0 or input.numel() == 0:
         return grad_input.zero_()
 
@@ -266,12 +274,17 @@ def adaptive_avg_pool3d_backward_grad_input(grad_output, input, *, grad_input):
     if grad_output.numel() == 0 or input.numel() == 0:
         return grad_input.zero_()
 
-    input = input.contiguous()
     if grad_input.is_contiguous():
         _fill_grad_input(grad_output, input, grad_input)
         return grad_input
 
-    scratch = torch.empty_like(input)
+    # Non-contiguous destination: compute into a contiguous scratch buffer,
+    # then scatter into the strided grad_input with a gems Triton copy kernel
+    # (pointwise_dynamic honours the destination strides).  No torch
+    # data-movement fallback is used.
+    from flag_gems.ops.copy import copy_ as _gems_copy_
+
+    scratch = torch.empty(input.shape, dtype=input.dtype, device=input.device)
     _fill_grad_input(grad_output, input, scratch)
-    grad_input.copy_(scratch)
+    _gems_copy_(grad_input, scratch)
     return grad_input
