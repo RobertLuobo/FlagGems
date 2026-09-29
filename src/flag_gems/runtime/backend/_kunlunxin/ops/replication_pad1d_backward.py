@@ -4,9 +4,40 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.ops.copy import copy_ as _gems_copy_
 from flag_gems.runtime import torch_device_fn
 
 logger = logging.getLogger(__name__)
+
+
+def _gems_copy(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    """Copy ``src`` into ``dst`` via the generic gems Triton copy kernel.
+
+    ``flag_gems.ops.copy.copy_`` is the ``pointwise_dynamic`` ``_copy_kernel``;
+    calling it by function reference bypasses the dispatcher, so it never re-enters
+    the vendor ``copy_`` (whose strided branch is a known wedge). It handles
+    broadcasting and arbitrary strides. Here it only ever materialises a contiguous
+    ``dst`` from a strided real ``src``, which lands squarely on its Triton path
+    (real dtype, strided layout, non-empty).
+    """
+    _gems_copy_(dst, src)
+    return dst
+
+
+def _ensure_contiguous(t: torch.Tensor) -> torch.Tensor:
+    """Row-major contiguous ``t`` with no torch data-movement fallback.
+
+    Already-contiguous tensors (the common case: native forward emits a contiguous
+    grad_output) are returned unchanged -- a true no-op, no extra kernel launch.
+    A strided grad_output is materialised into a fresh contiguous buffer via the
+    gems Triton copy. Zero-element tensors are returned as-is: the caller
+    early-returns before the kernel reads them, and gems ``copy_`` would redispatch
+    to aten on an empty dst (which we must avoid).
+    """
+    if t.numel() == 0 or t.is_contiguous():
+        return t
+    return _gems_copy(torch.empty(t.shape, dtype=t.dtype, device=t.device), t)
+
 
 _SCALAR_NAMES = {
     torch.float16: "Half",
@@ -30,8 +61,13 @@ def _replication_pad1d_backward_fold_kernel(
     W_in,
     pl,
     total,
+    go_row_stride,
+    go_col_stride,
+    gi_row_stride,
+    gi_col_stride,
     MAXG: tl.constexpr,
     BLOCK: tl.constexpr,
+    CONTIG: tl.constexpr,
 ):
     """Fold grad_output columns back onto grad_input columns.
 
@@ -42,6 +78,14 @@ def _replication_pad1d_backward_fold_kernel(
     ``tl.static_range(MAXG)`` bound plus a ``c < cnt`` mask -- this avoids the
     runtime-bound ``scf.for`` loops the TritonXPU legalize pass rejects with
     "operand does not dominate this use".
+
+    ``CONTIG`` selects between two address modes. When both ``grad_output`` and
+    ``grad_input`` are row-major contiguous (the plain real path) the store lands
+    at ``gi_ptr + o`` -- a compiler-provable stride-1 write that lowers to a block
+    DMA. When the caller passes a strided view (the complex path folds directly
+    into ``view_as_real(grad_input)[..., comp]``, whose element stride is 2) the
+    store is addressed through the explicit row/column strides, letting the kernel
+    write straight into ``grad_input`` with no scratch buffer and no ``copy_``.
     """
     pid = tl.program_id(0)
     o = pid * BLOCK + tl.arange(0, BLOCK)
@@ -63,18 +107,42 @@ def _replication_pad1d_backward_fold_kernel(
         ),
     )
 
-    out_base = nc * W_out
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
-    for c in tl.static_range(MAXG):
-        cc = tl.minimum(c, tl.maximum(cnt - 1, 0))
-        v = tl.load(go_ptr + out_base + lo + cc, mask=mask, other=0.0).to(tl.float32)
-        acc += tl.where(c < cnt, v, 0.0)
+    if CONTIG:
+        out_base = nc * W_out
+        for c in tl.static_range(MAXG):
+            cc = tl.minimum(c, tl.maximum(cnt - 1, 0))
+            v = tl.load(go_ptr + out_base + lo + cc, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            acc += tl.where(c < cnt, v, 0.0)
+        tl.store(gi_ptr + o, acc.to(gi_ptr.dtype.element_ty), mask=mask)
+    else:
+        go_base = nc * go_row_stride
+        for c in tl.static_range(MAXG):
+            cc = tl.minimum(c, tl.maximum(cnt - 1, 0))
+            v = tl.load(
+                go_ptr + go_base + (lo + cc) * go_col_stride, mask=mask, other=0.0
+            ).to(tl.float32)
+            acc += tl.where(c < cnt, v, 0.0)
+        gi_off = nc * gi_row_stride + iw * gi_col_stride
+        tl.store(gi_ptr + gi_off, acc.to(gi_ptr.dtype.element_ty), mask=mask)
 
-    tl.store(gi_ptr + o, acc.to(gi_ptr.dtype.element_ty), mask=mask)
 
+def _run_fold(
+    grad_output_2d: torch.Tensor,
+    grad_input: torch.Tensor,
+    W_out,
+    W_in,
+    pl,
+    contiguous: bool = True,
+):
+    """Fold grad_output_2d (NC, W_out) onto grad_input (NC, W_in).
 
-def _run_fold(grad_output_2d: torch.Tensor, grad_input: torch.Tensor, W_out, W_in, pl):
-    """grad_output_2d: contiguous (NC, W_out); grad_input: contiguous (NC, W_in)."""
+    Both are 2-D. When ``contiguous`` is True they are row-major contiguous and
+    the kernel uses the stride-1 fast path; otherwise the actual element strides
+    are passed and the kernel writes straight into the (possibly strided) view.
+    """
     total = grad_input.numel()
     if total == 0:
         return grad_input
@@ -84,6 +152,8 @@ def _run_fold(grad_output_2d: torch.Tensor, grad_input: torch.Tensor, W_out, W_i
     maxg = max(maxg, 1)
     BLOCK = 1024
     grid = (triton.cdiv(total, BLOCK),)
+    go_row_stride, go_col_stride = grad_output_2d.stride()
+    gi_row_stride, gi_col_stride = grad_input.stride()
     with torch_device_fn.device(grad_input.device):
         _replication_pad1d_backward_fold_kernel[grid](
             grad_output_2d,
@@ -92,18 +162,15 @@ def _run_fold(grad_output_2d: torch.Tensor, grad_input: torch.Tensor, W_out, W_i
             W_in,
             int(pl),
             total,
+            go_row_stride,
+            go_col_stride,
+            gi_row_stride,
+            gi_col_stride,
             MAXG=maxg,
             BLOCK=BLOCK,
+            CONTIG=contiguous,
         )
     return grad_input
-
-
-def _fold_component(go_real: torch.Tensor, W_out, W_in, pl, N, C):
-    """Sum-fold a single real component; returns a contiguous (N*C, W_in)."""
-    go_flat = go_real.contiguous().reshape(N * C, W_out)
-    gi_flat = torch.empty((N * C, W_in), device=go_real.device, dtype=go_real.dtype)
-    _run_fold(go_flat, gi_flat, W_out, W_in, pl)
-    return gi_flat
 
 
 def replication_pad1d_backward(
@@ -154,11 +221,17 @@ def replication_pad1d_backward(
     if self_tensor.is_complex():
         go_r = torch.view_as_real(grad_output)
         gi_r = torch.view_as_real(grad_input)
+        # Real and imaginary parts fold independently, so run the real kernel once
+        # per component. view_as_real of a contiguous complex tensor is contiguous,
+        # so slicing the trailing axis yields a strided (element stride 2) view whose
+        # (N, C) axes collapse cleanly; the kernel folds straight into it, so there is
+        # no scratch buffer and no copy_ write-back.
         for comp in (0, 1):
-            folded = _fold_component(go_r[..., comp], W_out, W_in, left, N, C)
-            gi_r[..., comp].copy_(folded.reshape(gi_r[..., comp].shape))
+            go_c = go_r[..., comp].reshape(N * C, W_out)
+            gi_c = gi_r[..., comp].reshape(N * C, W_in)
+            _run_fold(go_c, gi_c, W_out, W_in, left, contiguous=False)
         return grad_input
 
-    go_flat = grad_output.contiguous().reshape(N * C, W_out)
+    go_flat = _ensure_contiguous(grad_output).reshape(N * C, W_out)
     _run_fold(go_flat, grad_input.reshape(N * C, W_in), W_out, W_in, left)
     return grad_input

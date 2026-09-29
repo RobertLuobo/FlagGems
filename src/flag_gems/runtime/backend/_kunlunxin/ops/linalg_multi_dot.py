@@ -16,9 +16,31 @@
 import logging
 import warnings
 
+import torch
+
+from flag_gems.ops.copy import copy_ as _gems_copy_
+
 from .mm import mm as _vendor_mm
 
 logger = logging.getLogger(__name__)
+
+
+def _to_f32_contig(t):
+    """Return a contiguous float32 copy of ``t`` using only gems kernels.
+
+    ``torch.empty`` is a pure allocation (never a compute/movement fallback) and
+    the generic gems Triton copy (``flag_gems.ops.copy.copy_``) casts dtype AND
+    lands contiguous in a single pointwise pass -- it replaces the previous
+    ``t.float().contiguous()`` which relied on torch's own cast + materialize
+    fallbacks. For fp16/bf16/fp32 real strided sources into a contiguous fp32
+    destination the copy stays on the Triton branch of ``copy.py`` (not complex,
+    not float8, not zerotensor, not an alias, numel < 2**31, numel != 0).
+    """
+    if t.dtype == torch.float32 and t.is_contiguous():
+        return t
+    dst = torch.empty(t.shape, dtype=torch.float32, device=t.device)
+    _gems_copy_(dst, t)
+    return dst
 
 
 def _matrix_multiply(left, right, out=None):
@@ -28,12 +50,21 @@ def _matrix_multiply(left, right, out=None):
     back to the working dtype reproduces hardware bf16/fp16 matmul semantics
     (fp32 accumulate, round-to-dtype). No native/ATen matmul fallback is used.
     """
-    result = _vendor_mm(left.float().contiguous(), right.float().contiguous())
-    result = result.to(left.dtype)
+    result = _vendor_mm(_to_f32_contig(left), _to_f32_contig(right))
     if out is not None:
-        out.copy_(result)
+        # Write back through the gems Triton copy kernel (flag_gems.ops.copy),
+        # not torch's ``.copy_``/``.to`` fallback. The pointwise copy casts the
+        # fp32 product to ``out``'s working dtype AND honours a non-contiguous
+        # view of the user's tensor (strided stores) in a single pass.
+        _gems_copy_(out, result)
         return out
-    return result
+    if result.dtype == left.dtype:
+        return result
+    # Round the fp32 product back to the working dtype via the gems copy kernel
+    # (matches ATen bf16/fp16 matmul: fp32 accumulate, round-to-dtype).
+    typed = torch.empty(result.shape, dtype=left.dtype, device=result.device)
+    _gems_copy_(typed, result)
+    return typed
 
 
 def _validate_and_prepare(tensors):

@@ -54,6 +54,12 @@ import logging
 from collections import namedtuple
 
 import torch
+import triton
+import triton.language as tl
+
+from flag_gems.ops.copy import copy_ as _gems_copy_
+from flag_gems.utils import libentry
+from flag_gems.utils import triton_lang_extension as tle
 
 from .bmm import bmm
 from .linalg_householder_product import linalg_householder_product
@@ -63,6 +69,115 @@ logger = logging.getLogger(__name__)
 LinalgQrResult = namedtuple("LinalgQrResult", ["Q", "R"])
 
 _SUPPORTED_DTYPES = (torch.float32, torch.float64)
+
+
+# Comparison modes for the triangular ones-table kernel below.
+_TRI_GE = 0  # OUT[i, j] = 1 if j >= i  (torch.triu(ones))
+_TRI_LT = 1  # OUT[i, j] = 1 if j <  i  (torch.tril(ones, -1))
+_TRI_EQ = 2  # OUT[i, j] = 1 if j == i  (torch.eye)
+_TRI_GT = 3  # OUT[i, j] = 1 if j >  i  (torch.triu(ones, 1))
+
+
+@libentry()
+@triton.jit
+def _tri_table_kernel(
+    OUT,
+    NCOL,
+    TOTAL,
+    CMP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Fill a (K, NCOL) buffer with a triangular / diagonal ones table.
+
+    Depending on the compile-time ``CMP`` selector this reproduces, byte-for-byte,
+    ``torch.triu(torch.ones(K, NCOL))`` (GE), ``torch.tril(ones, -1)`` (LT),
+    ``torch.eye(K, NCOL)`` (EQ) or ``torch.triu(ones, 1)`` (GT).  Uses a 1-D flat
+    store (no ``tl.load``) because the small-tile / small-grid 2-D construction
+    pattern is miscompiled on this backend (see linalg_matrix_exp eye note); the
+    flat form is safe.
+    """
+    pid = tle.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < TOTAL
+    r = idx // NCOL
+    c = idx % NCOL
+    # CMP is a compile-time literal: 0 GE (c>=r), 1 LT (c<r), 2 EQ (c==r), 3 GT (c>r).
+    if CMP == 0:
+        pred = c >= r
+    elif CMP == 1:
+        pred = c < r
+    elif CMP == 2:
+        pred = c == r
+    else:
+        pred = c > r
+    val = pred.to(OUT.dtype.element_ty)
+    tl.store(OUT + idx, val, mask=mask)
+
+
+def _tri_ones(k, n, cmp, dtype, device):
+    """Build a (k, n) triangular/diagonal ones table via a gems Triton kernel."""
+    out = torch.empty(k, n, dtype=dtype, device=device)
+    total = k * n
+    block = 1024
+    grid = (triton.cdiv(total, block),)
+    _tri_table_kernel[grid](out, n, total, CMP=cmp, BLOCK=block)
+    return out
+
+
+@libentry()
+@triton.jit
+def _batched_eye_kernel(
+    OUT,
+    NP,
+    TOTAL,
+    BLOCK: tl.constexpr,
+):
+    """Fill a (B, NP, NP) buffer with a per-batch identity (1-D flat store)."""
+    pid = tle.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < TOTAL
+    within = idx % (NP * NP)
+    r = within // NP
+    c = within % NP
+    val = (r == c).to(OUT.dtype.element_ty)
+    tl.store(OUT + idx, val, mask=mask)
+
+
+@libentry()
+@triton.jit
+def _fill_kernel(
+    OUT,
+    VAL,
+    TOTAL,
+    BLOCK: tl.constexpr,
+):
+    """Fill a flat buffer with a scalar (replaces ``torch.zeros`` / ``torch.ones``)."""
+    pid = tle.program_id(0)
+    idx = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = idx < TOTAL
+    val = tl.full((BLOCK,), VAL, OUT.dtype.element_ty)
+    tl.store(OUT + idx, val, mask=mask)
+
+
+def _filled(shape, value, dtype, device):
+    """``torch.full(shape, value)`` via a gems Triton kernel (pure alloc + fill)."""
+    out = torch.empty(shape, dtype=dtype, device=device)
+    total = out.numel()
+    if total == 0:
+        return out
+    block = 1024
+    grid = (triton.cdiv(total, block),)
+    _fill_kernel[grid](out, value, total, BLOCK=block)
+    return out
+
+
+def _ensure_contiguous(t):
+    """Return a contiguous view of ``t`` (gems copy into a fresh buffer if needed)."""
+    if t.is_contiguous():
+        return t
+    out = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    _gems_copy_(out, t)
+    return out
 
 
 def _validate_mode(mode):
@@ -114,30 +229,35 @@ def _geqrf(af):
     """
     B, m, n = af.shape
     k = min(m, n)
-    tau = torch.zeros(B, k, dtype=af.dtype, device=af.device)
-    V = torch.zeros(B, m, k, dtype=af.dtype, device=af.device)
-    one = torch.ones(B, 1, dtype=af.dtype, device=af.device)
-    ones_km = torch.ones(k, m, dtype=af.dtype, device=af.device)
-    ge_tab = torch.triu(ones_km)
-    lt_tab = torch.tril(ones_km, -1)
-    eye_tab = torch.eye(k, m, dtype=af.dtype, device=af.device)
-    gt_tab = torch.triu(torch.ones(k, n, dtype=af.dtype, device=af.device), 1)
+    # tau (B, k) and V (B, m, k) are fully written column-by-column in the loop
+    # below, so a pure ``torch.empty`` allocation is sufficient (no zero-init).
+    tau = torch.empty(B, k, dtype=af.dtype, device=af.device)
+    V = torch.empty(B, m, k, dtype=af.dtype, device=af.device)
+    ge_tab = _tri_ones(k, m, _TRI_GE, af.dtype, af.device)
+    lt_tab = _tri_ones(k, m, _TRI_LT, af.dtype, af.device)
+    eye_tab = _tri_ones(k, m, _TRI_EQ, af.dtype, af.device)
+    gt_tab = _tri_ones(k, n, _TRI_GT, af.dtype, af.device)
     for j in range(k):
         af_col = af[:, :, j]
         ge = ge_tab[j].reshape(1, m)
         x = af_col * ge
         normx = torch.sqrt((x * x).sum(dim=1, keepdim=True))
         alpha = af_col[:, j : j + 1]
-        zero = normx == 0
-        s = torch.where(alpha >= 0, one, -one)
+        # zf = 1.0 where the sub-column norm is zero (rank-deficient), else 0.0.
+        zf = (normx == 0).to(af.dtype)
+        # s = +1 if alpha >= 0 else -1  (sign with sign(0) = +1).
+        s = 2.0 * (alpha >= 0).to(af.dtype) - 1.0
         beta = -s * normx
         denom = alpha - beta
-        safe_denom = torch.where(zero, one, denom)
+        # safe_denom = denom where norm != 0 else 1  (avoids 0/0); pure arithmetic
+        # select, bit-exact to torch.where(zero, one, denom).
+        safe_denom = denom * (1.0 - zf) + zf
         v = x / safe_denom
         atdiag = eye_tab[j].reshape(1, m)
         v = v * (1.0 - atdiag) + atdiag
-        safe_beta = torch.where(zero, one, beta)
-        tau_j = torch.where(zero, torch.zeros_like(beta), (beta - alpha) / safe_beta)
+        safe_beta = beta * (1.0 - zf) + zf
+        # tau_j = (beta - alpha) / safe_beta where norm != 0 else 0.
+        tau_j = ((beta - alpha) / safe_beta) * (1.0 - zf)
         tau[:, j : j + 1] = tau_j
         V[:, :, j] = v
         w = bmm(v.unsqueeze(1), af)
@@ -153,10 +273,10 @@ def _assemble_q(V, tau, m, k, qcols):
     """Form Q (B, m, qcols) from the packed reflectors via vendor orgqr."""
     B = V.shape[0]
     if qcols <= k:
-        Aq = V[:, :, :qcols].contiguous()
+        Aq = _ensure_contiguous(V[:, :, :qcols])
     else:
-        Aq = torch.zeros(B, m, qcols, dtype=V.dtype, device=V.device)
-        Aq[:, :, :k] = V[:, :, :k]
+        Aq = _filled((B, m, qcols), 0.0, V.dtype, V.device)
+        _gems_copy_(Aq[:, :, :k], V[:, :, :k])
     return linalg_householder_product(Aq, tau)
 
 
@@ -190,11 +310,20 @@ def _linalg_qr(A, mode="reduced", *, out=None):
             Q = A.new_empty(q_shape)
             R = A.new_empty(r_shape)
         if mode == "complete" and n == 0 and m > 0:
-            eye = torch.eye(m, dtype=A.dtype, device=A.device)
-            Q.copy_(eye.expand(*batch_shape, m, m))
+            # Q = batched identity; the eye kernel writes every element (0 off /
+            # 1 on diagonal), so a bare torch.empty alloc suffices. Build into a
+            # fresh contiguous buffer, then gems-copy into (possibly strided) Q.
+            eye = torch.empty((B, m, m), dtype=A.dtype, device=A.device)
+            total = B * m * m
+            block = 1024
+            grid = (triton.cdiv(total, block),)
+            _batched_eye_kernel[grid](eye, m, total, BLOCK=block)
+            _gems_copy_(Q.reshape(B, m, m), eye)
         return LinalgQrResult(Q, R)
 
-    af = A.reshape(B, m, n).contiguous().clone()
+    A2 = _ensure_contiguous(A)
+    af = torch.empty((B, m, n), dtype=A.dtype, device=A.device)
+    _gems_copy_(af, A2.reshape(B, m, n))
     af, tau, V = _geqrf(af)
 
     rrows = k if mode in ("reduced", "r") else m
@@ -202,7 +331,7 @@ def _linalg_qr(A, mode="reduced", *, out=None):
 
     if mode == "r":
         if out is not None:
-            out[1].reshape(B, rrows, n).copy_(R_flat)
+            _gems_copy_(out[1].reshape(B, rrows, n), R_flat)
             return LinalgQrResult(out[0], out[1])
         return LinalgQrResult(A.new_empty(0), R_flat.reshape(r_shape))
 
@@ -210,8 +339,8 @@ def _linalg_qr(A, mode="reduced", *, out=None):
     Q_flat = _assemble_q(V, tau, m, k, qcols)
 
     if out is not None:
-        out[0].reshape(B, m, qcols).copy_(Q_flat)
-        out[1].reshape(B, rrows, n).copy_(R_flat)
+        _gems_copy_(out[0].reshape(B, m, qcols), Q_flat)
+        _gems_copy_(out[1].reshape(B, rrows, n), R_flat)
         return LinalgQrResult(out[0], out[1])
 
     return LinalgQrResult(Q_flat.reshape(q_shape), R_flat.reshape(r_shape))
