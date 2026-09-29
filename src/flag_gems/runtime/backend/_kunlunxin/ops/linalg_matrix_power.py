@@ -1,6 +1,11 @@
 import logging
 
 import torch
+import triton
+import triton.language as tl
+
+from flag_gems.runtime import torch_device_fn
+from flag_gems.utils import libentry
 
 from .bmm import bmm
 from .linalg_lu_factor_ex import linalg_lu_factor_ex
@@ -9,6 +14,63 @@ from .lu_unpack import lu_unpack
 from .mm import mm
 
 logger = logging.getLogger(__name__)
+
+
+def _gems_copy(dst: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    """Data movement via the generic gems Triton copy kernel (no torch fallback).
+
+    ``flag_gems.ops.copy.copy_`` is pointwise_dynamic-based and handles arbitrary
+    strides / broadcasting; a by-reference call bypasses the dispatcher (it will
+    not re-route to the vendor ``copy_``). Inputs here are always fp32/fp64 on
+    the op device, so the call stays on the Triton branch (verified).
+    """
+    from flag_gems.ops.copy import copy_ as _copy_
+
+    _copy_(dst, src)
+    return dst
+
+
+@libentry()
+@triton.jit
+def _identity_kernel(out_ptr, numel, mm_elems, m, BLOCK: tl.constexpr):
+    # Build a (possibly batched) identity matrix directly into a contiguous
+    # buffer. Layout is a flat run of consecutive m x m blocks. For flat index
+    # ``offs`` the within-matrix offset is ``offs % (m*m)``; its row/col are
+    # ``within // m`` / ``within % m``. The value is 1 on the diagonal and 0
+    # elsewhere, so the full buffer is written in a single launch (no separate
+    # zero-fill pass and no torch.eye / expand / clone).
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    within = offs % mm_elems
+    row = within // m
+    col = within - row * m
+    value = tl.where(row == col, 1, 0)
+    tl.store(out_ptr + offs, value, mask=mask)
+
+
+def _make_identity_like(a: torch.Tensor) -> torch.Tensor:
+    """Allocate a contiguous buffer shaped like ``a`` and fill it with a
+    (batched) identity via the gems Triton kernel above."""
+    m = a.shape[-1]
+    eye = torch.empty(a.shape, dtype=a.dtype, device=a.device)
+    numel = eye.numel()
+    if numel == 0:
+        return eye
+    BLOCK = 1024
+    grid = (triton.cdiv(numel, BLOCK),)
+    with torch_device_fn.device(eye.device):
+        _identity_kernel[grid](eye, numel, m * m, m, BLOCK)
+    return eye
+
+
+def _ensure_contiguous(t: torch.Tensor) -> torch.Tensor:
+    """Materialise ``t`` into a contiguous buffer via the gems copy kernel when
+    it is not already contiguous (metadata check only; no torch data movement)."""
+    if t.is_contiguous():
+        return t
+    c = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    return _gems_copy(c, t)
 
 
 def _matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -29,20 +91,11 @@ def _inverse(a_flat: torch.Tensor) -> torch.Tensor:
     """
     bn, m, _ = a_flat.shape
     lu, pivots, _info = linalg_lu_factor_ex(a_flat)
-    p, l, u = lu_unpack(lu, pivots)
-    pt = p.transpose(-2, -1).contiguous()
-    y = linalg_solve_triangular(l, pt, upper=False, left=True, unitriangular=True)
+    p, lower, u = lu_unpack(lu, pivots)
+    pt = _ensure_contiguous(p.transpose(-2, -1))
+    y = linalg_solve_triangular(lower, pt, upper=False, left=True, unitriangular=True)
     x = linalg_solve_triangular(u, y, upper=True, left=True)
     return x
-
-
-def _eye_like(a: torch.Tensor) -> torch.Tensor:
-    m = a.shape[-1]
-    shape = a.shape
-    eye = torch.eye(m, dtype=a.dtype, device=a.device)
-    if len(shape) > 2:
-        eye = eye.expand(shape[:-2] + (m, m)).clone()
-    return eye
 
 
 def _validate(a: torch.Tensor, n) -> None:
@@ -76,17 +129,16 @@ def linalg_matrix_power(
     m = shape[-1]
 
     if n == 0:
-        eye = _eye_like(a)
+        eye = _make_identity_like(a)
         if out is not None:
-            out.copy_(eye)
-            return out
+            return _gems_copy(out, eye)
         return eye
 
     if n == 1:
         if out is not None:
-            out.copy_(a)
-            return out
-        return a.clone()
+            return _gems_copy(out, a)
+        res = torch.empty(a.shape, dtype=a.dtype, device=a.device)
+        return _gems_copy(res, a)
 
     import flag_gems
 
@@ -96,7 +148,7 @@ def linalg_matrix_power(
             f"got {a.device}"
         )
 
-    a_flat = a.reshape(-1, m, m).contiguous() if a.dim() != 2 else a.contiguous()
+    a_flat = _ensure_contiguous(a.reshape(-1, m, m) if a.dim() != 2 else a)
 
     if n < 0:
         if a_flat.dim() == 2:
@@ -117,8 +169,7 @@ def linalg_matrix_power(
 
     r = result.reshape(shape)
     if out is not None:
-        out.copy_(r)
-        return out
+        return _gems_copy(out, r)
     return r
 
 

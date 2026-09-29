@@ -168,6 +168,32 @@ def _div_fast_kernel_unmasked(x_ptr, y_ptr, out_ptr, BLOCK_SIZE: tl.constexpr):
     tl.store(out_ptr + offset, x / y)
 
 
+@triton.jit
+def _fill_scalar_kernel(out_ptr, n_elements, scalar, BLOCK_SIZE: tl.constexpr):
+    # gems Triton scalar-fill (replaces the banned torch `.fill_()` in the
+    # both-scalar true_divide.out branch): store scalar into every element of
+    # a contiguous output. scalar is cast to the output element type in-kernel,
+    # matching `Tensor.fill_` dtype semantics.
+    pid = tl.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offset < n_elements
+    val = tl.full((BLOCK_SIZE,), scalar, out_ptr.dtype.element_ty)
+    tl.store(out_ptr + offset, val, mask=mask)
+
+
+def _fill_scalar(out, scalar):
+    # scoped gems fill for the scalar/scalar true_divide.out branch (kept for
+    # the direct-call `true_divide_out(scalar, scalar, out)` contract; the aten
+    # true_divide.out schema itself only dispatches tensor operands here).
+    n = out.numel()
+    if n:
+        BLOCK = 1024
+        _fill_scalar_kernel[(triton.cdiv(n, BLOCK),)](
+            out, n, float(scalar), BLOCK_SIZE=BLOCK
+        )
+    return out
+
+
 def _div_small_eligible(A, B):
     return (
         A.dtype == B.dtype
@@ -349,74 +375,6 @@ def _scalar_over_complex(A, B, out=None):
     return out
 
 
-@pointwise_dynamic(
-    is_tensor=[True, True, True, True],
-    num_outputs=2,
-    promotion_methods=[(0, 1, 2, 3, "INT_TO_FLOAT"), (0, 1, 2, 3, "INT_TO_FLOAT")],
-    config=config_,
-)
-@triton.jit
-def true_div_complex_kernel(ar, ai, br, bi):
-    abs_br = tl.abs(br)
-    abs_bi = tl.abs(bi)
-    use_br = abs_br >= abs_bi
-
-    ratio1 = tl.where(br == 0, 0.0, bi / br)
-    denom1 = br + bi * ratio1
-    real1 = (ar + ai * ratio1) / denom1
-    imag1 = (ai - ar * ratio1) / denom1
-
-    ratio2 = tl.where(bi == 0, 0.0, br / bi)
-    denom2 = bi + br * ratio2
-    real2 = (ar * ratio2 + ai) / denom2
-    imag2 = (ai * ratio2 - ar) / denom2
-
-    real = tl.where(use_br, real1, real2)
-    imag = tl.where(use_br, imag1, imag2)
-    return real, imag
-
-
-def _complex_real_parts(z, upcast):
-    zr = torch.view_as_real(z)
-    if upcast:
-        zr = zr.to(torch.float32)
-    return zr[..., 0].contiguous(), zr[..., 1].contiguous()
-
-
-def _true_divide_complex_tensors(A, B):
-    A_is_complex = A.is_complex()
-    B_is_complex = B.is_complex()
-    if A_is_complex and B_is_complex:
-        upcast = A.dtype == torch.complex32
-        ar, ai = _complex_real_parts(A, upcast)
-        br, bi = _complex_real_parts(B, upcast)
-        real, imag = true_div_complex_kernel(ar, ai, br, bi)
-        if upcast:
-            real, imag = real.to(torch.float16), imag.to(torch.float16)
-        return torch.view_as_complex(torch.stack((real, imag), dim=-1))
-    elif A_is_complex:
-        upcast = A.dtype == torch.complex32
-        Ar = torch.view_as_real(A)
-        if upcast:
-            Ar = Ar.to(torch.float32)
-            Br = B.unsqueeze(-1).to(torch.float32)
-        else:
-            Br = B.unsqueeze(-1)
-        out = true_div_func(Ar, Br)
-        if upcast:
-            out = out.to(torch.float16)
-        return torch.view_as_complex(out.contiguous())
-    else:
-        upcast = B.dtype == torch.complex32
-        br, bi = _complex_real_parts(B, upcast)
-        ar = A.to(br.dtype)
-        ai = torch.zeros_like(ar)
-        real, imag = true_div_complex_kernel(ar, ai, br, bi)
-        if upcast:
-            real, imag = real.to(torch.float16), imag.to(torch.float16)
-        return torch.view_as_complex(torch.stack((real, imag), dim=-1))
-
-
 def _same_layout_out0(A, B):
     if A.is_floating_point() and B.dtype == A.dtype and B.shape == A.shape:
         return torch.empty_like(A)
@@ -432,8 +390,10 @@ def true_divide(A, B):
             return _rational_true_divide(A, B)
         return _scalar_over_complex(A, B)
     if isinstance(A, torch.Tensor) and isinstance(B, torch.Tensor):
-        if A.is_complex() or B.is_complex():
-            return _true_divide_complex_tensors(A, B)
+        # NOTE: complex operands are already handled above (A complex ->
+        # _complex_true_divide, B complex -> _rational_true_divide /
+        # _scalar_over_complex), so both A and B are guaranteed non-complex
+        # real tensors here.
         kernel = true_div_func
         if (
             A.dtype in (torch.float16, torch.float32)
@@ -498,7 +458,9 @@ def true_divide_out(A, B, out):
         return true_div_func_scalar_tensor(A, B, out0=out)
     else:
         # Both scalar
-        return torch.tensor(A / B) if out is None else out.fill_(A / B)
+        if out is None:
+            return torch.tensor(A / B)
+        return _fill_scalar(out, A / B)
 
 
 def true_divide_(A, B):
