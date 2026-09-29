@@ -17,6 +17,7 @@ import logging
 import torch
 import triton
 
+from flag_gems.ops.copy import copy_ as _generic_copy_
 from flag_gems.ops.fix import _copy_kernel, _fix_trunc_kernel
 
 from ..utils.tle_copy import tle_copy
@@ -24,6 +25,26 @@ from .copy import copy_ as gems_copy_
 from .trunc import trunc as gems_trunc
 
 logger = logging.getLogger("flag_gems.ops.fix")
+
+
+def _ensure_contiguous(t: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous view of ``t`` without any torch copy fallback.
+
+    Contiguous inputs are returned unchanged.  For strided / transposed inputs
+    the strided read is materialized into a freshly allocated contiguous buffer
+    using the generic gems Triton pointwise copy (``flag_gems.ops.copy.copy_``),
+    which casts/gathers the strided source in a single pass.  This mirrors the
+    ``_triton_copy_`` regularization already used by the in-place ``fix_`` but
+    avoids both the bare ``.contiguous()`` torch fallback and the vendor
+    ``copy_slice`` strided-wedge path.
+    """
+    if t.is_contiguous():
+        return t
+    dst = torch.empty(t.shape, dtype=t.dtype, device=t.device)
+    if t.numel() == 0:
+        # gems copy_ redispatches to aten on empty dst; contents are irrelevant.
+        return dst
+    return _generic_copy_(dst, t)
 
 
 def _fix_complex(self: torch.Tensor) -> torch.Tensor:
@@ -54,8 +75,12 @@ def fix(self: torch.Tensor):
     if self.is_complex():
         return _fix_complex(self)
 
-    out = torch.empty_like(self)
-    _launch_fix_kernel(self, out)
+    # The flat trunc/copy kernel requires contiguous operands.  Regularize a
+    # non-contiguous input and always allocate a contiguous output (empty_like
+    # would inherit self's strides for a non-contiguous self).
+    x = _ensure_contiguous(self)
+    out = torch.empty(self.shape, dtype=self.dtype, device=self.device)
+    _launch_fix_kernel(x, out)
     return out
 
 
@@ -69,5 +94,14 @@ def fix_out(self: torch.Tensor, out: torch.Tensor):
             gems_copy_(out_real, src_real)
         return out
 
-    _launch_fix_kernel(self, out)
+    x = _ensure_contiguous(self)
+    if out.is_contiguous():
+        _launch_fix_kernel(x, out)
+    else:
+        # Kernel can only write a contiguous buffer; compute into a contiguous
+        # scratch then write through to the strided out (identity preserved).
+        scratch = torch.empty(out.shape, dtype=out.dtype, device=out.device)
+        _launch_fix_kernel(x, scratch)
+        if out.numel() != 0:
+            _generic_copy_(out, scratch)
     return out
