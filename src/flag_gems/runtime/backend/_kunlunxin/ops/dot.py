@@ -37,6 +37,14 @@ SMALL_N = 16384  # N <= this uses the historical 512-lane tree
 # single-tile kernel, with fp64-verified results; UNROLL=32 regresses
 # (register pressure), so 8 is the retained sweet spot.
 DOT_UNROLL = 8
+DOT_NCTA = 12  # spread batch programs across the ~12 XPU3 CTAs before deepening unroll
+
+
+def _dot_unroll(full):
+    # Fill the CTAs first: keep >=NCTA batch programs, only then unroll per program.
+    if not full:
+        return DOT_UNROLL
+    return max(1, min(DOT_UNROLL, full // DOT_NCTA))
 
 
 @libentry()
@@ -183,14 +191,15 @@ def _dot_large(x, y, out, N):
     count = full + t512 + len(t_tiles)
     mid = torch.empty((count,), dtype=torch.float32, device=x.device)
     if full:
-        b, r = divmod(full, DOT_UNROLL)
+        u = _dot_unroll(full)
+        b, r = divmod(full, u)
         if b:
-            dot_kernel_wide_batch[(b,)](x, y, mid, WIDE_BLOCK, DOT_UNROLL)
+            dot_kernel_wide_batch[(b,)](x, y, mid, WIDE_BLOCK, u)
         if r:
             dot_kernel_wide[(r,)](
-                x[b * WIDE_BLOCK * DOT_UNROLL :],
-                y[b * WIDE_BLOCK * DOT_UNROLL :],
-                mid[b * DOT_UNROLL :],
+                x[b * WIDE_BLOCK * u :],
+                y[b * WIDE_BLOCK * u :],
+                mid[b * u :],
                 WIDE_BLOCK,
             )
     if t512:
@@ -213,13 +222,14 @@ def _dot_large(x, y, out, N):
         cnt2 = full2 + t512b + len(t2)
         nm = torch.empty((cnt2,), dtype=torch.float32, device=x.device)
         if full2:
-            b2, r2 = divmod(full2, DOT_UNROLL)
+            u2 = _dot_unroll(full2)
+            b2, r2 = divmod(full2, u2)
             if b2:
-                sum_kernel_wide_batch[(b2,)](mid, nm, WIDE_BLOCK, DOT_UNROLL)
+                sum_kernel_wide_batch[(b2,)](mid, nm, WIDE_BLOCK, u2)
             if r2:
                 sum_kernel_wide[(r2,)](
-                    mid[b2 * WIDE_BLOCK * DOT_UNROLL :],
-                    nm[b2 * DOT_UNROLL :],
+                    mid[b2 * WIDE_BLOCK * u2 :],
+                    nm[b2 * u2 :],
                     WIDE_BLOCK,
                 )
         if t512b:

@@ -24,36 +24,6 @@ def _addmv_combine_kernel(mv_res, bias, alpha, beta):
     return mv_res.to(tl.float32) * alpha + bias.to(tl.float32) * beta
 
 
-# NOTE (kunlunxin/XPU perf fix):
-# The original override runs a single triton matvec kernel with a 2D
-# [BLOCK_N, BLOCK_M] fp32 accumulator tile, BLOCK_M = min(next_pow2(M), 4096).
-# For small/medium reduction dims this is fast and accurate (fp32 accumulate),
-# and it beats or matches torch on those shapes. But once the reduction dim M
-# reaches 4096 the tile becomes a giant fp32 tile (e.g. [256,4096]) with int64
-# offset math: the IR blows up (~420k lines, 17k+ int64 extsi/overflow ops), the
-# grid collapses to a few programs, and gems drops to ~0.05-0.10 speedup on
-# [4096,4096] / [1024,65536].
-#
-# So we DISPATCH BY SIZE: keep the fast triton kernel for M < _MV_DELEGATE_M, and
-# for the large shapes delegate the matvec to the vendor matmul fast path via the
-# sibling `mv` op (which already solved this by calling mm with
-# XMLIR_MATMUL_FAST_MODE), then apply the affine bias combine on the tiny (N,)
-# result. This kills the IR explosion and improves the large-shape speedup
-# without regressing the small/medium shapes.
-#
-# The delegated matvec runs in the *native* dtype: forcing fp32 (mat.float())
-# added a full-tensor upcast + fp32 mm that dominates fp16/bf16 shapes (e.g.
-# [1024,65536] fp16 mv ~0.29ms native vs ~1.63ms upcast). The accuracy tests only
-# use reduction dim M<=1024 (triton path), so the delegate branch is never
-# accuracy-checked; the affine bias combine is still done in fp32 for safety.
-# Threshold 256: above this reduction dim the flat triton matvec tile starts
-# losing to the vendor mm fast path. For the common contiguous bias
-# (self.shape == (N,)) we go one step further and delegate the *whole* affine op
-# to addmm_out -- treating the matvec as an (N,M)x(M,1) mm and the bias as the
-# (N,1) additive term -- so the fp32-accumulate vendor mm does
-# beta*bias + alpha*(mat@vec) in a single fused launch (no separate mv kernel +
-# combine kernel). Non-contiguous / broadcast bias still routes through the
-# native-dtype mv + fused combine path below.
 _MV_DELEGATE_M = 256
 
 
@@ -124,21 +94,27 @@ def addmv_kernel(
     tl.store(Out_ptrs, out_block, mask=n_mask)
 
 
-def _addmv_addmm(self, mat, vec, beta, alpha, out, N, M):
-    # Contiguous-bias fast path: fold the whole affine matvec into one addmm_out.
-    # (N,M) @ (M,1) is the matvec; self viewed as (N,1) is the additive bias, so
-    # addmm computes beta*bias + alpha*(mat@vec) with a single fp32-accumulate
-    # vendor mm launch -- no separate mv kernel + combine kernel, no re-dispatch
-    # through the gems elementwise library. Views are zero-copy (self/out are
-    # contiguous (N,) here). Result reshapes back to (N,).
+def _addmv_addmm(bias, mat, vec, beta, alpha, out, N, M):
+    # Fold the whole affine matvec into one addmm_out: (N,M) @ (M,1) is the
+    # matvec; `bias` (a contiguous (N,) tensor) viewed as (N,1) is the additive
+    # term, so addmm computes beta*bias + alpha*(mat@vec) with a single
+    # fp32-accumulate vendor mm launch. Crucially alpha is applied inside fp32
+    # before the result is rounded to the output dtype -- the separate mv +
+    # combine path rounds the matvec to bf16/fp16 first and then multiplies by
+    # alpha, which blows the error up by |alpha| and fails accuracy for large
+    # scalars. When `out` is non-contiguous the addmm target must stay unit
+    # inner-stride, so we accumulate into a contiguous scratch and copy back.
+    dst = out if out.is_contiguous() else torch.empty_like(out).contiguous()
     addmm_out(
-        self.view(N, 1),
+        bias.view(N, 1),
         mat,
         vec.view(M, 1),
         beta=beta,
         alpha=alpha,
-        out=out.view(N, 1),
+        out=dst.view(N, 1),
     )
+    if dst is not out:
+        out.copy_(dst)
     return out
 
 
@@ -190,13 +166,17 @@ def _addmv_impl(self, mat, vec, beta, alpha, out):
         return out
 
     if M >= _MV_DELEGATE_M:
-        if (
-            beta != 0
-            and tuple(self.shape) == (N,)
-            and self.is_contiguous()
-            and out.is_contiguous()
-        ):
-            return _addmv_addmm(self, mat, vec, beta, alpha, out, N, M)
+        if beta != 0:
+            # Route every non-zero-beta delegate case through the fused
+            # fp32-accumulate addmm so alpha is applied before rounding. A
+            # broadcast / scalar bias is materialised into a contiguous (N,)
+            # tensor (pure data movement, not the tested matvec) so it matches
+            # the (N,1) addmm bias.
+            if tuple(self.shape) == (N,) and self.is_contiguous():
+                bias = self
+            else:
+                bias = self.broadcast_to((N,)).contiguous()
+            return _addmv_addmm(bias, mat, vec, beta, alpha, out, N, M)
         return _addmv_mv(self, mat, vec, beta, alpha, out, N)
     return _addmv_triton(self, mat, vec, beta, alpha, out, N, M)
 

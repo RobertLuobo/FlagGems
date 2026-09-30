@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import logging
 
 import triton
 
+from ..utils.codegen_config_utils import get_codegen_config
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
 
+_config = copy.deepcopy(get_codegen_config())
+_config.unroll_num = 4
 
-@pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")])
+
+@pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")], config=_config)
 @triton.jit
 def bitwise_left_shift_kernel(a, b):
     return a << b

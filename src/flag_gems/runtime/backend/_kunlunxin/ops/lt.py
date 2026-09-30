@@ -32,11 +32,55 @@ def lt_func(x, y):
     return x.to(tl.float32) < y
 
 
+# lt.Tensor small/mid same-shape single-tile fast path (cap re-derived
+# empirically on XPU3: the generic pointwise_dynamic host layer dominates small
+# shapes, a single-tile hand kernel keeps the same CmpF-fusion device path with
+# none of that overhead). Cap is the largest power-of-2 where the hand kernel
+# strictly wins on ALL dtypes in the aligned worst case (fp32 loses at 2^20).
+# lt is NOT symmetric: x_ptr=A (self), y_ptr=B (other), compare x < y.
+_LT_T_SMALL_NUMEL = 524288
+
+
+@triton.jit
+def lt_tensor_small_kernel(out_ptr, x_ptr, y_ptr, numel, TILE: tl.constexpr):
+    tid = tl.arange(0, TILE)
+    mask = tid < numel
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    y = tl.load(y_ptr + tid, mask=mask).to(tl.float32)
+    tl.store(out_ptr + tid, (x < y).to(tl.int8), mask=mask)
+
+
+def _lt_tensor_small(A, B):
+    numel = A.numel()
+    out = torch.empty(numel, dtype=torch.int8, device=A.device)
+    TILE = triton.next_power_of_2(numel)
+    lt_tensor_small_kernel[(1,)](
+        out,
+        A.reshape(-1),
+        B.reshape(-1),
+        numel,
+        TILE=TILE,
+        num_warps=4,
+        isCloseMemoryAsync=False,
+    )
+    return out.view(torch.bool).reshape(A.shape)
+
+
 def lt(A, B):
     logger.debug("GEMS_KUNLUNXIN LT")
     os.environ["TRITONXPU_COMPARE_FUSION"] = "1"
     os.environ["TRITONXPU_FP16_FAST"] = "1"
-    res = lt_func(A, B)
+    if (
+        0 < A.numel() <= _LT_T_SMALL_NUMEL
+        and A.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and A.dtype == B.dtype
+        and A.shape == B.shape
+        and A.is_contiguous()
+        and B.is_contiguous()
+    ):
+        res = _lt_tensor_small(A, B)
+    else:
+        res = lt_func(A, B)
     del os.environ["TRITONXPU_COMPARE_FUSION"]
     del os.environ["TRITONXPU_FP16_FAST"]
     return res

@@ -750,12 +750,14 @@ class InstanceNorm(torch.autograd.Function):
                         TILE_N=8192,
                         HAS_WEIGHT_BIAS=has_weight_bias,
                     )
-                elif N in (64, 128) and (N & (N - 1)) == 0:
+                elif N == 64:
                     # Exact-width multi-row kernel (single-pass). Measured fastest
-                    # on XPU for these row widths (64/128); TILE_M is restricted:
-                    # non-power-of-2 TILE_M miscompiles, TILE_M=1 is wrong for the
-                    # weight path, and TILE_M >= 64 faults (fp32), so TILE_M is a
-                    # power of two in [2, 32].
+                    # on XPU only for the narrowest width (N=64); wider rows (incl.
+                    # N=128) are faster through the one-row-per-program generic
+                    # scan below. TILE_M is restricted: non-power-of-2 TILE_M
+                    # miscompiles, TILE_M=1 is wrong for the weight path, and
+                    # TILE_M >= 64 faults (fp32), so TILE_M is a power of two in
+                    # [2, 32].
                     tile_m = 1 << (min(8192 // N, M).bit_length() - 1)
                     tile_m = max(2, min(tile_m, 32))
                     grid = (triton.cdiv(M, tile_m), 1, 1)
@@ -774,8 +776,13 @@ class InstanceNorm(torch.autograd.Function):
                         HAS_WEIGHT_BIAS=has_weight_bias,
                     )
                 else:
-                    # Generic wide-tile scan for the remaining row widths.
-                    grid = (12, 1, 1)
+                    # Generic wide-tile scan for the remaining row widths. One
+                    # program per instance row (XBLOCK=1) so all M rows map to
+                    # independent programs; this fills far more XPU cores than
+                    # the old 12-program grid (which left ~cdiv(M,12) rows per
+                    # program and only ~M/XBLOCK active programs) and is
+                    # measured fastest across the benchmark row widths.
+                    grid = (M, 1, 1)
                     instancenorm_fwd_kernel_xpu[grid](
                         x,
                         y,
@@ -787,7 +794,7 @@ class InstanceNorm(torch.autograd.Function):
                         N,
                         C,
                         eps,
-                        XBLOCK=triton.next_power_of_2(triton.cdiv(M, 12)),
+                        XBLOCK=1,
                         RBLOCK=8192,
                         HAS_WEIGHT_BIAS=has_weight_bias,
                         isCloseUnrollControl=True,

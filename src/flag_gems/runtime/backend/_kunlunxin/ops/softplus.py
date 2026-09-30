@@ -58,6 +58,46 @@ def softplus_func_beta1(x, beta, threshold):
     return soft_z.to(x.dtype)
 
 
+# Small-shape fast path. At small numel the generic pointwise_dynamic host
+# layer (dynamic shape/stride analysis, task build, grid compute, arg packing)
+# dominates; a single-tile hand kernel keeps the same device math with none of
+# that overhead. Semantics are identical to softplus_func
+# (where(z>threshold, z, log(1+exp(z)))/beta), so the large-x threshold branch
+# and all beta values match torch. Only contiguous float tensors with
+# numel<=cap are taken; everything else falls through to the generic paths.
+# Cap 65536: above it the single masked tile loses to the generic autogrid
+# vectorized DMA (measured across fp16/fp32/bf16).
+_SOFTPLUS_SMALL_NUMEL = 65536
+
+
+@triton.jit
+def softplus_small_kernel(out_ptr, x_ptr, beta, threshold, numel, TILE: tl.constexpr):
+    tid = tl.arange(0, TILE)
+    mask = tid < numel
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    z = x * beta
+    soft_z = tl.where(z > threshold, z, tl.log(1.0 + tl.exp(z)))
+    out = soft_z / beta
+    tl.store(out_ptr + tid, out.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def _softplus_small(self, beta, threshold):
+    numel = self.numel()
+    out = torch.empty_like(self)
+    TILE = triton.next_power_of_2(numel)
+    with torch_device_fn.device(self.device):
+        softplus_small_kernel[(1,)](
+            out.reshape(-1),
+            self.reshape(-1),
+            float(beta),
+            float(threshold),
+            numel,
+            TILE=TILE,
+            num_warps=4,
+        )
+    return out
+
+
 # (numel_upper_bound, BLOCK_SIZE, num_warps), following log_sigmoid_forward.
 _TIERS = (
     (2048, 1024, 4),
@@ -105,6 +145,12 @@ def softplus_backward_kernel(
 
 def softplus(self, beta=1.0, threshold=20.0):
     logger.debug("GEMS_KUNLUNXIN SOFTPLUS")
+    if (
+        0 < self.numel() <= _SOFTPLUS_SMALL_NUMEL
+        and self.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and self.is_contiguous()
+    ):
+        return _softplus_small(self, float(beta), float(threshold))
     # beta==1 && threshold>=17: guard is redundant (log(1+exp(z))==z within
     # fp32/fp16/bf16 tolerance), so skip it and the per-element division.
     if float(beta) == 1.0 and float(threshold) >= 17.0:

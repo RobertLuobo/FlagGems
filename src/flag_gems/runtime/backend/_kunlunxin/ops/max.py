@@ -23,6 +23,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
+from .copy import copy_
+
 logger = logging.getLogger(__name__)
 
 _FULL_REDUCTION_BLOCK_SIZE = 8192
@@ -131,6 +133,37 @@ def max_kernel_2d_pk(
         tl.store(out_value, (key64 ^ 0x80000000).to(tl.uint32).to(tl.int32))
 
 
+@libentry()
+@triton.jit
+def max_value_kernel_2d(
+    inp,
+    out_value,
+    M,
+    N,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # Value-only row max over a contiguous, floor-padded [M, N] input. The
+    # full (dim=None) reduction never needs the argmax, so this path skips the
+    # int64 key packing / bit manipulation that max_kernel_2d_pk pays per
+    # element and reduces in the native dtype with a plain tl.max. Every load
+    # is mask-free (the launcher pads rows/columns to the tile with the dtype
+    # floor), so no XPU masked-memory slow path or OOB-into-reduction leak is
+    # possible. acc is seeded from the first (always in-bounds) column tile so
+    # no dtype-specific identity constant is needed.
+    pid = ext.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
+    inp = inp + rows * N
+    out_value = out_value + rows
+
+    ar = tl.arange(0, BLOCK_N)
+    acc = tl.max(tl.load(inp + ar[None, :]), axis=1)[:, None]
+    for off in range(BLOCK_N, N, BLOCK_N):
+        a = tl.load(inp + (off + ar)[None, :])
+        acc = tl.maximum(acc, tl.max(a, axis=1)[:, None])
+    tl.store(out_value, acc)
+
+
 def _max_flat(inp1d, out, device):
     """Full (dim=None) reduction. The flat buffer is viewed as rows of 8192
     elements over a row-padded matrix (floor-filled) and reduced with the
@@ -140,7 +173,6 @@ def _max_flat(inp1d, out, device):
     block = _FULL_REDUCTION_BLOCK_SIZE
     numel = inp1d.numel()
     dtype = inp1d.dtype
-    kind = 2 if dtype == torch.int64 else (0 if dtype.is_floating_point else 1)
     floor = _dtype_floor(dtype)
     is_fp32 = dtype == torch.float32
 
@@ -151,11 +183,10 @@ def _max_flat(inp1d, out, device):
         # only one real row: use a 2-row padded tile so BLOCK_M >= 2
         n_pow2 = triton.next_power_of_2(numel)
         pad = torch.full((2, n_pow2), floor, dtype=dtype, device=device)
-        torch.ops.aten._copy_from(inp1d, pad[0, :numel].reshape(-1), False)
+        copy_(pad[0, :numel].reshape(-1), inp1d)
         tmp_v = torch.empty((2,), dtype=dtype, device=device)
-        tmp_i = torch.empty((2,), dtype=torch.int64, device=device)
-        max_kernel_2d_pk[(1, 1)](
-            pad, tmp_v, tmp_i, 2, n_pow2, kind, 2, n_pow2, buffer_size_limit=2048
+        max_value_kernel_2d[(1, 1)](
+            pad, tmp_v, 2, n_pow2, 2, n_pow2, buffer_size_limit=2048
         )
         out[()] = tmp_v[0]
         return
@@ -164,12 +195,11 @@ def _max_flat(inp1d, out, device):
     # power of two, so the tile is exact). The flat copy fills rows in order;
     # tail columns of the last row keep the floor fill.
     pad = torch.full((Mr, block), floor, dtype=dtype, device=inp1d.device)
-    torch.ops.aten._copy_from(inp1d, pad.reshape(-1)[:numel], False)
+    copy_(pad.reshape(-1)[:numel], inp1d)
     mid = torch.empty((Mr,), dtype=dtype, device=device)
-    mid_idx = torch.empty((Mr,), dtype=torch.int64, device=device)
     bn = 1024 if not is_fp32 else 256
-    max_kernel_2d_pk[(Mr // bm, 1)](
-        pad, mid, mid_idx, Mr, block, kind, bm, bn, buffer_size_limit=2048
+    max_value_kernel_2d[(Mr // bm, 1)](
+        pad, mid, Mr, block, bm, bn, buffer_size_limit=2048
     )
     _reduce_mid(mid, out, device)
 
@@ -182,7 +212,6 @@ def _reduce_mid(mid, out, device):
     padded row-major trick."""
     block = _FULL_REDUCTION_BLOCK_SIZE
     dtype = mid.dtype
-    kind = 2 if dtype == torch.int64 else (0 if dtype.is_floating_point else 1)
     floor = _dtype_floor(dtype)
     is_fp32 = dtype == torch.float32
     while mid.numel() > block:
@@ -190,22 +219,20 @@ def _reduce_mid(mid, out, device):
         bm = next((m for m in (128, 64, 32, 256, 16, 8, 4, 2) if rows % m == 0), 2)
         Mr = triton.cdiv(rows, bm) * bm
         pad = torch.full((Mr, block), floor, dtype=dtype, device=device)
-        torch.ops.aten._copy_from(mid, pad.reshape(-1)[: mid.numel()], False)
+        copy_(pad.reshape(-1)[: mid.numel()], mid)
         nxt = torch.empty((Mr,), dtype=dtype, device=device)
-        nxt_idx = torch.empty((Mr,), dtype=torch.int64, device=device)
         bn = 1024 if not is_fp32 else 256
-        max_kernel_2d_pk[(Mr // bm, 1)](
-            pad, nxt, nxt_idx, Mr, block, kind, bm, bn, buffer_size_limit=1024
+        max_value_kernel_2d[(Mr // bm, 1)](
+            pad, nxt, Mr, block, bm, bn, buffer_size_limit=1024
         )
         mid = nxt
     n = mid.numel()
     n_pow2 = triton.next_power_of_2(n)
     pad = torch.full((2, n_pow2), floor, dtype=dtype, device=device)
-    torch.ops.aten._copy_from(mid, pad[0, :n].reshape(-1), False)
+    copy_(pad[0, :n].reshape(-1), mid)
     tmp_v = torch.empty((2,), dtype=dtype, device=device)
-    tmp_i = torch.empty((2,), dtype=torch.int64, device=device)
-    max_kernel_2d_pk[(1, 1)](
-        pad, tmp_v, tmp_i, 2, n_pow2, kind, 2, n_pow2, buffer_size_limit=1024
+    max_value_kernel_2d[(1, 1)](
+        pad, tmp_v, 2, n_pow2, 2, n_pow2, buffer_size_limit=1024
     )
     out[()] = tmp_v[0]
 
@@ -241,21 +268,21 @@ def max_dim(inp, dim=None, keepdim=False):
 
     if N == 1:
         # The reduced dim has size 1: values are the identity and indices are
-        # all 0. Use the native strided-copy engine (flag_gems does not
-        # override `_copy_from`) instead of a reduction kernel; this also
-        # bypasses the head kernel's [BLOCK_M, N=1] reduction tile, which
-        # fails to compile on this XPU (uni_sram OOM in TritonXPUCoreTiling).
+        # all 0. Use the kunlunxin triton strided-copy instead of a reduction
+        # kernel; this also bypasses the head kernel's [BLOCK_M, N=1] reduction
+        # tile, which fails to compile on this XPU (uni_sram OOM in
+        # TritonXPUCoreTiling).
         out_index.fill_(0)
         with torch_device_fn.device(inp.device):
-            torch.ops.aten._copy_from(inp, out_value, False)
+            copy_(out_value, inp)
         if not keepdim:
             out_value = torch.squeeze(out_value, dim)
             out_index = torch.squeeze(out_index, dim)
         return Max_out(values=out_value, indices=out_index)
 
     # Reorder so the reduced dim is innermost (dim_compress order), then make
-    # it physically contiguous with the native strided-copy engine instead of
-    # the much slower gems `.contiguous()`. The kernel then runs over the
+    # it physically contiguous with the kunlunxin triton strided-copy instead
+    # of the much slower gems `.contiguous()`. The kernel then runs over the
     # folded [M*K, N] view: the index inside the reduced dim is unchanged by
     # the fold and the output flat index m*K + k matches the (M, 1, K) layout.
     dim_i = inp.dim()
@@ -267,7 +294,7 @@ def max_dim(inp, dim=None, keepdim=False):
     else:
         src = torch.empty((inp.numel() // N, N), dtype=dtype, device=inp.device)
         with torch_device_fn.device(inp.device):
-            torch.ops.aten._copy_from(view.reshape(inp.numel() // N, N), src, False)
+            copy_(src, view.reshape(inp.numel() // N, N))
     M2 = src.shape[0]  # M * K rows
 
     is_fp32 = dtype == torch.float32
@@ -303,7 +330,7 @@ def max_dim(inp, dim=None, keepdim=False):
             Mr = triton.cdiv(M2, block_m) * block_m
             Np = triton.cdiv(N, block_n) * block_n
             pad = torch.full((Mr, Np), floor, dtype=dtype, device=inp.device)
-            torch.ops.aten._copy_from(src, pad[:M2, :N], False)
+            copy_(pad[:M2, :N], src)
             out_vp = torch.empty((Mr,), dtype=dtype, device=inp.device)
             out_ip = torch.empty((Mr,), dtype=torch.int64, device=inp.device)
             grid = (Mr // block_m,)

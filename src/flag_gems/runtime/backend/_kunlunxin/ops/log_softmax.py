@@ -170,7 +170,7 @@ FWD_CHUNK_BN = 8192  # big-N chunk width (tl.sum/tl.max lane-safety bound)
 FWD_TAIL_PIECE = 4096  # masked 1D tail pieces kept <= 4096 lanes (exact)
 # TILE_M buckets per N (probed XPU 5). Non-power-of-2 N < 64 needs TILE_M>=64
 # to compile correctly; handled in the dispatch.
-FWD_N_TILE_M = [(16, 64), (64, 32), (256, 16), (1024, 16), (4096, 8)]
+FWD_N_TILE_M = [(16, 64), (64, 32), (256, 64), (1024, 32), (4096, 8)]
 
 
 @libentry()
@@ -262,7 +262,7 @@ FWD_CHUNK_BN = 8192  # big-N chunk width (tl.sum/tl.max lane-safety bound)
 FWD_TAIL_PIECE = 4096  # masked 1D tail pieces kept <= 4096 lanes (exact)
 # TILE_M buckets per N (probed XPU 5). Non-power-of-2 N < 64 needs TILE_M>=64
 # to compile correctly; handled in the dispatch.
-FWD_N_TILE_M = [(16, 64), (64, 32), (256, 16), (1024, 16), (4096, 8)]
+FWD_N_TILE_M = [(16, 64), (64, 32), (256, 64), (1024, 32), (4096, 8)]
 FWD_KEY_MAX_N = 64  # singlepass rows wider than this use the exact tl.max
 
 
@@ -700,8 +700,6 @@ def _pow2_tail_pieces(n, cap=FWD_TAIL_PIECE):
 
 
 def _fwd_chunk_split(out, inp, M, N):
-    # the wide-chunk path keeps the int-key max for fp16/fp32 (measured 1.42x)
-    # but not for bf16, where it is numerically wrong (FWD_KEY_MAX_N above).
     use_key = inp.dtype != torch.bfloat16
     c_full = N // FWD_CHUNK_BN
     taillen = N - c_full * FWD_CHUNK_BN

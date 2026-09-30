@@ -57,18 +57,30 @@ def _triu_flat_kernel(
     N: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NEED_MASK: tl.constexpr,
+    USE_SHIFT: tl.constexpr,
+    LOG2N: tl.constexpr,
+    NMASK: tl.constexpr,
+    MNMASK: tl.constexpr,
 ):
     # Batched single-pass triu: keep where col >= row + diag, else write 0.
     # `% MN` folds the flat index into one matrix, so this works for any batch.
     # NEED_MASK is False only when total % BLOCK_SIZE == 0 (every block full),
     # which lets the load/store drop the always-true mask (slow masked-memory
     # path on this XPU).
+    # USE_SHIFT replaces the per-element integer div/mod (~157-186 GB/s ceiling
+    # on this XPU) with shift/and when N and MN are powers of 2 (all benchmark
+    # shapes), roughly doubling throughput.
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
-    matrix_offsets = offsets % MN
-    rows = matrix_offsets // N
-    cols = matrix_offsets - rows * N
+    if USE_SHIFT:
+        matrix_offsets = offsets & MNMASK
+        rows = matrix_offsets >> LOG2N
+        cols = matrix_offsets & NMASK
+    else:
+        matrix_offsets = offsets % MN
+        rows = matrix_offsets // N
+        cols = matrix_offsets - rows * N
     keep = cols >= rows + diag
 
     if NEED_MASK:
@@ -91,15 +103,23 @@ def _triu_flat_2d_kernel(
     N: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NEED_MASK: tl.constexpr,
+    USE_SHIFT: tl.constexpr,
+    LOG2N: tl.constexpr,
+    NMASK: tl.constexpr,
 ):
     # Single-matrix fast path: no `% MN`. Works out-of-place (in != out),
     # in-place (in == out), and over a contiguous top-row prefix of one matrix
     # (offsets stay within [0, M*N) so row = offset // N is exact).
+    # USE_SHIFT swaps div/mod for shift/and when N is a power of 2.
     pid = tl.program_id(0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
-    rows = offsets // N
-    cols = offsets - rows * N
+    if USE_SHIFT:
+        rows = offsets >> LOG2N
+        cols = offsets & NMASK
+    else:
+        rows = offsets // N
+        cols = offsets - rows * N
     keep = cols >= rows + diag
 
     if NEED_MASK:
@@ -152,6 +172,15 @@ def _triu_row_kernel(
 # (measured: BLOCK 1024 -> 8192 roughly halves latency on [4096,4096]).
 _BLOCK_SIZE = 8192
 
+# Shift/and fast path uses a much larger tile (block-DMA regime, ~330-620 GB/s
+# vs ~180 GB/s for the small-tile div/mod path).
+_SHIFT_BLOCK_SIZE = 65536
+
+
+def _is_pow2(x):
+    return x > 0 and (x & (x - 1)) == 0
+
+
 # Route to the per-row kernel when the last dim is at least this wide. Below it
 # the flat kernel wins (row grid becomes launch-bound); at/above it the per-row
 # kernel wins by dropping the per-element div/mod. [1024,1024] flat wins,
@@ -164,6 +193,30 @@ def _launch_flat(input_c, out, diagonal, total=None):
     MN = M * N
     if total is None:
         total = input_c.numel()
+    # Fast path: N (and MN for the batched fold) power-of-2 -> shift/and instead
+    # of per-element div/mod, in a large block-DMA tile. Covers all benchmark
+    # shapes and roughly doubles throughput over the div/mod kernels. Only worth
+    # it once there is enough work to fill the block-DMA tile; tiny tensors are
+    # launch-bound and stay on the small-tile path (no regression).
+    if total >= _SHIFT_BLOCK_SIZE and _is_pow2(N) and _is_pow2(MN):
+        log2n = N.bit_length() - 1
+        # Cap the tile at the work size so tiny tensors don't launch a huge
+        # (mostly-masked) block; large tensors get the full block-DMA tile.
+        block = min(_SHIFT_BLOCK_SIZE, triton.next_power_of_2(total))
+        grid = (triton.cdiv(total, block),)
+        need_mask = total % block != 0
+        with torch_device_fn.device(input_c.device):
+            if total <= MN:
+                _triu_flat_2d_kernel[grid](
+                    input_c, out, total, diagonal, N, block, need_mask,
+                    True, log2n, N - 1, num_warps=8,
+                )
+            else:
+                _triu_flat_kernel[grid](
+                    input_c, out, total, diagonal, MN, N, block, need_mask,
+                    True, log2n, N - 1, MN - 1, num_warps=8,
+                )
+        return
     if N >= _ROW_N_THRESHOLD:
         # Large N: one program per row (avoids per-element div/mod). `total` may
         # be a top-row prefix (band_hi * N) -> that many rows; row = pid % M.
@@ -188,6 +241,9 @@ def _launch_flat(input_c, out, diagonal, total=None):
                 N,
                 _BLOCK_SIZE,
                 need_mask,
+                False,
+                0,
+                0,
                 num_warps=8,
             )
         else:
@@ -200,6 +256,10 @@ def _launch_flat(input_c, out, diagonal, total=None):
                 N,
                 _BLOCK_SIZE,
                 need_mask,
+                False,
+                0,
+                0,
+                0,
                 num_warps=8,
             )
 

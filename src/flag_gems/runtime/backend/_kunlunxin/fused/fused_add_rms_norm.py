@@ -210,6 +210,76 @@ def fused_add_rmsnorm_multirow_kernel(
     tl.store(X + offs, y.to(X.dtype.element_ty), mask=m_mask[:, None])
 
 
+@libentry()
+@triton.jit(do_not_specialize=["eps"])
+def fused_add_rmsnorm_tile2d_kernel(
+    X,  # pointer to the input (gets normalized output)
+    R,  # pointer to the residual (gets x + r)
+    W,  # pointer to the weight
+    eps,  # epsilon to avoid division by zero
+    TILE_M: tl.constexpr,  # rows per program (M % TILE_M == 0 guaranteed)
+    N: tl.constexpr,  # number of columns (normalized dim), used as tile width
+):
+    # Unmasked 2D multi-row tile, mirroring rms_norm's rms_norm_tile2d_kernel.
+    # Any mask involvement on the 2D row-tile makes XPU OffsetAnalysis give up on
+    # block-DMA and the kernel collapses (rms_norm measured [10000,256] tile:
+    # unmasked 292us vs masked 2.4ms). So this kernel is strictly unmasked and is
+    # only launched when M % TILE_M == 0 (no out-of-range rows). Columns span
+    # exactly [0, N) with N a constexpr -> tile is one stride-1 contiguous block.
+    pid = ext.program_id(0)
+
+    n_off = tl.arange(0, N)
+    w = tl.load(W + n_off).to(tl.float32)
+
+    m_off = pid * TILE_M + tl.arange(0, TILE_M)
+    offs = m_off[:, None] * N + n_off[None, :]
+
+    x = tl.load(X + offs).to(tl.float32)
+    r = tl.load(R + offs).to(tl.float32)
+    x += r
+    # write the residual sum back to R (in-place)
+    tl.store(R + offs, x.to(R.dtype.element_ty))
+
+    var = tl.sum(x * x, axis=1) / N
+    rrms = 1.0 / tl.sqrt(var + eps)
+
+    y = (x * rrms[:, None]).to(X.dtype.element_ty) * w[None, :]
+    # write the normalized output back to X (in-place)
+    tl.store(X + offs, y.to(X.dtype.element_ty))
+
+
+def _fused_tile_m(N, M):
+    """TILE_M for the unmasked 2D tile kernel, or None if not applicable.
+
+    The tile kernel is strictly unmasked (any mask collapses block-DMA on XPU),
+    so it is only valid when M % TILE_M == 0. Two [TILE_M, N] fp32 tiles are live
+    at once (X and R), so the tile budget is tighter than rms_norm's single-tile
+    kernel and we cap TILE_M at 32.
+      * N == 1 is excluded: a [TILE_M, 1] tile is inefficient; the existing
+        multi-row / per-row paths handle it at least as well (no regression).
+      * N > MULTIROW_N: only tile when at least 16 rows fit the per-tile budget
+        (tm >= 16). Otherwise (e.g. N=4096 -> tm=8) the narrow-tile 2D reduce is
+        slower than the per-row kernel, so fall through to per-row.
+    """
+    if N == 1:
+        return None
+    if N <= MULTIROW_N:
+        tm = builtins.min(32, _prev_pow2(builtins.max(1, TILE_BUDGET // N)))
+        while tm >= 1:
+            if M % tm == 0:
+                return tm
+            tm //= 2
+        return None
+    tm = builtins.min(32, _prev_pow2(32768 // N))
+    if tm < 16:
+        return None
+    while tm >= 16:
+        if M % tm == 0:
+            return tm
+        tm //= 2
+    return None
+
+
 def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
     """
     This function performs fused residual addition and RMS normalization **in-place**.
@@ -234,11 +304,31 @@ def fused_add_rms_norm(x, residual, normalized_shape, weight, eps=1e-5):
             fused_add_rmsnorm_kernel_tile[M,](
                 x, residual, weight, N, 1, N, 1, N, eps, BLOCK_SIZE, need_mask
             )
+        elif (TILE_M := _fused_tile_m(N, M)) is not None:
+            # Unmasked 2D tile fast path (mirrors rms_norm's tile2d kernel). Each
+            # program owns a [TILE_M, N] contiguous block -> XPU block DMA; the
+            # grid drops from M to M // TILE_M, so this both fixes the per-row
+            # launch-bound corner (small N, huge M) and avoids the masked
+            # multi-row block-DMA collapse. Requires M % TILE_M == 0 (guaranteed
+            # by _fused_tile_m) so all loads/stores are unmasked. Two full-tile
+            # stores (R then X): disable the XPU unroll/vectorize passes that
+            # otherwise fail on that store pattern (same kwargs as the multirow
+            # kernel below).
+            grid = (M // TILE_M,)
+            fused_add_rmsnorm_tile2d_kernel[grid](
+                x,
+                residual,
+                weight,
+                eps,
+                TILE_M,
+                N,
+                isCloseUnrollControl=True,
+                isCloseVectorization=True,
+            )
         elif N <= MULTIROW_N and M >= MULTIROW_M:
-            # Small N + many rows: the per-row kernel is launch-bound, so batch
-            # TILE_M rows per program to cut the grid from M to cdiv(M, TILE_M).
-            # Columns span exactly N (no padding) so the tile is one contiguous
-            # block -> block DMA. N is a constexpr for the same reason.
+            # Small N + many rows, M not divisible by any TILE_M candidate:
+            # batched masked multi-row fallback (correct, slower than the unmasked
+            # tile above, still better than per-row launches).
             TILE_M = _pick_tile_m(M, N)
             grid = (triton.cdiv(M, TILE_M),)
             # The 2D multirow kernel does two masked stores (R then X); the

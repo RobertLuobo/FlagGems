@@ -14,12 +14,57 @@
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
 
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
+
+# Small shapes route through a single-tile kernel that bypasses the
+# pointwise_dynamic host layer (dynamic shape/stride/broadcast analysis + task
+# build + arg packing), which dominates small numel on XPU3. Measured device
+# collapse point for this two-input exp/div op is numel=4096 (fp32 regresses);
+# 2048 is the largest safe power-of-2 cap with an all-dtype win.
+_FAST_CAP = 2048
+_FAST_DTYPES = (torch.float16, torch.float32, torch.bfloat16)
+
+
+@triton.jit
+def _log_sigmoid_backward_single_tile_kernel(
+    grad_ptr, self_ptr, out_ptr, numel, TILE: tl.constexpr
+):
+    tid = tl.arange(0, TILE)
+    mask = tid < numel
+    g = tl.load(grad_ptr + tid, mask=mask)
+    x = tl.load(self_ptr + tid, mask=mask).to(tl.float32)
+    z = tl.exp(-tl.abs(x))
+    r = 1.0 / (1.0 + z)
+    d = tl.where(x < 0.0, 1.0, z) * r
+    out = g.to(tl.float32) * d
+    tl.store(out_ptr + tid, out.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+def _fast_eligible(grad_output, self):
+    numel = grad_output.numel()
+    return (
+        0 < numel <= _FAST_CAP
+        and grad_output.dtype == self.dtype
+        and grad_output.dtype in _FAST_DTYPES
+        and grad_output.shape == self.shape
+        and grad_output.is_contiguous()
+        and self.is_contiguous()
+    )
+
+
+def _fast_launch(grad_output, self, out):
+    numel = grad_output.numel()
+    TILE = triton.next_power_of_2(numel)
+    _log_sigmoid_backward_single_tile_kernel[(1,)](
+        grad_output, self, out, numel, TILE=TILE, num_warps=4
+    )
+    return out
 
 
 @pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, 1, "DEFAULT")])
@@ -47,15 +92,15 @@ def log_sigmoid_backward(grad_output, self, buffer):
     logger.debug("GEMS_KUNLUNXIN LOG_SIGMOID_BACKWARD")
 
     del buffer
+    if _fast_eligible(grad_output, self):
+        return _fast_launch(grad_output, self, torch.empty_like(grad_output))
     return log_sigmoid_backward_kernel(grad_output, self)
 
 
 def log_sigmoid_backward_out(grad_output, self, buffer, *, grad_input):
     logger.debug("GEMS_KUNLUNXIN LOG_SIGMOID_BACKWARD_OUT")
 
-    # Always go through the tuned pointwise kernel (out0=grad_input writes in
-    # place). The previous dedicated contiguous kernel launched one 1024-element
-    # program per tile (16M elements -> 16384 tiny programs, ~94 GB/s) and was
-    # measured far slower than the pointwise path for every benchmark shape.
     del buffer
+    if _fast_eligible(grad_output, self) and grad_input.is_contiguous():
+        return _fast_launch(grad_output, self, grad_input)
     return log_sigmoid_backward_kernel(grad_output, self, out0=grad_input)

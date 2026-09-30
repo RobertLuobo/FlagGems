@@ -489,6 +489,9 @@ def _gather_backward_sum_kernel(
     i_t0,
     i_t1,
     i_t2,
+    id0,
+    id1,
+    id2,
     S,
     total,
     dim: tl.constexpr,
@@ -503,6 +506,7 @@ def _gather_backward_sum_kernel(
     cur = tl.minimum(oo, total - 1)
     n = tl.zeros((BLOCK_OUTPUT,), dtype=tl.int32)
     base = tl.zeros((BLOCK_OUTPUT,), dtype=tl.int32)
+    row_valid = ov  # non-dim output coords beyond index.shape get no gradient
     if ndim == 3:
         x2 = cur % d2
         cur = cur // d2
@@ -513,14 +517,17 @@ def _gather_backward_sum_kernel(
             n = x0
             base = x1 * i_t1 + x2 * i_t2
             sdim = i_t0
+            row_valid = row_valid & (x1 < id1) & (x2 < id2)
         elif dim == 1:
             n = x1
             base = x0 * i_t0 + x2 * i_t2
             sdim = i_t1
+            row_valid = row_valid & (x0 < id0) & (x2 < id2)
         else:
             n = x2
             base = x0 * i_t0 + x1 * i_t1
             sdim = i_t2
+            row_valid = row_valid & (x0 < id0) & (x1 < id1)
     else:
         x1 = cur % d1
         cur = cur // d1
@@ -529,16 +536,18 @@ def _gather_backward_sum_kernel(
             n = x0
             base = x1 * i_t1
             sdim = i_t0
+            row_valid = row_valid & (x1 < id1)
         else:
             n = x1
             base = x0 * i_t0
             sdim = i_t1
+            row_valid = row_valid & (x0 < id0)
     acc = tl.zeros((BLOCK_OUTPUT,), dtype=tl.float32)
     for jt in range(0, LOOP):
         j = jt * BLOCK_INDEX + tl.arange(0, BLOCK_INDEX)
         jm = j < S
         jc = tl.minimum(j, S - 1)
-        m = ov[:, None] & jm[None, :]
+        m = row_valid[:, None] & jm[None, :]
         off = base[:, None] + jc[None, :] * sdim
         gi = tl.load(index + off, mask=m, other=0)
         gv = tl.load(grad + off, mask=m, other=0.0).to(tl.float32)
@@ -700,6 +709,7 @@ def _gather_backward_sum(grad, self, dim, index_contiguous, result):
 
     out_shapes = list(self.shape) + pad
     idx_strides = index_strides + pad
+    idx_sizes = index_shape + pad
 
     BO, nw = 64, 4
     BI = min(512, max(32, triton.next_power_of_2(S)))
@@ -717,6 +727,9 @@ def _gather_backward_sum(grad, self, dim, index_contiguous, result):
         idx_strides[0],
         idx_strides[1],
         idx_strides[2],
+        idx_sizes[0],
+        idx_sizes[1],
+        idx_sizes[2],
         S,
         total,
         dim=dim,

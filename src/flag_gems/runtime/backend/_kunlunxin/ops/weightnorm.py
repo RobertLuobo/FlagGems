@@ -187,14 +187,20 @@ def _wn_row1d_kernel(output, norm, v, g, N: tl.constexpr, eps):
 # kernels and are ~25x faster than any launch-bound triton chunked reduction.
 def _wn_first_forward(output, norm, v, g, M, N):
     eps = torch.finfo(torch.float32).tiny
+    n_pow2 = (N & (N - 1)) == 0
     with torch_device_fn.device(v.device):
         if N <= _WN_TILE:
             TILE_M = _wn_fwd_tile_m(M, N)
-            need_mask = (M % TILE_M) != 0
-            grid = (triton.cdiv(M, TILE_M),)
-            _wn_multirow_kernel[grid](
-                output, norm, v, g, M, N, TILE_M, need_mask, eps, num_warps=4
-            )
+            # non-pow2 N 2D tile fails XPU lowering; route to 1-row kernel
+            if TILE_M >= 2 and n_pow2:
+                need_mask = (M % TILE_M) != 0
+                grid = (triton.cdiv(M, TILE_M),)
+                _wn_multirow_kernel[grid](
+                    output, norm, v, g, M, N, TILE_M, need_mask, eps, num_warps=4
+                )
+            else:
+                grid = (M,)
+                _wn_row1d_kernel[grid](output, norm, v, g, N, eps, num_warps=2)
         else:
             # N > 8192: a triton per-row reduction needs >=2 chunks/row, but
             # tl.sum caps at 8192 lanes and a chunked [K, TILE] tile hits the
