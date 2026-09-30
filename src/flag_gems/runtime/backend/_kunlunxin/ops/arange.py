@@ -114,7 +114,7 @@ def arange_start(
         BLOCK_SIZE = 4096
         num_warps = 8
     else:
-        BLOCK_SIZE = 16384
+        BLOCK_SIZE = 32768 // dtype.itemsize
         num_warps = 8
 
     grid = triton.cdiv(size, BLOCK_SIZE)

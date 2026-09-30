@@ -24,8 +24,6 @@ def _addmv_combine_kernel(mv_res, bias, alpha, beta):
     return mv_res.to(tl.float32) * alpha + bias.to(tl.float32) * beta
 
 
-#
-#
 _MV_DELEGATE_M = 256
 
 
@@ -96,15 +94,27 @@ def addmv_kernel(
     tl.store(Out_ptrs, out_block, mask=n_mask)
 
 
-def _addmv_addmm(self, mat, vec, beta, alpha, out, N, M):
+def _addmv_addmm(bias, mat, vec, beta, alpha, out, N, M):
+    # Fold the whole affine matvec into one addmm_out: (N,M) @ (M,1) is the
+    # matvec; `bias` (a contiguous (N,) tensor) viewed as (N,1) is the additive
+    # term, so addmm computes beta*bias + alpha*(mat@vec) with a single
+    # fp32-accumulate vendor mm launch. Crucially alpha is applied inside fp32
+    # before the result is rounded to the output dtype -- the separate mv +
+    # combine path rounds the matvec to bf16/fp16 first and then multiplies by
+    # alpha, which blows the error up by |alpha| and fails accuracy for large
+    # scalars. When `out` is non-contiguous the addmm target must stay unit
+    # inner-stride, so we accumulate into a contiguous scratch and copy back.
+    dst = out if out.is_contiguous() else torch.empty_like(out).contiguous()
     addmm_out(
-        self.view(N, 1),
+        bias.view(N, 1),
         mat,
         vec.view(M, 1),
         beta=beta,
         alpha=alpha,
-        out=out.view(N, 1),
+        out=dst.view(N, 1),
     )
+    if dst is not out:
+        out.copy_(dst)
     return out
 
 
@@ -156,13 +166,17 @@ def _addmv_impl(self, mat, vec, beta, alpha, out):
         return out
 
     if M >= _MV_DELEGATE_M:
-        if (
-            beta != 0
-            and tuple(self.shape) == (N,)
-            and self.is_contiguous()
-            and out.is_contiguous()
-        ):
-            return _addmv_addmm(self, mat, vec, beta, alpha, out, N, M)
+        if beta != 0:
+            # Route every non-zero-beta delegate case through the fused
+            # fp32-accumulate addmm so alpha is applied before rounding. A
+            # broadcast / scalar bias is materialised into a contiguous (N,)
+            # tensor (pure data movement, not the tested matvec) so it matches
+            # the (N,1) addmm bias.
+            if tuple(self.shape) == (N,) and self.is_contiguous():
+                bias = self
+            else:
+                bias = self.broadcast_to((N,)).contiguous()
+            return _addmv_addmm(bias, mat, vec, beta, alpha, out, N, M)
         return _addmv_mv(self, mat, vec, beta, alpha, out, N)
     return _addmv_triton(self, mat, vec, beta, alpha, out, N, M)
 

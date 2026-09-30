@@ -12,20 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kunlunxin (XPU) override of uniform_.
-#
-# The kernel was decorated with @triton.heuristics(get_heuristic_config("uniform")),
-# letting the heuristic supply BLOCK *and* num_warps at launch time. On the XPU
-# triton fork this heuristic-supplied launch path is pathologically slow /
-# intermittent (IR baseline harness/perf_ir_3/ir-uniform_-dev0.log: many shapes
-# stall at ~2400-3200 ms, gems speedup 0.000-0.001, even large shapes flip between
-# ~4.5 ms and ~2600 ms across runs).
-#
-# Launching the *same* kernel with BLOCK and num_warps passed explicitly from
-# Python (heuristic decorator removed) is robustly fast at every size. So this
-# override drops the decorator and computes the launch config in the Python
-# wrapper, mirroring the "uniform" heuristic values exactly. Kernel body /
-# algorithm is unchanged (zero correctness risk). Same fix as bernoulli_.
+# Kunlunxin (XPU) override of uniform_: launch config computed in the Python
+# wrapper (no heuristic decorator) and the per-program work split into REP small
+# philox calls, which is faster than one wide call on the XPU triton fork.
 import logging
 
 import torch
@@ -51,49 +40,52 @@ def uniform_kernel(
     from_,
     to,
     BLOCK: tl.constexpr,
+    REP: tl.constexpr,
 ):
     philox_seed = philox_seed.to(tl.int64)
     philox_offset = philox_offset.to(tl.int64)
-    c0 = (philox_offset & 0xFFFFFFFF).to(tl.uint32)
+    c0_base = (philox_offset & 0xFFFFFFFF).to(tl.uint32)
     c1 = ((philox_offset >> 32) & 0xFFFFFFFF).to(tl.uint32)
-    i4 = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    c0 += i4
-    _O = c0 * 0
-    r0, r1, r2, r3 = tl.philox(philox_seed, c0, c1, _O, _O)
-    r0 = uint_to_uniform_float(r0) * (to - from_) + from_
-    r1 = uint_to_uniform_float(r1) * (to - from_) + from_
-    r2 = uint_to_uniform_float(r2) * (to - from_) + from_
-    r3 = uint_to_uniform_float(r3) * (to - from_) + from_
-    off_0 = tl.program_id(0) * BLOCK * 4 + tl.arange(0, BLOCK)
-    off_1 = off_0 + BLOCK
-    off_2 = off_1 + BLOCK
-    off_3 = off_2 + BLOCK
-    tl.store(out_ptr + off_0, r0, mask=off_0 < N, eviction_policy="evict_first")
-    tl.store(out_ptr + off_1, r1, mask=off_1 < N, eviction_policy="evict_first")
-    tl.store(out_ptr + off_2, r2, mask=off_2 < N, eviction_policy="evict_first")
-    tl.store(out_ptr + off_3, r3, mask=off_3 < N, eviction_policy="evict_first")
+    prog_base = tl.program_id(0) * BLOCK * REP
+    for k in tl.static_range(REP):
+        lane_base = prog_base + k * BLOCK
+        i4 = lane_base + tl.arange(0, BLOCK)
+        c0 = c0_base + i4
+        _O = c0 * 0
+        r0, r1, r2, r3 = tl.philox(philox_seed, c0, c1, _O, _O)
+        r0 = uint_to_uniform_float(r0) * (to - from_) + from_
+        r1 = uint_to_uniform_float(r1) * (to - from_) + from_
+        r2 = uint_to_uniform_float(r2) * (to - from_) + from_
+        r3 = uint_to_uniform_float(r3) * (to - from_) + from_
+        off_0 = lane_base * 4 + tl.arange(0, BLOCK)
+        off_1 = off_0 + BLOCK
+        off_2 = off_1 + BLOCK
+        off_3 = off_2 + BLOCK
+        tl.store(out_ptr + off_0, r0, mask=off_0 < N, eviction_policy="evict_first")
+        tl.store(out_ptr + off_1, r1, mask=off_1 < N, eviction_policy="evict_first")
+        tl.store(out_ptr + off_2, r2, mask=off_2 < N, eviction_policy="evict_first")
+        tl.store(out_ptr + off_3, r3, mask=off_3 < N, eviction_policy="evict_first")
 
 
 UNROLL = 4
 
 
 def _launch_config(N):
-    # Mirrors the "uniform" heuristic values (uniform_heur_block /
-    # uniform_heur_num_warps), but computed in Python and passed explicitly so
-    # the slow heuristic-supplied launch path is never taken.
+    # per-program work = BLOCK * UNROLL * REP; on the XPU triton fork a small
+    # philox arange width (<=512) split over REP calls beats one wide call.
     if N <= 512:
-        return 512, 4
+        return 512, 1, 4
     elif N <= 1024:
-        return 1024, 8
+        return 1024, 1, 8
     else:
-        return 1024, 16
+        return 512, 2, 16
 
 
 def uniform_(self, from_=0.0, to=1.0, *, generator=None):
     logger.debug("GEMS_KUNLUNXIN UNIFORM_")
     N = volume(self.shape)
-    BLOCK, num_warps = _launch_config(N)
-    grid = (triton.cdiv(N, BLOCK * UNROLL),)
+    BLOCK, REP, num_warps = _launch_config(N)
+    grid = (triton.cdiv(N, BLOCK * UNROLL * REP),)
 
     increment = triton.cdiv(N, UNROLL)
     philox_seed, philox_offset = philox_backend_seed_offset(
@@ -108,6 +100,7 @@ def uniform_(self, from_=0.0, to=1.0, *, generator=None):
             from_,
             to,
             BLOCK=BLOCK,
+            REP=REP,
             num_warps=num_warps,
         )
     return self

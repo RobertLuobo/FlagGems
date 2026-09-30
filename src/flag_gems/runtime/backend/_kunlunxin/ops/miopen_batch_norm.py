@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import logging
 from typing import Optional, Tuple
 
@@ -32,29 +31,25 @@ def miopen_batch_norm(
     exponential_average_factor: float,
     epsilon: float,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Forward pass for batch normalization (MIOpen variant) on Kunlunxin XPU.
+    """aten::miopen_batch_norm on the Kunlunxin 1D-tile batch-norm kernels.
 
-    The generic implementation in ``flag_gems.ops.miopen_batch_norm`` binds the
-    shared ``batch_norm_forward_kernel`` (2D-tile Welford), whose lowering fails
-    on XPU ("triton_xpu.convert_layout" op requires the same shape ... during
-    ``TritonXPUUnrollControl``). This override delegates to the Kunlunxin
-    ``native_batch_norm`` kernel path, which is the exact operator used as the
-    test reference and compiles/runs on XPU. The MIOpen schema is a 1:1 rename of
-    ``native_batch_norm`` (``exponential_average_factor`` == momentum,
-    ``epsilon`` == eps); the returned ``save_var`` is the saved inverse standard
-    deviation, matching the generic convention and the backward override.
-
-    Returns:
-        Tuple of (output, save_mean, save_var(=inv_std)).
+    The generic ``batch_norm`` forward kernel (a single 2D ``[BLOCK_M, BLOCK_N]``
+    online-accumulator loop with ``BLOCK_M * BLOCK_N`` up to 16384) fails to
+    lower on XPU3 (``TritonXPUUnrollControl`` ``out of resource: uni_sram``).
+    The vendor ``native_batch_norm`` implements the identical math with fixed,
+    bounded 1D ``TILE_S`` stats/normalize kernels that compile, so this override
+    reuses it. ``exponential_average_factor`` maps to ``momentum`` and returns
+    ``(output, save_mean, save_inv_std)`` as miopen expects.
     """
-    logger.debug("GEMS_KUNLUNXIN MIOPEN_BATCH_NORM FORWARD")
+    logger.debug("GEMS_KUNLUNXIN MIOPEN_BATCH_NORM")
+
     return native_batch_norm(
         input,
         weight,
         bias,
         running_mean,
         running_var,
-        training,
+        bool(training),
         exponential_average_factor,
         epsilon,
     )

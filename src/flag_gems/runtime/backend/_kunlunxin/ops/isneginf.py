@@ -14,16 +14,18 @@
 
 import logging
 
+import torch
 import triton
 import triton.language as tl
+
+from flag_gems.utils import tl_extra_shim
 
 from ..utils.codegen_config_utils import CodeGenConfig
 from ..utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger(__name__)
+_isinf = tl_extra_shim.isinf
 
-# A direct comparison with -inf has the same floating-point semantics as
-# isinf(x) & (x < 0), but avoids the libdevice isinf extern call.
 _config = CodeGenConfig(
     512,
     (65536, 65536, 65536),
@@ -42,14 +44,26 @@ def isneginf_func(x):
     return x.to(tl.float32) == -float("inf")
 
 
+# fp16-only fast path: isinf(min(x,0)) lowers to the vectorized isinf extern.
+@pointwise_dynamic(promotion_methods=[(0, "ALWAYS_BOOL")], config=_config)
+@triton.jit
+def isneginf_func_fp16(x):
+    return _isinf(tl.minimum(x.to(tl.float32), 0.0))
+
+
+def _select(dtype):
+    return isneginf_func_fp16 if dtype == torch.float16 else isneginf_func
+
+
 def isneginf(A):
     logger.debug("GEMS_KUNLUNXIN ISNEGINF")
-    return isneginf_func(A)
+    return _select(A.dtype)(A)
 
 
 def isneginf_out(A, *, out=None):
     logger.debug("GEMS_KUNLUNXIN ISNEGINF_OUT")
+    fn = _select(A.dtype)
     if out is None:
-        return isneginf_func(A)
-    isneginf_func(A, out0=out)
+        return fn(A)
+    fn(A, out0=out)
     return out

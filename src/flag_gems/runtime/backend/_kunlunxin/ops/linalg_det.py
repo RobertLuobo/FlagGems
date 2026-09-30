@@ -323,7 +323,7 @@ def _launch_det(A_work, out, batch_count, n, dtype, device):
         return
 
     rows, lda, tot, blk, nblk = _plan(n)
-    if n >= 32 and batch_count >= 2 and nblk == 1:
+    if n >= 32 and batch_count >= 1 and nblk == 1:
         work0 = torch.empty(batch_count * tot, dtype=dtype, device=device)
         work1 = torch.empty(batch_count * tot, dtype=dtype, device=device)
         with torch_device_fn.device(device):

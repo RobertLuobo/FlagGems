@@ -1,27 +1,33 @@
-"""
-Triton implementation of mHC Post operator (kunlunxin / XPU specialized).
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Computes:
-    out[n, i, h] = post_layer_mix[n, i] * x[n, h]
-                 + sum_j(comb_res_mix[n, j, i] * residual[n, j, h])
+"""mHC Post operator (kunlunxin / XPU specialized launch).
 
-Key points (XPU):
-- NO @triton.autotune. On XPU triton, autotune over many configs recompiles
-  ALL configs for each new key value during warmup -> hundreds of compiles ->
-  multi-GB IR dumps + slow warmup. Launch params (BLOCK_H / num_warps /
-  num_stages) are computed in the Python wrapper and passed explicitly.
-- Whole-row BLOCK_H = next_power_of_2(H) (capped) -> grid (N, cdiv(H, BLOCK_H)),
-  usually (N, 1). Bigger BLOCK_H is strictly better here (measured), reaching
-  ~23/42/97 GBPS for H=1280/2560/7168 vs the old autotune (BLOCK_H<=1024) ~0.09.
-- num_stages=1 (software pipelining generates pathological IR on XPU).
-- Contiguous layout; all 4 accumulators computed then stored (ILP).
+Same interface and semantics as `flag_gems.fused.mhc.mhc_post.mhc_post`, but
+without @triton.autotune and with a const-tuple grid + fixed BLOCK_H so the
+launch does not recompile on every call.
 """
 
 import logging
+import os
+import sys
 
 import torch
 import triton
 import triton.language as tl
+
+from flag_gems.fused.mhc.mhc_post import mhc_post as _general_mhc_post
 
 logger = logging.getLogger(__name__)
 
@@ -217,3 +223,31 @@ def mhc_post(
             num_stages=1,
         )
     return out
+
+
+def _use_general_for_ab():
+    """A/B escape hatch: set FLAGGEMS_XPU_MHC_POST_GENERAL=1 to force the
+    general implementation (used only for baseline measurement / ablation)."""
+    return os.environ.get("FLAGGEMS_XPU_MHC_POST_GENERAL", "0") == "1"
+
+
+def _install():
+    """Wire the XPU implementation into the direct-import entrypoint.
+
+    The mhc fused family is called via direct module import
+    (`from flag_gems.fused.mhc.mhc_post import mhc_post`) in both
+    tests/test_mhc_ops.py and benchmark/test_mhc.py, so the normal
+    SpecOpRegistrar namespace swap can not reach it. Replace the attribute on
+    the already-imported module (loaded during `import flag_gems`).
+    """
+    if _use_general_for_ab():
+        return
+
+    mod = sys.modules.get("flag_gems.fused.mhc.mhc_post")
+    if mod is not None:
+        cur = getattr(mod, "mhc_post", None)
+        if cur is _general_mhc_post:
+            mod.mhc_post = mhc_post
+
+
+_install()

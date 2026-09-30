@@ -9,9 +9,11 @@ from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
+_REDUCTIONS = {"prod": 0, "mean": 1, "amax": 2, "amin": 3}
+
 
 @libentry()
-@triton.jit
+@triton.jit(do_not_specialize=["output_dim_size", "inner_size", "source_dim_size"])
 def _index_reduce_kernel(
     inp,
     index,
@@ -19,7 +21,7 @@ def _index_reduce_kernel(
     output,
     output_dim_size,
     inner_size,
-    SOURCE_DIM_SIZE: tl.constexpr,
+    source_dim_size,
     REDUCE: tl.constexpr,
     INCLUDE_SELF: tl.constexpr,
 ):
@@ -39,10 +41,11 @@ def _index_reduce_kernel(
         accumulator = self_value if INCLUDE_SELF else float("inf")
     count = 1 if INCLUDE_SELF else 0
 
-    for source_dim_offset in tl.static_range(0, SOURCE_DIM_SIZE):
+    source_dim_offset = 0
+    while source_dim_offset < source_dim_size:
         selected = tl.load(index + source_dim_offset) == output_dim_offset
         source_offset = (
-            outer_offset * SOURCE_DIM_SIZE + source_dim_offset
+            outer_offset * source_dim_size + source_dim_offset
         ) * inner_size + inner_offset
         value = tl.load(source + source_offset).to(tl.float32)
         if REDUCE == 0:
@@ -58,6 +61,7 @@ def _index_reduce_kernel(
                 selected, tl.minimum(accumulator, value), accumulator
             )
         count += selected.to(tl.int32)
+        source_dim_offset += 1
 
     if REDUCE == 1:
         accumulator /= count
@@ -66,50 +70,69 @@ def _index_reduce_kernel(
     tl.store(output + output_offset, accumulator)
 
 
-_REDUCTIONS = {"prod": 0, "mean": 1, "amax": 2, "amin": 3}
+def _validate(inp, dim, index, source, reduce):
+    assert reduce in _REDUCTIONS, f"Unsupported reduce: {reduce}"
+    assert inp.ndim > 0, "index_reduce_(): Expected self to have non-zero dimensionality"
+    d = dim % inp.ndim
+    assert (
+        index.ndim == 1 and index.numel() == source.shape[d]
+    ), "index_reduce_(): Expected index to be a vector matching source.size(dim)"
+    assert not any(
+        source.shape[axis] != inp.shape[axis]
+        for axis in range(inp.ndim)
+        if axis != d
+    ), "index_reduce_(): source must match self outside the reduced dimension"
+    return d
 
 
-def index_reduce_(inp, dim, index, source, reduce, *, include_self=True):
-    logger.debug("GEMS_KUNLUNXIN INDEX_REDUCE_")
-    if reduce not in _REDUCTIONS:
-        raise RuntimeError(
-            f"index_reduce(): Expected reduce to be one of prod, mean, amax or amin but got {reduce}."
-        )
-    if inp.ndim == 0:
-        raise IndexError(
-            "index_reduce_(): Expected self to have non-zero dimensionality"
-        )
-
-    dim %= inp.ndim
-    if index.ndim != 1 or index.numel() != source.shape[dim]:
-        raise RuntimeError(
-            "index_reduce_(): Expected index to be a vector matching source.size(dim)"
-        )
-    if any(
-        source.shape[axis] != inp.shape[axis] for axis in range(inp.ndim) if axis != dim
-    ):
-        raise RuntimeError(
-            "index_reduce_(): source must match self outside the reduced dimension"
-        )
-
+def _run(inp, dim, index, source, reduce, include_self):
+    d = _validate(inp, dim, index, source, reduce)
     input_contiguous = inp.contiguous()
     source = source.contiguous()
     index = index.contiguous()
     result = input_contiguous.clone()
-    inner_size = math.prod(inp.shape[dim + 1 :])
+    inner_size = math.prod(inp.shape[d + 1 :])
     with torch_device_fn.device(inp.device):
         _index_reduce_kernel[(result.numel(),)](
             input_contiguous,
             index,
             source,
             result,
-            inp.shape[dim],
+            inp.shape[d],
             inner_size,
-            SOURCE_DIM_SIZE=index.numel(),
+            index.numel(),
             REDUCE=_REDUCTIONS[reduce],
             INCLUDE_SELF=include_self,
-            isCloseVectorization=True,
-            buffer_size_limit=2048,
         )
+    return result
+
+
+def index_reduce_(inp, dim, index, source, reduce, *, include_self=True):
+    logger.debug("GEMS_KUNLUNXIN INDEX_REDUCE_")
+    result = _run(inp, dim, index, source, reduce, include_self)
     inp.copy_(result)
     return inp
+
+
+def index_reduce(inp, dim, index, source, reduce, *, include_self=True):
+    logger.debug("GEMS_KUNLUNXIN INDEX_REDUCE")
+    return _run(inp, dim, index, source, reduce, include_self)
+
+
+def index_reduce_out(inp, dim, index, source, reduce, *, include_self=True, out=None):
+    logger.debug("GEMS_KUNLUNXIN INDEX_REDUCE_OUT")
+    if out is None:
+        return _run(inp, dim, index, source, reduce, include_self)
+    if out.dtype != inp.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {inp.dtype}, but got {out.dtype} instead"
+        )
+    if out.device != inp.device:
+        raise RuntimeError(
+            f"Expected out tensor to be on device {inp.device}, but got {out.device} instead"
+        )
+    result = _run(inp, dim, index, source, reduce, include_self)
+    if tuple(out.shape) != tuple(result.shape):
+        out.resize_(result.shape)
+    out.copy_(result)
+    return out

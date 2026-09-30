@@ -12,24 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import itertools
 import logging
 from typing import List, Tuple, Union
 
 import torch
 import triton
-
-from flag_gems.utils.tensor_wrapper import StridedBuffer
-
-from ..utils.pointwise_dynamic import pointwise_dynamic
+import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
 
-@pointwise_dynamic(is_tensor=[True], promotion_methods=[(0, "DEFAULT")])
 @triton.jit
-def copy_func(x):
-    return x
+def stk_contig_kernel(
+    out_ptr, in_ptr, base_offset, total_elements, BLOCK_X: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid.to(tl.int64) * BLOCK_X + tl.arange(0, BLOCK_X).to(tl.int64)
+    mask = idx < total_elements
+    out_idx = base_offset + idx
+    tl.store(out_ptr + out_idx, tl.load(in_ptr + idx, mask=mask), mask=mask)
+
+
+@triton.jit
+def stk_flat_kernel(
+    out_ptr, in_ptr, block_in, out_row_stride, base_offset,
+    total_elements, BLOCK_X: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid.to(tl.int64) * BLOCK_X + tl.arange(0, BLOCK_X).to(tl.int64)
+    mask = idx < total_elements
+    pre_idx = idx // block_in
+    within = idx % block_in
+    out_idx = pre_idx * out_row_stride + base_offset + within
+    tl.store(out_ptr + out_idx, tl.load(in_ptr + idx, mask=mask), mask=mask)
+
+
+def _pick_block(numel: int) -> int:
+    # A large per-program block is what makes a single copy kernel saturate HBM
+    # on XPU3 (num_warps is not a tunable knob here): a small BLOCK leaves the
+    # 16M-element copy at ~70 GB/s, while BLOCK>=16384 reaches ~360 GB/s.
+    target = numel // 128
+    b = 4096
+    while b < 16384 and b < target:
+        b <<= 1
+    return b
 
 
 def stack(
@@ -57,18 +83,43 @@ def stack(
     if dim < 0:
         dim = dim + len(inp0_shape) + 1
 
-    in0_shape = inp0_shape[:dim] + [1] + inp0_shape[dim:]
-    out_shape = inp0_shape[:dim] + [len(tensors)] + inp0_shape[dim:]
-    out0 = torch.empty(out_shape, dtype=tensors[0].dtype, device=tensors[0].device)
-    out0_strides = out0.stride()
-    out0_offsets = list(
-        itertools.accumulate([out0_strides[dim] for _ in inp_shapes[:-1]], initial=0)
-    )
+    dtype = tensors[0].dtype
+    for t in tensors[1:]:
+        dtype = torch.promote_types(dtype, t.dtype)
+    tensors = [t.to(dtype) if t.dtype != dtype else t for t in tensors]
 
-    for a, out0_offset in zip(tensors, out0_offsets):
-        a = a.reshape(in0_shape)
-        in_view = StridedBuffer(a, in0_shape, a.stride())
-        out_view = StridedBuffer(out0, in0_shape, out0.stride(), offset=out0_offset)
-        copy_func.instantiate(a.ndim)(in_view, out0=out_view)
+    n = len(tensors)
+    out_shape = inp0_shape[:dim] + [n] + inp0_shape[dim:]
+    out0 = torch.empty(out_shape, dtype=dtype, device=tensors[0].device)
+
+    # ``post`` is the contiguous run written per input row; ``pre`` how many such
+    # runs. stack writes input i into out[..., i, ...]: a per-row contiguous copy
+    # with output row stride n*post and per-input base offset i*post.
+    post = 1
+    for s in inp0_shape[dim:]:
+        post *= s
+    pre = 1
+    for s in inp0_shape[:dim]:
+        pre *= s
+    out_row_stride = n * post
+
+    for i, a in enumerate(tensors):
+        a = a.contiguous()
+        total_elements = a.numel()
+        if total_elements == 0:
+            continue
+        base_offset = i * post
+        BLOCK = _pick_block(total_elements)
+        grid = (triton.cdiv(total_elements, BLOCK),)
+        if pre == 1:
+            # out[..., i, ...] is a single contiguous run: plain memcpy.
+            stk_contig_kernel[grid](
+                out0, a, base_offset, total_elements, BLOCK_X=BLOCK,
+            )
+        else:
+            stk_flat_kernel[grid](
+                out0, a, post, out_row_stride, base_offset,
+                total_elements, BLOCK_X=BLOCK,
+            )
 
     return out0

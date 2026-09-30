@@ -20,7 +20,14 @@ from .bf16_paged_mqa_logits import (  # noqa: F401  (import triggers _install)
 from .bin_topk import bucket_sort_topk_xpu  # noqa: F401  (import triggers _install)
 from .bincount import bincount
 from .concat_and_cache_mla import concat_and_cache_mla
+from .cp_gather_indexer_k_quant_cache import (  # noqa: F401  (import triggers _install)
+    cp_gather_indexer_k_quant_cache,
+)
 from .cross_entropy_loss import cross_entropy_loss
+from .deepseek_v4_attention_compute_global_topk_indices_and_lens import (  # noqa: F401  (import triggers _install)
+    compute_global_topk_indices_and_lens,
+)
+from .flash_mla_xpu import flash_mla  # noqa: F401  (import triggers _install)
 from .flashmla_sparse import flash_mla_sparse_fwd
 from .fused_add_rms_norm import fused_add_rms_norm
 from .fused_deepseek_v4_qnorm_rope_kv_rope_insert import (
@@ -36,9 +43,11 @@ from .instance_norm import instance_norm
 from .matmul_bias_activation import matmul_bias_activation
 from .matmuladd import matmuladd
 from .mhc_bwd import mhc_bwd  # noqa: F401  (import triggers _install)
+from .mhc_post import mhc_post  # noqa: F401  (import triggers _install)
 from .mhc_pre import mhc_pre  # noqa: F401  (import triggers _install)
 from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
 from .outer import outer
+from .pack_seq import pack_seq_triton_xpu  # noqa: F401  (import triggers _install)
 from .reglu import dreglu, reglu
 from .reshape_and_cache import reshape_and_cache
 from .reshape_and_cache_flash import reshape_and_cache_flash
@@ -57,6 +66,7 @@ from .sparse_mla import (  # noqa: F401  (import triggers _install)
 )
 from .swiglu import dswiglu, swiglu
 from .topk_softmax import topk_softmax
+from .unpack_seq import unpack_seq_triton_xpu  # noqa: F401  (import triggers _install)
 from .weight_norm import weight_norm
 
 __all__ = [
@@ -80,6 +90,8 @@ __all__ = [
     "instance_norm",
     "weight_norm",
     "concat_and_cache_mla",
+    "cp_gather_indexer_k_quant_cache",
+    "compute_global_topk_indices_and_lens",
     "reshape_and_cache",
     "moe_align_block_size",
     "moe_align_block_size_triton",

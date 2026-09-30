@@ -255,16 +255,19 @@ def apply_rotary_pos_emb_flat_kernel(
     HALF: tl.constexpr,
     PAD: tl.constexpr,  # HALF for non-interleaved, 1 for interleaved
     INTERLEAVED: tl.constexpr,
+    HEAD_DIM_POW2: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     pid = ext.program_id(0)
     off = pid * BLOCK + tl.arange(0, BLOCK)
     m = off < N
-    d = off % HEAD_DIM
+    # `off % HEAD_DIM` over the whole BLOCK is a very expensive XPU integer op; use bitwise forms when possible.
     if INTERLEAVED:
-        first = (d % 2) == 0
+        first = (off & 1) == 0
+    elif HEAD_DIM_POW2:
+        first = (off & (HEAD_DIM - 1)) < HALF
     else:
-        first = d < HALF
+        first = (off % HEAD_DIM) < HALF
 
     # All three loads are AFFINE (base + affine offset) -> XPU block DMA. The
     # padding guarantees off+2*PAD and off never leave the allocation.
@@ -410,6 +413,7 @@ def apply_rotary_pos_emb(
         if q.is_contiguous() and k.is_contiguous():
             half = head_dim // 2
             half_off = 1 if rotary_interleaved else half
+            head_dim_pow2 = (head_dim & (head_dim - 1)) == 0
             if position_ids is None:
                 pos = torch.arange(n_tokens, device=q.device) % seq_len
             else:
@@ -440,6 +444,7 @@ def apply_rotary_pos_emb(
                     half,
                     half_off,
                     rotary_interleaved,
+                    head_dim_pow2,
                     BLOCK,
                     isCloseUnrollControl=True,
                 )
@@ -465,6 +470,7 @@ def apply_rotary_pos_emb(
                     half,
                     half_off,
                     rotary_interleaved,
+                    head_dim_pow2,
                     BLOCK,
                     isCloseUnrollControl=True,
                 )

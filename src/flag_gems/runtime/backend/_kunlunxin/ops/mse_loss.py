@@ -125,6 +125,27 @@ def kernel_2(mid, out, mid_size, BLOCK_MID: tl.constexpr):
     tl.store(out, tl.sum(mid_val))
 
 
+@libentry()
+@triton.jit
+def kernel_single(inp, target, out, M, BLOCK: tl.constexpr, reduction: tl.constexpr):
+    # Whole reduction in one program (one launch). Addresses are clamped into
+    # range so every load is in-bounds (a masked/OOB load is unreliable here),
+    # and the padding lanes are dropped BY VALUE with tl.where before the sum.
+    offset = tl.arange(0, BLOCK)
+    addr = tl.minimum(offset, M - 1)
+    inp_val = tl.load(inp + addr).to(tl.float32)
+    target_val = tl.load(target + addr).to(tl.float32)
+    sub = inp_val - target_val
+    pow_val = sub * sub
+    pow_val = tl.where(offset < M, pow_val, 0.0)
+    # Reduction.MEAN.value: 1 Reduction.SUM.value: 2
+    if reduction == 1:
+        sum_val = tl.sum(pow_val) / M
+    else:
+        sum_val = tl.sum(pow_val)
+    tl.store(out, sum_val)
+
+
 @pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, "DEFAULT")])
 @triton.jit
 def func(x, y):
@@ -137,14 +158,19 @@ class Reduction(Enum):
     SUM = 2
 
 
-# Unmasked stage-1 tile: the largest tl.sum tile that is exact on this XPU
-# with buffer_size_limit=2048 (see kunlunxin reduction notes), and the only
-# tile whose unmasked instruction path was validated across the full
-# benchmark grid (256..20000 programs on [4096,4096]..[10000,65536]).
-_FULL_BLOCK = 32768
-# Stage-2 must stay inside the 32768-lane tl.sum ceiling; grow stage-1 blocks
-# if the grid would exceed it (legacy MAX_MID rule).
+# Unmasked stage-1 tile. tl.sum on this XPU is exact up to this width with
+# buffer_size_limit=2048 (verified against a fp32/fp16/bf16 reference across
+# the benchmark grid); the 65536-lane block runs the block-DMA path at a
+# higher bandwidth than the older 32768 tile.
+_FULL_BLOCK = 65536
+# Stage-2 must stay inside the tl.sum ceiling; grow stage-1 blocks if the grid
+# would exceed it (legacy MAX_MID rule).
 _MAX_MID = 32768
+# Tensors up to this size are reduced in a single program (one launch), which
+# removes the second-stage launch that dominates the smallest reductions. Kept
+# small: one cluster reading a large block serially is slower than the
+# multi-program path, so only genuinely tiny tensors take this branch.
+_SINGLE_MAX = 4096
 
 
 def mse_loss(inp, target, reduction=Reduction.MEAN.value):
@@ -157,15 +183,36 @@ def mse_loss(inp, target, reduction=Reduction.MEAN.value):
     M = inp.numel()
     dtype = inp.dtype
 
-    block_size = get_block_size_1d(M, inp.element_size() * 2)
+    if M <= _SINGLE_MAX:
+        # One-program reduction: a single launch, no stage-2, no partials.
+        block = triton.next_power_of_2(M)
+        out = torch.empty([], dtype=dtype, device=inp.device)
+        os.environ["TRITONXPU_OTHER_SIM"] = "1"
+        with torch_device_fn.device(inp.device):
+            kernel_single[(1, 1, 1)](
+                inp, target, out, M, block, reduction, buffer_size_limit=2048
+            )
+        if "TRITONXPU_OTHER_SIM" in os.environ:
+            del os.environ["TRITONXPU_OTHER_SIM"]
+        return out
 
-    if (M > _FULL_BLOCK) and (M % _FULL_BLOCK == 0):
-        # Fully divisible by the 32768-lane tile: the unmasked stage-1 path
-        # skips the masked-memory penalty entirely (3-4x on the large shapes).
+    # Pick the largest unmasked stage-1 tile that divides M into at least two
+    # programs. 65536 gets the block-DMA bandwidth on the large shapes; 32768
+    # keeps M == 65536 on two clusters (one cluster of 65536 serialises and is
+    # far slower than 2 x 32768). A single-program divisible case is left to
+    # the legacy path.
+    stage1_block = None
+    for cand in (_FULL_BLOCK, _FULL_BLOCK // 2):
+        if (M % cand == 0) and (M // cand >= 2):
+            stage1_block = cand
+            break
+    if stage1_block is not None:
+        # Fully divisible by the stage-1 tile: the unmasked stage-1 path skips
+        # the masked-memory penalty entirely (3-4x on the large shapes).
         # Non-divisible tensors take the legacy path below, which reduces
         # full blocks unmasked and handles the remainder with a single
         # in-bounds window program (kernel_1_tail).
-        mid_size = M // _FULL_BLOCK
+        mid_size = M // stage1_block
         if mid_size <= _MAX_MID:
             block_mid = triton.next_power_of_2(mid_size)
             mid = torch.empty((block_mid,), dtype=torch.float32, device=inp.device)
@@ -181,7 +228,7 @@ def mse_loss(inp, target, reduction=Reduction.MEAN.value):
                     target,
                     mid,
                     M,
-                    _FULL_BLOCK,
+                    stage1_block,
                     reduction,
                     buffer_size_limit=2048,
                 )
@@ -198,6 +245,7 @@ def mse_loss(inp, target, reduction=Reduction.MEAN.value):
     # accumulation. Stage 1 is fully unmasked: full blocks via kernel_1 and
     # one in-bounds window program for the remainder (kernel_1_tail); the
     # mid padding lanes are dropped by value in kernel_2.
+    block_size = get_block_size_1d(M, inp.element_size() * 2)
     mid_size = triton.cdiv(M, block_size)
     if mid_size > _MAX_MID:
         block_size = triton.next_power_of_2(triton.cdiv(M, _MAX_MID))

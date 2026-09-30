@@ -26,6 +26,8 @@ from flag_gems.utils import triton_lang_extension as ext
 
 logger = logging.getLogger(__name__)
 
+_BLOCK_D_MAX = 32  # bound BLOCK_D so 2D-remapped tiles fit XPU local memory
+
 
 def heur_block_c(args):
     bc = triton.next_power_of_2(triton.cdiv(args["C"], 12))
@@ -35,7 +37,8 @@ def heur_block_c(args):
 
 def heur_block_d(args):
     # return args["D"]
-    return triton.cdiv(args["D"], 12)
+    bd = triton.cdiv(args["D"], 12)
+    return bd if bd < _BLOCK_D_MAX else _BLOCK_D_MAX
 
 
 @libentry()
@@ -598,7 +601,12 @@ class CrossEntropyLoss(torch.autograd.Function):
         tgt = target.contiguous()
         weight = weight.contiguous() if weight is not None else None
         out = torch.empty(shape, dtype=torch.float32, device=inp.device)
-        grid = lambda meta: (triton.cdiv(D_new, meta["BLOCK_D"]), N)
+        # 2D case (D==1): map batch rows onto the tiled D-axis (BLOCK_D rows/program)
+        if dim == 2:
+            k_N, k_D = 1, N
+        else:
+            k_N, k_D = N, D
+        grid = lambda meta: (triton.cdiv(k_D, meta["BLOCK_D"]), k_N)
 
         if tgt.ndim == dim:
             # target probabilities
@@ -614,7 +622,7 @@ class CrossEntropyLoss(torch.autograd.Function):
                     out,
                     label_smoothing,
                     C,
-                    D,
+                    k_D,
                 )
                 if shape != [1]:
                     if "TRITONXPU_OTHER_SIM" in os.environ:
@@ -635,7 +643,7 @@ class CrossEntropyLoss(torch.autograd.Function):
                     w_tgt,
                     ignore_index,
                     C,
-                    D,
+                    k_D,
                 )
                 if dim > 1:
                     out = out.view(shape[:axis] + shape[axis + 1 :])
@@ -654,7 +662,7 @@ class CrossEntropyLoss(torch.autograd.Function):
                     ignore_index,
                     label_smoothing,
                     C,
-                    D,
+                    k_D,
                 )
                 if "TRITONXPU_OTHER_SIM" in os.environ:
                     del os.environ["TRITONXPU_OTHER_SIM"]

@@ -101,6 +101,21 @@ def upsample_nearest2d(
         reciprocal_scale_w = 1 / scales_w
     else:
         reciprocal_scale_w = IW / OW
+
+    # Integer-scale fast path: nearest upsample with exact integer scale is a
+    # repeat_interleave along both spatial axes (avoids the per-pixel gather).
+    if (
+        scales_h is None
+        and scales_w is None
+        and IH > 0
+        and IW > 0
+        and OH % IH == 0
+        and OW % IW == 0
+    ):
+        sh = OH // IH
+        sw = OW // IW
+        return input.repeat_interleave(sh, dim=2).repeat_interleave(sw, dim=3)
+
     # allocate output
     output = torch.empty((N, C, OH, OW), device=input.device, dtype=input.dtype)
     total_threads = N * C * OH * OW

@@ -8,6 +8,8 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
+from .copy import copy_
+
 logger = logging.getLogger(__name__)
 
 
@@ -237,55 +239,48 @@ def _reduce_partials(data, n, out, device, acc32):
 
 def _prod_flat(inp, out, device):
     numel = inp.numel()
-    block = _REDUCE_BLOCK
-    rows = numel // block
-    res = numel - rows * block
     is_fp32 = inp.dtype == torch.float32
     acc32 = inp.dtype.is_floating_point
     tree16 = _tree16(inp.dtype)
     wdt = _work_dtype(inp.dtype)
+    block = _REDUCE_BLOCK
+    if numel <= block:
+        _reduce_partials(inp, numel, out, device, acc32)
+        return
+    rows = numel // block
+    res = numel - rows * block
     with torch_device_fn.device(device):
-        if rows:
-            tile = _pick_fast_tile(rows, block, is_fp32)
-            bm = tile[0] if tile else 2
-            if tree16:
-                bn = _TREE16_BLOCK
-            else:
-                bn = 512
-            chunks = _pow2_decomp(res) if res else []
-            mid = torch.empty((rows + len(chunks),), dtype=wdt, device=device)
-            prod_row2d[(max(rows // bm, 1), 1)](
+        tile = _pick_fast_tile(rows, block, is_fp32)
+        bm = tile[0] if tile else 2
+        if tree16:
+            bn = _TREE16_BLOCK
+        else:
+            bn = 512
+        chunks = _pow2_decomp(res) if res else []
+        mid = torch.empty((rows + len(chunks),), dtype=wdt, device=device)
+        prod_row2d[(max(rows // bm, 1), 1)](
+            inp,
+            mid,
+            rows,
+            block,
+            bm,
+            bn,
+            False,
+            acc32,
+            tree16,
+            buffer_size_limit=2048,
+        )
+        pos = rows * block
+        for i, w in enumerate(chunks):
+            prod_tailk[(1, 1)](
                 inp,
-                mid,
-                rows,
-                block,
-                bm,
-                bn,
-                False,
+                mid[rows + i : rows + i + 1],
+                pos,
+                w,
                 acc32,
-                tree16,
                 buffer_size_limit=2048,
             )
-            pos = rows * block
-            for i, w in enumerate(chunks):
-                prod_tailk[(1, 1)](
-                    inp,
-                    mid[rows + i : rows + i + 1],
-                    pos,
-                    w,
-                    acc32,
-                    buffer_size_limit=2048,
-                )
-                pos += w
-        else:
-            chunks = _pow2_decomp(res)
-            mid = torch.empty((len(chunks),), dtype=wdt, device=device)
-            pos = 0
-            for i, w in enumerate(chunks):
-                prod_tailk[(1, 1)](
-                    inp, mid[i : i + 1], pos, w, acc32, buffer_size_limit=2048
-                )
-                pos += w
+            pos += w
         _reduce_partials(mid, mid.numel(), out, device, acc32)
 
 
@@ -300,7 +295,7 @@ def prod(inp, *, dtype=None):
         return out
     if numel == 1:
         with torch_device_fn.device(inp.device):
-            torch.ops.aten._copy_from(inp.reshape([]), out, False)
+            copy_(out, inp.reshape([]))
         return out
     with torch_device_fn.device(inp.device):
         _prod_flat(inp, out, inp.device)
@@ -336,7 +331,7 @@ def prod_dim(inp, dim=None, keepdim=False, *, dtype=None):
         return out
     if N == 1:
         with torch_device_fn.device(inp.device):
-            torch.ops.aten._copy_from(inp, out, False)
+            copy_(out, inp)
         if not keepdim:
             out = torch.squeeze(out, d)
         return out
@@ -348,7 +343,7 @@ def prod_dim(inp, dim=None, keepdim=False, *, dtype=None):
     else:
         src = torch.empty(list(view.shape), dtype=inp.dtype, device=inp.device)
         with torch_device_fn.device(inp.device):
-            torch.ops.aten._copy_from(view, src, False)
+            copy_(src, view)
 
     rows = M * K
     out_flat = out.reshape(rows)

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import math
 
 import torch
 import triton
@@ -22,6 +23,9 @@ from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.limits import get_dtype_max, get_dtype_min
+
+from ..utils.tle_copy import tle_copy
+from .copy import copy_
 
 logger = logging.getLogger(__name__)
 
@@ -259,14 +263,14 @@ def _aminmax_flat(inp, min_out, max_out, device):
     # Flatten first: the staging below slices `inp[rows * block:]` as a flat
     # buffer, which for a rank>1 input would instead be a (out-of-range)
     # dim-0 slice and silently drop the residue. Non-contiguous inputs are
-    # copied to a fresh contiguous buffer with the native strided-copy
-    # engine (`_copy_from` is not overridden by flag_gems).
+    # copied to a fresh contiguous buffer with the kunlunxin triton
+    # strided-copy.
     if inp.is_contiguous():
         flat = inp.view(-1)
     else:
         flat = torch.empty((inp.numel(),), dtype=inp.dtype, device=inp.device)
         with torch_device_fn.device(inp.device):
-            torch.ops.aten._copy_from(inp, flat, False)
+            copy_(flat.view(inp.shape), inp)
     inp = flat
     block = _FULL_REDUCTION_BLOCK_SIZE
     numel = inp.numel()
@@ -372,11 +376,11 @@ def aminmax(inp, dim=None, keepdim=False, *, out=None):
 
         if N == 1:
             # Every reduced dim has size 1: aminmax over it is the identity.
-            # Use the native strided-copy engine (flag_gems does not override
-            # `_copy_from`) instead of launching a reduction kernel at all.
+            # Use the kunlunxin triton strided-copy instead of launching a
+            # reduction kernel at all.
             with torch_device_fn.device(inp.device):
-                torch.ops.aten._copy_from(inp, min_out, False)
-                torch.ops.aten._copy_from(inp, max_out, False)
+                copy_(min_out, inp)
+                copy_(max_out, inp)
             if not keepdim:
                 min_out = min_out.squeeze(dim=dim)
                 max_out = max_out.squeeze(dim=dim)
@@ -410,7 +414,7 @@ def aminmax(inp, dim=None, keepdim=False, *, out=None):
         else:
             src = torch.empty(list(view.shape), dtype=dtype, device=inp.device)
             with torch_device_fn.device(inp.device):
-                torch.ops.aten._copy_from(view, src, False)
+                copy_(src, view)
 
         big_acc = dtype != torch.float16  # fp32/bf16 use fp32 accumulator lanes
         tile = _pick_fast_tile(M, N, big_acc)
@@ -457,3 +461,225 @@ def aminmax(inp, dim=None, keepdim=False, *, out=None):
             min_out = min_out.squeeze(dim=dim)
             max_out = max_out.squeeze(dim=dim)
         return min_out, max_out
+
+
+# ---------------------------------------------------------------------------
+# aten::_aminmax / aten::_aminmax.out  (whole-tensor reduction, dim=None only)
+#
+# The generic KernelGen implementation loads OOB tail lanes with
+# `tl.load(mask=..., other=fill)` and feeds them straight into `tl.max` /
+# `tl.min`. On this XPU the load mask is NOT honored inside the reduction, so
+# out-of-range memory (which may exceed the true max, e.g. +inf) leaks into the
+# result. These backend kernels replace OOB lanes with the reduction IDENTITY
+# via `tl.where` BEFORE reducing (identity-fill), which the device does honor.
+# NaN propagation matches torch._aminmax (a NaN forces both outputs to NaN).
+# ---------------------------------------------------------------------------
+@libentry()
+@triton.jit
+def _aminmax_full_kernel_1(
+    inp,
+    min_out,
+    max_out,
+    M,
+    BLOCK_SIZE: tl.constexpr,
+    IS_FLOAT: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    pid = ext.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    inp_ptrs = inp + offset
+
+    dtype = inp.type.element_ty
+    min_fill = get_dtype_max(dtype)  # identity for the min reduction
+    max_fill = get_dtype_min(dtype)  # identity for the max reduction
+
+    if NEED_MASK:
+        mask = offset < M
+        min_val = tl.load(inp_ptrs, mask=mask, other=min_fill)
+        max_val = tl.load(inp_ptrs, mask=mask, other=max_fill)
+        min_in = tl.where(mask, min_val, min_fill)
+        max_in = tl.where(mask, max_val, max_fill)
+    else:
+        # Full tiles: every lane is in-bounds so no identity-fill is needed.
+        # Two separate masked loads (rather than one shared load) are used
+        # because on this XPU a single-load-feeds-both form compiles to a
+        # markedly slower memory path than the twin masked-load form.
+        mask = offset < M
+        min_val = tl.load(inp_ptrs, mask=mask, other=min_fill)
+        max_val = tl.load(inp_ptrs, mask=mask, other=max_fill)
+        min_in = min_val
+        max_in = max_val
+
+    if IS_FLOAT:
+        has_nan = tl.sum((min_val != min_val).to(tl.int32)) > 0
+        nan = float("nan")
+        min_val = tl.where(has_nan, nan, tl.min(min_in))
+        max_val = tl.where(has_nan, nan, tl.max(max_in))
+    else:
+        min_val = tl.min(min_in)
+        max_val = tl.max(max_in)
+
+    tl.store(min_out + pid, min_val)
+    tl.store(max_out + pid, max_val)
+
+
+@libentry()
+@triton.jit
+def _aminmax_full_kernel_2(
+    min_inp,
+    max_inp,
+    min_out,
+    max_out,
+    mid_size,
+    BLOCK_MID: tl.constexpr,
+    IS_FLOAT: tl.constexpr,
+    NEED_MASK: tl.constexpr,
+):
+    offset = tl.arange(0, BLOCK_MID)
+    min_ptrs = min_inp + offset
+    max_ptrs = max_inp + offset
+
+    dtype = min_inp.type.element_ty
+    min_fill = get_dtype_max(dtype)
+    max_fill = get_dtype_min(dtype)
+
+    if NEED_MASK:
+        mask = offset < mid_size
+        min_value = tl.load(min_ptrs, mask=mask, other=0)
+        max_value = tl.load(max_ptrs, mask=mask, other=0)
+        min_in = tl.where(mask, min_value, min_fill)
+        max_in = tl.where(mask, max_value, max_fill)
+    else:
+        min_value = tl.load(min_ptrs)
+        max_value = tl.load(max_ptrs)
+        min_in = min_value
+        max_in = max_value
+
+    if IS_FLOAT:
+        has_nan = (
+            tl.sum((min_value != min_value).to(tl.int32))
+            + tl.sum((max_value != max_value).to(tl.int32))
+        ) > 0
+        nan = float("nan")
+        min_val = tl.where(has_nan, nan, tl.min(min_in))
+        max_val = tl.where(has_nan, nan, tl.max(max_in))
+    else:
+        min_val = tl.min(min_in)
+        max_val = tl.max(max_in)
+
+    tl.store(min_out, min_val)
+    tl.store(max_out, max_val)
+
+
+def _aminmax_reduce(inp, min_out, max_out):
+    """Two-stage whole-tensor reduction of a 1-D contiguous `inp`.
+
+    The main pass runs over the full BLOCK_SIZE tiles: every lane is in-bounds
+    so no identity-fill (`tl.where`) is applied, matching the cost of a plain
+    contiguous reduction. Only the trailing residue program and the final
+    reduce read out-of-range lanes, and those use the identity-fill path so no
+    out-of-bounds value can leak into `tl.max`/`tl.min`.
+    """
+    M = inp.numel()
+    is_float = inp.is_floating_point()
+    block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
+    n_full = M // block_size
+    res = M - n_full * block_size
+    mid_size = n_full + (1 if res else 0)
+    min_mid = torch.empty((mid_size,), dtype=inp.dtype, device=inp.device)
+    max_mid = torch.empty((mid_size,), dtype=inp.dtype, device=inp.device)
+    if n_full > 0:
+        _aminmax_full_kernel_1[(n_full, 1)](
+            inp,
+            min_mid,
+            max_mid,
+            M,
+            block_size,
+            is_float,
+            False,
+            buffer_size_limit=2048,
+        )
+    if res:
+        _aminmax_full_kernel_1[(1, 1)](
+            inp[n_full * block_size :],
+            min_mid[n_full:],
+            max_mid[n_full:],
+            res,
+            triton.next_power_of_2(res),
+            is_float,
+            True,
+            buffer_size_limit=2048,
+        )
+    block_mid = triton.next_power_of_2(mid_size)
+    _aminmax_full_kernel_2[(1, 1)](
+        min_mid,
+        max_mid,
+        min_out,
+        max_out,
+        mid_size,
+        block_mid,
+        is_float,
+        mid_size % block_mid != 0,
+        buffer_size_limit=2048,
+    )
+
+
+def _aminmax_run(inp, out0=None, out1=None):
+    if inp.numel() == 0:
+        # ATen refuses to reduce an empty input rather than returning +-inf.
+        raise RuntimeError(
+            "aminmax(): cannot compute aminmax over an empty dimension as the "
+            "operation has no identity."
+        )
+
+    dtype = inp.dtype
+    if out0 is None:
+        min_out = torch.empty([], dtype=dtype, device=inp.device)
+        max_out = torch.empty([], dtype=dtype, device=inp.device)
+    else:
+        # ATen validates dtype and device but resizes a mis-shaped output to a
+        # scalar in place, returning the caller's objects (so they alias).
+        for _name, o in (("out0", out0), ("out1", out1)):
+            if o.dtype != dtype:
+                raise RuntimeError(
+                    f"Expected out tensor to have dtype {dtype}, but got "
+                    f"{o.dtype} instead"
+                )
+            if o.device != inp.device:
+                raise RuntimeError(
+                    f"Expected out tensor to have device {inp.device}, but got "
+                    f"{o.device} instead"
+                )
+        if out0.shape != torch.Size([]):
+            out0.resize_(())
+        if out1.shape != torch.Size([]):
+            out1.resize_(())
+        min_out, max_out = out0, out1
+
+    # Flatten to a 1-D contiguous buffer without the slow gems `.contiguous()`
+    # override: a sliced/transposed/expanded view would otherwise be read in the
+    # wrong element order (or past its own storage for stride-0 expands). The
+    # dense copy uses a shape-matched destination (the native strided-copy
+    # engine requires matching shapes) and is then flattened.
+    if inp.is_contiguous():
+        flat = inp.view(-1)
+    else:
+        src = torch.empty(list(inp.shape), dtype=dtype, device=inp.device)
+        with torch_device_fn.device(inp.device):
+            if not tle_copy(inp, src):
+                src.copy_(inp)
+        flat = src.view(-1)
+
+    with torch_device_fn.device(inp.device):
+        _aminmax_reduce(flat, min_out, max_out)
+    return min_out, max_out
+
+
+def _aminmax(inp):
+    logger.debug("GEMS_KUNLUNXIN _AMINMAX")
+    return _aminmax_run(inp)
+
+
+def _aminmax_out(inp, *, out0, out1):
+    logger.debug("GEMS_KUNLUNXIN _AMINMAX_OUT")
+    return _aminmax_run(inp, out0=out0, out1=out1)

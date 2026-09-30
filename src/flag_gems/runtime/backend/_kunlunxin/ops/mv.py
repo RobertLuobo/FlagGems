@@ -94,8 +94,10 @@ def mv(inp, vec):
 
     out = torch.empty((N,), device=inp.device, dtype=inp.dtype)
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]),)
+    # The hand GEMV kernel beats the mm(N=1) rebind on small problems; the mm rebind wins once the accumulator tile grows large.
+    use_hand = (M == 1) or (N * M <= 1_000_000)
     with torch_device_fn.device(inp.device):
-        if M == 1:
+        if use_hand:
             mv_kernel[grid](
                 inp,
                 vec,

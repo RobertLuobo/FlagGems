@@ -31,20 +31,20 @@ def embedding_kernel(
     out_ptr,  # pointer to the output
     in_ptr,  # pointer to the input
     weight_ptr,  # pointer to the weights
+    n_elem,  # total number of output elements (M * N)
     N: tl.constexpr,  # number of columns in X
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = ext.program_id(0)
-    out_ptr += pid * N
-    in_ptr += pid
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elem
 
-    mask = tl.arange(0, BLOCK_SIZE) < N
-    cols = tl.arange(0, BLOCK_SIZE)
+    rows = offsets // N
+    cols = offsets % N
 
-    row_idx = tl.load(in_ptr)
-    weight_ptr += row_idx * N
-    embedding_weight = tl.load(weight_ptr + cols, mask, other=0.0)
-    tl.store(out_ptr + cols, embedding_weight, mask)
+    row_idx = tl.load(in_ptr + rows, mask=mask, other=0)
+    embedding_weight = tl.load(weight_ptr + row_idx * N + cols, mask=mask, other=0.0)
+    tl.store(out_ptr + offsets, embedding_weight, mask=mask)
 
 
 @libentry()
@@ -131,14 +131,20 @@ def embedding(weight, indices, padding_idx=-1, scale_grad_by_freq=False, sparse=
     M = indices.numel()
     N = weight.shape[-1]
 
-    BLOCK_SIZE = triton.next_power_of_2(N)
     # TODO: remove contiguous enforcement
     indices = indices.contiguous()
     weight = weight.contiguous()
     output = torch.empty((*indices.shape, N), device=indices.device, dtype=weight.dtype)
 
+    n_elem = M * N
+    if n_elem <= 8192:
+        BLOCK_SIZE = max(64, triton.next_power_of_2(n_elem))
+    else:
+        BLOCK_SIZE = 65536
+    grid = (triton.cdiv(n_elem, BLOCK_SIZE),)
+
     with torch_device_fn.device(weight.device):
-        embedding_kernel[M,](output, indices, weight, N, BLOCK_SIZE)
+        embedding_kernel[grid](output, indices, weight, n_elem, N, BLOCK_SIZE)
 
     return output
 

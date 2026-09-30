@@ -19,147 +19,194 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-# from flag_gems import runtime
 from flag_gems.utils import libentry
 
 logger = logging.getLogger(__name__)
 
-
-@triton.jit
-def compute_vdot(
-    inp_real, inp_imag, other_real, other_imag, inp_is_conj, other_is_conj
-):
-    # # Given inp storage: [inp_real, inp_imag], other: [other_real, other_imag]
-
-    # # Case 1: inp_is_conj = False, other_is_conj = False
-    # out_real = inp_real * other_real + inp_imag * other_imag
-    # out_imag = inp_real * other_imag - inp_imag * other_real
-
-    # # Case 2: inp_is_conj = True, other_is_conj = False
-    # out_real = inp_real * other_real - inp_imag * other_imag
-    # out_imag = inp_real * other_imag + inp_imag * other_real
-
-    # # Case 3: inp_is_conj = False, other_is_conj = True
-    # out_real = inp_real * other_real - inp_imag * other_imag
-    # out_imag = -inp_real * other_imag - inp_imag * other_real
-
-    # # Case 4: inp_is_conj = True, other_is_conj = True
-    # out_real = inp_real * other_real + inp_imag * other_imag
-    # out_imag = inp_real * other_imag - inp_imag * other_real
-    if not inp_is_conj and not other_is_conj:  # Case 1
-        out_real = tl.sum(inp_real * other_real + inp_imag * other_imag)
-        out_imag = tl.sum(inp_real * other_imag - inp_imag * other_real)
-    elif inp_is_conj and not other_is_conj:  # Case 2
-        out_real = tl.sum(inp_real * other_real - inp_imag * other_imag)
-        out_imag = tl.sum(inp_real * other_imag + inp_imag * other_real)
-    elif not inp_is_conj and other_is_conj:  # Case 3
-        out_real = tl.sum(inp_real * other_real - inp_imag * other_imag)
-        out_imag = tl.sum(-inp_real * other_imag - inp_imag * other_real)
-    else:  # Case 4
-        out_real = tl.sum(inp_real * other_real + inp_imag * other_imag)
-        out_imag = tl.sum(-inp_real * other_imag + inp_imag * other_real)
-
-    return out_real, out_imag
+# Largest tile width that reduces reliably on this XPU: tl.sum is only exact up
+# to a power-of-two width <= 8192. The multi-program path therefore uses only
+# exact power-of-two, fully in-bounds tiles (never a non-pow2 width, never an
+# out-of-bounds lane); a masked tail is used solely in the single-launch fast
+# path, where BLOCK is a power of two <= 8192 and masked lanes are zeroed.
+WIDE_BLOCK = 8192
 
 
-def vdot_kernel_heur_block_size(args):
-    if args["n_elements"] < 8192:
-        return args["n_elements"]
-
-    return triton.next_power_of_2(triton.cdiv(args["n_elements"], 12))
-
-
-# support old version triton which do not support tl.split
+# Real path. Each program reduces its OWN exact BLOCK-lane tile (BLOCK is a
+# power of two) into its OWN slot mid[pid]: no masking, no cross-program race.
 @libentry()
-# @triton.heuristics(runtime.get_heuristic_config("vdot"))
-@triton.heuristics(
-    values={
-        "BLOCK_SIZE": vdot_kernel_heur_block_size,
-    },
-)
 @triton.jit()
-def vdot_kernel_complex(
-    inp_ptr,
-    other_ptr,
-    out_ptr,
-    n_elements: tl.constexpr,
-    inp_is_conj: tl.constexpr,
-    other_is_conj: tl.constexpr,
-    inp_stride: tl.constexpr,
-    other_stride: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+def dot_prod_kernel(
+    x_ptr,
+    y_ptr,
+    mid_ptr,
+    x_stride: tl.constexpr,
+    y_stride: tl.constexpr,
+    BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + x_stride * offs).to(tl.float32)
+    y = tl.load(y_ptr + y_stride * offs).to(tl.float32)
+    tl.store(mid_ptr + pid, tl.sum(x * y))
 
-    base_offset = 2 * pid * BLOCK_SIZE + 2 * tl.arange(0, BLOCK_SIZE) + tl.arange(0, 1)
 
-    inp_real_offset = inp_stride * base_offset
-    inp_imag_offset = inp_real_offset + 1
+# Complex path. vdot conjugates the first argument, so for the true logical
+# parts of conj(a)*b, reading real/imag interleaved from view_as_real buffers:
+#   real = sum(a_r*b_r + a_i*b_i)   imag = sum(a_r*b_i - a_i*b_r)
+# Both partials are produced in one launch into their own mid slots.
+@libentry()
+@triton.jit()
+def dot_prod_complex_kernel(a_ptr, b_ptr, midr_ptr, midi_ptr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    k = pid * BLOCK + tl.arange(0, BLOCK)
+    ar = tl.load(a_ptr + 2 * k).to(tl.float32)
+    ai = tl.load(a_ptr + 2 * k + 1).to(tl.float32)
+    br = tl.load(b_ptr + 2 * k).to(tl.float32)
+    bi = tl.load(b_ptr + 2 * k + 1).to(tl.float32)
+    tl.store(midr_ptr + pid, tl.sum(ar * br + ai * bi))
+    tl.store(midi_ptr + pid, tl.sum(ar * bi - ai * br))
 
-    other_real_offset = other_stride * base_offset
-    other_imag_offset = other_real_offset + 1
 
-    mask = base_offset < n_elements
+# Second-stage reduction: sum a zero-padded power-of-two buffer; also mask-free.
+@libentry()
+@triton.jit()
+def dot_sum_kernel(in_ptr, out_ptr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(in_ptr + offs).to(tl.float32)
+    tl.store(out_ptr + pid, tl.sum(v))
 
-    inp_real = tl.load(inp_ptr + inp_real_offset, mask=mask)
-    inp_imag = tl.load(inp_ptr + inp_imag_offset, mask=mask)
 
-    other_real = tl.load(other_ptr + other_real_offset, mask=mask)
-    other_imag = tl.load(other_ptr + other_imag_offset, mask=mask)
+# Single-launch masked variants for the N <= WIDE_BLOCK fast path. A masked
+# tail load is reliable here because BLOCK is a power of two <= 8192 and the
+# masked-out lanes are forced to zero before the reduction, so no lane is
+# silently dropped and no padded copy is needed.
+@libentry()
+@triton.jit()
+def dot_prod_masked_kernel(
+    x_ptr,
+    y_ptr,
+    out_ptr,
+    N,
+    x_stride: tl.constexpr,
+    y_stride: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(x_ptr + x_stride * offs, mask=mask, other=0.0).to(tl.float32)
+    x = tl.where(mask, x, 0.0)
+    y = tl.load(y_ptr + y_stride * offs, mask=mask, other=0.0).to(tl.float32)
+    y = tl.where(mask, y, 0.0)
+    tl.store(out_ptr, tl.sum(x * y))
 
-    inp_real = tl.where(mask, inp_real, 0.0)
-    inp_imag = tl.where(mask, inp_imag, 0.0)
-    other_real = tl.where(mask, other_real, 0.0)
-    other_imag = tl.where(mask, other_imag, 0.0)
 
-    # Compute based on conjugate flags
-    out_real, out_imag = compute_vdot(
-        inp_real, inp_imag, other_real, other_imag, inp_is_conj, other_is_conj
+@libentry()
+@triton.jit()
+def dot_prod_complex_masked_kernel(a_ptr, b_ptr, or_ptr, oi_ptr, N, BLOCK: tl.constexpr):
+    k = tl.arange(0, BLOCK)
+    mask = k < N
+    ar = tl.load(a_ptr + 2 * k, mask=mask, other=0.0).to(tl.float32)
+    ai = tl.load(a_ptr + 2 * k + 1, mask=mask, other=0.0).to(tl.float32)
+    br = tl.load(b_ptr + 2 * k, mask=mask, other=0.0).to(tl.float32)
+    bi = tl.load(b_ptr + 2 * k + 1, mask=mask, other=0.0).to(tl.float32)
+    ar = tl.where(mask, ar, 0.0)
+    ai = tl.where(mask, ai, 0.0)
+    br = tl.where(mask, br, 0.0)
+    bi = tl.where(mask, bi, 0.0)
+    tl.store(or_ptr, tl.sum(ar * br + ai * bi))
+    tl.store(oi_ptr, tl.sum(ar * bi - ai * br))
+
+
+def _pow2_decomp(v):
+    """Exact power-of-two aligned slices covering [0, v) with no overlap."""
+    out = []
+    off = 0
+    while v:
+        size = 1 << (v.bit_length() - 1)
+        out.append((off, size))
+        off += size
+        v -= size
+    return out
+
+
+def _sum_reduce_to(buf, out):
+    """Reduce a power-of-two-length fp32 buffer to the scalar `out`, mask-free."""
+    n = buf.numel()
+    while n > WIDE_BLOCK:
+        g = n // WIDE_BLOCK  # exact: both are powers of two
+        nxt = torch.zeros(
+            triton.next_power_of_2(g), dtype=torch.float32, device=buf.device
+        )
+        dot_sum_kernel[(g,)](buf, nxt, WIDE_BLOCK)
+        buf = nxt
+        n = nxt.numel()
+    dot_sum_kernel[(1,)](buf, out, n)
+
+
+def _dot_reduce(x, y, out, x_stride, y_stride):
+    """sum(x * y) -> scalar fp32 `out`, mask-free power-of-two tiles only."""
+    N = x.numel()
+    if N == 0:
+        out.zero_()
+        return
+
+    if N <= WIDE_BLOCK:
+        BLOCK = triton.next_power_of_2(N)
+        xc = x if x_stride == 1 else x.contiguous()
+        yc = y if y_stride == 1 else y.contiguous()
+        dot_prod_masked_kernel[(1,)](xc, yc, out, N, 1, 1, BLOCK)
+        return
+
+    full, rem = divmod(N, WIDE_BLOCK)
+    tiles = _pow2_decomp(rem)
+    cnt = full + len(tiles)
+    mid = torch.zeros(
+        triton.next_power_of_2(cnt), dtype=torch.float32, device=x.device
     )
-
-    tl.store(out_ptr, out_real)
-    tl.store(out_ptr + 1, out_imag)
-
-
-def dot_kernel_heur_block_size(args):
-    if args["n_elements"] % 2 != 0:
-        return triton.next_power_of_2(args["n_elements"])
-
-    if args["n_elements"] < 8192:
-        return args["n_elements"]
-
-    return triton.next_power_of_2(triton.cdiv(args["n_elements"], 12))
+    if full:
+        dot_prod_kernel[(full,)](x, y, mid, x_stride, y_stride, WIDE_BLOCK)
+    base = full * WIDE_BLOCK
+    for j, (off, size) in enumerate(tiles):
+        start = base + off
+        dot_prod_kernel[(1,)](
+            x[start:], y[start:], mid[full + j :], x_stride, y_stride, size
+        )
+    _sum_reduce_to(mid, out)
 
 
-# only support real number
-@libentry()
-# @triton.heuristics(runtime.get_heuristic_config("vdot"))
-@triton.heuristics(
-    values={
-        "BLOCK_SIZE": dot_kernel_heur_block_size,
-    },
-)
-@triton.jit()
-def dot_kernel(
-    inp_ptr,
-    other_ptr,
-    out_ptr,
-    n_elements: tl.constexpr,
-    inp_stride: tl.constexpr,
-    other_stride: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offset < n_elements
+def _vdot_reduce_complex(a_flat, b_flat, N, out_real, out_imag):
+    """conj(a).b -> (out_real, out_imag). a_flat / b_flat are contiguous 1D
+    view_as_real buffers of length 2N (real/imag interleaved)."""
+    if N == 0:
+        out_real.zero_()
+        out_imag.zero_()
+        return
 
-    inp = tl.load(inp_ptr + inp_stride * offset, mask=mask).to(tl.float32)
-    inp = tl.where(mask, inp, 0.0)
-    other = tl.load(other_ptr + other_stride * offset, mask=mask).to(tl.float32)
-    other = tl.where(mask, other, 0.0)
+    if N <= WIDE_BLOCK:
+        BLOCK = triton.next_power_of_2(N)
+        dot_prod_complex_masked_kernel[(1,)](
+            a_flat, b_flat, out_real, out_imag, N, BLOCK
+        )
+        return
 
-    out = tl.sum(inp * other)
-    tl.store(out_ptr, out)
+    full, rem = divmod(N, WIDE_BLOCK)
+    tiles = _pow2_decomp(rem)
+    cnt = full + len(tiles)
+    mid_r = torch.zeros(
+        triton.next_power_of_2(cnt), dtype=torch.float32, device=a_flat.device
+    )
+    mid_i = torch.zeros_like(mid_r)
+    if full:
+        dot_prod_complex_kernel[(full,)](a_flat, b_flat, mid_r, mid_i, WIDE_BLOCK)
+    base = full * WIDE_BLOCK
+    for j, (off, size) in enumerate(tiles):
+        s = base + off
+        dot_prod_complex_kernel[(1,)](
+            a_flat[2 * s :], b_flat[2 * s :], mid_r[full + j :], mid_i[full + j :], size
+        )
+    _sum_reduce_to(mid_r, out_real)
+    _sum_reduce_to(mid_i, out_imag)
 
 
 def vdot(input: Tensor, other: Tensor):
@@ -175,64 +222,31 @@ def vdot(input: Tensor, other: Tensor):
         input.size() == other.size()
     ), f"Input tensors must have the same size. Got {input.size()} and {other.size()}."
 
+    if input.is_complex():
+        # Resolve any conj view so view_as_real yields the true logical parts,
+        # then reduce the interleaved real/imag buffers directly.
+        inp_c = input.resolve_conj().contiguous()
+        other_c = other.resolve_conj().contiguous()
+        a_flat = torch.view_as_real(inp_c).reshape(-1)
+        b_flat = torch.view_as_real(other_c).reshape(-1)
+
+        device = input.device
+        N = input.numel()
+        out_real = torch.zeros([], dtype=torch.float32, device=device)
+        out_imag = torch.zeros([], dtype=torch.float32, device=device)
+        _vdot_reduce_complex(a_flat, b_flat, N, out_real, out_imag)
+        return torch.complex(out_real, out_imag).to(input.dtype)
+
     inp = input
+    inp_dtype = inp.dtype
+    n_elements = inp.numel()
+    if n_elements == 1041 and inp.dtype == torch.bfloat16:
+        inp = inp.to(torch.float32)
+        other = other.to(torch.float32)
+
     inp_stride = inp.stride()[0]
     other_stride = other.stride()[0]
 
-    if inp.is_complex():
-        inp_is_conj = False
-        other_is_conj = False
-
-        if inp.is_conj():
-            inp_is_conj = True
-            inp = inp.conj()
-
-        if other.is_conj():
-            other_is_conj = True
-            other = other.conj()
-
-        inp_real = torch.view_as_real(inp)
-        other_real = torch.view_as_real(other)
-
-        n_elements = inp_real.numel()
-        n_complex = inp.numel()
-
-        output_real = torch.zeros(2, dtype=inp_real.dtype, device=inp.device)
-
-        grid = lambda meta: (triton.cdiv(n_complex, meta["BLOCK_SIZE"]),)
-
-        vdot_kernel_complex[grid](
-            inp_real,
-            other_real,
-            output_real,
-            n_elements=n_elements,
-            inp_is_conj=inp_is_conj,
-            other_is_conj=other_is_conj,
-            inp_stride=inp_stride,
-            other_stride=other_stride,
-            isCLOSE_TTXPU_O_ATOMIC_SIM=True,
-            isCloseOffsetAnalysis=True,
-            isCloseUnrollControl=True,
-        )
-
-        return torch.view_as_complex(output_real)
-    else:
-        output = torch.zeros([], dtype=torch.float32, device=inp.device)
-        n_elements = inp.numel()
-        inp_dtype = inp.dtype
-        if n_elements == 1041 and inp.dtype == torch.bfloat16:
-            inp = inp.to(torch.float32)
-            other = other.to(torch.float32)
-
-        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-        dot_kernel[grid](
-            inp,
-            other,
-            output,
-            n_elements=n_elements,
-            inp_stride=inp_stride,
-            other_stride=other_stride,
-            isCLOSE_TTXPU_O_ATOMIC_SIM=True,
-            isCloseOffsetAnalysis=True,
-        )
-        return output.to(inp_dtype)
+    output = torch.zeros([], dtype=torch.float32, device=inp.device)
+    _dot_reduce(inp, other, output, inp_stride, other_stride)
+    return output.to(inp_dtype)

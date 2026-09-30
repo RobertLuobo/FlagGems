@@ -154,7 +154,7 @@ def avg_pool3d(
     total = output.numel()
     if total:
         x = x.contiguous()
-        block = 128
+        block = 1024
         divisor = 0 if divisor_override is None else divisor_override
         with torch_device_fn.device(input.device):
             _avg_pool3d_kernel[(triton.cdiv(total, block),)](

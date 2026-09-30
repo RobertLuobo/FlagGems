@@ -586,7 +586,9 @@ def _input_grad(
     dxsw,
     BM: tl.constexpr,
     BC: tl.constexpr,
-    BO: tl.constexpr,
+    KH: tl.constexpr,
+    KW: tl.constexpr,
+    OPG: tl.constexpr,
 ):
     pm, pc = tl.program_id(0), tl.program_id(1)
     m = pm * BM + tl.arange(0, BM)
@@ -597,39 +599,41 @@ def _input_grad(
     ih, iw = q // win, q % win
     g, lc = c // cpg, c % cpg
     acc = tl.zeros((BM, BC), tl.float32)
-    for r in range(0, kh):
-        hnum = ih + ph - r * dh
+    for i in range(KH * KW * OPG):
+        rs = i // OPG
+        o = i % OPG
+        r = rs // KW
+        s = rs % KW
+        hnum = ih + (ph - r * dh)
         oh = hnum // sh
         hvalid = (hnum == oh * sh) & (oh >= 0) & (oh < hout)
-        for s in range(0, kw):
-            wnum = iw + pw - s * dw
-            ow = wnum // sw
-            wvalid = (wnum == ow * sw) & (ow >= 0) & (ow < wout)
-            for obase in range(0, opg, BO):
-                o = obase + tl.arange(0, BO)
-                gy = tl.load(
-                    dy
-                    + ni[:, None, None] * dysn
-                    + (g[None, :, None] * opg + o[None, None, :]) * dysc
-                    + oh[:, None, None] * dysh
-                    + ow[:, None, None] * dysw,
-                    mask=(ni[:, None, None] < n)
-                    & (c[None, :, None] < cin)
-                    & (o[None, None, :] < opg)
-                    & hvalid[:, None, None]
-                    & wvalid[:, None, None],
-                    other=0.0,
-                )
-                ww = tl.load(
-                    w
-                    + (g[:, None] * opg + o[None, :]) * wso
-                    + lc[:, None] * wsi
-                    + r * wsh
-                    + s * wsw,
-                    mask=(c[:, None] < cin) & (o[None, :] < opg),
-                    other=0.0,
-                )
-                acc += tl.sum(gy * ww[None, :, :], axis=2)
+        wnum = iw + (pw - s * dw)
+        ow = wnum // sw
+        wvalid = (wnum == ow * sw) & (ow >= 0) & (ow < wout)
+        safe_oh = tl.where(hvalid, oh, 0)
+        safe_ow = tl.where(wvalid, ow, 0)
+        valid = (
+            (ni[:, None] < n)
+            & (c[None, :] < cin)
+            & hvalid[:, None]
+            & wvalid[:, None]
+        )
+        gy = tl.load(
+            dy
+            + ni[:, None] * dysn
+            + (g[None, :] * OPG + o) * dysc
+            + safe_oh[:, None] * dysh
+            + safe_ow[:, None] * dysw,
+            mask=valid,
+            other=0.0,
+        )
+        gy = tl.where(valid, gy, 0.0)
+        ww = tl.load(
+            w + (g * OPG + o) * wso + lc * wsi + r * wsh + s * wsw,
+            mask=c < cin,
+            other=0.0,
+        )
+        acc += gy * ww[None, :]
     tl.store(
         dx
         + ni[:, None] * dxsn
@@ -686,40 +690,38 @@ def _weight_grad(
     rem = rem % (kh * kw)
     r, s = rem // kw, rem % kw
     g = oc // opg
+    ocmask = oc < cout
     acc = tl.zeros((BK,), tl.float32)
     total = n * hout * wout
-    for pbase in range(0, total, BP):
-        p = pbase + tl.arange(0, BP)
-        ni = p // (hout * wout)
-        q = p % (hout * wout)
-        oh, ow = q // wout, q % wout
-        ih = oh[:, None] * sh - ph + r[None, :] * dh
-        iw = ow[:, None] * sw - pw + s[None, :] * dw
+    plane = hout * wout
+    for pp in range(0, total):
+        ni = pp // plane
+        q = pp % plane
+        oh = q // wout
+        ow = q % wout
+        ih = oh * sh - ph + r * dh
+        iw = ow * sw - pw + s * dw
+        ihv = (ih >= 0) & (ih < hin)
+        iwv = (iw >= 0) & (iw < win)
+        safe_ih = tl.where(ihv, ih, 0)
+        safe_iw = tl.where(iwv, iw, 0)
         xv = tl.load(
             x
-            + ni[:, None] * xsn
-            + (g[None, :] * cpg + ci[None, :]) * xsc
-            + ih * xsh
-            + iw * xsw,
-            mask=(p[:, None] < total)
-            & (oc[None, :] < cout)
-            & (ih >= 0)
-            & (ih < hin)
-            & (iw >= 0)
-            & (iw < win),
+            + ni * xsn
+            + (g * cpg + ci) * xsc
+            + safe_ih * xsh
+            + safe_iw * xsw,
+            mask=ocmask & ihv & iwv,
             other=0.0,
         )
+        xv = tl.where(ihv & iwv, xv, 0.0)
         gy = tl.load(
-            dy
-            + ni[:, None] * dysn
-            + oc[None, :] * dysc
-            + oh[:, None] * dysh
-            + ow[:, None] * dysw,
-            mask=(p[:, None] < total) & (oc[None, :] < cout),
+            dy + ni * dysn + oc * dysc + oh * dysh + ow * dysw,
+            mask=ocmask,
             other=0.0,
         )
-        acc += tl.sum(xv * gy, axis=0)
-    tl.store(grad_w + oc * gws0 + ci * gws1 + r * gws2 + s * gws3, acc, mask=oc < cout)
+        acc += xv.to(tl.float32) * gy.to(tl.float32)
+    tl.store(grad_w + oc * gws0 + ci * gws1 + r * gws2 + s * gws3, acc, mask=ocmask)
 
 
 @libentry()
@@ -740,23 +742,21 @@ def _bias_grad(
 ):
     o = tl.program_id(0) * BO + tl.arange(0, BO)
     total = n * hout * wout
+    plane = hout * wout
+    omask = o < cout
     acc = tl.zeros((BO,), tl.float32)
-    for pbase in range(0, total, BP):
-        p = pbase + tl.arange(0, BP)
-        ni = p // (hout * wout)
-        q = p % (hout * wout)
-        oh, ow = q // wout, q % wout
+    for pp in range(0, total):
+        ni = pp // plane
+        q = pp % plane
+        oh = q // wout
+        ow = q % wout
         value = tl.load(
-            dy
-            + ni[:, None] * dysn
-            + o[None, :] * dysc
-            + oh[:, None] * dysh
-            + ow[:, None] * dysw,
-            mask=(p[:, None] < total) & (o[None, :] < cout),
+            dy + ni * dysn + o * dysc + oh * dysh + ow * dysw,
+            mask=omask,
             other=0.0,
         )
-        acc += tl.sum(value, axis=0)
-    tl.store(grad_b + o, acc, mask=o < cout)
+        acc += value.to(tl.float32)
+    tl.store(grad_b + o, acc, mask=omask)
 
 
 def _pair(value, name):
@@ -1020,7 +1020,9 @@ class Conv2d(torch.autograd.Function):
                 *grad_x.stride(),
                 BM=32,
                 BC=32,
-                BO=32,
+                KH=kh,
+                KW=kw,
+                OPG=cout // groups,
             )
         if need_w:
             grad_w = torch.empty_like(weight)

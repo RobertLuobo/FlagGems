@@ -11,38 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Kunlunxin XPU override for ``aten::convolution_overrideable``.
-
-The generic FlagGems implementation
-(``flag_gems.ops.convolution_overrideable``) drives an im2col ``tl.dot``
-matmul kernel.  On the P800 TritonXPU backend that kernel produces NaN /
-garbage (masked ``tl.load`` ``other`` values are unreliable and ``tl.dot``
-reads past the padded contraction boundary), so 99/111 accuracy cases fail.
-
-Instead of the ``tl.dot`` path, this override reuses the device-resident
-Kunlunxin forward conv kernels (scalar fp32 accumulation, no ``tl.dot``),
-which are already validated on this backend:
-
-  * Forward 1D/2D/3D convolution -> the vendor ``conv1d``/``conv2d``/``conv3d``
-    kernels.
-  * Transposed convolution -> expressed as a forward ``conv2d`` on a
-    stride-dilated input with the spatially-flipped, channel-transposed
-    weight (the standard "transposed conv == fractionally-strided conv"
-    identity).  The vendor ``conv_transpose2d`` xpudnn-fusion binding and the
-    ``conv2d`` input-gradient kernel both mis-compile / mis-compute on this
-    stack, whereas the forward ``conv2d`` kernel is exact; only tensor
-    rearrangement (zero-insertion, weight flip/permute) is done outside the
-    kernel, never the convolution arithmetic itself.
-"""
-
 import logging
 
 import torch
 
-from .conv1d import conv1d
-from .conv2d import conv2d
-from .conv3d import conv3d
+from flag_gems.runtime.backend._kunlunxin.ops.add import add as _xpu_add
+from flag_gems.runtime.backend._kunlunxin.ops.conv1d import conv1d as _xpu_conv1d
+from flag_gems.runtime.backend._kunlunxin.ops.conv2d import Conv2d as _XpuConv2d
+from flag_gems.runtime.backend._kunlunxin.ops.conv2d import conv2d as _xpu_conv2d
+from flag_gems.runtime.backend._kunlunxin.ops.conv3d import conv3d as _xpu_conv3d
+from flag_gems.runtime.backend._kunlunxin.ops.conv_transpose1d import (
+    conv_transpose1d as _xpu_conv_transpose1d,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,41 +35,46 @@ def _pair(value):
     return int(value), int(value)
 
 
-def _conv_transpose2d(
-    input, weight, bias, stride, padding, output_padding, groups, dilation
-):
-    """Transposed 2D convolution via the forward ``conv2d`` kernel.
+def _conv_transpose2d_via_grad_input(
+    input, weight, bias, stride, padding, dilation, output_padding, groups
+): 
+    stride_h, stride_w = _pair(stride)
+    pad_h, pad_w = _pair(padding)
+    dil_h, dil_w = _pair(dilation)
+    opad_h, opad_w = _pair(output_padding)
 
-    Uses the identity ``convT(x, w) == conv(dilate(x), flip(swap(w)))`` so all
-    multiply-accumulate work runs through the validated forward conv2d Triton
-    kernel; only zero-insertion and weight reshaping happen on the host.
-    """
-    sh, sw = _pair(stride)
-    ph, pw = _pair(padding)
-    oph, opw = _pair(output_padding)
-    dh, dw = _pair(dilation)
-
-    n, cin, hin, win = input.shape
-    _, cout_pg, kh, kw = weight.shape
-    cin_pg = cin // groups
-
-    pf_h = dh * (kh - 1) - ph
-    pf_w = dw * (kw - 1) - pw
-
-    hd = (hin - 1) * sh + 1 + oph
-    wd = (win - 1) * sw + 1 + opw
-    x_dil = torch.zeros((n, cin, hd, wd), device=input.device, dtype=input.dtype)
-    x_dil[:, :, 0 : (hin - 1) * sh + 1 : sh, 0 : (win - 1) * sw + 1 : sw] = input
-
-    w_flip = (
-        weight.reshape(groups, cin_pg, cout_pg, kh, kw)
-        .permute(0, 2, 1, 3, 4)
-        .flip(-1, -2)
-        .reshape(groups * cout_pg, cin_pg, kh, kw)
-        .contiguous()
+    kH, kW = weight.shape[2], weight.shape[3]
+    out_c = weight.shape[1] * groups
+    out_h = (
+        (input.shape[2] - 1) * stride_h - 2 * pad_h + dil_h * (kH - 1) + opad_h + 1
     )
+    out_w = (
+        (input.shape[3] - 1) * stride_w - 2 * pad_w + dil_w * (kW - 1) + opad_w + 1
+    )
+    target_shape = (input.shape[0], out_c, out_h, out_w)
 
-    return conv2d(x_dil, w_flip, bias, (1, 1), (pf_h, pf_w), (dh, dw), groups)
+    with torch.enable_grad():
+        x = torch.zeros(
+            target_shape,
+            device=input.device,
+            dtype=input.dtype,
+            requires_grad=True,
+        )
+        out = _XpuConv2d.apply(
+            x,
+            weight.detach(),
+            None,
+            stride,
+            padding,
+            dilation,
+            groups,
+        )
+        out.backward(input)
+    result = x.grad.detach()
+
+    if bias is not None:
+        result = _xpu_add(result, bias.view(1, -1, 1, 1))
+    return result
 
 
 def _convolution_overrideable_impl(
@@ -102,12 +87,7 @@ def _convolution_overrideable_impl(
     transposed,
     output_padding,
     groups,
-):
-    """Route to the matching Kunlunxin Triton conv kernel by spatial rank.
-
-    Mirrors ``aten::convolution_overrideable``: the spatial rank is inferred
-    from ``weight.ndim - 2``.
-    """
+): 
     spatial_dims = weight.ndim - 2
     assert spatial_dims in (1, 2, 3), (
         f"convolution_overrideable only supports 1D/2D/3D convolutions, "
@@ -116,34 +96,27 @@ def _convolution_overrideable_impl(
 
     if transposed:
         if spatial_dims == 1:
-            stride_w = _pair(stride)[0]
-            padding_w = _pair(padding)[0]
-            output_padding_w = _pair(output_padding)[0]
-            dilation_w = _pair(dilation)[0]
-            out = _conv_transpose2d(
-                input.unsqueeze(-2),
-                weight.unsqueeze(-2),
-                bias,
-                (1, stride_w),
-                (0, padding_w),
-                (0, output_padding_w),
-                groups,
-                (1, dilation_w),
-            )
-            return out.squeeze(-2)
-        if spatial_dims == 2:
-            return _conv_transpose2d(
+            return _xpu_conv_transpose1d(
                 input, weight, bias, stride, padding, output_padding, groups, dilation
+            )
+        if spatial_dims == 2:
+            return _conv_transpose2d_via_grad_input(
+                input, weight, bias, stride, padding, dilation, output_padding, groups
             )
         raise NotImplementedError(
             "convolution_overrideable does not support 3D transposed convolution."
         )
 
     if spatial_dims == 1:
-        return conv1d(input, weight, bias, stride, padding, dilation, groups)
+        stride_w = _pair(stride)[0]
+        padding_w = _pair(padding)[0]
+        dilation_w = _pair(dilation)[0]
+        return _xpu_conv1d(
+            input, weight, bias, stride_w, padding_w, dilation_w, groups
+        )
     if spatial_dims == 2:
-        return conv2d(input, weight, bias, stride, padding, dilation, groups)
-    return conv3d(input, weight, bias, stride, padding, dilation, groups)
+        return _xpu_conv2d(input, weight, bias, stride, padding, dilation, groups)
+    return _xpu_conv3d(input, weight, bias, stride, padding, dilation, groups)
 
 
 def convolution_overrideable(

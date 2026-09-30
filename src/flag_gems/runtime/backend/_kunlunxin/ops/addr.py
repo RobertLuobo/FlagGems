@@ -60,6 +60,29 @@ def addr_forward(inp, v1, v2, beta, alpha):
     return beta * inp.to(tl.float32) + alpha * (v1.to(tl.float32) * v2.to(tl.float32))
 
 
+# beta==0 path: PyTorch ignores `input` entirely (even if it holds inf/nan), so
+# we must NOT emit the beta*input term at all — computing 0*inf would give nan.
+@pointwise_dynamic(
+    is_tensor=[True, True, False],
+    promotion_methods=[(0, 1, "DEFAULT")],
+    config=config_,
+)
+@triton.jit
+def addr_outer_only(v1, v2, alpha):
+    return alpha * (v1.to(tl.float32) * v2.to(tl.float32))
+
+
+# alpha==0 path: PyTorch ignores the outer product entirely; result is beta*input.
+@pointwise_dynamic(
+    is_tensor=[True, False],
+    promotion_methods=[(0, "DEFAULT")],
+    config=config_,
+)
+@triton.jit
+def addr_input_only(inp, beta):
+    return beta * inp.to(tl.float32)
+
+
 def addr(input, vec1, vec2, *, beta=1, alpha=1):
     logger.debug("GEMS_KUNLUNXIN ADDR")
     if vec1.dim() != 1 or vec2.dim() != 1:
@@ -77,12 +100,63 @@ def addr(input, vec1, vec2, *, beta=1, alpha=1):
             f"to output shape {output_shape}"
         )
     out = torch.empty(output_shape, device=input.device, dtype=input.dtype)
-    addr_forward(
-        input_broadcasted,
-        vec1.reshape(M, 1),
-        vec2.reshape(1, N),
-        beta,
-        alpha,
-        out0=out,
-    )
+    beta_is_zero = beta == 0
+    alpha_is_zero = alpha == 0
+    if beta_is_zero and alpha_is_zero:
+        out.zero_()
+    elif beta_is_zero:
+        addr_outer_only(
+            vec1.reshape(M, 1),
+            vec2.reshape(1, N),
+            alpha,
+            out0=out,
+        )
+    elif alpha_is_zero:
+        addr_input_only(input_broadcasted, beta, out0=out)
+    else:
+        addr_forward(
+            input_broadcasted,
+            vec1.reshape(M, 1),
+            vec2.reshape(1, N),
+            beta,
+            alpha,
+            out0=out,
+        )
     return out
+
+
+def addr_(input, vec1, vec2, *, beta=1, alpha=1):
+    logger.debug("GEMS_KUNLUNXIN ADDR_")
+    if vec1.dim() != 1 or vec2.dim() != 1:
+        raise ValueError("addr_: expected 1-D vectors")
+
+    M, N = input.shape
+    if vec1.shape[0] != M or vec2.shape[0] != N:
+        raise ValueError(
+            f"addr_: vec1 size {vec1.shape[0]} must match input rows {M}, "
+            f"vec2 size {vec2.shape[0]} must match input cols {N}"
+        )
+
+    beta_is_zero = beta == 0
+    alpha_is_zero = alpha == 0
+    if beta_is_zero and alpha_is_zero:
+        input.zero_()
+    elif beta_is_zero:
+        addr_outer_only(
+            vec1.reshape(M, 1),
+            vec2.reshape(1, N),
+            alpha,
+            out0=input,
+        )
+    elif alpha_is_zero:
+        addr_input_only(input, beta, out0=input)
+    else:
+        addr_forward(
+            input,
+            vec1.reshape(M, 1),
+            vec2.reshape(1, N),
+            beta,
+            alpha,
+            out0=input,
+        )
+    return input

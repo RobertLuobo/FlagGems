@@ -46,11 +46,49 @@ def ge_func(x, y):
     return x.to(tl.float32) >= y
 
 
+_GE_T_SMALL_NUMEL = 1 << 14
+
+
+@triton.jit
+def ge_tensor_small_kernel(out_ptr, x_ptr, y_ptr, numel, TILE: tl.constexpr):
+    tid = tl.arange(0, TILE)
+    mask = tid < numel
+    x = tl.load(x_ptr + tid, mask=mask).to(tl.float32)
+    y = tl.load(y_ptr + tid, mask=mask).to(tl.float32)
+    tl.store(out_ptr + tid, (x >= y).to(tl.int8), mask=mask)
+
+
+def _ge_tensor_small(A, B):
+    numel = A.numel()
+    out = torch.empty(numel, dtype=torch.int8, device=A.device)
+    TILE = triton.next_power_of_2(numel)
+    ge_tensor_small_kernel[(1,)](
+        out,
+        A.reshape(-1),
+        B.reshape(-1),
+        numel,
+        TILE=TILE,
+        num_warps=4,
+        isCloseMemoryAsync=False,
+    )
+    return out.view(torch.bool).reshape(A.shape)
+
+
 def ge(A, B):
     logger.debug("GEMS_KUNLUNXIN GE")
     os.environ["TRITONXPU_COMPARE_FUSION"] = "1"
     os.environ["TRITONXPU_FP16_FAST"] = "1"
-    res = ge_func(A, B)
+    if (
+        0 < A.numel() <= _GE_T_SMALL_NUMEL
+        and A.dtype in (torch.float16, torch.float32, torch.bfloat16)
+        and A.dtype == B.dtype
+        and A.shape == B.shape
+        and A.is_contiguous()
+        and B.is_contiguous()
+    ):
+        res = _ge_tensor_small(A, B)
+    else:
+        res = ge_func(A, B)
     del os.environ["TRITONXPU_COMPARE_FUSION"]
     del os.environ["TRITONXPU_FP16_FAST"]
     return res

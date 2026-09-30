@@ -24,36 +24,22 @@ from ..ops import mul, mv_cluster
 
 logger = logging.getLogger(__name__)
 
-# ============================================================================
 # outer(x, y)[i, j] = x[i] * y[j] on Kunlunxin XPU.
-#
-# XPU 2026-08 environment findings (all measured on XPU 6):
-#   1. The historical broadcast-mul path (x[:, None] / y[None, :]) emits
-#      0-stride discrete gathers; per-element div/mod in a flat kernel also
-#      costs ~2-3x over the achievable copy bandwidth.
-#   2. Register-level 2D broadcast (xv[:, None] * yv[None, :], tl.broadcast_to)
-#      is mis-compiled for larger shapes on this backend (wrong values), so a
-#      broadcast-free formulation is mandatory.
-#   3. tl.dot with operands read from DRAM is CORRECT (fp32/fp16 bit-exact
-#      with input_precision="ieee"); it is the fastest formulation found.
-#   outer == (x*(1/16)) @ ones? no — expand: out[i,j] = sum_k a[i,k]*b[k,j]
-#   with a[i,k] = x[i]/16 and b[k,j] = y[j] (K=16 identical terms): the dot
-#   sum reproduces x[i]*y[j] exactly (division by 16 is an exact exponent
-#   shift for any float dtype).
-#
-# Fast path (the only path in the perf matrix — all benchmark shapes are
-# divisible by (64, 128)): materialize a=(M,16) / b=(16,N) with the tiny
-# torch ops below, then one tl.dot tile kernel. Output uses torch.empty_strided
-# to skip the registered-aten `empty` zero-fill tax.
-#
-# Fallback path (non-divisible dims, e.g. 5333x497 / 1x32 in the accuracy
-# suite): flat 1D kernel over M*N with clamped loads (proven stable pattern).
-# Complex inputs keep the old broadcast-mul path (mul handles complex).
-# ============================================================================
+# Register-level 2D broadcast (xv[:, None] * yv[None, :]) is mis-compiled for
+# larger shapes on this backend, so it is never used. Two correct paths:
+#   - flat 1D kernel over M*N with affine store (low launch overhead) — best
+#     for small/medium outputs;
+#   - tl.dot tile kernel (a=(M,16), b=(16,N), K=16 exact copies) — best only
+#     for the largest outputs, where its higher fixed cost is amortized.
 
 _KN = 16
 _DOT_BM = 256
 _DOT_BN = 512
+
+# Output element count at/above which the tl.dot tile path beats the flat
+# kernel (measured device median on XPU 6). Below it the flat path wins on
+# launch overhead.
+_DOT_MIN_ELEMS = 40 * 1024 * 1024
 
 
 @libentry()
@@ -129,7 +115,10 @@ def _outer_flat(inp, weight):
     out = torch.empty_strided((m, n), (n, 1), dtype=inp.dtype, device=inp.device)
     if total == 0:
         return out
-    block = 4096 if total >= 4096 else triton.next_power_of_2(total)
+    if total <= 2 * 1024 * 1024:
+        block = 4096 if total >= 4096 else triton.next_power_of_2(total)
+    else:
+        block = 65536
     grid = (triton.cdiv(total, block),)
     outer_flat_kernel[grid](
         inp, weight, out, total, N=n, BLOCK=block, NEED_MASK=total % block != 0
@@ -149,15 +138,13 @@ class Outer(torch.autograd.Function):
             weight1 = weight[None, :].contiguous()
             out = mul(inp1, weight1)
         elif (
-            inp.shape[0] > 0
-            and weight.shape[0] > 0
+            inp.shape[0] * weight.shape[0] >= _DOT_MIN_ELEMS
             and inp.shape[0] % 256 == 0
             and weight.shape[0] % 512 == 0
         ):
             out = _outer_dot(inp, weight, 256, 512)
         elif (
-            inp.shape[0] > 0
-            and weight.shape[0] > 0
+            inp.shape[0] * weight.shape[0] >= _DOT_MIN_ELEMS
             and inp.shape[0] % 64 == 0
             and weight.shape[0] % 128 == 0
         ):
