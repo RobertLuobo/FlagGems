@@ -28,18 +28,23 @@ handled for the sibling ``tril_indices`` override.
 
 This override keeps the vendor-neutral, overflow-safe host-side validation and
 plan computation verbatim (imported from the generic module) and replaces only
-the data-generation step with a device-side ``arange`` / ``repeat_interleave``
-construction. No CPU/ATen/composite fallback is used: every tensor lives on the
-target device and is built from plain allocations plus integer arithmetic. Both
-the ramp and rectangle regions are bounded by the true output size, so the
-INT64_MAX sparse/far-offset cases (which produce a size-0 or size-1 output) stay
-cheap while the overflow/allocation validation still raises exactly as torch
-does.
+the data-generation step. Index ramps are built from a device-side ``iota``
+Triton kernel plus closed-form integer arithmetic (the upper-triangular ramp
+start offsets are the arithmetic-series prefix sum
+``start[r] = r*first_length - r*(r-1)/2``, so no ``cumsum`` is needed) and
+``repeat_interleave``. No CPU/ATen/composite ``arange``/``cumsum`` fallback is
+used: every tensor lives on the target device and is built from plain
+allocations plus integer arithmetic. Both the ramp and rectangle regions are
+bounded by the true output size, so the INT64_MAX sparse/far-offset cases
+(which produce a size-0 or size-1 output) stay cheap while the
+overflow/allocation validation still raises exactly as torch does.
 """
 
 import logging
 
 import torch
+import triton
+import triton.language as tl
 
 from flag_gems.ops.triangular_indices import (
     _make_triu_plan,
@@ -50,6 +55,24 @@ from flag_gems.runtime import device as runtime_device
 
 logger = logging.getLogger(__name__)
 
+_IOTA_BLOCK = 1024
+
+
+@triton.jit
+def _iota_kernel(out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0).to(tl.int64)
+    offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    tl.store(out_ptr + offs, offs, mask=offs < n)
+
+
+def _iota(n, device):
+    """Device-side ``torch.arange(n, dtype=int64)`` replacement (no fallback)."""
+    out = torch.empty(n, device=device, dtype=torch.int64)
+    if n > 0:
+        grid = (triton.cdiv(n, _IOTA_BLOCK),)
+        _iota_kernel[grid](out, n, BLOCK=_IOTA_BLOCK)
+    return out
+
 
 def _fill_rectangle(output, plan, col):
     """Fill the full-width rectangle region (rows all have ``col`` columns)."""
@@ -58,8 +81,8 @@ def _fill_rectangle(output, plan, col):
         return
     dev = output.device
     dtype = output.dtype
-    rows = torch.arange(n, device=dev, dtype=torch.int64) + plan.rectangle_row_start
-    cols = torch.arange(col, device=dev, dtype=torch.int64)
+    rows = _iota(n, dev) + plan.rectangle_row_start
+    cols = _iota(col, dev)
     row_block = rows.reshape(n, 1).expand(n, col).reshape(-1)
     col_block = cols.reshape(1, col).expand(n, col).reshape(-1)
     off = plan.rectangle_output_offset
@@ -81,15 +104,21 @@ def _fill_triu_ramp(output, plan, col):
         return
     dev = output.device
     dtype = output.dtype
-    local_row = torch.arange(m, device=dev, dtype=torch.int64)
-    lengths = plan.ramp_first_length - local_row
-    total = int(lengths.sum().item())
-    starts = torch.cumsum(lengths, 0) - lengths
+    first_length = plan.ramp_first_length
+    local_row = _iota(m, dev)
+    lengths = first_length - local_row
+    # Closed-form prefix sum of the (decreasing) arithmetic series
+    # ``first_length - r``:
+    #   total      = m*first_length - m*(m-1)/2
+    #   starts[r]  = r*first_length - r*(r-1)/2   (exclusive prefix sum)
+    # avoids torch.cumsum / a .sum().item() device sync entirely.
+    total = m * first_length - m * (m - 1) // 2
+    starts = local_row * first_length - local_row * (local_row - 1) // 2
     matrix_rows = plan.ramp_row_start + local_row
     row_block = torch.repeat_interleave(matrix_rows, lengths)
     starts_rep = torch.repeat_interleave(starts, lengths)
     lengths_rep = torch.repeat_interleave(lengths, lengths)
-    within = torch.arange(total, device=dev, dtype=torch.int64) - starts_rep
+    within = _iota(total, dev) - starts_rep
     col_block = (col - lengths_rep) + within
     off = plan.ramp_output_offset
     end = off + total
