@@ -99,9 +99,19 @@ def uniform_(self, from_=0.0, to=1.0, *, generator=None):
     philox_seed, philox_offset = philox_backend_seed_offset(
         increment, generator=generator
     )
+    # The kernel writes N values linearly from data_ptr, which is only correct
+    # for contiguous storage. For a non-contiguous self (e.g. a strided view
+    # like base[::2]) a flat write would land at the wrong logical positions and
+    # clobber neighboring storage outside the view. Stage into a contiguous
+    # buffer and copy back in that case.
+    buf = (
+        self
+        if self.is_contiguous()
+        else torch.empty(self.shape, dtype=self.dtype, device=self.device)
+    )
     with torch_device_fn.device(self.device):
         uniform_kernel[grid](
-            self,
+            buf,
             N,
             philox_seed,
             philox_offset,
@@ -110,6 +120,8 @@ def uniform_(self, from_=0.0, to=1.0, *, generator=None):
             BLOCK=BLOCK,
             num_warps=num_warps,
         )
+    if buf is not self:
+        self.copy_(buf)
     return self
 
 
@@ -177,7 +189,10 @@ def uniform(self, from_=0.0, to=1.0, *, generator=None):
             "uniform_ expects to return a [from, to) range, but found "
             f"from={from_:g} > to={to:g}"
         )
-    out = torch.empty_like(self)
+    # Allocate a contiguous output: the kernel writes N values linearly from
+    # data_ptr, so empty_like's preserved (possibly strided) layout would place
+    # values at the wrong logical positions for non-contiguous self.
+    out = torch.empty(self.shape, dtype=self.dtype, device=self.device)
     N = volume(out.shape)
     BLOCK, num_warps = _launch_config(N)
     grid = (triton.cdiv(N, BLOCK * UNROLL),)
