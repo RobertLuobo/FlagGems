@@ -53,6 +53,7 @@ def batch_norm_impl_index(
         training,
         momentum,
         eps,
+        update_running_all_dtypes=True,
     )
     reserve = torch.empty((0,), dtype=torch.uint8, device=input.device)
     return output, save_mean, save_var, reserve, 0

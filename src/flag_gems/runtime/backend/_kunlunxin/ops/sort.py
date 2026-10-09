@@ -29,6 +29,16 @@ from .topk import _get_finfo_val, _get_iinfo_val, argsort
 logger = logging.getLogger(__name__)
 
 
+def _check_sort_dim(ndim, dim):
+    lo = -ndim if ndim > 0 else -1
+    hi = ndim - 1 if ndim > 0 else 0
+    if dim < lo or dim > hi:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of [{lo}, {hi}], "
+            f"but got {dim})"
+        )
+
+
 def unwrap_if_constexpr(o):
     return o.value if isinstance(o, tl.constexpr) else o
 
@@ -105,6 +115,14 @@ def convert_to_uint_preverse_order(x: tl.tensor, descending: tl.constexpr = Fals
     if x.dtype.is_floating():
         if x.dtype == tl.bfloat16:
             x = x.to(tl.float32)
+        kdtype: tl.constexpr = x.dtype
+        num_bits: tl.constexpr = x.dtype.primitive_bitwidth
+        udtype = get_int_t(num_bits, False)
+        ux = x.to(udtype, bitcast=True)
+        neg_zero_v: tl.constexpr = one_zeros(num_bits)
+        neg_zero = tl.full((), value=neg_zero_v, dtype=udtype)
+        x = tl.where(ux == neg_zero, 0.0, x).to(kdtype)
+        x = tl.where(x != x, float("nan"), x).to(kdtype)
         out = floating_to_uint(x, descending)
     elif x.dtype.is_int_signed():
         out = int_to_uint(x, descending)
@@ -352,12 +370,16 @@ def _copy_bitview(t):
     # the copy is bit-exact.  Same workaround as the cat family.
     if t.dtype == torch.int32:
         return t.view(torch.float32)
+    if t.dtype == torch.bfloat16:
+        return t.view(torch.float16)
     return t
 
 
 def _permute_copy_to_last(inp, dim):
     """Materialize a dim-last view without routing a strided copy through copy_."""
     order = [i for i in range(inp.ndim) if i != dim] + [dim]
+    if inp.element_size() == 1:
+        return inp.permute(order).contiguous(), order
     shape = tuple(inp.shape[i] for i in order)
     strides = tuple(inp.stride()[i] for i in order)
     out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
@@ -371,6 +393,11 @@ def _permute_copy_to_last(inp, dim):
 
 def _permute_copy_from_last(inp, out_shape, order):
     """Copy a dim-last result into the original contiguous dimension order."""
+    if inp.element_size() == 1:
+        inverse = [0] * len(order)
+        for new_pos, old_dim in enumerate(order):
+            inverse[old_dim] = new_pos
+        return inp.permute(inverse).contiguous()
     out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)
     shape = tuple(out_shape[i] for i in order)
     strides = tuple(out.stride()[i] for i in order)
@@ -418,6 +445,7 @@ def sort_kernel(
 
 def sort(inp, dim=-1, descending=False):
     logger.debug("GEMS_KUNLUNXIN SORT")
+    _check_sort_dim(inp.ndim, dim)
     if inp.ndim == 0:
         return inp.clone(), torch.zeros_like(inp, dtype=torch.int64)
     sort_elem_cnt = inp.shape[dim]
@@ -438,6 +466,7 @@ def sort_stable(inp, *, stable, dim=-1, descending=False):
     logger.debug("GEMS_KUNLUNXIN SORT_STABLE")
     # We only implement stable radix sort here
     _ = stable
+    _check_sort_dim(inp.ndim, dim)
     if inp.ndim == 0:
         return inp.clone(), torch.zeros_like(inp, dtype=torch.int64)
     sort_elem_cnt = inp.shape[dim]

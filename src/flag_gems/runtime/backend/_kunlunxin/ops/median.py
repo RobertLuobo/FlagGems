@@ -1082,8 +1082,8 @@ def _median_dim_impl(inp, dim, keepdim, out=None):
     with torch_device_fn.device(inp.device):
         rows = _reduction_rows(inp, dim, M, N)
         out_values, out_indices = _median_key_select(rows, N)
-        torch.ops.aten._copy_from(out_values, values, False)
-        torch.ops.aten._copy_from(out_indices, indices, False)
+        torch.ops.aten._copy_from(out_values.reshape(values.shape), values, False)
+        torch.ops.aten._copy_from(out_indices.reshape(indices.shape), indices, False)
 
     if out is None and not keepdim:
         values = torch.squeeze(values, dim)

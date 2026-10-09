@@ -1574,37 +1574,8 @@ def _run_lengths_kernel(
     tl.store(counts_ptr + r, s_next - s, mask=m)
 
 
-def _unique2(
-    in0: torch.Tensor,
-    sorted: bool = True,
-    return_inverse: bool = False,
-    return_counts: bool = False,
-):
-    logger.debug("GEMS_KUNLUNXIN _UNIQUE2")
-    _ = sorted
-    flat = in0.contiguous().view(-1)
+def _unique2_core(flat, return_inverse, return_counts):
     N = flat.numel()
-
-    if N == 0:
-        data_out = flat.clone()
-        inverse_indices = (
-            torch.empty_like(flat, dtype=torch.int64) if return_inverse else None
-        )
-        counts = (
-            torch.empty(0, dtype=torch.int64, device=flat.device)
-            if return_counts
-            else None
-        )
-        return (
-            data_out,
-            (
-                inverse_indices
-                if inverse_indices is None
-                else inverse_indices.view_as(in0)
-            ),
-            counts,
-        )
-
     sorted_data, sorted_indices = torch.sort(flat)
     ne = torch.empty(N, dtype=torch.bool, device=flat.device)
     cum_input = torch.empty(N, dtype=torch.int64, device=flat.device)
@@ -1632,8 +1603,81 @@ def _unique2(
                 start, counts, N, n_unique, BLOCK=_SCAN_BLOCK
             )
 
-    return (
-        data_out,
-        inverse_indices if inverse_indices is None else inverse_indices.view_as(in0),
-        counts,
-    )
+    return data_out, inverse_indices, counts, n_unique
+
+
+def _unique2(
+    in0: torch.Tensor,
+    sorted: bool = True,
+    return_inverse: bool = False,
+    return_counts: bool = False,
+):
+    logger.debug("GEMS_KUNLUNXIN _UNIQUE2")
+    _ = sorted
+    flat = in0.contiguous().view(-1)
+    N = flat.numel()
+
+    if N == 0:
+        data_out = flat.clone()
+        inverse_indices = (
+            torch.empty_like(flat, dtype=torch.int64).view_as(in0)
+            if return_inverse
+            else torch.empty(0, dtype=torch.int64, device=flat.device)
+        )
+        counts = torch.empty(0, dtype=torch.int64, device=flat.device)
+        return (
+            data_out,
+            inverse_indices,
+            counts,
+        )
+
+    empty64 = torch.empty(0, dtype=torch.int64, device=flat.device)
+    nan_mask = flat != flat if flat.is_floating_point() else None
+    num_nan = int(nan_mask.sum()) if nan_mask is not None else 0
+
+    if num_nan == 0:
+        data_out, inverse_indices, counts, _ = _unique2_core(
+            flat, return_inverse, return_counts
+        )
+        inverse_indices = (
+            inverse_indices.view_as(in0) if return_inverse else empty64
+        )
+        counts = counts if return_counts else empty64
+        return (data_out, inverse_indices, counts)
+
+    nan_idx = torch.nonzero(nan_mask).ravel()
+    non_nan_idx = torch.nonzero(~nan_mask).ravel()
+    flat_nn = flat[non_nan_idx]
+
+    if flat_nn.numel() == 0:
+        core_out = flat.new_empty(0)
+        inv_nn = torch.empty(0, dtype=torch.int64, device=flat.device)
+        cnt_nn = torch.empty(0, dtype=torch.int64, device=flat.device)
+        n_nn_unique = 0
+    else:
+        core_out, inv_nn, cnt_nn, n_nn_unique = _unique2_core(
+            flat_nn, return_inverse, return_counts
+        )
+
+    nan_vals = flat.new_full((num_nan,), float("nan"))
+    data_out = torch.cat([core_out, nan_vals])
+
+    if return_inverse:
+        inverse_indices = torch.empty(N, dtype=torch.int64, device=flat.device)
+        if non_nan_idx.numel() > 0:
+            inverse_indices.scatter_(0, non_nan_idx, inv_nn)
+        nan_slots = torch.arange(
+            n_nn_unique, n_nn_unique + num_nan, dtype=torch.int64, device=flat.device
+        )
+        inverse_indices.scatter_(0, nan_idx, nan_slots)
+        inverse_indices = inverse_indices.view_as(in0)
+    else:
+        inverse_indices = empty64
+
+    if return_counts:
+        nan_counts = torch.ones(num_nan, dtype=torch.int64, device=flat.device)
+        counts = torch.cat([cnt_nn, nan_counts])
+    else:
+        counts = empty64
+
+    return (data_out, inverse_indices, counts)

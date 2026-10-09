@@ -116,7 +116,8 @@ def _lu_scale_column_kernel(
     base = LU + batch * M * N
     pivot = tl.load(base + J * N + J)
     values = tl.load(base + rows * N + J, mask=rows < M, other=0.0)
-    tl.store(base + rows * N + J, values / pivot, mask=rows < M)
+    scale = tl.where(pivot != 0.0, 1.0 / pivot, 0.0)
+    tl.store(base + rows * N + J, values * scale, mask=rows < M)
 
 
 @triton.jit
@@ -164,12 +165,6 @@ def _check_linalg_lu_factor(input, pivot):
 
 def _linalg_lu_factor(input, pivot):
     _check_linalg_lu_factor(input, pivot)
-    if not pivot:
-        raise NotImplementedError(
-            "Kunlunxin linalg_lu_factor does not support pivot=False: "
-            "the vendor lu_factor_ex primitive rejects it and no XPU-safe "
-            "no-pivot kernel is available"
-        )
 
     input_contiguous = input.contiguous()
     m, n = input_contiguous.shape[-2:]
@@ -197,55 +192,56 @@ def _linalg_lu_factor(input, pivot):
 
     with torch_device_fn.device(input.device):
         for j in range(k):
-            if blocks_full:
-                _lu_find_pivot_main_kernel[(batch * blocks_full,)](
-                    lu,
+            if pivot:
+                if blocks_full:
+                    _lu_find_pivot_main_kernel[(batch * blocks_full,)](
+                        lu,
+                        partial_values,
+                        partial_rows,
+                        m,
+                        n,
+                        k,
+                        j,
+                        BLOCKS=blocks_full,
+                        BLOCK_P=block_p,
+                        num_warps=4,
+                    )
+                if tail:
+                    _lu_find_pivot_tail_kernel[(batch,)](
+                        lu,
+                        partial_values,
+                        partial_rows,
+                        m,
+                        n,
+                        k,
+                        j,
+                        TAIL_START=blocks_full * 64,
+                        BLOCK_M=tail,
+                        SLOT=blocks_full,
+                        BLOCK_P=block_p,
+                        num_warps=4,
+                    )
+                _lu_finish_pivot_kernel[(batch,)](
                     partial_values,
                     partial_rows,
+                    pivot_log,
+                    k,
+                    j,
+                    BLOCK_P=block_p,
+                    num_warps=4,
+                )
+                swap_blocks = triton.cdiv(n, 64)
+                _lu_swap_rows_kernel[(batch * swap_blocks,)](
+                    lu,
+                    pivot_log,
                     m,
                     n,
                     k,
                     j,
-                    BLOCKS=blocks_full,
-                    BLOCK_P=block_p,
+                    BLOCKS=swap_blocks,
+                    BLOCK_N=64,
                     num_warps=4,
                 )
-            if tail:
-                _lu_find_pivot_tail_kernel[(batch,)](
-                    lu,
-                    partial_values,
-                    partial_rows,
-                    m,
-                    n,
-                    k,
-                    j,
-                    TAIL_START=blocks_full * 64,
-                    BLOCK_M=tail,
-                    SLOT=blocks_full,
-                    BLOCK_P=block_p,
-                    num_warps=4,
-                )
-            _lu_finish_pivot_kernel[(batch,)](
-                partial_values,
-                partial_rows,
-                pivot_log,
-                k,
-                j,
-                BLOCK_P=block_p,
-                num_warps=4,
-            )
-            swap_blocks = triton.cdiv(n, 64)
-            _lu_swap_rows_kernel[(batch * swap_blocks,)](
-                lu,
-                pivot_log,
-                m,
-                n,
-                k,
-                j,
-                BLOCKS=swap_blocks,
-                BLOCK_N=64,
-                num_warps=4,
-            )
             if j + 1 < m:
                 scale_blocks = triton.cdiv(m - j - 1, 64)
                 _lu_scale_column_kernel[(batch * scale_blocks,)](
@@ -270,7 +266,14 @@ def _linalg_lu_factor(input, pivot):
                     BLOCK_N=128,
                     num_warps=4,
                 )
-    pivots.copy_(pivot_log)
+    if pivot:
+        pivots.copy_(pivot_log)
+    else:
+        # No pivoting: the permutation is the identity, so pivots[..., j] = j + 1
+        # (1-based, matching torch.linalg.lu_factor's convention).  This is index
+        # bookkeeping, not a numeric factorization step.
+        identity = torch.arange(1, k + 1, device=input.device, dtype=torch.int32)
+        pivots.copy_(identity.expand_as(pivots))
     return lu, pivots
 
 
@@ -279,7 +282,18 @@ def linalg_lu_factor(input, *, pivot=True):
     return _linalg_lu_factor(input, pivot)
 
 
-def _resolve_linalg_lu_factor_out_args(input, LU, pivots):
+def _resolve_linalg_lu_factor_out_args(input, LU, pivots, out):
+    if out is not None:
+        if LU is not None or pivots is not None:
+            raise TypeError(
+                "linalg_lu_factor(): out and LU/pivots cannot both be set"
+            )
+        if len(out) != 2:
+            raise TypeError(
+                "linalg_lu_factor(): out must be a tuple of 2 tensors, "
+                f"got {len(out)}"
+            )
+        LU, pivots = out
     if LU is None or pivots is None:
         raise TypeError(
             "linalg_lu_factor(): LU and pivots must both be provided " "for out variant"
@@ -295,9 +309,9 @@ def _resolve_linalg_lu_factor_out_args(input, LU, pivots):
     return LU, pivots
 
 
-def linalg_lu_factor_out(input, *, pivot=True, LU=None, pivots=None):
+def linalg_lu_factor_out(input, *, pivot=True, LU=None, pivots=None, out=None):
     logger.debug("GEMS_KUNLUNXIN LINALG_LU_FACTOR_OUT")
-    lu_out, pivots_out = _resolve_linalg_lu_factor_out_args(input, LU, pivots)
+    lu_out, pivots_out = _resolve_linalg_lu_factor_out_args(input, LU, pivots, out)
     lu, pivots_result = _linalg_lu_factor(input, pivot)
     lu_out.resize_(lu.shape)
     pivots_out.resize_(pivots_result.shape)

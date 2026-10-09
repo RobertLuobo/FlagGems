@@ -176,19 +176,15 @@ def _pick_rows(M):
 
 def kron(A, B):
     logger.debug("GEMS_KUNLUNXIN KRON")
-    if A.dim() == 0 and B.dim() == 0:
-        return A * B
 
     if A.numel() == 0 or B.numel() == 0:
         A_prepared, B_prepared, out_shape = prepare_tensor_for_kron(A, B)
         output_dtype = torch.promote_types(A.dtype, B.dtype)
         return torch.empty(out_shape, device=A.device, dtype=output_dtype)
 
-    if A.dim() == 0:
-        return A.unsqueeze(0) * B
-    if B.dim() == 0:
-        return A * B.unsqueeze(0)
-
+    # Scalar (0-d) operands flow through the triton kernel below. The old torch-mul
+    # fast paths (A * B) raise "kint16 is unsupported" on XPU for integer scalars;
+    # the kernel's fp32-upcast store handles every dtype uniformly.
     A_prepared, B_prepared, out_shape = prepare_tensor_for_kron(A, B)
     M1, N1 = A_prepared.shape[-2:]
     M2, N2 = B_prepared.shape[-2:]
@@ -280,6 +276,9 @@ def kron(A, B):
                     need_mask,
                     1,
                 )
+
+    if A.dim() == 0 and B.dim() == 0:
+        return C.reshape(())
 
     if A.dim() <= 1 and B.dim() <= 1:
         return C.reshape(-1)

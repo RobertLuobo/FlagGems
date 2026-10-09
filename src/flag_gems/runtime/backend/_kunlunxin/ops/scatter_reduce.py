@@ -198,6 +198,9 @@ def _scatter_reduce_prod_3d_kernel(
 
     product = self_value if INCLUDE_SELF else 1.0
     selected_count = 0
+    neg = 0
+    if INCLUDE_SELF:
+        neg ^= (self_value.to(tl.int32, bitcast=True) >> 31) & 1
     offset = 0
     if valid_base:
         while offset < dim_size:
@@ -205,10 +208,20 @@ def _scatter_reduce_prod_3d_kernel(
             value = tl.load(src + src_base + offset * src_stride).to(tl.float32)
             matched = index_value == destination
             product = tl.where(matched, product * value, product)
+            vneg = (value.to(tl.int32, bitcast=True) >> 31) & 1
+            neg = tl.where(matched, neg ^ vneg, neg)
             selected_count += matched.to(tl.int32)
             offset += 1
     if not INCLUDE_SELF:
         product = tl.where(selected_count == 0, self_value, product)
+        neg = tl.where(
+            selected_count == 0,
+            (self_value.to(tl.int32, bitcast=True) >> 31) & 1,
+            neg,
+        )
+    zbits = tl.where(neg == 1, 0x80000000, 0).to(tl.uint32).to(tl.int32)
+    negzero = zbits.to(tl.float32, bitcast=True)
+    product = tl.where(product == 0.0, tl.where(neg == 1, negzero, 0.0), product)
     tl.store(out + output_offset, product)
 
 
@@ -537,12 +550,199 @@ def _scatter_reduce_prod_general_kernel(
     tl.store(out + output_offset, product)
 
 
+@triton.jit
+def _sr_mul(a, b):
+    return a * b
+
+
+@libentry()
+@triton.jit
+def _scatter_reduce_chunked_kernel(
+    inp,
+    index,
+    src,
+    out,
+    input_size0,
+    input_size1,
+    input_size2,
+    index_size0,
+    index_size1,
+    index_size2,
+    src_size1,
+    src_size2,
+    REDUCE: tl.constexpr,
+    INCLUDE_SELF: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    output_offset = tl.program_id(0)
+    z = output_offset % input_size2
+    y = (output_offset // input_size2) % input_size1
+    x = output_offset // (input_size1 * input_size2)
+    valid_base = (x < index_size0) & (z < index_size2)
+    dim_size = index_size1
+    index_base = x * index_size1 * index_size2 + z
+    src_base = x * src_size1 * src_size2 + z
+    index_stride = index_size2
+    src_stride = src_size2
+    destination = y
+
+    self_value = tl.load(inp + output_offset).to(tl.float32)
+    if REDUCE == 0 or REDUCE == 2:
+        acc = 0.0
+    elif REDUCE == 3:
+        acc = -float("inf")
+    else:
+        acc = float("inf")
+    cnt = 0
+    for start in tl.range(0, dim_size, BLOCK):
+        off = start + tl.arange(0, BLOCK)
+        valid = valid_base & (off < dim_size)
+        idx = tl.load(index + index_base + off * index_stride, mask=valid, other=-1)
+        sel = valid & (idx == destination)
+        val = tl.load(
+            src + src_base + off * src_stride, mask=sel, other=0.0
+        ).to(tl.float32)
+        cnt += tl.sum(sel.to(tl.int32), axis=0)
+        if REDUCE == 0 or REDUCE == 2:
+            acc += tl.sum(tl.where(sel, val, 0.0), axis=0)
+        elif REDUCE == 3:
+            acc = tl.maximum(acc, tl.max(tl.where(sel, val, -float("inf")), axis=0))
+        else:
+            acc = tl.minimum(acc, tl.min(tl.where(sel, val, float("inf")), axis=0))
+
+    if REDUCE == 2:
+        count = cnt + (1 if INCLUDE_SELF else 0)
+        if INCLUDE_SELF:
+            acc += self_value
+        acc = acc / count
+    elif INCLUDE_SELF:
+        if REDUCE == 0:
+            acc += self_value
+        elif REDUCE == 3:
+            acc = tl.maximum(acc, self_value)
+        else:
+            acc = tl.minimum(acc, self_value)
+    if not INCLUDE_SELF:
+        acc = tl.where(cnt == 0, self_value, acc)
+    tl.store(out + output_offset, acc)
+
+
+@libentry()
+@triton.jit
+def _scatter_reduce_prod_chunked_kernel(
+    inp,
+    index,
+    src,
+    out,
+    input_size0,
+    input_size1,
+    input_size2,
+    index_size0,
+    index_size1,
+    index_size2,
+    src_size1,
+    src_size2,
+    INCLUDE_SELF: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    output_offset = tl.program_id(0)
+    z = output_offset % input_size2
+    y = (output_offset // input_size2) % input_size1
+    x = output_offset // (input_size1 * input_size2)
+    valid_base = (x < index_size0) & (z < index_size2)
+    dim_size = index_size1
+    index_base = x * index_size1 * index_size2 + z
+    src_base = x * src_size1 * src_size2 + z
+    index_stride = index_size2
+    src_stride = src_size2
+    destination = y
+
+    self_value = tl.load(inp + output_offset).to(tl.float32)
+    product = self_value if INCLUDE_SELF else 1.0
+    neg = 0
+    if INCLUDE_SELF:
+        neg ^= (self_value.to(tl.int32, bitcast=True) >> 31) & 1
+    cnt = 0
+    for start in tl.range(0, dim_size, BLOCK):
+        off = start + tl.arange(0, BLOCK)
+        valid = valid_base & (off < dim_size)
+        idx = tl.load(index + index_base + off * index_stride, mask=valid, other=-1)
+        sel = valid & (idx == destination)
+        val = tl.load(
+            src + src_base + off * src_stride, mask=sel, other=1.0
+        ).to(tl.float32)
+        product *= tl.reduce(tl.where(sel, val, 1.0), 0, _sr_mul)
+        vneg = (val.to(tl.int32, bitcast=True) >> 31) & 1
+        neg ^= tl.sum(tl.where(sel, vneg, 0), axis=0) & 1
+        cnt += tl.sum(sel.to(tl.int32), axis=0)
+
+    if not INCLUDE_SELF:
+        product = tl.where(cnt == 0, self_value, product)
+        neg = tl.where(
+            cnt == 0, (self_value.to(tl.int32, bitcast=True) >> 31) & 1, neg
+        )
+    zbits = tl.where(neg == 1, 0x80000000, 0).to(tl.uint32).to(tl.int32)
+    negzero = zbits.to(tl.float32, bitcast=True)
+    product = tl.where(product == 0.0, tl.where(neg == 1, negzero, 0.0), product)
+    tl.store(out + output_offset, product)
+
+
 _REDUCTIONS = {"sum": 0, "prod": 1, "mean": 2, "amax": 3, "amin": 4}
+_SINGLE_TILE_LIMIT = 65536
+_CHUNK_BLOCK = 4096
 
 
 def _pad5(shape, fill=1):
     """Rank-pad a shape tuple to 5 entries (scatter_reduce supports <= 5D)."""
     return tuple(shape) + (fill,) * (5 - len(shape))
+
+
+def _scatter_reduce_high_rank(inp, dim, index, src, reduce, include_self):
+    """Collapse an arbitrary-rank scatter into an equivalent 3D problem.
+
+    ``index`` defines the active prefix domain. Only that domain is read from
+    ``src`` and updated in ``inp``; everything outside it is copied through
+    unchanged. After narrowing the active prefixes every valid scatter maps to
+    ``(outer, scatter_dim, inner)`` and is handled by the existing aligned 3D
+    kernels (no atomics, deterministic).
+    """
+    index_shape = tuple(int(size) for size in index.shape)
+    active_inp = inp
+    active_src = src
+    for axis, index_size in enumerate(index_shape):
+        active_src = active_src.narrow(axis, 0, index_size)
+        if axis != dim:
+            active_inp = active_inp.narrow(axis, 0, index_size)
+
+    outer = 1
+    for s in index_shape[:dim]:
+        outer *= s
+    inner = 1
+    for s in index_shape[dim + 1 :]:
+        inner *= s
+    active_shape = tuple(active_inp.shape)
+    inp_3d = active_inp.contiguous().reshape(outer, inp.size(dim), inner)
+    index_3d = index.contiguous().reshape(outer, index_shape[dim], inner)
+    src_3d = active_src.contiguous().reshape(outer, index_shape[dim], inner)
+
+    active_result = scatter_reduce(
+        inp_3d, 1, index_3d, src_3d, reduce, include_self=include_self
+    )
+
+    active_domain_is_full = all(
+        axis == dim or index_size == inp.size(axis)
+        for axis, index_size in enumerate(index_shape)
+    )
+    if active_domain_is_full:
+        return active_result.reshape(active_shape)
+
+    result = inp.contiguous().clone()
+    result_active = result
+    for axis, index_size in enumerate(index_shape):
+        if axis != dim:
+            result_active = result_active.narrow(axis, 0, index_size)
+    result_active.copy_(active_result.reshape(active_shape))
+    return result
 
 
 def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
@@ -555,9 +755,10 @@ def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
         raise RuntimeError(
             "scatter_reduce(): Expected self to have non-zero dimensionality"
         )
-    if inp.ndim > 5:
-        raise AssertionError(
-            f"scatter_reduce supports up to 5D tensors, got {inp.ndim}D"
+    if dim < -inp.ndim or dim >= inp.ndim:
+        raise IndexError(
+            "Dimension out of range (expected to be in range of "
+            f"[{-inp.ndim}, {inp.ndim - 1}], but got {dim})"
         )
 
     dim %= inp.ndim
@@ -571,17 +772,18 @@ def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
                 "index must not be larger than src or self outside the scatter dimension"
             )
 
+    if inp.ndim > 5:
+        return _scatter_reduce_high_rank(inp, dim, index, src, reduce, include_self)
+
     result = inp.contiguous().clone()
     if index.numel() == 0 or result.numel() == 0:
         return result
 
     index = index.contiguous()
     src = src.contiguous()
-    block = triton.next_power_of_2(index.shape[dim])
-    if block > 65536:
-        raise RuntimeError(
-            "Kunlunxin scatter_reduce supports at most 65536 source elements along dim"
-        )
+    idx_dim_size = index.shape[dim]
+    use_chunked = idx_dim_size > _SINGLE_TILE_LIMIT
+    block = triton.next_power_of_2(idx_dim_size) if not use_chunked else _CHUNK_BLOCK
 
     outer_d = 1
     for s in index.shape[:dim]:
@@ -602,7 +804,7 @@ def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
     for s in src.shape[dim + 1 :]:
         src_inner *= s
 
-    if inp.ndim == 2 and reduce != "prod":
+    if inp.ndim == 2 and reduce != "prod" and not use_chunked:
         with torch_device_fn.device(inp.device):
             _scatter_reduce_2d_kernel[(result.numel(),)](
                 inp.contiguous(),
@@ -627,7 +829,52 @@ def scatter_reduce(inp, dim, index, src, reduce, *, include_self=True):
 
     input_contiguous = inp.contiguous()
     with torch_device_fn.device(inp.device):
-        if not aligned:
+        if use_chunked:
+            if not aligned:
+                raise RuntimeError(
+                    "Kunlunxin scatter_reduce chunked path requires aligned "
+                    "non-scatter dimensions"
+                )
+            if reduce == "prod":
+                _scatter_reduce_prod_chunked_kernel[(result.numel(),)](
+                    input_contiguous,
+                    index,
+                    src,
+                    result,
+                    outer_i,
+                    in_dim,
+                    inner_i,
+                    outer_d,
+                    idx_dim,
+                    inner_d,
+                    src_dim,
+                    src_inner,
+                    INCLUDE_SELF=include_self,
+                    BLOCK=_CHUNK_BLOCK,
+                    isCloseVectorization=True,
+                    buffer_size_limit=2048,
+                )
+            else:
+                _scatter_reduce_chunked_kernel[(result.numel(),)](
+                    input_contiguous,
+                    index,
+                    src,
+                    result,
+                    outer_i,
+                    in_dim,
+                    inner_i,
+                    outer_d,
+                    idx_dim,
+                    inner_d,
+                    src_dim,
+                    src_inner,
+                    REDUCE=_REDUCTIONS[reduce],
+                    INCLUDE_SELF=include_self,
+                    BLOCK=_CHUNK_BLOCK,
+                    isCloseVectorization=True,
+                    buffer_size_limit=2048,
+                )
+        elif not aligned:
             sp = _pad5(inp.shape, 1)
             ip = _pad5(index.shape, 1)
             rp = _pad5(src.shape, 1)
@@ -713,6 +960,10 @@ def scatter_reduce_(inp, dim, index, src, reduce, *, include_self=True):
 
 def scatter_reduce_out(inp, dim, index, src, reduce, *, include_self=True, out=None):
     logger.debug("GEMS_KUNLUNXIN SCATTER_REDUCE_TWO_OUT")
+    if out is not None and out.dtype != inp.dtype:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {inp.dtype}, but got {out.dtype} instead"
+        )
     result = scatter_reduce(inp, dim, index, src, reduce, include_self=include_self)
     if tuple(out.shape) != tuple(result.shape):
         out.resize_(result.shape)

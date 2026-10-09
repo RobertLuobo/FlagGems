@@ -190,11 +190,20 @@ def _wn_first_forward(output, norm, v, g, M, N):
     with torch_device_fn.device(v.device):
         if N <= _WN_TILE:
             TILE_M = _wn_fwd_tile_m(M, N)
-            need_mask = (M % TILE_M) != 0
-            grid = (triton.cdiv(M, TILE_M),)
-            _wn_multirow_kernel[grid](
-                output, norm, v, g, M, N, TILE_M, need_mask, eps, num_warps=4
-            )
+            n_pow2 = (N & (N - 1)) == 0
+            # The 2D-tile multirow kernel is only safe when BOTH the tile rows
+            # (TILE_M >= 2) and the tile width N are powers of two: a non-pow2 N
+            # tile (e.g. N=768) fails the XPU ConvertTritonXPUToLLVM lowering
+            # (same 2D-tile non-pow2 layout bug as the backward path), so any
+            # non-pow2 N / single-row tile must use the 1-row kernel below.
+            if TILE_M >= 2 and n_pow2:
+                need_mask = (M % TILE_M) != 0
+                grid = (triton.cdiv(M, TILE_M),)
+                _wn_multirow_kernel[grid](
+                    output, norm, v, g, M, N, TILE_M, need_mask, eps, num_warps=4
+                )
+            else:
+                _wn_row1d_kernel[(M,)](output, norm, v, g, N, eps, num_warps=2)
         else:
             # N > 8192: a triton per-row reduction needs >=2 chunks/row, but
             # tl.sum caps at 8192 lanes and a chunked [K, TILE] tile hits the

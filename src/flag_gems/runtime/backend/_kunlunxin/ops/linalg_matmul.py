@@ -118,4 +118,7 @@ def linalg_matmul(input, other):
             f"expected mat1 and mat2 to have the same dtype, but got: "
             f"{input.dtype} != {other.dtype}"
         )
+    if input.dtype in (torch.float16, torch.bfloat16):
+        orig_dtype = input.dtype
+        return _matmul(input.float(), other.float()).to(orig_dtype)
     return _matmul(input, other)

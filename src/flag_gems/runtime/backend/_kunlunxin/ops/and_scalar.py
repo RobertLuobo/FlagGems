@@ -39,6 +39,7 @@ def and_scalar(self, other):
     scalar identically to both packed lanes, so the result is bit-exact.
     """
     logger.debug("GEMS_KUNLUNXIN AND_SCALAR")
+    logger.debug("GEMS AND SCALAR")
     if (
         isinstance(self, torch.Tensor)
         and self.dtype == torch.int16

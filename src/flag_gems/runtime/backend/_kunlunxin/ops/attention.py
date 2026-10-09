@@ -388,7 +388,7 @@ def _attn_fwd(
 
 
 # XPU backward is staged to keep multiple dot accumulators out of a single loop.
-_STAGED_RED = 64
+_STAGED_RED = 16
 _STAGED_BLOCK_N = 8
 _STAGED_BLOCK_D = 4
 _STAGED_GRAD_R = 8

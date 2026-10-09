@@ -502,3 +502,81 @@ def cummax(
         # (exact vs CPU fp64 oracle for large B and all dtypes).
         scan_then_fan_loop(input, out, out_indices, M, N, K, compute_dtype)
     return out, out_indices
+
+
+@triton.jit
+def cummaxmin_backward_col_kernel(
+    grad_ptr,
+    indices_ptr,
+    grad_input_ptr,
+    reduction_size,
+    inner_size,
+    red_stride,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    outer = row // inner_size
+    inner = row % inner_size
+
+    base = outer * (reduction_size * inner_size) + inner
+
+    grad_base = grad_ptr + base
+    indices_base = indices_ptr + base
+    grad_input_base = grad_input_ptr + base
+
+    for block_start in range(0, reduction_size, BLOCK_SIZE):
+        pos = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = pos < reduction_size
+
+        off = pos * red_stride
+        g = tl.load(grad_base + off, mask=mask, other=0.0).to(tl.float32)
+        t = tl.load(indices_base + off, mask=mask, other=0)
+
+        tl.atomic_add(grad_input_base + t * red_stride, g, mask=mask)
+
+
+def cummaxmin_backward(
+    grad_output: Tensor, input: Tensor, indices: Tensor, dim: int
+) -> Tensor:
+    logger.debug("GEMS_KUNLUNXIN CUMMAXMIN_BACKWARD")
+
+    ndim = grad_output.ndim
+    if dim < 0:
+        dim = dim + ndim
+
+    shape = list(grad_output.shape)
+    reduction_size = shape[dim]
+
+    grad_c = grad_output.contiguous()
+    indices_c = indices.contiguous()
+
+    inner_size = 1
+    for i in range(dim + 1, ndim):
+        inner_size *= shape[i]
+    outer_size = 1
+    for i in range(dim):
+        outer_size *= shape[i]
+
+    grad_input_f32 = torch.zeros(shape, dtype=torch.float32, device=grad_output.device)
+
+    # XPU3: cross-program tl.atomic_add silently drops colliding updates, and
+    # cummax/cummin indices collide heavily (a running-extremum index repeats
+    # across many reduction positions). Assign one program per (outer, inner)
+    # column so every grad_input column has a single owning program; all
+    # colliding adds for that column become intra-program (which the backend
+    # accumulates correctly). red_stride == inner_size walks the reduction axis.
+    num_cols = outer_size * inner_size
+    BLOCK_SIZE = min(triton.next_power_of_2(max(reduction_size, 1)), 1024)
+    grid = (num_cols,)
+    with torch_device_fn.device(grad_output.device):
+        cummaxmin_backward_col_kernel[grid](
+            grad_c,
+            indices_c,
+            grad_input_f32,
+            reduction_size,
+            inner_size,
+            inner_size,
+            BLOCK_SIZE,
+        )
+
+    return grad_input_f32.to(grad_output.dtype)

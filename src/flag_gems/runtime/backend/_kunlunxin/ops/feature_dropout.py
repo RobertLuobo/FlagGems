@@ -608,8 +608,12 @@ def feature_dropout(input, p, train=True):
                 spatial *= input.shape[i]
 
         out = torch.empty_like(input)
-        pattern = input.dtype == torch.bfloat16
-        out_store = out.view(torch.int16) if pattern else out
+        # bf16 goes through the plain fp32-product -> HW cast store path (same as
+        # fp16/fp32). The XPU fp32->bf16 cast already matches torch's RNE
+        # bit-for-bit, and the int16-view bit-trick store suffers a 16-lane
+        # duplication codegen bug on this XPU, so it must not be used.
+        pattern = False
+        out_store = out
         if _kg_is_pow2(spatial):
             _kg_run_flat(
                 inp=input,

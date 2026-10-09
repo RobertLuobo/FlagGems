@@ -490,6 +490,8 @@ def native_batch_norm(
     training=False,
     momentum=0.1,
     eps=1e-5,
+    unbiased_running_var=False,
+    stats_dtype=None,
 ):
     """aten::native_batch_norm on dedicated Kunlunxin kernels.
 
@@ -499,6 +501,7 @@ def native_batch_norm(
     used instead.
     """
     logger.debug("GEMS_KUNLUNXIN NATIVE_BATCH_NORM")
+    logger.debug("GEMS NATIVE_BATCH_NORM")
 
     input_3d = make_3d_for_bn(input)
     if not input_3d.is_contiguous():
@@ -508,7 +511,8 @@ def native_batch_norm(
     n_slices = batch_dim * feat_dim
 
     output = torch.empty_like(input_3d)
-    save_mean = torch.empty(feat_dim, device=input.device, dtype=input.dtype)
+    save_dtype = stats_dtype if stats_dtype is not None else input.dtype
+    save_mean = torch.empty(feat_dim, device=input.device, dtype=save_dtype)
     save_inv_std = torch.empty_like(save_mean)
 
     training = bool(training)
@@ -525,7 +529,10 @@ def native_batch_norm(
     output_flat = output.reshape(-1)
     has_weight = weight is not None
     has_bias = bias is not None
-    var_correction = (count / (count - 1)) if count > 1 else 1.0
+    if unbiased_running_var and count > 1:
+        var_correction = count / (count - 1)
+    else:
+        var_correction = 1.0
 
     fused_plan = _nbn_fused_plan(batch_dim, feat_dim, spatial_dim) if training else None
     if fused_plan is not None:

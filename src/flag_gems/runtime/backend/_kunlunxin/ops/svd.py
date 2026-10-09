@@ -375,7 +375,7 @@ def _ortho_complete(Q, out_cols, tol=1.0e-6):
             coeff = (qj * v).sum(dim=1, keepdim=True)
             v = v - coeff * qj
         norm = torch.sqrt((v * v).sum(dim=1))
-        vn = v / torch.clamp(norm, min=tol)
+        vn = v / torch.clamp(norm, min=tol).unsqueeze(1)
         for b in range(batch):
             if filled[b] < out_cols and norm[b].item() > tol:
                 out[b, :, filled[b]] = vn[b]

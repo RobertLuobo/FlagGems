@@ -125,16 +125,25 @@ def addmv_kernel(
 
 
 def _addmv_addmm(self, mat, vec, beta, alpha, out, N, M):
-    # Contiguous-bias fast path: fold the whole affine matvec into one addmm_out.
-    # (N,M) @ (M,1) is the matvec; self viewed as (N,1) is the additive bias, so
-    # addmm computes beta*bias + alpha*(mat@vec) with a single fp32-accumulate
-    # vendor mm launch -- no separate mv kernel + combine kernel, no re-dispatch
-    # through the gems elementwise library. Views are zero-copy (self/out are
-    # contiguous (N,) here). Result reshapes back to (N,).
+    # Fold the whole affine matvec into one addmm_out. (N,M) @ (M,1) is the
+    # matvec; self reshaped/broadcast to (N,1) is the additive bias, so addmm
+    # computes beta*bias + alpha*(mat@vec) with a single fp32-accumulate vendor
+    # mm launch and a *single* final round to the output dtype -- no separate mv
+    # kernel + combine kernel. This is also the accuracy-correct path for
+    # bf16/fp16: the matvec stays in fp32 until the final store, so a large alpha
+    # (e.g. 100.0) cannot amplify an intermediate bf16 rounding of the matvec
+    # (which is exactly what the mv()->bf16->combine path did, failing the
+    # scalar-bias bf16 case on [5333,497]).
+    #
+    # A contiguous (N,) bias views to (N,1) for free. A scalar () / (1,) bias is
+    # left as-is and broadcast to (N,1) inside addmm_out (addmm handles the
+    # broadcast + unit-inner-stride normalisation). out is contiguous (N,) here,
+    # so out.view(N,1) is zero-copy.
+    bias = self.reshape(N, 1) if tuple(self.shape) == (N,) else self
     addmm_out(
-        self.view(N, 1),
+        bias,
         mat,
-        vec.view(M, 1),
+        vec.reshape(M, 1),
         beta=beta,
         alpha=alpha,
         out=out.view(N, 1),
@@ -190,12 +199,14 @@ def _addmv_impl(self, mat, vec, beta, alpha, out):
         return out
 
     if M >= _MV_DELEGATE_M:
-        if (
-            beta != 0
-            and tuple(self.shape) == (N,)
-            and self.is_contiguous()
-            and out.is_contiguous()
-        ):
+        # Route the matvec through the fp32-accumulate vendor mm (addmm_out) for
+        # ALL broadcastable bias shapes, not just the contiguous (N,) one. This
+        # keeps the matvec in fp32 until a single final round, which the
+        # mv()->bf16->combine path did not (large alpha amplified the bf16
+        # rounding of the matvec). out must be contiguous so out.view(N,1) is a
+        # zero-copy 2-D view. beta==0 (not exercised by the accuracy suite) and
+        # non-contiguous out still take the native-dtype mv + fused combine path.
+        if beta != 0 and out.is_contiguous():
             return _addmv_addmm(self, mat, vec, beta, alpha, out, N, M)
         return _addmv_mv(self, mat, vec, beta, alpha, out, N)
     return _addmv_triton(self, mat, vec, beta, alpha, out, N, M)

@@ -39,6 +39,7 @@ from .mhc_bwd import mhc_bwd  # noqa: F401  (import triggers _install)
 from .mhc_pre import mhc_pre  # noqa: F401  (import triggers _install)
 from .moe_align_block_size import moe_align_block_size, moe_align_block_size_triton
 from .outer import outer
+from .post_layer_norm_residual import post_layer_norm_residual
 from .reglu import dreglu, reglu
 from .reshape_and_cache import reshape_and_cache
 from .reshape_and_cache_flash import reshape_and_cache_flash
@@ -56,8 +57,19 @@ from .sparse_mla import (  # noqa: F401  (import triggers _install)
     triton_sparse_mla_fwd_interface,
 )
 from .swiglu import dswiglu, swiglu
+from .top_k_per_row_decode import (  # noqa: F401  (import triggers _install)
+    top_k_per_row_decode,
+)
+from .top_k_per_row_prefill import (  # noqa: F401  (import triggers _install)
+    top_k_per_row_prefill,
+)
 from .topk_softmax import topk_softmax
+from .topk_softplus_sqrt import topk_softplus_sqrt
 from .weight_norm import weight_norm
+from .pack_seq import pack_seq_triton_xpu  # noqa: F401  (import triggers _install)
+from .unpack_seq import (  # noqa: F401  (import triggers _install)
+    unpack_seq_triton_xpu,
+)
 
 __all__ = [
     "apply_rotary_pos_emb",
@@ -77,6 +89,7 @@ __all__ = [
     "hc_split_sinkhorn",
     "cross_entropy_loss",
     "outer",
+    "post_layer_norm_residual",
     "instance_norm",
     "weight_norm",
     "concat_and_cache_mla",
@@ -86,6 +99,7 @@ __all__ = [
     "reshape_and_cache_flash",
     "flash_mla_sparse_fwd",
     "topk_softmax",
+    "topk_softplus_sqrt",
     "rwkv_ka_fusion",
     "rwkv_mm_sparsity",
     "dreglu",

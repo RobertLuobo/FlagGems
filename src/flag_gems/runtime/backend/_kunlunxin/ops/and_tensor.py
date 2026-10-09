@@ -66,6 +66,7 @@ def and_tensor(self, other):
     preparation, which dominates latency at that size.
     """
     logger.debug("GEMS_KUNLUNXIN AND_TENSOR")
+    logger.debug("GEMS AND_TENSOR")
     if _use_flat_path(self, other):
         numel = self.numel()
         out = torch.empty_like(self)

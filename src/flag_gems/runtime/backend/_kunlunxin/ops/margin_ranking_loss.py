@@ -252,10 +252,24 @@ def _margin_ranking_loss_backward_kernel(
     tl.store(grad_input2 + offsets, grad_input2_val.to(input1_val.dtype), mask=mask)
 
 
-def _margin_ranking_loss_forward(input1, input2, target, margin, reduction):
-    logger.debug("GEMS_KUNLUNXIN MARGIN_RANKING_LOSS")
+_REDUCTION_STR_TO_INT = {"none": 0, "mean": 1, "sum": 2}
+
+
+def _normalize_reduction(reduction):
+    # Accept both the string form ("none"/"mean"/"sum", the torch convention)
+    # and the integer form (0/1/2) that the kernels consume internally.
+    if isinstance(reduction, str):
+        if reduction not in _REDUCTION_STR_TO_INT:
+            raise ValueError("reduction must be one of 'none', 'mean', or 'sum'")
+        return _REDUCTION_STR_TO_INT[reduction]
     if reduction not in (0, 1, 2):
         raise ValueError("reduction must be 0 (none), 1 (mean), or 2 (sum)")
+    return reduction
+
+
+def _margin_ranking_loss_forward(input1, input2, target, margin, reduction):
+    logger.debug("GEMS_KUNLUNXIN MARGIN_RANKING_LOSS")
+    reduction = _normalize_reduction(reduction)
 
     input1, input2, target = torch.broadcast_tensors(input1, input2, target)
     output_shape = input1.shape
@@ -328,6 +342,7 @@ def _margin_ranking_loss_forward(input1, input2, target, margin, reduction):
 class _MarginRankingLoss(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input1, input2, target, margin, reduction):
+        reduction = _normalize_reduction(reduction)
         input1, input2, target = torch.broadcast_tensors(input1, input2, target)
         ctx.save_for_backward(
             input1.contiguous(), input2.contiguous(), target.contiguous()
@@ -363,6 +378,5 @@ class _MarginRankingLoss(torch.autograd.Function):
 
 
 def margin_ranking_loss(input1, input2, target, margin=0.0, reduction=1):
-    if reduction not in (0, 1, 2):
-        raise ValueError("reduction must be 0 (none), 1 (mean), or 2 (sum)")
+    reduction = _normalize_reduction(reduction)
     return _MarginRankingLoss.apply(input1, input2, target, margin, reduction)
