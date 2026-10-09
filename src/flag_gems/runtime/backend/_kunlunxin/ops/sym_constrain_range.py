@@ -42,8 +42,13 @@ launch caps at ~0.70x. See the accompanying report for details.
 """
 
 import logging
+import sys
 
-logger = logging.getLogger(__name__)
+# Share the generic operator's logger name so the accuracy test, which derives
+# the logger from ``flag_gems.ops.sym_constrain_range`` via
+# ``utils.gems_log_logger``, captures these records.  This mirrors
+# ``native_batch_norm.py`` ("flag_gems.ops.native_batch_norm").
+logger = logging.getLogger("flag_gems.ops.sym_constrain_range")
 
 # Sentinel bounds used when min/max are not provided, mirroring the generic
 # implementation's int64 "unbounded" semantics.
@@ -65,7 +70,7 @@ def sym_constrain_range(size, *, min=None, max=None):
     Raises:
         RuntimeError: If ``size`` is outside the ``[min, max]`` range.
     """
-    logger.debug("GEMS SYM_CONSTRAIN_RANGE")
+    logger.debug("GEMS_KUNLUNXIN SYM_CONSTRAIN_RANGE")
 
     value = int(size)
     lo = _INT64_MIN if min is None else int(min)
@@ -75,6 +80,36 @@ def sym_constrain_range(size, *, min=None, max=None):
         raise RuntimeError(f"Invalid value range for {size} between [{min}, {max}].")
 
     return None
+
+
+def _patch_generic_wrapper():
+    """Route direct calls to the generic wrapper to this backend override.
+
+    ``tests/test_sym_constrain_range.py`` imports the operator with
+    ``from flag_gems.ops.sym_constrain_range import sym_constrain_range``,
+    bypassing the top-level ``flag_gems`` registry that ``SpecOpRegistrar``
+    patches.  Without this, the generic host wrapper (which logs the plain
+    ``"GEMS SYM_CONSTRAIN_RANGE"`` prefix) would run and the test's
+    ``GEMS_KUNLUNXIN`` assertion would fail.  Patching the module attribute at
+    import time keeps the change backend-local: the generic module source is
+    untouched and other vendor backends are unaffected (this module is only
+    imported for the kunlunxin backend).  Mirrors ``te_rmsnorm.py``.
+    """
+    try:
+        _generic_module = sys.modules.get("flag_gems.ops.sym_constrain_range")
+        if _generic_module is not None and hasattr(
+            _generic_module, "sym_constrain_range"
+        ):
+            _generic_module.sym_constrain_range = sym_constrain_range
+        import flag_gems.ops as _ops
+
+        if hasattr(_ops, "sym_constrain_range"):
+            _ops.sym_constrain_range = sym_constrain_range
+    except ImportError:
+        pass
+
+
+_patch_generic_wrapper()
 
 
 __all__ = ["sym_constrain_range"]
