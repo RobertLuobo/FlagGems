@@ -657,6 +657,11 @@ def parse_perf_data(op, result_file):
 
     bench_res = {}
     records = data.get("details", [])
+    # Some benchmark runs emit each detail record as a JSON-encoded string
+    # instead of a dict; decode those so the key access below is uniform.
+    records = [
+        json.loads(item) if isinstance(item, str) else item for item in records
+    ]
     if not any(item.get("native_baseline_skip_reason") for item in records):
         for item in records:
             dtype = consts.DTYPE_MAP.get(item["dtype"], item["dtype"])
@@ -670,14 +675,17 @@ def parse_perf_data(op, result_file):
                 details[shape]["gems"] = res.get("latency", 0.0)
                 speedup = res.get("speedup", 0.0)
                 details[shape]["speedup"] = speedup
-                count += 1
-                total += speedup
+                # speedup is None when the native baseline was not measured;
+                # exclude those cases from the average rather than crashing.
+                if isinstance(speedup, (int, float)):
+                    count += 1
+                    total += speedup
 
             if details:
                 bench_res[dtype] = {
                     "result": "OK",
                     "details": details,
-                    "speedup": total / count,
+                    "speedup": total / count if count else None,
                 }
             else:
                 bench_res[dtype] = {
@@ -776,7 +784,16 @@ def run_accuracy_q(gpu_id, op):
         base += " --ref cpu"
     if CFG.quick:
         base += " --quick"
-    cmd = base + " --continue-on-collection-errors -vs"
+    # Ignore modules that corrupt the device context during collection:
+    # test_apply_repetition_penalties.py launches a real CUDA kernel at import
+    # time, and test_FLA fails to import. Both cause spurious
+    # "invalid device function" failures in unrelated operators.
+    cmd = (
+        base
+        + " --continue-on-collection-errors -vs"
+        + f" --ignore={ROOT.joinpath('tests', 'test_apply_repetition_penalties.py')}"
+        + f" --ignore={ROOT.joinpath('tests', 'test_FLA')}"
+    )
 
     accuracy_dir = ROOT.joinpath("tests")
     result_file = accuracy_dir / f"accuracy_{op}.json"

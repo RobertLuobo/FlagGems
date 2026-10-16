@@ -23,25 +23,10 @@ vendor_info = VendorDescriptor(
     fp8_enabled=False,
 )
 
-CUSTOMIZED_UNUSED_OPS = (
-    "atan2_out",
-    "cumsum",
-    "grid_sampler_3d_backward",
-    "randperm",
-    "searchsorted",
-    "searchsorted_out",
-    "searchsorted_scalar",
-    "topk",
-    "unique",
-    "slice",
-    "conv_transpose1d",
-    "mkldnn_rnn_layer",
-    "_linalg_eigvals",
-    "linalg_eig",
-    "linalg_eigvals",
-    "linalg_eigvals.out",
-    "linalg_eigvals_out",
-)
+# NOTE(2026-10-14): kunlunxin specializations disabled. The generic
+# implementations of these ops must now be registered, so the exclusion list
+# is empty. The original list is preserved in git history.
+CUSTOMIZED_UNUSED_OPS = ()
 
 
 # NOTE(2026-09-23): atanh_ is already registered by the generic _FULL_CONFIG
