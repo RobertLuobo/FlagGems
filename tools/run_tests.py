@@ -761,6 +761,124 @@ def parse_accuracy_data(result_file):
     return result
 
 
+def parse_perf_data(op, result_file):
+    raw_data = {}
+    try:
+        with result_file.open("r") as f:
+            raw_data = json.load(f)
+    except (json.JSONDecodeError, ValueError):
+        return {
+            "status": "Error",
+            "reason": f"Invalid JSON in {result_file}",
+        }
+
+    data = raw_data.get(op, {})
+    if not data:
+        return {"status": "NotFound"}
+
+    result = data.get("result", "NotFound")
+    if result in ["failed", "skipped"]:
+        return {
+            "status": result.title(),
+            "reason": data.get("reason", "Unknown"),
+            "test_case": data.get("test_case", "Unknown"),
+        }
+
+    bench_res = {}
+    records = data.get("details", [])
+    # Some benchmark runs emit each detail record as a JSON-encoded string
+    # instead of a dict; decode those so the key access below is uniform.
+    records = [
+        json.loads(item) if isinstance(item, str) else item for item in records
+    ]
+    if not any(item.get("native_baseline_skip_reason") for item in records):
+        for item in records:
+            dtype = consts.DTYPE_MAP.get(item["dtype"], item["dtype"])
+            details = {}
+            total = 0.0
+            count = 0
+            for res in item.get("result", []):
+                shape = str(res.get("shape_detail", "Unknown")).replace(" ", "")
+                details.setdefault(shape, {})
+                details[shape]["base"] = res.get("latency_base", 0.0)
+                details[shape]["gems"] = res.get("latency", 0.0)
+                speedup = res.get("speedup", 0.0)
+                details[shape]["speedup"] = speedup
+                # speedup is None when the native baseline was not measured;
+                # exclude those cases from the average rather than crashing.
+                if isinstance(speedup, (int, float)):
+                    count += 1
+                    total += speedup
+
+            if details:
+                bench_res[dtype] = {
+                    "result": "OK",
+                    "details": details,
+                    "speedup": total / count if count else None,
+                }
+            else:
+                bench_res[dtype] = {
+                    "result": "Unknown",
+                    "details": {},
+                    "speedup": 0,
+                }
+
+        return {
+            "status": result.title(),
+            "data": bench_res,
+            "test_case": data.get("test_case", "Unknown"),
+        }
+
+    native_baseline_skip_reasons = []
+    speedup_totals = {}
+    speedup_counts = {}
+
+    for item in records:
+        dtype = consts.DTYPE_MAP.get(item["dtype"], item["dtype"])
+        skip_reason = item.get("native_baseline_skip_reason")
+        if skip_reason and skip_reason not in native_baseline_skip_reasons:
+            native_baseline_skip_reasons.append(skip_reason)
+        dtype_result = bench_res.setdefault(
+            dtype,
+            {
+                "result": "Unknown",
+                "details": {},
+                "speedup": None,
+            },
+        )
+        details = dtype_result["details"]
+        for res in item.get("result", []):
+            shape = str(res.get("shape_detail", "Unknown")).replace(" ", "")
+            details.setdefault(shape, {})
+            details[shape]["base"] = res.get("latency_base")
+            details[shape]["gems"] = res.get("latency")
+            speedup = res.get("speedup")
+            details[shape]["speedup"] = speedup
+            if isinstance(speedup, (int, float)):
+                speedup_counts[dtype] = speedup_counts.get(dtype, 0) + 1
+                speedup_totals[dtype] = speedup_totals.get(dtype, 0.0) + speedup
+
+        if details:
+            dtype_result["result"] = "OK"
+
+    for dtype, dtype_result in bench_res.items():
+        count = speedup_counts.get(dtype, 0)
+        dtype_result["speedup"] = (
+            speedup_totals.get(dtype, 0.0) / count if count else None
+        )
+
+    parsed_result = {
+        "status": result.title(),
+        "data": bench_res,
+        "test_case": data.get("test_case", "Unknown"),
+    }
+    if native_baseline_skip_reasons:
+        parsed_result["native_baseline_skip_reason"] = "; ".join(
+            native_baseline_skip_reasons
+        )
+    return parsed_result
+
+
 def op_marker(op):
     """Return the pytest marker name for an operator id.
 
@@ -795,7 +913,16 @@ def run_accuracy_q(gpu_id, op):
         base += " --ref cpu"
     if CFG.quick:
         base += " --quick"
-    cmd = base + " --continue-on-collection-errors -vs"
+    # Ignore modules that corrupt the device context during collection:
+    # test_apply_repetition_penalties.py launches a real CUDA kernel at import
+    # time, and test_FLA fails to import. Both cause spurious
+    # "invalid device function" failures in unrelated operators.
+    cmd = (
+        base
+        + " --continue-on-collection-errors -vs"
+        + f" --ignore={ROOT.joinpath('tests', 'test_apply_repetition_penalties.py')}"
+        + f" --ignore={ROOT.joinpath('tests', 'test_FLA')}"
+    )
 
     accuracy_dir = ROOT.joinpath("tests")
     result_file = accuracy_dir / f"accuracy_{op}.json"
