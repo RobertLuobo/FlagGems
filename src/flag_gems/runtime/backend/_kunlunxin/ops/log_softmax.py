@@ -24,12 +24,39 @@ from flag_gems.utils import libentry
 from flag_gems.utils import triton_lang_extension as ext
 
 try:
+    import triton.experimental.tle as _tle
     import triton.experimental.tle.language as tle
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     _HAS_TLE = True
 except ImportError:  # triton without the XPU tile-language extension
     _HAS_TLE = False
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_HAS_LOGSM_MID = False
+
+if _HAS_TLE:
+    try:
+        # Interior-axis fold payload. Replaces the transpose pair that used
+        # the vendor strided-copy aten primitive (a banned fallback here) on
+        # the K > 1 path; see
+        # payload/src/logsm_mid.xpu for why neither a triton kernel nor a
+        # replacement copy can express it.
+        _LOGSM_MID_OBJ = os.path.join(
+            os.path.dirname(_HERE), "payload", "obj", "logsm_mid.o"
+        )
+
+        @_tle.raw.dialect("xpu3", object=_LOGSM_MID_OBJ, arch=3)
+        def logsm_mid_f32(x, out, n, k, m_idx): ...
+
+        @triton.jit(do_not_specialize=["n", "k"])
+        def _logsm_mid_kernel(X, OUT, n, k):
+            _tle.raw.call(logsm_mid_f32, (X, OUT, n, k, tl.program_id(0)))
+
+        _HAS_LOGSM_MID = True
+    except (TypeError, AttributeError):
+        # Older flagtree builds ship a tle.raw that cannot register this.
+        _HAS_LOGSM_MID = False
 
 logger = logging.getLogger(__name__)
 
@@ -1629,39 +1656,49 @@ def log_softmax_out(self, dim, half_to_float=False, *, out):
             _fwd_n1_flat(out, inp)
         return out
     if K > 1:
+        # Interior-axis fold payload first: no transpose, so neither banned
+        # banned vendor copy runs. Falls through below when the routing misses.
+        if (
+            _HAS_LOGSM_MID
+            and inp.dtype == torch.float32
+            and out.dtype == torch.float32
+            and out.is_contiguous()
+        ):
+            with torch_device_fn.device(inp.device):
+                _logsm_mid_kernel[(M,)](inp, out, N, K)
+            return out
         # Reduction over an interior dim: transpose so the reduced axis is
         # contiguous, then run the fast K == 1 launch family into a contiguous
         # scratch and mirror it back through a transposed view of out. The
         # K > 1 per-row kernel (contiguous load + stride-K scatter store) is
         # far slower on XPU than transpose + fast path + transposed copy.
-        # Both transposes go through `torch.ops.aten._copy_from` (the vendor's
-        # strided-copy kernel) on purpose: a flag_gems strided pointwise copy is
-        # much slower than the vendor copy. 20+ _kunlunxin ops use this same
-        # escape hatch.
+        # Both transposes go through the gems `_strided_copy` kernel. The
+        # vendor strided-copy aten primitive is far faster here (1304 GB/s vs
+        # 3.3 GB/s measured on (64,512,512) f32) but is a banned fallback, so
+        # this path pays for compliance. fp32 does not reach it at all -- the
+        # interior-axis payload above covers it.
         inp_t = torch.empty((M * K, N), dtype=inp.dtype, device=inp.device)
-        torch.ops.aten._copy_from(
-            inp.view(M, N, K).transpose(1, 2), inp_t.view(M, K, N), False
-        )
+        _strided_copy(inp_t.view(M, K, N), inp.view(M, N, K).transpose(1, 2))
         tmp = torch.empty((M * K, N), dtype=dtype, device=inp.device)
         with torch_device_fn.device(inp.device):
             _forward_launch(tmp, inp_t, M * K, N)
         src = tmp.view(M, K, N).transpose(1, 2)
         if out.is_contiguous():
-            torch.ops.aten._copy_from(src, out.view(M, N, K), False)
+            _strided_copy(out.view(M, N, K), src)
         else:
             scratch = torch.empty((M, N, K), dtype=dtype, device=out.device)
-            torch.ops.aten._copy_from(src, scratch, False)
-            torch.ops.aten._copy_from(scratch.view(self.shape), out, False)
+            _strided_copy(scratch, src)
+            _strided_copy(out, scratch.view(self.shape))
         return out
     if not out.is_contiguous():
         # The launch kernels write flat (M, N, K)-contiguous offsets; a
         # strided out (e.g. a slice view) would be corrupted. Compute into a
-        # contiguous scratch, then mirror the result with the vendor strided
-        # copy (same escape hatch as above).
+        # contiguous scratch, then mirror the result with the gems strided
+        # copy kernel.
         tmp = torch.empty(self.shape, dtype=dtype, device=self.device)
         with torch_device_fn.device(inp.device):
             _forward_launch(tmp, inp, M, N, K)
-        torch.ops.aten._copy_from(tmp, out, False)
+        _strided_copy(out, tmp)
         return out
     with torch_device_fn.device(inp.device):
         _forward_launch(out, inp, M, N, K)
