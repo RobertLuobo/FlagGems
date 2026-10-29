@@ -324,6 +324,9 @@ from .conv3d import conv3d
 from .conv_depthwise2d import _conv_depthwise2d
 from .conv_transpose1d import conv_transpose1d
 from .conv_transpose2d import conv_transpose2d
+from .convert_indices_from_coo_to_csr import (  # noqa: F401
+    _coo_to_csr_lower_bound_kernel,
+)
 from .copy import copy, copy_
 from .copysign import copysign, copysign_out
 from .copysign_ import copysign_
