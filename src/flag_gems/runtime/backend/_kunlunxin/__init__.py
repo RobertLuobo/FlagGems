@@ -23,10 +23,12 @@ vendor_info = VendorDescriptor(
     fp8_enabled=False,
 )
 
+
 # NOTE(2026-10-14): kunlunxin specializations disabled. The generic
 # implementations of these ops must now be registered, so the exclusion list
 # is empty. The original list is preserved in git history.
 CUSTOMIZED_UNUSED_OPS = ()
+
 
 
 # NOTE(2026-09-23): atanh_ is already registered by the generic _FULL_CONFIG
